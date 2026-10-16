@@ -446,6 +446,14 @@ pub const ICON_SM: f32 = 16.0;
 pub const ICON_STATUS: f32 = 6.0;
 /// The plate behind a settings row's glyph.
 pub const ICON_SLOT: f32 = 34.0;
+/// The Agent mark inside the new-session page's sentence.
+///
+/// The sentence is set at [`FONT_TITLE`], and the mark stands in the line
+/// rather than beside it: a square brand mark drawn at the type's own nominal
+/// size reads smaller than the letterforms around it, so it is authored a step
+/// over them. Callers hand this to [`scaled_px`], which is what keeps the mark
+/// on the sentence's scale when the reader moves the text-size step.
+pub const NEW_SESSION_AGENT_LOGO_SIZE: f32 = FONT_TITLE + 2.0;
 /// A settings row is title + detail, so it is taller than a single-line list
 /// row while staying a single touch target.
 pub const SETTINGS_ROW_HEIGHT: f32 = 60.0;

@@ -27284,6 +27284,15 @@ impl MobileApp {
         let runtime_option = runtime_catalog
             .zip(runtime_selection)
             .and_then(|(catalog, selection)| matching_runtime_option(&catalog.options, selection));
+        // The Agent this page would hand the work to, named the way the
+        // sidebar rows and the runtime sheets name one: the catalogue's own
+        // label when it has one, the id when it does not.
+        let new_session_agent = runtime_selection.map(|selection| {
+            let label = runtime_option
+                .map(|option| option.agent_label.as_str())
+                .unwrap_or_else(|| selection.agent_id.as_str());
+            (&selection.agent_id, label)
+        });
         let model_id = match runtime_selection.map(|selection| &selection.model) {
             Some(vibex_core::RuntimeModelSelection::Explicit { model_id }) => {
                 Some(model_id.clone())
@@ -27381,17 +27390,7 @@ impl MobileApp {
                                             |intro, delta| intro.opacity(delta),
                                         )
                                         .child(self.render_pairing_brand())
-                                        .child(
-                                            div()
-                                                .text_size(theme::font_title())
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(theme::text_primary())
-                                                .child(locale::text(
-                                                    "Start something new",
-                                                    "开始新的工作",
-                                                    "開始新的工作",
-                                                )),
-                                        )
+                                        .child(new_session_slogan_line(new_session_agent))
                                         .child(
                                             div()
                                                 .mt(px(theme::SPACING_SM))
@@ -30749,6 +30748,97 @@ fn runtime_agent_icon(
     tint: Hsla,
 ) -> gpui::AnyElement {
     agent_brand_icon(&agent_brand_identity(agent_id.as_str(), label), size, tint)
+}
+
+/// The three slots the new-session sentence is drawn from, in the order the
+/// reader's language puts them: the words before the mark, the connector, and
+/// the words after it.
+///
+/// English keeps the phrase whole and ends on the mark — a sentence as ordinary
+/// as "start something new" has no room for a conjunction on its left. Chinese
+/// reads the connector first, which is what lands the mark between it and the
+/// words it governs. Keeping the split in one place is what lets both languages
+/// share a renderer that owns nothing but the order.
+fn new_session_slogan_words(locale: Locale) -> (&'static str, &'static str, &'static str) {
+    match locale {
+        Locale::En => ("Start something new", "with", ""),
+        Locale::ZhCn => ("", "和", "开始新的工作"),
+        Locale::ZhTw => ("", "和", "開始新的工作"),
+    }
+}
+
+/// The new-session page's own sentence, with the Agent that will answer it
+/// inside the line.
+///
+/// The page's chips name the model and the mode it will run with, and neither
+/// names the Agent — the Agent is the choice the page exists to make, so the
+/// sentence carries its mark, in the place the reader's language leaves for it.
+/// The phrase keeps the title's weight and colour; the connector steps back to
+/// the muted ink, so the sentence is still what the page says and the Agent is
+/// what it says it with.
+///
+/// A page with no Agent chosen yet says only the sentence: naming one before
+/// the reader has picked it would answer a question the page is still asking.
+fn new_session_slogan_line(agent: Option<(&AgentId, &str)>) -> gpui::AnyElement {
+    let phrase = |text: &'static str| {
+        div()
+            .text_size(theme::font_title())
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme::text_primary())
+            .child(text)
+    };
+    let connector = |text: &'static str| {
+        div()
+            .text_size(theme::font_title())
+            .text_color(theme::text_muted())
+            .child(text)
+    };
+    let Some((agent_id, agent_label)) = agent else {
+        return div()
+            .debug_selector(|| "mobile-new-session-slogan".to_string())
+            .child(phrase(locale::text(
+                "Start something new",
+                "开始新的工作",
+                "開始新的工作",
+            )))
+            .into_any_element();
+    };
+
+    let (lead, connector_text, trail) = new_session_slogan_words(locale::current());
+    // The mark is the one part of the line a screen reader cannot read, so the
+    // sentence is spoken with the Agent's name in its place.
+    let spoken = [lead, connector_text, agent_label, trail]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mark = agent_brand_icon(
+        &agent_brand_identity(agent_id.as_str(), agent_label),
+        theme::scaled_px(theme::NEW_SESSION_AGENT_LOGO_SIZE),
+        theme::text_primary(),
+    );
+    let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(4);
+    if !lead.is_empty() {
+        children.push(phrase(lead).into_any_element());
+    }
+    if !connector_text.is_empty() {
+        children.push(connector(connector_text).into_any_element());
+    }
+    children.push(mark);
+    if !trail.is_empty() {
+        children.push(phrase(trail).into_any_element());
+    }
+    div()
+        .id("mobile-new-session-slogan")
+        .debug_selector(|| "mobile-new-session-slogan".to_string())
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_center()
+        .gap(px(theme::SPACING_SM))
+        .aria_label(spoken)
+        .children(children)
+        .into_any_element()
 }
 
 /// Brand icon for a model id, desktop-style: colored marks render through
@@ -39059,6 +39149,59 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             source.contains("self.refresh_composer_commands(cx);"),
             "the page has to load the Agent's catalogue"
+        );
+    }
+
+    /// The new-session page says which Agent it will hand the work to.
+    ///
+    /// The chips on the page name the model and the mode, and neither names the
+    /// Agent — the Agent is the choice the page exists to make. So the sentence
+    /// carries its mark, placed where the reader's language leaves room for it,
+    /// and the mark is the Agent the page would start the session with rather
+    /// than whichever brand the model happens to belong to.
+    #[test]
+    fn the_new_session_sentence_carries_the_chosen_agent_mark() {
+        let source = include_str!("app.rs");
+        let page = renderer_source(source, "render_new_session");
+        assert!(
+            page.contains("new_session_slogan_line(new_session_agent)"),
+            "the sentence is the line that names the Agent"
+        );
+        assert!(
+            page.contains("let new_session_agent = runtime_selection.map(")
+                && page.contains("option.agent_label.as_str()"),
+            "the mark follows the page's own runtime selection"
+        );
+
+        let line = source
+            .split_once("fn new_session_slogan_line")
+            .map(|(_, tail)| tail.split_once("\nfn ").map_or(tail, |(body, _)| body))
+            .expect("the sentence should stay inspectable");
+        assert!(line.contains("agent_brand_identity("));
+        assert!(
+            line.contains("theme::scaled_px(theme::NEW_SESSION_AGENT_LOGO_SIZE)"),
+            "the mark tracks the title it stands in, not a frozen pixel box"
+        );
+        assert!(
+            line.contains("let Some((agent_id, agent_label)) = agent else {")
+                && line.contains("mobile-new-session-slogan"),
+            "a page with no Agent chosen yet says only the sentence"
+        );
+
+        // Chinese leads with the connector, so the mark lands between it and
+        // the words it governs; English keeps the phrase whole and ends on the
+        // mark instead of opening on a conjunction.
+        assert_eq!(
+            new_session_slogan_words(Locale::ZhCn),
+            ("", "和", "开始新的工作")
+        );
+        assert_eq!(
+            new_session_slogan_words(Locale::ZhTw),
+            ("", "和", "開始新的工作")
+        );
+        assert_eq!(
+            new_session_slogan_words(Locale::En),
+            ("Start something new", "with", "")
         );
     }
 
