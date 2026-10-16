@@ -250,6 +250,12 @@ pub enum ConfigAction {
     Validate,
     /// Make a second profile with the same settings under a new name.
     Duplicate,
+    /// Open the page an Agent that is missing can be installed from.
+    InstallDocs,
+    /// Open the page a market card names for itself.
+    OpenPage,
+    /// Install a market entry that is already installed.
+    Reinstall,
     /// Move a profile one place earlier in its Agent's order.
     MoveUp,
     /// Move a profile one place later in its Agent's order.
@@ -282,6 +288,9 @@ impl ConfigAction {
             Self::Matrix => strings.config_action_matrix(),
             Self::Import => strings.config_action_import(),
             Self::Duplicate => strings.config_action_duplicate(),
+            Self::InstallDocs => strings.config_action_install_docs(),
+            Self::OpenPage => strings.config_action_open_page(),
+            Self::Reinstall => strings.config_action_reinstall(),
             Self::MoveUp => strings.config_action_move_up(),
             Self::MoveDown => strings.config_action_move_down(),
         }
@@ -1339,7 +1348,7 @@ fn managed_line(agent: &vibex_core::AgentSnapshotEntry, strings: Strings) -> Str
     }
 }
 
-fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+pub fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
     data.agents
         .iter()
         .map(|agent| {
@@ -1371,6 +1380,12 @@ fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                 }
             } else {
                 actions.insert(0, ConfigAction::Install);
+            }
+            // An Agent that is not installed and whose Install cannot run is a
+            // row with nothing to press: the vendor's page is the one thing
+            // this client can still do about it.
+            if !agent.installed && vibex_core::agent_install_url(agent).is_some() {
+                actions.push(ConfigAction::InstallDocs);
             }
             // The authentication the runtime advertises for this Agent, when
             // the reader has asked for it: the row says "not signed in" rather
@@ -1752,10 +1767,18 @@ fn skill_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
         .collect()
 }
 
-fn market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+pub fn market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
     data.mcp_market
         .iter()
         .map(|entry| {
+            // The registry has no idea what this machine already has, so the
+            // card is matched against the stored servers by name: a card that
+            // said "Install" over a server the reader already runs would be
+            // offering to do what has been done.
+            let installed = data
+                .mcp
+                .iter()
+                .any(|server| server.display_name == entry.name);
             let command = entry
                 .url
                 .clone()
@@ -1766,13 +1789,23 @@ fn market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                 .cell(entry.version.clone().unwrap_or_default())
                 .cell(entry.author.clone().unwrap_or_default())
                 .cell(entry.package_kind.clone().unwrap_or_default())
+                // The registry's own lifecycle wins over the local answer: a
+                // deprecated entry the reader happens to have is deprecated
+                // first, and installed second.
+                // A registry that has withdrawn the entry wins over the local
+                // answer — deprecated first, installed second — but "active" is
+                // not a lifecycle of its own, so a card the reader already runs
+                // says so rather than repeating the registry's default.
                 .chip(
-                    entry
-                        .status
-                        .clone()
-                        .unwrap_or_else(|| strings.config_state_active().to_string()),
-                    if entry.status.as_deref() == Some("deprecated") {
+                    match (lifecycle_status(entry), installed) {
+                        (Some(status), _) => status,
+                        (None, true) => strings.config_state_installed().to_string(),
+                        (None, false) => strings.config_state_active().to_string(),
+                    },
+                    if lifecycle_status(entry).is_some() {
                         ConfigTone::Warn
+                    } else if installed {
+                        ConfigTone::Ok
                     } else {
                         ConfigTone::Muted
                     },
@@ -1809,9 +1842,47 @@ fn market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                     strings.config_field_updated(),
                     entry.updated_at.clone().unwrap_or_default(),
                 )
-                .actions(&[ConfigAction::Install, ConfigAction::Validate])
+                .actions(&market_actions(entry, installed))
         })
         .collect()
+}
+
+/// The lifecycle a registry entry is in, when it is in one at all.
+///
+/// A registry says "active" about almost everything, which is a default rather
+/// than a state: only the states that change what the reader should do with the
+/// card are worth the chip.
+fn lifecycle_status(entry: &vibex_core::McpMarketEntry) -> Option<String> {
+    match entry.status.as_deref() {
+        Some("deprecated") | Some("removed") => entry.status.clone(),
+        _ => None,
+    }
+}
+
+/// What a market card offers: install (or reinstall), check the launcher, and
+/// the entry's own page when it names one.
+fn market_actions(entry: &vibex_core::McpMarketEntry, installed: bool) -> Vec<ConfigAction> {
+    let mut actions = vec![
+        if installed {
+            ConfigAction::Reinstall
+        } else {
+            ConfigAction::Install
+        },
+        ConfigAction::Validate,
+    ];
+    if entry.homepage.is_some() || entry.repository.is_some() {
+        actions.push(ConfigAction::OpenPage);
+    }
+    actions
+}
+
+/// The page a market entry names for itself, preferring its own homepage.
+pub fn market_entry_url(entry: &vibex_core::McpMarketEntry) -> Option<String> {
+    entry
+        .homepage
+        .clone()
+        .or_else(|| entry.repository.clone())
+        .filter(|url| !url.trim().is_empty())
 }
 
 fn skill_market_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
@@ -2230,6 +2301,13 @@ pub enum FormPurpose {
     /// dropped them would not be a copy. They travel whole instead.
     NewProviderProfile {
         source: Option<Box<vibex_core::ProviderProfile>>,
+    },
+    /// A Skill from the registry, and the Agents that should receive it.
+    SkillMarketInstall {
+        entry_id: String,
+        slug: String,
+        owner_handle: Option<String>,
+        version: Option<String>,
     },
     /// One Agent's sign-in method, and the variables it collects.
     AgentAuthMethod {
@@ -2801,6 +2879,9 @@ pub fn provider_form(
         strings.config_form_edit_provider(),
         fields,
     )
+    // The headers as JSON: what `c` copies, and what the reader checks their
+    // `Name: value` lines against.
+    .preview(write_header_override(&options.headers))
 }
 
 /// The form that creates a profile, or starts a copy of one.
@@ -3526,6 +3607,37 @@ pub enum AgentAuthAction {
     Credentials {
         url: String,
     },
+}
+
+/// The form a Skill install asks for.
+///
+/// A Skill is stored once and enabled per Agent, so the install is a question
+/// about who receives it rather than a press: the desktop asks the same
+/// question, and an install that quietly enabled it for nobody would be an
+/// install the reader cannot find afterwards.
+pub fn skill_market_install_form(
+    entry: &vibex_core::SkillMarketEntry,
+    agents: &[vibex_core::AgentSnapshotEntry],
+    strings: Strings,
+) -> ConfigForm {
+    let mut fields = Vec::new();
+    for agent in agents {
+        fields.push(FormField::toggle(
+            format!("agent:{}", agent.id.as_str()),
+            agent.label.clone(),
+            true,
+        ));
+    }
+    ConfigForm::new(
+        FormPurpose::SkillMarketInstall {
+            entry_id: entry.id.clone(),
+            slug: entry.slug.clone(),
+            owner_handle: entry.owner_handle.clone(),
+            version: entry.version.clone(),
+        },
+        format!("{} · {}", strings.config_action_install(), entry.name),
+        fields,
+    )
 }
 
 /// The form one sign-in method asks for.

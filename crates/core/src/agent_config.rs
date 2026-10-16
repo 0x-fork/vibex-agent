@@ -309,6 +309,82 @@ pub struct AgentSnapshotEntry {
     pub deleted_at_ms: Option<i64>,
 }
 
+/// The page an Agent that is not installed can be installed from.
+///
+/// The authority publishes one for most Agents in the snapshot's own `params`,
+/// which is the answer to prefer. The table under it is for the Agents whose
+/// entry carries none: a reader looking at "missing" with an Install verb that
+/// cannot run is a reader who needs the vendor's page, and the client can name
+/// it from what it already has rather than sending them to a search engine.
+///
+/// This mirrors the desktop's rule; the two are kept in step by their tests
+/// until the desktop is moved onto this one.
+pub fn agent_install_url(agent: &AgentSnapshotEntry) -> Option<&str> {
+    if let Some(install_url) = agent
+        .params
+        .get("installUrl")
+        .and_then(serde_json::Value::as_str)
+        .filter(|install_url| !install_url.trim().is_empty())
+    {
+        return Some(install_url);
+    }
+    let identity = format!(
+        "{} {} {} {}",
+        agent.id,
+        agent.label,
+        agent
+            .command
+            .as_ref()
+            .map(|command| command.command.as_str())
+            .unwrap_or_default(),
+        agent.description.as_deref().unwrap_or_default(),
+    )
+    .to_ascii_lowercase();
+    let compact = identity
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>();
+    let tokens = identity
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let has_token = |candidates: &[&str]| {
+        candidates
+            .iter()
+            .any(|candidate| tokens.contains(candidate))
+    };
+
+    if compact.contains("opencode") || compact.contains("openaiopencode") {
+        Some("https://opencode.ai/docs/")
+    } else if compact.contains("codebuddy") {
+        Some("https://www.codebuddy.ai/cli")
+    } else if compact.contains("githubcopilot") || has_token(&["copilot"]) {
+        Some("https://github.com/features/copilot/cli")
+    } else if has_token(&["qwen", "tongyi", "dashscope"]) || compact.contains("qwencode") {
+        Some("https://qwen.ai/qwencode")
+    } else if has_token(&["gemini"]) || compact.contains("geminicli") {
+        Some("https://geminicli.com/")
+    } else if has_token(&["goose"]) {
+        Some("https://goose-docs.ai/docs/getting-started/installation")
+    } else if has_token(&["qoder"]) {
+        Some("https://qoder.com/zh/cli")
+    } else if has_token(&["kiro"]) {
+        Some("https://kiro.dev/cli/")
+    } else if has_token(&["cline"]) {
+        Some("https://cline.bot/cli")
+    } else if has_token(&["auggie", "augment", "augmentcode"]) {
+        Some("https://www.augmentcode.com/product/cli")
+    } else if has_token(&["amp", "ampcode", "sourcegraph"]) {
+        Some("https://ampcode.com/manual")
+    } else if has_token(&["claude", "anthropic"]) || compact.contains("claudecode") {
+        Some("https://code.claude.com/docs/quickstart")
+    } else if has_token(&["codex", "openai", "chatgpt"]) {
+        Some("https://developers.openai.com/codex/cli")
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentListRequest {

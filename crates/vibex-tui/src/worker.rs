@@ -1002,6 +1002,7 @@ impl Dispatch {
                 slug,
                 owner_handle,
                 version,
+                agent_ids,
             } => {
                 let document_request = vibex_core::SkillMarketDocumentRequest {
                     entry_id: entry_id.clone(),
@@ -1018,7 +1019,7 @@ impl Dispatch {
                     Ok(document) => {
                         let request = MutationRequest::new(vibex_core::SkillMarketInstallRequest {
                             entry_id,
-                            agent_ids: Vec::new(),
+                            agent_ids,
                             document,
                         });
                         self.facade

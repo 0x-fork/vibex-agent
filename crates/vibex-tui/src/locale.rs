@@ -919,6 +919,9 @@ strings! {
     config_action_move_up => { "Move up", "上移", "上移" },
     config_action_move_down => { "Move down", "下移", "下移" },
     config_action_clear_secret => { "Clear key", "清除密钥", "清除金鑰" },
+    config_action_install_docs => { "Open install page", "打开安装页", "開啟安裝頁" },
+    config_action_open_page => { "Open homepage", "打开主页", "開啟首頁" },
+    config_action_reinstall => { "Reinstall", "重新安装", "重新安裝" },
     config_action_import_native => { "Import settings", "导入配置", "匯入設定" },
     config_import_title => { "Import provider settings", "导入模型服务配置", "匯入模型服務設定" },
     config_import_hint => { "Enter imports the highlighted one · r looks again", "Enter 导入选中项 · r 重新查找", "Enter 匯入選中項 · r 重新尋找" },
@@ -1211,6 +1214,7 @@ strings! {
     config_form_error_header_variable => { "The only fillable variable is {{session_id}}", "唯一可填的变量是 {{session_id}}", "唯一可填的變數是 {{session_id}}" },
     config_form_error_header_duplicate => { "The same header is declared twice", "同一个请求头声明了两次", "同一個請求標頭宣告了兩次" },
     config_form_error_protocol_url => { "Protocol addresses read like `wire=https://…`, one per line", "协议地址需形如 `wire=https://…`，每行一个", "協定位址需形如 `wire=https://…`，每行一個" },
+    config_form_error_no_agent => { "Choose at least one Agent to enable it for", "至少要选一个 Agent 启用", "至少要選一個 Agent 啟用" },
     config_hint_models => { "one Model id per line", "每行一个模型 ID", "每行一個模型 ID" },
     config_hint_provider_url => { "this client cannot read the stored address", "此客户端无法读取已保存的地址", "此客戶端無法讀取已儲存的位址" },
     config_field_website => { "Website", "网站", "網站" },
@@ -1384,6 +1388,79 @@ strings! {
         "当前设备的权限级别不允许配对。",
         "目前裝置的權限層級不允許配對。"
     },
+    // ---- the audit trail: what the runtime recorded, in the reader's words --
+    audit_empty => {
+        "Nothing has been recorded yet",
+        "尚无审计记录",
+        "尚無稽核記錄"
+    },
+    audit_field_device => { "device", "设备", "裝置" },
+    audit_field_target => { "target", "目标", "目標" },
+    audit_field_request => { "request", "请求", "請求" },
+    audit_field_correlation => { "correlation", "关联", "關聯" },
+    audit_outcome_allowed => { "Allowed", "已允许", "已允許" },
+    audit_outcome_denied => { "Denied", "已拒绝", "已拒絕" },
+    audit_outcome_failed => { "Failed", "失败", "失敗" },
+    audit_outcome_created => { "Created", "已创建", "已建立" },
+    audit_outcome_revoked => { "Revoked", "已吊销", "已撤銷" },
+    audit_action_pairing_code_created => {
+        "Pairing code created",
+        "一次性配对码已生成",
+        "一次性配對碼已產生"
+    },
+    audit_action_pairing_code_claimed => {
+        "Pairing code claimed",
+        "一次性配对码已被领取",
+        "一次性配對碼已被領取"
+    },
+    audit_action_pairing_code_rejected => {
+        "Pairing code rejected",
+        "一次性配对码被拒绝",
+        "一次性配對碼被拒絕"
+    },
+    audit_action_pairing_offer_created => {
+        "Pairing offer created",
+        "配对邀请已生成",
+        "配對邀請已產生"
+    },
+    audit_action_pairing_offer_claimed => {
+        "Pairing offer claimed",
+        "配对邀请已被领取",
+        "配對邀請已被領取"
+    },
+    audit_action_pairing_offer_canceled => {
+        "Pairing offer canceled",
+        "配对邀请已取消",
+        "配對邀請已取消"
+    },
+    audit_action_pairing_offer_rejected => {
+        "Pairing offer rejected",
+        "配对邀请被拒绝",
+        "配對邀請被拒絕"
+    },
+    audit_action_device_authenticated => {
+        "Device authenticated",
+        "设备已通过认证",
+        "裝置已通過認證"
+    },
+    audit_action_device_auth_failed => {
+        "Device authentication failed",
+        "设备认证失败",
+        "裝置認證失敗"
+    },
+    audit_action_device_revoked => { "Device revoked", "设备已吊销", "裝置已撤銷" },
+    audit_action_device_restored => { "Device restored", "设备已恢复", "裝置已還原" },
+    audit_action_device_deleted => { "Device deleted", "设备已删除", "裝置已刪除" },
+    audit_action_device_renamed => { "Device renamed", "设备已重命名", "裝置已重新命名" },
+    audit_action_runtime_renamed => {
+        "Runtime renamed",
+        "运行时已重命名",
+        "執行時已重新命名"
+    },
+    audit_action_permission_allowed => { "Permission allowed", "权限已允许", "權限已允許" },
+    audit_action_permission_denied => { "Permission denied", "权限已拒绝", "權限已拒絕" },
+    audit_action_mutation_allowed => { "Change allowed", "改动已允许", "改動已允許" },
+    audit_action_mutation_denied => { "Change denied", "改动已拒绝", "改動已拒絕" },
     // ---- the publishing half: how this runtime can be reached -------------
     devices_tab_publishing => { "Remote access", "远程接入", "遠端存取" },
     devices_publications_hint => {

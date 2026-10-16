@@ -1357,6 +1357,7 @@ fn a_registry_entry_is_installed_through_a_form() {
         form.field_mut("env:TRACE_TOKEN")
             .expect("token field")
             .value = "s3cret".to_string();
+        // The second Agent, which is the one the assertion below is about.
         form.field_mut("agent:claude").expect("agent field").value = "off".to_string();
     }
     let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
@@ -2878,5 +2879,188 @@ fn a_sign_in_that_finishes_elsewhere_says_where() {
     assert!(
         !done.contains("still signing in"),
         "a completed sign-in was reported as waiting: {done}"
+    );
+}
+
+/// A market card the reader already runs says so, and offers to do it again.
+///
+/// The registry has no idea what this machine holds, so the match is against
+/// the stored servers by name: a card that said "Install" over a server the
+/// reader already runs would be offering to do what has been done. The card's
+/// own page is one press away when it names one.
+#[test]
+fn a_market_card_the_reader_already_runs_says_so() {
+    let mut app = loaded(140, 40);
+    let mut entry = market_entry("entry_trace");
+    entry.homepage = Some("https://example.test/trace".to_string());
+    app.management_data.mcp_market = vec![entry];
+    app.show_config_module(ConfigModule::Mcp, Some(ConfigSection::Catalog));
+
+    // Nothing stored: the card offers the install.
+    let rows = vibex_tui::config_center::market_rows(&app.management_data, app.strings);
+    let actions = rows[0].actions.clone();
+    assert!(
+        actions.contains(&ConfigAction::Install),
+        "a card for something not installed did not offer the install: {actions:?}"
+    );
+    assert!(actions.contains(&ConfigAction::OpenPage));
+
+    // The same server, stored: the card offers it again by its other name.
+    let mut server = mcp_server();
+    server.display_name = "Trace tools".to_string();
+    app.management_data.mcp = vec![server];
+    let rows = vibex_tui::config_center::market_rows(&app.management_data, app.strings);
+    let actions = rows[0].actions.clone();
+    assert!(
+        actions.contains(&ConfigAction::Reinstall) && !actions.contains(&ConfigAction::Install),
+        "an installed card offered a first install: {actions:?}"
+    );
+    assert_eq!(rows[0].chip, "Installed");
+
+    // And the press opens the page it named, preferring its own homepage.
+    let outcome = app.run_config_action_by_key("entry_trace", ConfigAction::OpenPage);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::OpenUrl { url }] => {
+            assert_eq!(url, "https://example.test/trace")
+        }
+        other => panic!("the card's page produced {other:?}"),
+    }
+}
+
+/// An Agent that is missing offers the page it can be installed from.
+///
+/// It is the one thing a client can still do about an Agent whose Install
+/// cannot run, and the authority publishes the address in the snapshot itself.
+#[test]
+fn a_missing_agent_offers_its_install_page() {
+    let mut app = loaded(140, 40);
+    let mut missing = agent();
+    missing.installed = false;
+    missing.install_status = vibex_core::AgentInstallStatus::Missing;
+    missing.params = serde_json::json!({"installUrl": "https://example.test/install"});
+    app.management_data.agents = vec![missing];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Agents));
+
+    let rows = vibex_tui::config_center::agent_rows(&app.management_data, app.strings);
+    assert!(
+        rows[0].actions.contains(&ConfigAction::InstallDocs),
+        "a missing Agent offered no page: {:?}",
+        rows[0].actions
+    );
+
+    let outcome = app.run_config_action_by_key("codex", ConfigAction::InstallDocs);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::OpenUrl { url }] => {
+            assert_eq!(url, "https://example.test/install")
+        }
+        other => panic!("the install page produced {other:?}"),
+    }
+
+    // An Agent that is installed has nothing to install, so it has no page.
+    let mut installed = agent();
+    installed.params = serde_json::json!({"installUrl": "https://example.test/install"});
+    app.management_data.agents = vec![installed];
+    let rows = vibex_tui::config_center::agent_rows(&app.management_data, app.strings);
+    assert!(
+        !rows[0].actions.contains(&ConfigAction::InstallDocs),
+        "an installed Agent offered an install page"
+    );
+}
+
+/// Installing a Skill asks which Agents receive it.
+///
+/// A Skill is stored once and enabled per Agent, so an install that quietly
+/// enabled it for nobody would be an install the reader cannot find afterwards.
+#[test]
+fn installing_a_skill_asks_which_agents_receive_it() {
+    let mut app = loaded(140, 40);
+    app.management_data.agents = vec![agent(), second_agent()];
+    app.management_data.skill_market = vec![skill_market_entry("entry_reader")];
+    app.show_config_module(ConfigModule::Skills, Some(ConfigSection::Catalog));
+
+    let outcome = app.run_config_action_by_key("entry_reader", ConfigAction::Install);
+    assert!(
+        outcome.effects.is_empty(),
+        "the install ran without asking who receives it: {:#?}",
+        outcome.effects
+    );
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("the skill install opened no form");
+    };
+    let toggles = form
+        .fields
+        .iter()
+        .filter(|field| field.key.starts_with("agent:"))
+        .collect::<Vec<_>>();
+    assert_eq!(toggles.len(), 2, "the Agents were not offered");
+    assert!(
+        toggles.iter().all(|field| field.value == "on"),
+        "an Agent did not start switched on"
+    );
+
+    // Turning them all off is refused with the reason on the form.
+    if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+        for field in form
+            .fields
+            .iter_mut()
+            .filter(|f| f.key.starts_with("agent:"))
+        {
+            field.value = "off".to_string();
+        }
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    assert!(outcome.effects.is_empty(), "an install for nobody was sent");
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("the form closed on an invalid save");
+    };
+    assert!(form.error.is_some(), "no reason was given");
+
+    // Turning one back on sends the install with the Agents that receive it.
+    if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
+        form.field_mut("agent:codex").unwrap().value = "on".to_string();
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::ConfigMutation { mutation, .. }] => {
+            let vibex_tui::app::ConfigMutation::InstallSkillMarketEntry {
+                entry_id,
+                agent_ids,
+                ..
+            } = mutation
+            else {
+                panic!("the install was not an install: {mutation:?}");
+            };
+            assert_eq!(entry_id, "entry_reader");
+            assert_eq!(
+                agent_ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                vec!["codex"]
+            );
+        }
+        other => panic!("the install produced {other:?}"),
+    }
+}
+
+/// The provider form's headers are carried as the JSON that will be written.
+///
+/// It is the form's preview, which is what `c` copies: the reader compares what
+/// they typed against what will be stored, in the shape the runtime reads.
+#[test]
+fn a_provider_form_carries_its_headers_as_json() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_first", "First")];
+    app.management_data.provider_detail = Some(provider_profile_detail());
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    app.perform(vibex_tui::action::Intent::EditSelectedEntry);
+    let Some(Overlay::Form { form }) = app.overlay.clone() else {
+        panic!("the editor did not open");
+    };
+    let preview = form.preview.clone().expect("the headers preview");
+    let headers: serde_json::Value = serde_json::from_str(&preview).expect("the preview is JSON");
+    assert_eq!(headers["X-Trace"], serde_json::json!("on"));
+    assert_eq!(
+        headers["x-opencode-session"],
+        serde_json::json!({"variable": "session_id"}),
+        "a variable came back as a literal: {preview}"
     );
 }

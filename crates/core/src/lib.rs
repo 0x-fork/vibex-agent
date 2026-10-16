@@ -87,8 +87,8 @@ pub use agent_config::{
     AgentRuntimeOptionProbeRequest, AgentRuntimeOptionProbeResult, AgentRuntimeStatus,
     AgentSnapshotEntry, AgentSourceKind, AgentUpdateConfigRequest, CustomAgentCreateRequest,
     CustomAgentDeleteRequest, USER_VISIBLE_AGENT_IDS, acp_registry_agent_id,
-    agent_id_for_provider_kind, builtin_agent_definitions, custom_agent_definition,
-    is_user_visible_agent, supports_native_provider_import,
+    agent_id_for_provider_kind, agent_install_url, builtin_agent_definitions,
+    custom_agent_definition, is_user_visible_agent, supports_native_provider_import,
 };
 pub use agent_provider_runtime::*;
 pub use automation_graph::{

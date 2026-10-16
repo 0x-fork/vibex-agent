@@ -8758,6 +8758,7 @@ pub enum ConfigMutation {
         slug: String,
         owner_handle: Option<String>,
         version: Option<String>,
+        agent_ids: Vec<vibex_core::AgentId>,
     },
     // ---- Prompts ---------------------------------------------------------
     CreatePrompt(Box<vibex_core::PromptCreateRequest>),

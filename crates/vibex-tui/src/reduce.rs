@@ -1838,7 +1838,34 @@ impl App {
                 let prompt_id = prompt.id.clone();
                 self.begin_config_mutation(crate::app::ConfigMutation::ValidatePrompt { prompt_id })
             }
-            (ConfigSection::Catalog, ConfigAction::Install) => self.install_registry_entry(key),
+            (ConfigSection::Agents, ConfigAction::InstallDocs) => {
+                let Some(agent) = self
+                    .management_data
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id.as_str() == key)
+                else {
+                    return Outcome::quiet();
+                };
+                match vibex_core::agent_install_url(agent) {
+                    Some(url) => Outcome::effects(vec![Effect::OpenUrl {
+                        url: url.to_string(),
+                    }]),
+                    None => Outcome::quiet(),
+                }
+            }
+            (ConfigSection::Catalog, ConfigAction::Install | ConfigAction::Reinstall) => {
+                self.install_registry_entry(key)
+            }
+            (ConfigSection::Catalog, ConfigAction::OpenPage) => {
+                let Some(entry) = self.mcp_market_entry(key) else {
+                    return Outcome::quiet();
+                };
+                match crate::config_center::market_entry_url(&entry) {
+                    Some(url) => Outcome::effects(vec![Effect::OpenUrl { url }]),
+                    None => Outcome::quiet(),
+                }
+            }
             (ConfigSection::Catalog, ConfigAction::Validate) => self.validate_registry_entry(key),
             (ConfigSection::Sources, ConfigAction::Import) => self.import_discovery(key),
             _ => Outcome::quiet(),
@@ -2723,12 +2750,15 @@ impl App {
         else {
             return Outcome::quiet();
         };
-        self.begin_config_mutation(crate::app::ConfigMutation::InstallSkillMarketEntry {
-            entry_id: entry.id.clone(),
-            slug: entry.slug.clone(),
-            owner_handle: entry.owner_handle.clone(),
-            version: entry.version.clone(),
-        })
+        // A Skill is stored once and enabled per Agent, so the install asks who
+        // receives it before it writes anything.
+        let form = crate::config_center::skill_market_install_form(
+            &entry,
+            &self.management_data.agents,
+            self.strings,
+        );
+        self.overlay = Some(Overlay::Form { form });
+        Outcome::effects(vec![])
     }
 
     /// Check one registry entry's launcher before it is installed.
@@ -3533,6 +3563,30 @@ impl App {
                     default_model: None,
                     configured_models: Some(models),
                     provider_options: None,
+                })
+            }
+            FormPurpose::SkillMarketInstall {
+                entry_id,
+                slug,
+                owner_handle,
+                version,
+            } => {
+                let agent_ids = form
+                    .enabled_agents()
+                    .iter()
+                    .filter_map(|id| vibex_core::AgentId::parse(id.clone()).ok())
+                    .collect::<Vec<_>>();
+                if agent_ids.is_empty() {
+                    // A Skill enabled for nobody is a Skill the reader cannot
+                    // find afterwards, so the authority would refuse it anyway.
+                    return Err("no-agent");
+                }
+                Ok(ConfigMutation::InstallSkillMarketEntry {
+                    entry_id: entry_id.clone(),
+                    slug: slug.clone(),
+                    owner_handle: owner_handle.clone(),
+                    version: version.clone(),
+                    agent_ids,
                 })
             }
             // Reached only through the sign-in hook above, which handles this
