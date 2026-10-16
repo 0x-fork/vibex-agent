@@ -130,6 +130,115 @@ Button::new("project-logo").xsmall().child(sidebar_project_logo(
 ));
 ```
 
+## Scenario: Desktop Wallpaper Background
+
+### 1. Scope / Trigger
+
+- Trigger: GPUI Desktop changes the user background image, the appearance page's
+  image controls, how a wallpaper shows through the theme, or the persisted
+  wallpaper preference.
+
+### 2. Signatures
+
+```rust
+BackgroundImageUiState {
+    file: Option<String>,
+    fit: BackgroundImageFit,   // cover | contain | fill
+    dim_percent: u16,          // 0..=90, default 40
+}
+
+import(source: &Path, home: &Path) -> Result<String, String>
+resolve(home: Option<&Path>, state: &BackgroundImageUiState) -> Option<PathBuf>
+wallpaper_layer(state: &BackgroundImageUiState, path: &Path, is_dark: bool) -> AnyElement
+theme::apply_appearance(appearance: &AppearanceUiState, backdrop: theme::Backdrop, window: Option<&mut Window>, cx: &mut App)
+```
+
+### 3. Contracts
+
+- `background_image.file` contains only a bounded content-addressed file name —
+  `<sha256>.<extension>`, lowercase hex, one of the supported raster formats —
+  never an external absolute path and never image bytes. The image lives under
+  `<runtime-home>/backgrounds/<sha256>.<extension>`.
+- Import validates the byte size and the pixel count before any decode, accepts
+  only the picker-supported raster formats, keeps the original bytes and format
+  (no resize, no re-encode), and lands through a temporary file before rename.
+  Equal content reuses the same name, so replacing an image produces a new name
+  rather than invalidating a cached decode.
+- Only the workbench window paints the image, and it paints it as the window's
+  bottom layer: an opaque plate of the theme's page color, the image, then the
+  veil the `dim_percent` preference mixes from that same page color. A window is
+  never translucent to whatever sits behind it.
+- The containers of the theme fade while an image is behind them
+  (`vibex_ui::let_wallpaper_through`): the page and the chrome that frames it
+  more, the panels and plates on it less. Ink, lines, status colors, selection
+  plates, and cards keep the authored color. The window's own base plate — the
+  legacy `background` token the framework paints `Root` from — is restored to
+  the authored color after the pass, because the framework realigns a legacy
+  token to its color on any edit that changes the color.
+- The theme is one process-wide palette, so every window applies the same
+  `Backdrop` the workbench resolved. A window that applied a different one would
+  repaint every other window with its own choice.
+- A missing home, a malformed stored name, or a missing stored file resolves to
+  no image: the workbench paints the theme's page color again, and the
+  appearance page shows the upload control without a thumbnail.
+- Clearing a wallpaper clears the preference; the managed file is left in place,
+  because names are content-addressed and a stale write that still names it must
+  keep resolving.
+- Legacy appearance JSON without `backgroundImage` decodes with the default
+  (no image, `cover`, 40 percent veil).
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Source is not a regular decodable raster image in a supported format | Reject and show a localized notification |
+| Source exceeds 32 MiB or 40 million pixels | Reject before full decode |
+| Storage directory/write/rename fails | Keep the previous wallpaper and report failure |
+| Persisted name is not `<64 lowercase hex>.<supported extension>` | Ignore it and paint the theme's page color |
+| Persisted file is missing | Paint the theme's page color |
+| User cancels the picker | Preserve the wallpaper without an error |
+| Picker runs while another import is in flight | Ignore the second request |
+
+### 5. Good/Base/Bad Cases
+
+- Good: upload a 4K JPEG, store one content-addressed copy, paint it behind
+  translucent surfaces in both appearances, and restore it after restart.
+- Base: a state file written before the feature loads with no image, the veil at
+  40 percent, and `cover`; clearing returns to the theme with no other setting
+  changed.
+- Bad: persist the selected external path, copy the image bytes into UI-state
+  JSON, keep a translucent window base plate, or let a second window apply a
+  different backdrop than the workbench.
+
+### 6. Tests Required
+
+- `vibex-desktop-model` covers legacy decode, name validation, dimension and
+  veil bounds, and JSON round-trip for `background_image`.
+- `vibex-ui` covers the surface fade: containers fade, ink and selection plates
+  keep the authored color, legacy tokens are untouched, and the pass is
+  idempotent.
+- `vibex-desktop` imports raster fixtures, asserts a stable content-addressed
+  name, rejects unsupported and undecodable files, and covers resolution for a
+  missing home, a traversal-like name, and a deleted file; the appearance pass
+  is covered for both backdrops, including the restored window plate.
+- Run `cargo test -p vibex-desktop-model --locked`, the targeted desktop tests,
+  and `cargo fmt --all -- --check` before commit.
+
+### 7. Wrong vs Correct
+
+```rust
+// Wrong: an external path can move, and a translucent base plate leaks the
+// desktop through the window.
+appearance.background_image.file = Some(selected_path.display().to_string());
+theme::apply_appearance(&appearance, Backdrop::Wallpaper, Some(window), cx);
+
+// Correct: persist a managed name, paint the image over an opaque plate, and
+// keep the window's own plate authored.
+appearance.background_image.file = Some(appearance_background::import(&selected_path, home)?);
+let backdrop = theme::Backdrop::for_wallpaper(appearance_background::resolve(Some(home), &appearance.background_image).is_some());
+theme::apply_appearance(&appearance, backdrop, Some(window), cx);
+```
+
 ## Scenario: Native First-Launch Locale
 
 ### 1. Scope / Trigger

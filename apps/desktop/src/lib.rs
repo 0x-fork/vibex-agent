@@ -3,6 +3,7 @@ use serde::Serialize;
 pub mod actions;
 mod activity_indicator;
 pub mod app;
+mod appearance_background;
 pub mod appearance_theme;
 mod arena;
 pub mod assets;

@@ -456,7 +456,9 @@ fn main() {
                     theme: fixture_theme,
                     ..AppearanceUiState::default()
                 };
-                theme::apply_appearance(&appearance, None, cx);
+                // A fixture paints the theme and nothing else; there is no home
+                // to resolve a background image against.
+                theme::apply_appearance(&appearance, theme::Backdrop::Theme, None, cx);
             }
             if let Err(error) = assets::load_fonts(cx) {
                 eprintln!("{error}");

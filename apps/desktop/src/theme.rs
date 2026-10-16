@@ -19,6 +19,41 @@ pub use vibex_ui::{
     TOKEN_PRODUCT_VISUAL_SOURCE, TOKEN_SCHEMA_VERSION, TOKEN_SOURCE_PATH, TOKEN_SOURCE_SHA256,
 };
 
+/// What is painted behind the workbench's surfaces.
+///
+/// The appearance pass maps the same palette either way; the backdrop only
+/// decides whether the theme's containers let an image through.
+///
+/// The theme is a process-wide value that every window paints from, so a window
+/// that publishes an appearance has to pass the backdrop the workbench
+/// resolved: one that decided differently would repaint every other window with
+/// its own choice. A window that never publishes one — the computer panel opens
+/// without an appearance pass — simply paints the palette it finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backdrop {
+    /// The theme's own page color, opaque.
+    #[default]
+    Theme,
+    /// A user image behind the surfaces, so the containers fade to let it show.
+    Wallpaper,
+}
+
+impl Backdrop {
+    /// Whether a user image is painted behind the surfaces.
+    pub fn is_wallpaper(self) -> bool {
+        matches!(self, Self::Wallpaper)
+    }
+
+    /// The backdrop that goes with an appearance whose wallpaper resolves.
+    pub fn for_wallpaper(wallpaper: bool) -> Self {
+        if wallpaper {
+            Self::Wallpaper
+        } else {
+            Self::Theme
+        }
+    }
+}
+
 /// The palette the renderer is currently painting with, per appearance.
 ///
 /// Colors are read imperatively at paint time through [`semantic_color`],
@@ -198,7 +233,12 @@ pub fn active_wash(is_dark: bool) -> Hsla {
     state_wash(is_dark, 0.16)
 }
 
-pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Window>, cx: &mut App) {
+pub fn apply_appearance(
+    appearance: &AppearanceUiState,
+    backdrop: Backdrop,
+    window: Option<&mut Window>,
+    cx: &mut App,
+) {
     match appearance.theme {
         ThemeMode::Light => Theme::change(ComponentThemeMode::Light, window, cx),
         ThemeMode::Dark => Theme::change(ComponentThemeMode::Dark, window, cx),
@@ -336,8 +376,31 @@ pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Wind
         // the result to the base layer that owns scrollbars, resize handles, and
         // text view defaults, and refreshes every window.
         vibex_ui::apply_component_palette(theme, active_theme(model_mode(is_dark)));
+        // A wallpaper is painted behind the workbench, so the container roles
+        // have to let it through — after the palette bridge, which derives its
+        // own container roles from the ones mapped above.
+        if backdrop.is_wallpaper() {
+            vibex_ui::let_wallpaper_through(theme);
+        }
     });
+    if backdrop.is_wallpaper() {
+        restore_window_plate(cx);
+    }
     apply_code_font_weight(appearance.code_font.weight, cx);
+}
+
+/// Puts the window's own base plate back to the authored page color.
+///
+/// The framework paints each window's background from the legacy
+/// `background` token, and it realigns that token to its color on every edit
+/// that changes the color — so the fade above reaches the plate too. The plate
+/// is restored after the pass has closed, because inside one the realignment
+/// would simply run again: a translucent base plate would let whatever sits
+/// behind the window show through it, and the surfaces painted over it would
+/// no longer compose the color they were authored in.
+fn restore_window_plate(cx: &mut App) {
+    let authored = page_plate(Theme::global(cx).is_dark());
+    Theme::global_mut(cx).tokens.background = authored.into();
 }
 
 pub fn scaled_font_size(size: u16, window_scale_percent: u16) -> gpui::Pixels {
@@ -364,6 +427,29 @@ pub fn semantic_color_for(theme: &GpuiThemeDefinition, name: &str) -> Hsla {
 /// Read a semantic token from the palette currently active for `dark`.
 pub fn semantic_token(name: &str, dark: bool) -> Option<GpuiColorToken> {
     catalog_token(active_theme(model_mode(dark)), name)
+}
+
+/// The authored page color at full opacity.
+///
+/// A wallpaper fades the theme's containers so the image shows through, which
+/// leaves the global `background` translucent — and a window's own base plate
+/// with it. This is the same color with its opacity back: the workbench paints
+/// a wallpaper over it, so a `Contain` fit's letterbox lands on the page rather
+/// than on nothing, and the veil [`wallpaper_veil`] dims an image with is mixed
+/// from it.
+pub fn page_plate(is_dark: bool) -> Hsla {
+    semantic_color_for(active_theme(model_mode(is_dark)), "background").alpha(1.0)
+}
+
+/// The veil painted over a wallpaper to keep the text above it legible.
+///
+/// Mixed from the page color rather than from black: in a light appearance the
+/// veil is the theme's own light page color, so the ink that reads over it
+/// keeps the contrast the palette was tuned for, and in a dark appearance it
+/// darkens the image the same way.
+pub fn wallpaper_veil(is_dark: bool, dim_percent: u16) -> Hsla {
+    let alpha = f32::from(dim_percent.min(100)) / 100.0;
+    page_plate(is_dark).alpha(alpha)
 }
 
 #[cfg(test)]
@@ -410,6 +496,62 @@ mod tests {
         }
     }
 
+    /// A wallpaper is painted behind the workbench's surfaces, so the pass has
+    /// to fade the theme's containers without touching the ink that reads over
+    /// them — and the window's own plate stays the authored page color, because
+    /// a translucent base plate would let the desktop behind the window show
+    /// through it.
+    #[gpui::test]
+    fn a_wallpaper_backdrop_fades_containers_and_keeps_the_window_plate_opaque(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let _guard = slot_guard();
+        cx.update(gpui_component::init);
+        let appearance = AppearanceUiState {
+            theme: ThemeMode::Dark,
+            ..Default::default()
+        };
+        let authored = semantic_color_for(active_theme(GpuiThemeMode::Dark), "background");
+
+        cx.update(|cx| apply_appearance(&appearance, Backdrop::Theme, None, cx));
+        cx.update(|cx| {
+            let theme = Theme::global(cx);
+            assert_eq!(
+                theme.background.a, authored.a,
+                "without a wallpaper the page keeps the authored color"
+            );
+            assert_eq!(theme.sidebar.a, semantic_color("sidebar", true).a);
+        });
+
+        cx.update(|cx| apply_appearance(&appearance, Backdrop::Wallpaper, None, cx));
+        cx.update(|cx| {
+            let theme = Theme::global(cx);
+            assert_eq!(
+                theme.background.a,
+                vibex_ui::WALLPAPER_BASE_ALPHA,
+                "the page has to let the image through"
+            );
+            assert_eq!(theme.sidebar.a, vibex_ui::WALLPAPER_BASE_ALPHA);
+            assert_eq!(theme.group_box.a, vibex_ui::WALLPAPER_RAISED_ALPHA);
+            assert_eq!(
+                theme.foreground,
+                semantic_color("foreground", true),
+                "text keeps the authored ink"
+            );
+            assert_eq!(
+                page_plate(true),
+                authored,
+                "the plate the image sits on is the authored page color"
+            );
+            assert_eq!(wallpaper_veil(true, 40).a, 0.4);
+            assert_eq!(wallpaper_veil(true, 400).a, 1.0);
+            assert_eq!(
+                theme.tokens.background.color.a, authored.a,
+                "the legacy plate the framework paints a window from must stay opaque"
+            );
+        });
+    }
+
     #[gpui::test]
     fn appearance_pass_completes_the_framework_palette(cx: &mut gpui::TestAppContext) {
         let _guard = slot_guard();
@@ -425,7 +567,7 @@ mod tests {
             };
             appearance.theme_selection.select_light("gruvbox-light");
             appearance.theme_selection.select_dark("tokyo-night");
-            cx.update(|cx| apply_appearance(&appearance, None, cx));
+            cx.update(|cx| apply_appearance(&appearance, Backdrop::Theme, None, cx));
 
             // gpui-component resets its palette to the stock neutrals on every
             // `Theme::change`; the appearance pass has to fill the component

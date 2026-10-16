@@ -143,16 +143,17 @@ use vibex_core::{
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
-    BrowserSearchEngine, BrowserStartPage, BrowserUiState, ComposerAttachment,
-    ComposerQueueCommand, ComposerQueueEntry, ComposerQueueSendMode, ComposerSuggestionSelection,
-    ComposerTrigger, ComputerUiState, DEFAULT_EDITOR_AUTOSAVE_DELAY_MS,
-    DEFAULT_NETWORK_PROXY_BYPASS, DesktopBehaviorUiState, DesktopUiStateV1, DeveloperUiState,
-    EditorAutosaveMode, GitSelectionKey, GitWorkbenchMode, LocaleMode,
-    MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS, MessageSendKey, NavigationHistory,
-    NetworkProxyMode, NetworkProxyUiState, NewSessionLocation, NewSessionProjectTicket,
-    NewSessionSubmissionStage, NewSessionWorkspaceState, PreviewWindowMode,
-    RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode, ReasoningExpansionMode,
-    RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
+    BACKGROUND_IMAGE_EXTENSIONS, BACKGROUND_IMAGE_MAX_DIM_PERCENT,
+    BACKGROUND_IMAGE_MIN_DIM_PERCENT, BackgroundImageFit, BrowserSearchEngine, BrowserStartPage,
+    BrowserUiState, ComposerAttachment, ComposerQueueCommand, ComposerQueueEntry,
+    ComposerQueueSendMode, ComposerSuggestionSelection, ComposerTrigger, ComputerUiState,
+    DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, DEFAULT_NETWORK_PROXY_BYPASS, DesktopBehaviorUiState,
+    DesktopUiStateV1, DeveloperUiState, EditorAutosaveMode, GitSelectionKey, GitWorkbenchMode,
+    LocaleMode, MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS, MessageSendKey,
+    NavigationHistory, NetworkProxyMode, NetworkProxyUiState, NewSessionLocation,
+    NewSessionProjectTicket, NewSessionSubmissionStage, NewSessionWorkspaceState,
+    PreviewWindowMode, RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode,
+    ReasoningExpansionMode, RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
     SESSION_GROUP_SPLIT_SCALE, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode,
     SessionGroupLayout, SessionGroupPane, SessionGroupSplitPosition, SessionGroupUiState,
     SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome, SidebarMutationRejection,
@@ -203,6 +204,7 @@ use crate::actions::{
 };
 
 use crate::activity_indicator::ActivityIndicator;
+use crate::appearance_background;
 use crate::appearance_theme;
 use crate::assets::{agent_brand_asset, agent_brand_icon, model_brand_icon, window_icon};
 use crate::code_workbench::{
@@ -8639,6 +8641,9 @@ pub struct VibexWorkbench {
     sidebar_context_menu_target: Option<SidebarContextMenuTarget>,
     sidebar_project_appearance_popover: Option<String>,
     sidebar_project_logo_upload_task: Option<Task<()>>,
+    /// The in-flight background-image picker, if any. Holding it keeps a second
+    /// import from starting while the first is still reading its file.
+    background_image_upload_task: Option<Task<()>>,
     sidebar_resize_drag: Option<SidebarResizeDragState>,
     right_panel_resize_drag: Option<RightPanelResizeDragState>,
     /// The developer FPS HUD's monitor, created the first time the Developer
@@ -9888,12 +9893,25 @@ impl VibexWorkbench {
         {
             eprintln!("vibex-fonts: {error}");
         }
-        theme::apply_appearance(&ui_state.appearance, Some(window), cx);
+        let backdrop = theme::Backdrop::for_wallpaper(
+            appearance_background::resolve(
+                config.as_ref().map(|config| config.home_dir.as_path()),
+                &ui_state.appearance.background_image,
+            )
+            .is_some(),
+        );
+        theme::apply_appearance(&ui_state.appearance, backdrop, Some(window), cx);
         Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
         let focus_handle = cx.focus_handle();
         let new_session_project_menu_focus = cx.focus_handle();
         let settings_open_on_start = std::env::var_os("VIBEX_FOUNDATION_OPEN_SETTINGS").is_some();
-        let settings_view = FoundationSettings::new(cx.weak_entity(), &ui_state, window, cx);
+        let settings_view = FoundationSettings::new(
+            cx.weak_entity(),
+            config.as_ref().map(|config| config.home_dir.clone()),
+            &ui_state,
+            window,
+            cx,
+        );
         let initial_strings = locale::strings(initial_locale);
         let command_palette = cx.new(|cx| CommandState::new(window, cx));
         let command_palette_input = cx.new(|cx| {
@@ -10394,6 +10412,7 @@ impl VibexWorkbench {
             sidebar_context_menu_target: None,
             sidebar_project_appearance_popover: None,
             sidebar_project_logo_upload_task: None,
+            background_image_upload_task: None,
             sidebar_resize_drag: None,
             right_panel_resize_drag: None,
             fps_monitor: None,
@@ -10803,12 +10822,14 @@ impl VibexWorkbench {
     pub(crate) fn bind_to_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.window_handle = Some(window.window_handle());
         if self.ui_state.appearance.theme == ModelThemeMode::System {
-            theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
+            let backdrop = self.backdrop();
+            theme::apply_appearance(&self.ui_state.appearance, backdrop, Some(window), cx);
         }
         self.appearance_subscription =
             Some(cx.observe_window_appearance(window, |this, window, cx| {
                 if this.ui_state.appearance.theme == ModelThemeMode::System {
-                    theme::apply_appearance(&this.ui_state.appearance, Some(window), cx);
+                    let backdrop = this.backdrop();
+                    theme::apply_appearance(&this.ui_state.appearance, backdrop, Some(window), cx);
                     cx.notify();
                 }
             }));
@@ -30367,8 +30388,12 @@ impl VibexWorkbench {
         };
         let code_workbench = self.code_workbench.clone();
         let appearance = self.ui_state.appearance.clone();
+        // The theme is one process-wide palette, so this window has to apply the
+        // same backdrop the workbench last did: a window that decided
+        // differently would repaint every other window with its own choice.
+        let backdrop = self.backdrop();
         let opened = cx.open_window(options, move |window, cx| {
-            theme::apply_appearance(&appearance, Some(window), cx);
+            theme::apply_appearance(&appearance, backdrop, Some(window), cx);
             let host = cx.new(|cx| PreviewWindowHost::new(code_workbench, window, cx));
             cx.new(|cx| Root::new(host, window, cx))
         });
@@ -39770,7 +39795,8 @@ impl VibexWorkbench {
 
     fn set_theme(&mut self, mode: ModelThemeMode, window: &mut Window, cx: &mut Context<Self>) {
         self.ui_state.appearance.theme = mode;
-        theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
+        let backdrop = self.backdrop();
+        theme::apply_appearance(&self.ui_state.appearance, backdrop, Some(window), cx);
         self.queue_ui_state();
         cx.notify();
     }
@@ -39789,7 +39815,8 @@ impl VibexWorkbench {
             GpuiThemeMode::Light => selection.select_light(id),
             GpuiThemeMode::Dark => selection.select_dark(id),
         }
-        theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
+        let backdrop = self.backdrop();
+        theme::apply_appearance(&self.ui_state.appearance, backdrop, Some(window), cx);
         self.queue_ui_state();
         cx.notify();
     }
@@ -39860,7 +39887,8 @@ impl VibexWorkbench {
             75,
             200,
         );
-        theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
+        let backdrop = self.backdrop();
+        theme::apply_appearance(&self.ui_state.appearance, backdrop, Some(window), cx);
         self.invalidate_timeline_layout_measurements();
         self.rebuild_timeline_sizes();
         self.queue_ui_state();
@@ -39879,7 +39907,8 @@ impl VibexWorkbench {
             eprintln!("vibex-fonts: {error}");
         }
         self.ui_state.appearance.interface_font.family = family;
-        theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
+        let backdrop = self.backdrop();
+        theme::apply_appearance(&self.ui_state.appearance, backdrop, Some(window), cx);
         self.queue_ui_state();
         cx.notify();
     }
@@ -39907,7 +39936,8 @@ impl VibexWorkbench {
         self.code_workbench.update(cx, |workbench, cx| {
             workbench.set_code_font(code_family, code_size, cx)
         });
-        theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
+        let backdrop = self.backdrop();
+        theme::apply_appearance(&self.ui_state.appearance, backdrop, Some(window), cx);
         self.queue_ui_state();
         cx.notify();
     }
@@ -40670,6 +40700,179 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Where the user's background image lives, when one is configured and the
+    /// stored file is still on disk.
+    ///
+    /// The stored name is validated before the path is built, so a hand-edited
+    /// state file cannot point the renderer outside the managed directory, and a
+    /// file the reader deleted resolves to no image rather than to a broken one.
+    pub(crate) fn background_image_path(&self) -> Option<std::path::PathBuf> {
+        appearance_background::resolve(
+            self.config.as_ref().map(|config| config.home_dir.as_path()),
+            &self.ui_state.appearance.background_image,
+        )
+    }
+
+    /// What the appearance pass paints behind the workbench's surfaces.
+    fn backdrop(&self) -> theme::Backdrop {
+        theme::Backdrop::for_wallpaper(self.background_image_path().is_some())
+    }
+
+    /// Re-runs the appearance pass after a background-image change.
+    ///
+    /// A full pass rather than a repaint: whether an image is behind them is
+    /// what decides if the theme's containers fade, so adding, replacing, or
+    /// clearing one changes the palette itself.
+    fn apply_background_image_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let backdrop = self.backdrop();
+        theme::apply_appearance(&self.ui_state.appearance, backdrop, Some(window), cx);
+        self.queue_ui_state();
+        cx.notify();
+    }
+
+    /// Import a picked image and paint it as the workbench's background.
+    ///
+    /// The picker and the copy run on the tokio runtime, because a large image
+    /// is read and hashed before it can be named, and the window must not stall
+    /// while that happens.
+    fn choose_background_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.background_image_upload_task.is_some() {
+            return;
+        }
+        let Some(home) = self.config.as_ref().map(|config| config.home_dir.clone()) else {
+            hint_layer::push(
+                window,
+                hint_notification(
+                    NotificationType::Error,
+                    locale::text(
+                        "Background image storage is unavailable",
+                        "背景图片存储不可用",
+                        "背景圖片儲存空間無法使用",
+                    ),
+                ),
+                cx,
+            );
+            return;
+        };
+        let picker = gpui_tokio::Tokio::spawn(cx, async move {
+            let Some(file) = rfd::AsyncFileDialog::new()
+                .set_title(locale::text(
+                    "Choose a background image",
+                    "选择背景图片",
+                    "選擇背景圖片",
+                ))
+                .add_filter("Images", &BACKGROUND_IMAGE_EXTENSIONS)
+                .pick_file()
+                .await
+            else {
+                return Ok(None);
+            };
+            appearance_background::import(file.path(), &home).map(Some)
+        });
+        self.background_image_upload_task = Some(cx.spawn_in(window, async move |entity, cx| {
+            let outcome = picker.await;
+            let _ = entity.update_in(cx, |this, window, cx| {
+                this.background_image_upload_task = None;
+                match outcome {
+                    Ok(Ok(Some(file_name))) => {
+                        this.ui_state.appearance.background_image.file = Some(file_name);
+                        this.apply_background_image_change(window, cx);
+                    }
+                    // A cancelled picker is not a failure and not a change.
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => {
+                        hint_layer::push(
+                            window,
+                            hint_notification(
+                                NotificationType::Error,
+                                format!(
+                                    "{}: {error}",
+                                    locale::text(
+                                        "Background image was not changed",
+                                        "背景图片未更改",
+                                        "背景圖片未變更",
+                                    )
+                                ),
+                            ),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        hint_layer::push(
+                            window,
+                            hint_notification(
+                                NotificationType::Error,
+                                format!(
+                                    "{}: {error}",
+                                    locale::text(
+                                        "Background image was not changed",
+                                        "背景图片未更改",
+                                        "背景圖片未變更",
+                                    )
+                                ),
+                            ),
+                            cx,
+                        );
+                    }
+                }
+            });
+        }));
+    }
+
+    /// Go back to the theme's own page color.
+    ///
+    /// The managed file is left in the background directory: names are
+    /// content-addressed, so selecting the same image again costs no copy, and a
+    /// stale state write that still names it keeps resolving.
+    fn clear_background_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .ui_state
+            .appearance
+            .background_image
+            .file
+            .take()
+            .is_none()
+        {
+            return;
+        }
+        self.apply_background_image_change(window, cx);
+    }
+
+    fn set_background_image_fit(
+        &mut self,
+        fit: BackgroundImageFit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ui_state.appearance.background_image.fit == fit {
+            return;
+        }
+        self.ui_state.appearance.background_image.fit = fit;
+        self.apply_background_image_change(window, cx);
+    }
+
+    /// Step the veil over the image. Higher values leave more of the theme's
+    /// page color on top of it, which is what buys contrast for the text above.
+    fn adjust_background_image_dim(
+        &mut self,
+        delta: i16,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dim_percent = &mut self.ui_state.appearance.background_image.dim_percent;
+        let adjusted = adjust_u16(
+            *dim_percent,
+            delta,
+            BACKGROUND_IMAGE_MIN_DIM_PERCENT,
+            BACKGROUND_IMAGE_MAX_DIM_PERCENT,
+        );
+        if adjusted == *dim_percent {
+            return;
+        }
+        *dim_percent = adjusted;
+        self.apply_background_image_change(window, cx);
+    }
+
     /// Records a won AI Souls encounter.
     ///
     /// The unlock is permanent: it is written once and never removed, so a
@@ -40696,7 +40899,8 @@ impl VibexWorkbench {
 
     fn set_high_contrast(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.ui_state.appearance.high_contrast = enabled;
-        theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
+        let backdrop = self.backdrop();
+        theme::apply_appearance(&self.ui_state.appearance, backdrop, Some(window), cx);
         self.queue_ui_state();
         cx.notify();
     }
@@ -40861,7 +41065,8 @@ impl VibexWorkbench {
         self.code_right_rail.update(cx, |right_rail, cx| {
             right_rail.set_mode(right_rail_mode, cx)
         });
-        theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
+        let backdrop = self.backdrop();
+        theme::apply_appearance(&self.ui_state.appearance, backdrop, Some(window), cx);
         locale::apply_locale(self.ui_state.appearance.locale);
         self.sync_locale_dependents(window, cx);
         crate::system_tray::update_locale(self.resolved_locale(), cx);
@@ -72985,6 +73190,47 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
             &["contrast", "accessibility", "对比度", "對比度"],
         ),
         settings_search_candidate(
+            SettingsSection::Appearance,
+            appearance_background::setting_title(),
+            appearance_background::setting_description(),
+            &[
+                "background",
+                "wallpaper",
+                "image",
+                "photo",
+                "picture",
+                "背景",
+                "背景图片",
+                "壁纸",
+                "壁紙",
+                "图片",
+                "圖片",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
+            appearance_background::fit_title(),
+            appearance_background::fit_setting_description(),
+            &[
+                "fit", "cover", "contain", "stretch", "fill", "填充", "拉伸", "缩放", "縮放",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
+            appearance_background::veil_title(),
+            appearance_background::veil_description(),
+            &[
+                "veil",
+                "dim",
+                "opacity",
+                "readability",
+                "暗化",
+                "透明度",
+                "对比度",
+                "可读性",
+            ],
+        ),
+        settings_search_candidate(
             SettingsSection::Session,
             strings.session_turn_preview_rail,
             strings.session_turn_preview_rail_description,
@@ -74404,6 +74650,10 @@ impl SearchableListItem for FontChoice {
 
 struct FoundationSettings {
     workbench: WeakEntity<VibexWorkbench>,
+    /// The runtime home a stored background image resolves against, for the
+    /// appearance page's preview. Held here rather than read back from the
+    /// workbench because the page renders inside the workbench's own update.
+    home_dir: Option<PathBuf>,
     font_families: Vec<String>,
     language_modes: Entity<SelectState<Vec<LocaleChoice>>>,
     /// The font families on offer, filtered by the popup's own search box.
@@ -74484,6 +74734,7 @@ type AboutUpdateAction = (&'static str, String, AnyElement);
 impl FoundationSettings {
     fn new(
         workbench: WeakEntity<VibexWorkbench>,
+        home_dir: Option<PathBuf>,
         ui_state: &DesktopUiStateV1,
         window: &mut Window,
         cx: &mut Context<VibexWorkbench>,
@@ -74876,6 +75127,7 @@ impl FoundationSettings {
             .detach();
             Self {
                 workbench,
+                home_dir,
                 font_families: families,
                 language_modes,
                 interface_fonts,
@@ -76330,6 +76582,46 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    /// Every background-image control on the appearance page routes through the
+    /// workbench, which owns the appearance state and the theme pass.
+    fn choose_background_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.choose_background_image(window, cx));
+        cx.notify();
+    }
+
+    fn clear_background_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.clear_background_image(window, cx));
+        cx.notify();
+    }
+
+    fn set_background_image_fit(
+        &mut self,
+        fit: BackgroundImageFit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.set_background_image_fit(fit, window, cx)
+        });
+        cx.notify();
+    }
+
+    fn adjust_background_image_dim(
+        &mut self,
+        delta: i16,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.adjust_background_image_dim(delta, window, cx)
+        });
+        cx.notify();
+    }
+
     fn set_pause_inactive_animation(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.set_pause_inactive_animation(enabled, cx)
@@ -77478,6 +77770,105 @@ impl FoundationSettings {
             Some(strings.choose_code_font),
             cx,
         );
+        // One managed file painted behind the theme's surfaces. The fit and veil
+        // rows only mean something while an image is configured, so they appear
+        // with one.
+        let background_image = &appearance.background_image;
+        let background_image_thumbnail =
+            appearance_background::resolve(self.home_dir.as_deref(), background_image)
+                .map(|path| appearance_background::thumbnail(&path));
+        let background_image_buttons = h_flex()
+            .items_center()
+            .gap_2()
+            .when_some(background_image_thumbnail, |this, thumbnail| {
+                this.child(thumbnail)
+            })
+            .child(
+                Button::new("background-image-choose")
+                    .small()
+                    .outline()
+                    .compact()
+                    .icon(Icon::default().path("icons/vibex/upload.svg"))
+                    .label(if background_image.is_configured() {
+                        locale::text("Replace image", "替换图片", "替換圖片")
+                    } else {
+                        locale::text("Upload image", "上传图片", "上傳圖片")
+                    })
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.choose_background_image(window, cx)),
+                    ),
+            )
+            .when(background_image.is_configured(), |this| {
+                this.child(
+                    Button::new("background-image-clear")
+                        .small()
+                        .ghost()
+                        .compact()
+                        .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                        .tooltip(locale::text(
+                            "Remove the background image",
+                            "移除背景图片",
+                            "移除背景圖片",
+                        ))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.clear_background_image(window, cx)
+                        })),
+                )
+            })
+            .into_any_element();
+        let mut background_image_rows = vec![setting_row(
+            appearance_background::setting_title(),
+            appearance_background::setting_description(),
+            background_image_buttons,
+            stacked,
+            cx,
+        )];
+        if background_image.is_configured() {
+            let fit = background_image.fit;
+            background_image_rows.push(setting_row(
+                appearance_background::fit_title(),
+                appearance_background::fit_setting_description(),
+                settings_segmented_control(
+                    "background-image-fit",
+                    BackgroundImageFit::ALL
+                        .into_iter()
+                        .map(|choice| {
+                            settings_segmented_option(
+                                appearance_background::fit_label(choice),
+                                choice == fit,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.set_background_image_fit(choice, window, cx)
+                                }),
+                            )
+                        })
+                        .collect(),
+                ),
+                stacked,
+                cx,
+            ));
+            background_image_rows.push(setting_row(
+                appearance_background::veil_title(),
+                appearance_background::veil_description(),
+                settings_number_stepper(
+                    "background-image-dim",
+                    background_image.dim_percent,
+                    Some("%"),
+                    BACKGROUND_IMAGE_MIN_DIM_PERCENT,
+                    BACKGROUND_IMAGE_MAX_DIM_PERCENT,
+                    cx.listener(|this, _, window, cx| {
+                        this.adjust_background_image_dim(-5, window, cx)
+                    }),
+                    cx.listener(|this, _, window, cx| {
+                        this.adjust_background_image_dim(5, window, cx)
+                    }),
+                    locale::text("Show more of the image", "减少暗化", "減少暗化"),
+                    locale::text("Dim the image further", "加大暗化", "加大暗化"),
+                    cx,
+                ),
+                stacked,
+                cx,
+            ));
+        }
         settings_page(
             strings.appearance,
             strings.appearance_description,
@@ -77503,6 +77894,10 @@ impl FoundationSettings {
                             cx,
                         ),
                     ],
+                ),
+                SettingsGroup::new(
+                    locale::text("Background image", "背景图片", "背景圖片"),
+                    background_image_rows,
                 ),
                 SettingsGroup::new(
                     locale::text("Display", "显示", "顯示"),
@@ -81037,7 +81432,8 @@ impl Render for VibexWorkbench {
         if self.appearance_reload_pending {
             self.appearance_reload_pending = false;
             let appearance = self.ui_state.appearance.clone();
-            theme::apply_appearance(&appearance, Some(window), cx);
+            let backdrop = self.backdrop();
+            theme::apply_appearance(&appearance, backdrop, Some(window), cx);
             locale::apply_locale(appearance.locale);
             self.sync_locale_dependents(window, cx);
             let session = self.ui_state.session.clone();
@@ -81177,6 +81573,23 @@ impl Render for VibexWorkbench {
                 )
                 .into_any_element()
         });
+        // A user wallpaper is the bottom layer of the window: the image, the
+        // veil that keeps text legible over it, and — underneath — an opaque
+        // plate of the theme's own page color, so the window is never
+        // translucent to whatever sits behind it. A `Contain` fit's letterbox
+        // lands on that plate, which is the same color the veil is mixed from.
+        let wallpaper_layer = self.background_image_path().map(|path| {
+            appearance_background::wallpaper_layer(
+                &self.ui_state.appearance.background_image,
+                &path,
+                cx.theme().is_dark(),
+            )
+        });
+        let page_background = if wallpaper_layer.is_some() {
+            theme::page_plate(cx.theme().is_dark())
+        } else {
+            cx.theme().background
+        };
         v_flex()
             .id("vibex-foundation")
             .track_focus(&self.focus_handle)
@@ -81280,11 +81693,12 @@ impl Render for VibexWorkbench {
             .relative()
             .min_w_0()
             .min_h_0()
-            .bg(cx.theme().background)
+            .bg(page_background)
             .text_color(cx.theme().foreground)
             .font_weight(FontWeight(
                 self.ui_state.appearance.interface_font.weight as f32,
             ))
+            .when_some(wallpaper_layer, |this, layer| this.child(layer))
             .child(content)
             // The chrome floats over the shell, so it paints after it — and
             // before the overlay layers, which still cover the bar.

@@ -19,6 +19,8 @@ pub mod theme_catalog;
 pub mod theme_files;
 pub mod timeline;
 pub mod tool_detail;
+#[cfg(feature = "gpui-component")]
+pub mod wallpaper;
 pub mod workflow;
 
 pub use agent::*;
@@ -36,6 +38,8 @@ pub use team::*;
 pub use terminal::*;
 pub use theme_catalog::*;
 pub use theme_files::*;
+#[cfg(feature = "gpui-component")]
+pub use wallpaper::*;
 pub use workflow::*;
 
 /// Canonical structured source used to generate the shared Rust token constants.

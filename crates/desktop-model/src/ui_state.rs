@@ -395,6 +395,115 @@ pub struct AppearanceUiState {
     /// theme selection existed keeps loading unchanged.
     #[serde(default)]
     pub theme_selection: ThemeSelection,
+    /// A user image painted behind the workbench, in place of the theme's page
+    /// color. Absent keeps the theme in charge of the whole window.
+    #[serde(default)]
+    pub background_image: BackgroundImageUiState,
+}
+
+/// How a user background image is fitted to the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundImageFit {
+    /// Fill the window and crop the overflow — the default for photographs.
+    #[default]
+    Cover,
+    /// Show the whole image inside the window, leaving the page color in the
+    /// letterbox it cannot reach.
+    Contain,
+    /// Stretch the image to the window, which only suits artwork authored at
+    /// the window's own aspect ratio.
+    Fill,
+}
+
+impl BackgroundImageFit {
+    pub const ALL: [Self; 3] = [Self::Cover, Self::Contain, Self::Fill];
+}
+
+/// The user's background image: a managed file name plus how it is painted.
+///
+/// Only a file name is stored, never an external path and never image bytes.
+/// The image itself lives under the runtime home's background directory, so a
+/// state file stays small, portable, and safe to decode. A stored name that is
+/// not a content-addressed name in a supported format is dropped when the state
+/// is normalized, and a file that has gone missing falls back to the theme's
+/// page color at paint time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundImageUiState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default)]
+    pub fit: BackgroundImageFit,
+    /// How much of the theme's page color veils the image, in percent. Zero
+    /// shows the image untouched; the ceiling keeps the text that reads over
+    /// the surfaces above it on a legible field.
+    #[serde(default = "default_background_image_dim_percent")]
+    pub dim_percent: u16,
+}
+
+impl Default for BackgroundImageUiState {
+    fn default() -> Self {
+        Self {
+            file: None,
+            fit: BackgroundImageFit::default(),
+            dim_percent: default_background_image_dim_percent(),
+        }
+    }
+}
+
+impl BackgroundImageUiState {
+    /// Whether an image is configured. The file may still be missing on disk;
+    /// the renderer treats that as no image rather than as an empty surface.
+    pub fn is_configured(&self) -> bool {
+        self.file.is_some()
+    }
+
+    fn normalize(&mut self) {
+        self.file = self
+            .file
+            .take()
+            .filter(|file_name| background_image_file_name_is_valid(file_name));
+        self.dim_percent = self.dim_percent.clamp(
+            BACKGROUND_IMAGE_MIN_DIM_PERCENT,
+            BACKGROUND_IMAGE_MAX_DIM_PERCENT,
+        );
+    }
+}
+
+fn default_background_image_dim_percent() -> u16 {
+    40
+}
+
+pub const BACKGROUND_IMAGE_MIN_DIM_PERCENT: u16 = 0;
+/// The veil never becomes a full cover: at 100 percent the image would be
+/// invisible while every surface stayed translucent for nothing.
+pub const BACKGROUND_IMAGE_MAX_DIM_PERCENT: u16 = 90;
+
+/// The formats a background image may be stored in.
+///
+/// Matches what the desktop image element decodes, minus SVG: a wallpaper is
+/// written once at import and never re-parsed per frame. The order is the
+/// picker's filter order.
+pub const BACKGROUND_IMAGE_EXTENSIONS: [&str; 9] = [
+    "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "avif",
+];
+
+/// Whether `file_name` is a content-addressed background image name.
+///
+/// The name is `<sha256>.<extension>`, with a lowercase hex digest and one of
+/// [`BACKGROUND_IMAGE_EXTENSIONS`]. Anything else — a relative path, an absolute
+/// path, a missing digest, an unsupported format — is rejected, so a state file
+/// cannot point the renderer at an arbitrary file.
+pub fn background_image_file_name_is_valid(file_name: &str) -> bool {
+    let Some((digest, extension)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && BACKGROUND_IMAGE_EXTENSIONS.contains(&extension)
 }
 
 /// The AI Souls encounters this user has already won.
@@ -548,6 +657,7 @@ impl Default for AppearanceUiState {
             pause_inactive_animation: false,
             high_contrast: false,
             theme_selection: ThemeSelection::default(),
+            background_image: BackgroundImageUiState::default(),
         }
     }
 }
@@ -1446,6 +1556,7 @@ impl DesktopUiStateV1 {
         self.appearance.window_scale_percent = self.appearance.window_scale_percent.clamp(75, 200);
         self.appearance.interface_font.normalize(12);
         self.appearance.code_font.normalize(10);
+        self.appearance.background_image.normalize();
         self.network_proxy.proxy_url = bounded_optional(self.network_proxy.proxy_url.take(), 2_048);
         self.network_proxy.bypass = self
             .network_proxy
@@ -3904,6 +4015,84 @@ mod tests {
             !decoded.appearance.pause_inactive_animation,
             "an older file must not opt into the pause"
         );
+    }
+
+    /// A file written before wallpapers existed keeps loading, and lands on the
+    /// theme's own background rather than on a half-configured image.
+    #[test]
+    fn background_image_defaults_when_state_predates_it() {
+        let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        value["appearance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("backgroundImage");
+        let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let background = &decoded.appearance.background_image;
+        assert!(!background.is_configured());
+        assert_eq!(background.file, None);
+        assert_eq!(background.fit, BackgroundImageFit::Cover);
+        assert_eq!(background.dim_percent, 40);
+    }
+
+    #[test]
+    fn background_image_round_trips_and_normalizes_its_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = UiStateStore::new(dir.path().join("desktop-ui-state.json"));
+        let digest = "a".repeat(64);
+        let mut state = DesktopUiStateV1::default();
+        state.appearance.background_image = BackgroundImageUiState {
+            file: Some(format!("{digest}.webp")),
+            fit: BackgroundImageFit::Contain,
+            dim_percent: 55,
+        };
+        store.save(&state).unwrap();
+        let loaded = store.load_or_default(2_000).unwrap().state;
+        assert_eq!(
+            loaded.appearance.background_image,
+            state.appearance.background_image
+        );
+
+        // A veil beyond the authored range comes back inside it, and an unfit
+        // stored name is dropped rather than pointed at a file.
+        let mut over = state.clone();
+        over.appearance.background_image.dim_percent = 400;
+        over.normalize().unwrap();
+        assert_eq!(
+            over.appearance.background_image.dim_percent,
+            BACKGROUND_IMAGE_MAX_DIM_PERCENT
+        );
+        let mut traversal = state.clone();
+        traversal.appearance.background_image.file = Some("../../../etc/passwd.png".to_string());
+        traversal.normalize().unwrap();
+        assert_eq!(traversal.appearance.background_image.file, None);
+        assert!(!traversal.appearance.background_image.is_configured());
+    }
+
+    #[test]
+    fn a_background_image_name_must_be_a_content_addressed_supported_image() {
+        let digest = "0123456789abcdef".repeat(4);
+        for extension in BACKGROUND_IMAGE_EXTENSIONS {
+            assert!(background_image_file_name_is_valid(&format!(
+                "{digest}.{extension}"
+            )));
+        }
+        for rejected in [
+            String::new(),
+            "background.png".to_string(),
+            format!("{digest}.svg"),
+            format!("{digest}.PNG"),
+            format!("{}x.png", &digest[..63]),
+            format!("{}.png", digest.to_uppercase()),
+            format!("{digest}.png/../secret"),
+            format!("/tmp/{digest}.png"),
+            digest.clone(),
+        ] {
+            assert!(
+                !background_image_file_name_is_valid(&rejected),
+                "{rejected} must not resolve to a stored background image"
+            );
+        }
     }
 
     #[test]
