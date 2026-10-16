@@ -832,6 +832,21 @@ pub fn row_active_bg() -> Hsla {
     hsla(0.0, 0.0, luminance, alpha)
 }
 
+/// The plate the surface tab the rail is on lights up with.
+///
+/// Dimmer than an active row: a tab is chrome over the surface, and the row
+/// wash at full strength made the strip the brightest thing on a page whose
+/// content is what the reader came for. It stays a shade over
+/// [`row_pressed_bg`], so the tab a finger lands on still answers.
+pub fn rail_tab_bg() -> Hsla {
+    let (luminance, alpha) = if is_dark() {
+        (0.92, 0.09)
+    } else {
+        (0.10, 0.07)
+    };
+    hsla(0.0, 0.0, luminance, alpha)
+}
+
 pub fn accent() -> Hsla {
     tone("accent")
 }

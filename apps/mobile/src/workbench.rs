@@ -122,6 +122,10 @@ const TREE_ROW_HEIGHT: f32 = 34.0;
 /// The gap between two controls in a toolbar row. Two of these are already a
 /// margin; a scale step each is what pushed the search field into a sliver.
 const TOOLBAR_GAP: f32 = 2.0;
+/// The corner of a surface tab's plate. Squarer than a control: the plate sits
+/// inside a strip that has corners of its own, and a soft one there reads as a
+/// card resting on the row rather than a tab cut into it.
+const TAB_RADIUS: f32 = 5.0;
 
 /// The two ends of a touch selection over the terminal grid.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -232,16 +236,24 @@ impl MobileFileSearchMode {
 impl WorkbenchSurface {
     pub const ALL: [Self; 3] = [Self::Files, Self::Git, Self::Terminal];
 
+    /// The surface's name as an identifier: the element id a test finds its tab
+    /// by, and the word the strip is drawn from.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Files => "Files",
-            Self::Git => "Git",
+            // The surface is the working tree, not the tool that reads it: the
+            // tab names what the reader finds there, the same word the desktop
+            // puts over the same list.
+            Self::Git => "Changes",
             Self::Terminal => "Terminal",
         }
     }
 
     pub fn localized_label(self) -> &'static str {
-        locale::common(self.label())
+        match self {
+            Self::Git => locale::text("Changes", "变更", "變更"),
+            _ => locale::common(self.label()),
+        }
     }
 }
 
@@ -1855,6 +1867,12 @@ impl MobileWorkbench {
             });
         });
         self.tasks.push(task);
+        // The branch list travels with the status it belongs to: the rail's
+        // Changes tab reads how far the branch is from its upstream from the
+        // same refresh that reads the working tree, so the badge is never a
+        // step behind the panel under it. The desktop's rail loads the two
+        // together for the same reason.
+        self.refresh_git_sync(cx);
     }
 
     fn can_mutate_git(&self) -> bool {
@@ -1875,6 +1893,19 @@ impl MobileWorkbench {
     /// Read fresh each time the sheet opens: branches appear when a worktree is
     /// created or a fetch lands, and a cached list would quietly go stale.
     fn load_git_branches(&mut self, cx: &mut Context<Self>) {
+        self.read_git_branches(true, cx);
+    }
+
+    /// Reads the branches the rail's own sync badge counts.
+    ///
+    /// The badge is a hint beside a tab, not a surface the reader opened, so a
+    /// list that fails to load leaves it empty rather than raising the rail's
+    /// error banner over a panel nobody asked for.
+    fn refresh_git_sync(&mut self, cx: &mut Context<Self>) {
+        self.read_git_branches(false, cx);
+    }
+
+    fn read_git_branches(&mut self, report_error: bool, cx: &mut Context<Self>) {
         if !self
             .git
             .capabilities()
@@ -1899,7 +1930,11 @@ impl MobileWorkbench {
                         this.git_branches = Some(branches.branches);
                         this.error = None;
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => {
+                        if report_error {
+                            this.error = Some(error);
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -7863,16 +7898,12 @@ impl MobileWorkbench {
     ///
     /// Three framed buttons read as three commands competing for the eye and
     /// cost a whole second row above the surface. A tab is a place, so the
-    /// selected one carries the only fill in the row and the rest recede; the
-    /// count that used to ride a coloured badge sits beside its label, where it
-    /// is read as part of the word rather than as an alert.
-    fn render_header(
-        &self,
-        surface: WorkbenchSurface,
-        changed_files: usize,
-        running_terminals: usize,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    /// selected one carries the only fill in the row and the rest recede. The
+    /// working tree's tab also carries how far its branch runs from its
+    /// upstream, in the two badges the desktop paints over the same list; a
+    /// running terminal is a state its own panel already shows, so the strip
+    /// leaves it uncounted.
+    fn render_header(&self, surface: WorkbenchSurface, cx: &mut Context<Self>) -> gpui::AnyElement {
         div()
             .flex_shrink_0()
             .h(px(WORKBENCH_HEADER_HEIGHT))
@@ -7898,21 +7929,18 @@ impl MobileWorkbench {
                     .gap(px(TOOLBAR_GAP))
                     .children(WorkbenchSurface::ALL.into_iter().map(|candidate| {
                         let selected = candidate == surface;
-                        let badge = match candidate {
-                            WorkbenchSurface::Git => changed_files,
-                            WorkbenchSurface::Terminal => running_terminals,
-                            WorkbenchSurface::Files => 0,
-                        };
                         div()
                             .id(format!("workbench-tab:{}", candidate.label()))
                             .h(px(WORKBENCH_TAB_HEIGHT))
                             .flex_shrink_0()
                             .px(px(theme::SPACING_SM))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            // The selected tab is a plate, not a button: one
-                            // wash, the same one the desktop rail marks its
-                            // active row with, and no border of its own.
-                            .when(selected, |tab| tab.bg(theme::row_active_bg()))
+                            // The plate a tab lights up with is the dimmest
+                            // wash in the palette and the squarest corner the
+                            // rail draws: navigation is not a card, and a tab
+                            // that reads as one competes with the surface under
+                            // it.
+                            .rounded(px(TAB_RADIUS))
+                            .when(selected, |tab| tab.bg(theme::rail_tab_bg()))
                             .flex()
                             .items_center()
                             .gap(px(theme::SPACING_XS))
@@ -7934,15 +7962,20 @@ impl MobileWorkbench {
                                 cx.listener(move |this, _, _, cx| this.set_surface(candidate, cx)),
                             )
                             .child(candidate.localized_label())
-                            .when(badge > 0, |tab| {
-                                tab.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .font_family("IBM Plex Mono")
-                                        .text_size(theme::font_micro())
-                                        .text_color(theme::text_muted())
-                                        .child(badge.min(99).to_string()),
-                                )
+                            // Only the working tree carries a count, and it is
+                            // the one the desktop's own Changes tab carries:
+                            // how far the branch has drifted from its upstream.
+                            // A running terminal is a state the panel shows in
+                            // full, so the strip leaves it uncounted.
+                            .when(candidate == WorkbenchSurface::Git, |tab| {
+                                let branches = self.git_branches.as_deref().unwrap_or_default();
+                                let (behind, ahead) = git_sync_counts(branches);
+                                tab.when(behind > 0, |tab| {
+                                    tab.child(sync_badge(behind, "↙", theme::accent_blue()))
+                                })
+                                .when(ahead > 0, |tab| {
+                                    tab.child(sync_badge(ahead, "↗", theme::accent_success()))
+                                })
                             })
                     })),
             )
@@ -7986,20 +8019,12 @@ impl Render for MobileWorkbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_inputs(window, cx);
         let surface = self.surface;
-        let changed_files = self.git.state.model.change_row_count();
-        let running_terminals = self
-            .terminal
-            .state
-            .sessions
-            .iter()
-            .filter(|session| session.status == TerminalStatus::Running)
-            .count();
         div()
             .size_full()
             .bg(theme::sidebar_bg())
             .flex()
             .flex_col()
-            .child(self.render_header(surface, changed_files, running_terminals, cx))
+            .child(self.render_header(surface, cx))
             .when_some(self.notice.clone(), |root, notice| {
                 root.child(
                     div()
@@ -8103,6 +8128,42 @@ fn input_element(input: Option<&Entity<InputState>>) -> gpui::AnyElement {
         Some(input) => Input::new(input).appearance(false).into_any_element(),
         None => div().into_any_element(),
     }
+}
+
+/// How far the current branch stands from its upstream, as `(behind, ahead)`.
+///
+/// The desktop's own reading of the same list, and nothing is counted for a
+/// branch with no upstream: a local-only branch has not drifted from anything,
+/// and a badge that said otherwise would be inventing a remote.
+fn git_sync_counts(branches: &[GitBranchSummary]) -> (u32, u32) {
+    branches
+        .iter()
+        .find(|branch| branch.current && branch.upstream.is_some())
+        .map(|branch| (branch.behind, branch.ahead))
+        .unwrap_or_default()
+}
+
+/// The count a rail tab carries beside its name.
+///
+/// Geometry and tone are the desktop's own sync badge: a plate of the count's
+/// colour at a twelfth, the count on it, and one corner small enough to read as
+/// a label rather than a button. A reader who knows what the arrow means on the
+/// desktop reads the same thing here.
+fn sync_badge(count: u32, arrow: &'static str, color: gpui::Hsla) -> gpui::AnyElement {
+    div()
+        .h(px(18.0))
+        .min_w(px(24.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(3.0))
+        .bg(color.opacity(0.12))
+        .font_family("IBM Plex Mono")
+        .text_size(theme::font_micro())
+        .text_color(color)
+        .child(format!("{arrow} {count}"))
+        .into_any_element()
 }
 
 /// A glyph action that sits in a bar beside a label rather than in a field of
@@ -9807,5 +9868,62 @@ mod tests {
             ]
         );
         assert_eq!(theme::workbench_bg(), theme::sidebar_bg());
+    }
+
+    /// The strip counts one thing: how far the branch has drifted.
+    ///
+    /// The tab names the surface by what the reader finds there, and only the
+    /// working tree carries a count — the same two the desktop paints over the
+    /// same list. A running terminal is a state its panel already shows, and a
+    /// tab that counted sessions spent the row on a number nobody acts on.
+    #[test]
+    fn the_surface_strip_counts_only_the_branchs_drift() {
+        let source = include_str!("workbench.rs");
+        let header = source
+            .split_once("fn render_header(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_close_control("))
+            .map(|(body, _)| body)
+            .expect("the rail header should remain inspectable");
+        assert!(
+            header.contains("git_sync_counts") && header.contains("WorkbenchSurface::Git"),
+            "the working tree's tab is the one that carries the branch's drift"
+        );
+        assert!(
+            !header.contains("running_terminals") && !header.contains("change_row_count"),
+            "no other tab counts anything"
+        );
+        assert_eq!(WorkbenchSurface::Git.label(), "Changes");
+        assert_eq!(WorkbenchSurface::Terminal.label(), "Terminal");
+    }
+
+    /// A branch with no upstream has not drifted from anything.
+    #[test]
+    fn the_sync_badge_counts_only_a_branch_that_has_an_upstream() {
+        let branch = |current: bool, upstream: bool, ahead: u32, behind: u32| GitBranchSummary {
+            name: "main".to_string(),
+            current,
+            upstream: upstream.then(|| "origin/main".to_string()),
+            ahead,
+            behind,
+            current_ahead: 0,
+            current_behind: 0,
+            detached: false,
+        };
+        assert_eq!(
+            git_sync_counts(&[branch(true, true, 3, 8)]),
+            (8, 3),
+            "behind first, then ahead, the order the two badges are drawn in"
+        );
+        assert_eq!(git_sync_counts(&[]), (0, 0));
+        assert_eq!(
+            git_sync_counts(&[branch(true, false, 5, 5)]),
+            (0, 0),
+            "a local-only branch has no remote to be ahead of"
+        );
+        assert_eq!(
+            git_sync_counts(&[branch(false, true, 5, 5)]),
+            (0, 0),
+            "and a branch the reader is not on is not the one on screen"
+        );
     }
 }
