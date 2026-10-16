@@ -81687,6 +81687,13 @@ fn startup_loading_wordmark(show_shimmer: bool, cx: &App) -> AnyElement {
 }
 
 fn startup_loading_overlay(show_loading_indicator: bool, cx: &App) -> AnyElement {
+    // The loading page is the window's first full cover, not a container that
+    // sits on the page: while a wallpaper is behind the workbench the theme
+    // fades `background` so the image shows through, and the very first screen
+    // would fade with it. It paints the authored page color instead, the same
+    // plate the window itself is painted from, so startup reads as a solid
+    // page until the workbench is ready to draw.
+    let plate = theme::page_plate(cx.theme().is_dark());
     div()
         .id("startup-loading-overlay")
         .absolute()
@@ -81695,7 +81702,7 @@ fn startup_loading_overlay(show_loading_indicator: bool, cx: &App) -> AnyElement
         .flex()
         .items_center()
         .justify_center()
-        .bg(cx.theme().background)
+        .bg(plate)
         .text_color(cx.theme().foreground)
         .child(startup_loading_wordmark(show_loading_indicator, cx))
         .into_any_element()
@@ -91186,6 +91193,12 @@ mod tests {
             .map(|(body, _)| body)
             .expect("startup overlay should remain inspectable");
         assert!(overlay.contains("startup_loading_wordmark(show_loading_indicator, cx)"));
+        // A wallpaper fades the theme's own page color so the image shows
+        // through, which would make the first screen see-through as well: the
+        // overlay paints the authored plate instead, and it is the window's
+        // last cover, so nothing behind it keeps showing.
+        assert!(overlay.contains("theme::page_plate(cx.theme().is_dark())"));
+        assert!(overlay.contains(".bg(plate)"));
 
         let wordmark = source
             .split_once("fn startup_loading_wordmark(")
