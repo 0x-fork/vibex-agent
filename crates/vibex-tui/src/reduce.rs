@@ -1120,16 +1120,30 @@ impl App {
                 self.config_center.step_zone(-1);
                 Outcome::effects(vec![])
             }
-            Intent::ConfigEntryActions => self.open_entry_actions(),
+            // Every record-scoped verb answers for the pane the reader is in.
+            // The centre has three panes and one cursor each, and a verb that
+            // acts on "the row" needs the reader to be on one: a reader whose
+            // focus is on the module tabs is not, and pressing `d` there is not
+            // a request to delete whatever row the cursor happens to be on in a
+            // pane they are not looking at.
+            Intent::ConfigEntryActions if self.config_rows_focused() => {
+                self.open_entry_actions()
+            }
             Intent::SidebarRowActions => self.open_sidebar_row_actions(),
-            Intent::ConfigEntryCreate => self.begin_entry_form(None),
-            Intent::ConfigEntryDelete => self.confirm_entry_delete(),
+            Intent::ConfigEntryCreate if self.config_rows_focused() => {
+                self.begin_entry_form(None)
+            }
+            Intent::ConfigEntryDelete if self.config_rows_focused() => {
+                self.confirm_entry_delete()
+            }
             // The three verbs every record shares. They mean the same thing in
             // every module, which is why they are keys; everything a *kind* of
             // record can also do lives in the action menu, where the row itself
             // decides what is offered.
-            Intent::ToggleSelectedEntry => self.toggle_selected_entry(),
-            Intent::EditSelectedEntry => {
+            Intent::ToggleSelectedEntry if self.config_rows_focused() => {
+                self.toggle_selected_entry()
+            }
+            Intent::EditSelectedEntry if self.config_rows_focused() => {
                 let row = self.selected_config_row();
                 self.begin_entry_form(row)
             }
@@ -1142,10 +1156,24 @@ impl App {
                 self.overlay = None;
                 Outcome::effects(vec![])
             }
-            Intent::ConfigModels => self.open_model_editor(),
-            Intent::ConfigImport => self.open_native_import(),
-            Intent::ConfigExport => self.open_native_export(),
-            Intent::ConfigDiscover => self.discover_local_agents(),
+            Intent::ConfigModels if self.config_rows_focused() => self.open_model_editor(),
+            Intent::ConfigImport if self.config_rows_focused() => self.open_native_import(),
+            Intent::ConfigExport if self.config_rows_focused() => self.open_native_export(),
+            Intent::ConfigDiscover if self.config_rows_focused() => {
+                self.discover_local_agents()
+            }
+            // A record verb pressed from another pane: the reader asked about
+            // the pane they are in, and that pane has no records, so nothing
+            // happens rather than something happening somewhere else.
+            Intent::ToggleSelectedEntry
+            | Intent::EditSelectedEntry
+            | Intent::ConfigEntryActions
+            | Intent::ConfigEntryCreate
+            | Intent::ConfigEntryDelete
+            | Intent::ConfigModels
+            | Intent::ConfigImport
+            | Intent::ConfigExport
+            | Intent::ConfigDiscover => Outcome::quiet(),
             // The Model editor's own keys, reaching here only when no overlay is
             // open to receive them.
             Intent::ConfigModelToggle
@@ -5450,6 +5478,16 @@ impl App {
         // whichever row a refresh or a deletion has since put under it.
         self.session_row_action = None;
         Some(self.perform(intent))
+    }
+
+    /// Whether the cursor is on the records rather than on the panes that
+    /// choose which records they are.
+    ///
+    /// A verb that acts on "the row" is about the row the reader is on, so it
+    /// needs the reader to be on one. The moves already answer for the pane
+    /// they are in; this is the same rule for the verbs that change something.
+    fn config_rows_focused(&self) -> bool {
+        self.config_center.zone == crate::config_center::ConfigZone::Rows
     }
 
     /// Move inside the configuration centre, where the same two keys mean

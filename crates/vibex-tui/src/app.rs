@@ -3758,7 +3758,11 @@ impl App {
         section: Option<crate::config_center::ConfigSection>,
     ) -> crate::reduce::Outcome {
         self.config_center.show_module(module, section);
-        self.config_center.zone = crate::config_center::ConfigZone::Modules;
+        // Opening an area leaves the reader where they were. The rows are where
+        // this surface starts (`ConfigCenter::default` says so) and the module
+        // and area keys work from any pane, so sending the focus back to the
+        // tabs would only take the record verbs away from a reader who came to
+        // use them on the first row.
         self.page = Page::Management;
         self.refresh_config_area()
     }

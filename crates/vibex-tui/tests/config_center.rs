@@ -4079,3 +4079,68 @@ fn the_builtin_tool_panels_are_switched_per_agent() {
         other => panic!("the switch produced {other:?}"),
     }
 }
+
+/// A record verb answers for the pane the reader is in.
+///
+/// The centre has three panes and one cursor each, and a verb that acts on "the
+/// row" needs the reader to be on one. A reader whose focus is on the module
+/// tabs or the area rail is not, and pressing `d` there is not a request to
+/// delete whatever row the cursor happens to be on in a pane they are not
+/// looking at. The moves already answer for their pane; this is the same rule
+/// for the keys that change something.
+#[test]
+fn record_verbs_answer_for_the_pane_the_reader_is_in() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_first", "First")];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+    assert_eq!(app.config_center.zone, ConfigZone::Rows);
+
+    // On the rows, the verbs act.
+    let _ = app.perform(vibex_tui::action::Intent::EditSelectedEntry);
+    assert!(
+        matches!(app.overlay, Some(Overlay::Form { .. })),
+        "the rows did not open the editor"
+    );
+    app.overlay = None;
+
+    // On the tabs, none of them do — and nothing opens behind the reader.
+    app.perform(vibex_tui::action::Intent::ConfigPanePrevious);
+    app.perform(vibex_tui::action::Intent::ConfigPanePrevious);
+    assert_eq!(app.config_center.zone, ConfigZone::Modules);
+    for intent in [
+        vibex_tui::action::Intent::EditSelectedEntry,
+        vibex_tui::action::Intent::ConfigEntryDelete,
+        vibex_tui::action::Intent::ToggleSelectedEntry,
+        vibex_tui::action::Intent::ConfigEntryActions,
+        vibex_tui::action::Intent::ConfigModels,
+        vibex_tui::action::Intent::ConfigEntryCreate,
+    ] {
+        let outcome = app.perform(intent);
+        assert!(
+            outcome.effects.is_empty() && app.overlay.is_none(),
+            "{intent:?} acted from the module tabs"
+        );
+        assert!(
+            app.config_center.pending.is_empty(),
+            "{intent:?} filed work from the module tabs"
+        );
+    }
+
+    // The area rail is a pane of its own, and it is not the rows either.
+    app.perform(vibex_tui::action::Intent::ConfigPaneNext);
+    assert_eq!(app.config_center.zone, ConfigZone::Rail);
+    let outcome = app.perform(vibex_tui::action::Intent::EditSelectedEntry);
+    assert!(
+        outcome.effects.is_empty() && app.overlay.is_none(),
+        "a record verb acted from the area rail"
+    );
+
+    // Moving back to the rows makes them act again.
+    app.perform(vibex_tui::action::Intent::ConfigPaneNext);
+    assert_eq!(app.config_center.zone, ConfigZone::Rows);
+    let _ = app.perform(vibex_tui::action::Intent::EditSelectedEntry);
+    assert!(
+        matches!(app.overlay, Some(Overlay::Form { .. })),
+        "the rows stopped acting after the walk back"
+    );
+}
