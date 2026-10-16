@@ -845,3 +845,245 @@ fn an_older_page_prepends_without_moving_the_reader(cx: &mut TestAppContext) {
     });
     draw(cx);
 }
+
+/// A request the reader has answered collapses to a record they can open.
+///
+/// The request keeps its `Pending` status after it is resolved — the durable
+/// resolution is its own timeline item — so a row that asked the payload would
+/// keep drawing the form. This pins the behaviour the phone owes the reader:
+/// once answered, the row is a summary; the answers are one tap away.
+#[gpui::test]
+fn a_settled_input_request_collapses_to_its_record(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let request_id = RequestId::parse("request_mobile_settled").unwrap();
+    let request = vibex_core::ElicitationRequest {
+        id: request_id.clone(),
+        session_id: VibexSessionId::parse("session_mobile_timeline").unwrap(),
+        provider_request_id: None,
+        tool_call_id: None,
+        message: "Which state model should the rail use?".into(),
+        title: None,
+        description: None,
+        fields: vec![vibex_core::ElicitationField {
+            id: "approach".into(),
+            title: "Approach".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::Text {
+                min_length: None,
+                max_length: None,
+                pattern: None,
+                format: None,
+                default: None,
+                options: vec![vibex_core::ElicitationOption {
+                    value: "global".into(),
+                    title: "Global state".into(),
+                    description: None,
+                }],
+            },
+        }],
+        status: vibex_core::ElicitationRequestStatus::Pending,
+        requested_at_ms: 1,
+    };
+    // The form is up first, exactly as the reader sees it before answering.
+    let (app, _, cx) = open_timeline(
+        cx,
+        data_dir.path(),
+        vec![TimelinePayload::ElicitationRequest(request.clone())],
+    );
+    let awaiting = app.read_with(cx, |app, _| {
+        app.timeline_turns
+            .iter()
+            .flat_map(|turn| turn.process_rows.iter())
+            .find(|row| row.kind == TimelineRowKind::ElicitationRequest)
+            .expect("the request has a row")
+            .pending_permission
+    });
+    assert!(awaiting, "an unanswered request is pending");
+    assert!(
+        app.read_with(cx, |app, _| app.question_form_open()),
+        "and it is what the panel is asking for"
+    );
+
+    // The reader answers. The resolution arrives as its own live item on the
+    // same session, which is how the phone learns a form is done.
+    let resolution = vibex_core::ElicitationResolution {
+        request_id: request.id.clone(),
+        session_id: request.session_id.clone(),
+        action: ElicitationResolutionAction::Accept,
+        answers: BTreeMap::from([(
+            "approach".into(),
+            vibex_core::ElicitationAnswerValue::String("global".into()),
+        )]),
+        responder_device_id: None,
+        resolved_at_ms: 2,
+    };
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            // The device learns a form is done from the event stream, so the
+            // test takes the same door rather than poking the controller.
+            assert!(
+                !app.apply_event_batch(
+                    vec![BackendEvent::Timeline(TimelineLiveEvent {
+                        session_id: request.session_id.clone(),
+                        sequence: 3,
+                        item: item(
+                            3,
+                            TimelinePayload::ElicitationResolution(resolution.clone()),
+                        ),
+                    })],
+                    cx,
+                ),
+                "a settle needs no authoritative refetch"
+            );
+        });
+    });
+    draw(cx);
+
+    // Answering is what closes the panel: the request is no longer waiting.
+    assert!(
+        !app.read_with(cx, |app, _| app.question_form_open()),
+        "the panel is gone once the form is submitted"
+    );
+    // The timeline row is the question, still in place.
+    let row = app.read_with(cx, |app, _| {
+        app.timeline_turns
+            .iter()
+            .flat_map(|turn| turn.process_rows.iter())
+            .find(|row| row.kind == TimelineRowKind::ElicitationRequest)
+            .expect("the request keeps its row")
+            .clone()
+    });
+    let (row_id, pending) = (row.id.clone(), row.pending_permission);
+    assert!(
+        !pending,
+        "a resolution in the timeline settles the row it answers"
+    );
+
+    let header = format!("settled-question:{row_id}");
+    let record = cx.debug_bounds(header.clone().leak()).is_some();
+    assert!(
+        record,
+        "an answered request is a record on the timeline, not a form"
+    );
+    // The collapsed record says which answer was given; the per-field body
+    // that spells it out stays behind the disclosure until it is asked for.
+    let answer_selector = "settled-answer:approach";
+    assert!(
+        cx.debug_bounds(answer_selector).is_none(),
+        "the answer body is folded away until it is opened"
+    );
+
+    // Opening it does not take the record away; it adds the per-field detail.
+    click(cx, &header);
+    assert!(
+        cx.debug_bounds(header.clone().leak()).is_some(),
+        "the record stays where it was"
+    );
+    let expanded = app.read_with(cx, |app, _| {
+        app.expanded_settled_questions.contains(&row_id)
+    });
+    assert!(expanded, "one tap opens the record");
+    // Opening it is what puts the reader's own answer on screen.
+    let answer = cx
+        .debug_bounds(answer_selector)
+        .expect("the opened record shows the answer that was given");
+    let header_bounds = cx.debug_bounds(header.clone().leak()).expect("the record");
+    assert!(
+        answer.top() >= header_bounds.top(),
+        "the answer reads under the question it answered"
+    );
+    click(cx, &header);
+    assert!(
+        cx.debug_bounds(answer_selector).is_none(),
+        "and closing it folds the answer away again"
+    );
+}
+
+/// A question the reader answered stays on the timeline after the turn ends.
+///
+/// The turn folds its process activity away when it completes, and the record
+/// of a question is part of that list. If the fold takes the record with it, the
+/// reader loses the answer they gave — which is the thing they were told they
+/// could come back and read.
+#[gpui::test]
+fn a_settled_question_survives_the_end_of_its_turn(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let request_id = RequestId::parse("request_mobile_endturn").unwrap();
+    let session_id = VibexSessionId::parse("session_mobile_timeline").unwrap();
+    let request = vibex_core::ElicitationRequest {
+        id: request_id.clone(),
+        session_id: session_id.clone(),
+        provider_request_id: None,
+        tool_call_id: None,
+        message: "Which state model should the rail use?".into(),
+        title: None,
+        description: None,
+        fields: vec![vibex_core::ElicitationField {
+            id: "approach".into(),
+            title: "Approach".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::Text {
+                min_length: None,
+                max_length: None,
+                pattern: None,
+                format: None,
+                default: None,
+                options: vec![vibex_core::ElicitationOption {
+                    value: "global".into(),
+                    title: "Global state".into(),
+                    description: None,
+                }],
+            },
+        }],
+        status: vibex_core::ElicitationRequestStatus::Pending,
+        requested_at_ms: 1,
+    };
+    let (_app, _probe, cx) = open_timeline(
+        cx,
+        data_dir.path(),
+        vec![
+            TimelinePayload::ElicitationRequest(request.clone()),
+            TimelinePayload::ElicitationResolution(vibex_core::ElicitationResolution {
+                request_id: request.id.clone(),
+                session_id: session_id.clone(),
+                action: ElicitationResolutionAction::Accept,
+                answers: BTreeMap::from([(
+                    "approach".into(),
+                    vibex_core::ElicitationAnswerValue::String("global".into()),
+                )]),
+                responder_device_id: None,
+                resolved_at_ms: 2,
+            }),
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: "The rail keeps global state.".into(),
+                is_final: true,
+            }),
+        ],
+    );
+
+    // The turn is over, so its process activity folds away.
+    let row_id = _app.read_with(cx, |app, _| {
+        let turn = app.timeline_turns.last().expect("a turn");
+        assert!(turn.complete, "the final answer completes the turn");
+        turn.process_rows
+            .iter()
+            .find(|row| row.kind == TimelineRowKind::ElicitationRequest)
+            .map(|row| row.id.clone())
+            .expect("the question keeps a row after the turn ends")
+    });
+    let header = format!("settled-question:{row_id}");
+
+    // The reader must still be able to find and open what they answered. The
+    // turn folds its activity when it completes, so the record either stays on
+    // screen or is one disclosure away.
+    let turn_id = _app.read_with(cx, |app, _| app.timeline_turns.last().unwrap().id.clone());
+    let visible_while_folded = cx.debug_bounds(header.clone().leak()).is_some();
+    click(cx, &format!("turn-process:{turn_id}"));
+    let visible_when_opened = cx.debug_bounds(header.clone().leak()).is_some();
+    assert!(
+        visible_while_folded || visible_when_opened,
+        "the answered question stays reachable once its turn completes"
+    );
+}

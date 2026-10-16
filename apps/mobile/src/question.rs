@@ -309,6 +309,10 @@ impl MobileApp {
         };
         let header = div()
             .id(format!("settled-question:{}", row.id))
+            .debug_selector({
+                let selector = row.id.clone();
+                move || format!("settled-question:{selector}")
+            })
             .w_full()
             .min_w_0()
             .flex()
@@ -440,6 +444,10 @@ impl MobileApp {
                                     div()
                                         .w_full()
                                         .min_w_0()
+                                        .debug_selector({
+                                            let field = answer.field_id.clone();
+                                            move || format!("settled-answer:{field}")
+                                        })
                                         .text_size(theme::font_caption())
                                         .line_height(theme::line_height_for(theme::FONT_CAPTION))
                                         .text_color(theme::text_primary())
@@ -1540,6 +1548,9 @@ fn settled_response_action(response: PermissionResponseKind) -> ElicitationResol
 
 /// One settled answer, ready to paint.
 struct ElicitationAnswerSummary {
+    /// The field the answer belongs to, so a rendered answer is addressable
+    /// without depending on the words in it.
+    field_id: String,
     label: String,
     /// Human-readable value, for the collapsed one-line preview.
     value: String,
@@ -1612,6 +1623,7 @@ fn elicitation_answer_summary(
         }
     };
     ElicitationAnswerSummary {
+        field_id: field.id.clone(),
         label: field.title.clone(),
         value: if value.trim().is_empty() {
             "—".to_string()
