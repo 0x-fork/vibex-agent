@@ -127,6 +127,12 @@ pub enum BackendOperation {
     /// one that has to answer it.
     DevicePairingPublications,
     DeviceRevoke,
+    /// Names a paired device, or the runtime itself.
+    ///
+    /// Its own operation because it is its own decision: an operator who may
+    /// revoke a device is not automatically the one who decides what a runtime
+    /// calls itself in every other client's list.
+    DeviceRename,
     DeviceAudit,
     /// Authority-local recovery: diagnostic export and database backup.
     RecoveryDiagnosticsExport,
@@ -347,6 +353,7 @@ impl BackendCapabilitySnapshot {
                 DeviceList,
                 DevicePairingPublications,
                 DeviceRevoke,
+                DeviceRename,
                 DeviceAudit,
                 RecoveryDiagnosticsExport,
                 RecoveryBackupCreate,

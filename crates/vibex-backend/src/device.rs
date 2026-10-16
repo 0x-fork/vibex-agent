@@ -47,6 +47,15 @@ pub trait DeviceBackend: BackendBound {
 
     fn list_devices(&self) -> BackendFuture<'_, Vec<RemoteDeviceDetail>>;
 
+    /// The name this runtime publishes for itself.
+    ///
+    /// Every client renders it — the phone that discovers it on the network, the
+    /// desktop that lists it, `/api/v2/info` — so a client that offers to change
+    /// it has to be able to read it first. An empty answer is a runtime that
+    /// predates the field, which the caller draws as no name rather than as an
+    /// empty one.
+    fn runtime_name(&self) -> BackendFuture<'_, String>;
+
     /// Whether an offer this client minted is still live, canceled, or claimed.
     ///
     /// The code and link are shown once and never stored, so this answers about

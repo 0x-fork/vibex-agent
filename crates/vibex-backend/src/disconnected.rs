@@ -1536,6 +1536,10 @@ impl DeviceBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn runtime_name(&self) -> BackendFuture<'_, String> {
+        disconnected_future!()
+    }
+
     fn pairing_publications(
         &self,
     ) -> BackendFuture<'_, Vec<vibex_core::RemotePairingPublicationSummary>> {

@@ -6791,6 +6791,23 @@ impl DeviceBackend for WebRemoteBackend {
         })
     }
 
+    /// The name the runtime published when this client attached.
+    ///
+    /// Read from the handshake rather than asked for: `/info` already carries
+    /// it, so a client that reconnects reads a name that changed while it was
+    /// away, and one that renamed it reads the answer to its own write. An empty
+    /// answer is a runtime that predates the field.
+    fn runtime_name(&self) -> BackendFuture<'_, String> {
+        let this = self.clone();
+        Box::pin(async move {
+            Ok(this
+                .transport
+                .server_info()
+                .map(|info| info.server_display_name)
+                .unwrap_or_default())
+        })
+    }
+
     fn rename_device(
         &self,
         request: MutationRequest<RemoteRenameDeviceRequest>,
@@ -7384,6 +7401,10 @@ fn remote_capabilities_for_grant(
                 ),
                 (
                     BackendOperation::DeviceRevoke,
+                    permits(RemoteActionClass::MutateDeviceManagement),
+                ),
+                (
+                    BackendOperation::DeviceRename,
                     permits(RemoteActionClass::MutateDeviceManagement),
                 ),
                 (

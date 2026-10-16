@@ -4368,6 +4368,17 @@ impl DeviceBackend for NativeBackend {
         })
     }
 
+    fn runtime_name(&self) -> BackendFuture<'_, String> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .runtime_display_name()
+                .map_err(Into::into)
+        })
+    }
+
     fn revoke_device(
         &self,
         request: MutationRequest<RemoteRevokeDeviceRequest>,
