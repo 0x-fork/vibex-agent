@@ -13168,9 +13168,13 @@ impl MobileApp {
                         | NearbyPairingState::Failed { .. }
                 );
                 let trailing = retry.then(|| {
-                    pairing_sheet_header_action("pairing-nearby-retry", locale::common("Try Again"))
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::start_nearby_pairing))
-                        .into_any_element()
+                    pairing_sheet_header_action(
+                        "pairing-nearby-retry",
+                        locale::common("Try Again"),
+                        "icons/rotate-ccw.svg",
+                    )
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::start_nearby_pairing))
+                    .into_any_element()
                 });
                 (
                     self.render_pairing_sheet_header(
@@ -13440,7 +13444,11 @@ impl MobileApp {
                             .cursor_pointer()
                             .active(|style| style.opacity(0.7))
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::paste_pairing_entry))
-                            .child(locale::text("Paste", "粘贴", "貼上")),
+                            .child(sheet_action_content(
+                                "icons/clipboard-paste.svg",
+                                locale::text("Paste", "粘贴", "貼上"),
+                                theme::text_primary(),
+                            )),
                     ),
             )
             .child(
@@ -13480,9 +13488,19 @@ impl MobileApp {
                     })
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_XS))
                             .text_size(theme::font_body())
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::bg_primary())
+                            .child(
+                                svg()
+                                    .path("icons/plug-zap.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .flex_shrink_0()
+                                    .text_color(theme::bg_primary()),
+                            )
                             .child(if busy {
                                 locale::text("Connecting…", "连接中…", "連線中…")
                             } else {
@@ -14944,8 +14962,9 @@ impl MobileApp {
                            label: String,
                            destructive: bool,
                            action: SheetAction| {
+            let icon = sidebar_row_menu_icon(&id);
             sheet.child(
-                sidebar_sheet_entry(id, label, destructive, false).on_mouse_up(
+                sidebar_sheet_entry_with_icon(id, label, icon, destructive, false).on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
@@ -15669,9 +15688,10 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let sheet = div().p_2().flex().flex_col().gap(px(2.0)).child(
-            sidebar_sheet_entry(
+            sidebar_sheet_entry_with_icon(
                 "mobile-sidebar-root-menu-new-folder".to_string(),
                 locale::text("New folder", "新建文件夹", "新增資料夾").to_string(),
+                sidebar_row_menu_icon("mobile-sidebar-root-menu-new-folder"),
                 false,
                 false,
             )
@@ -15896,9 +15916,10 @@ impl MobileApp {
         for seconds in MOBILE_RESCHEDULE_CHOICES {
             let target = target.clone();
             sheet = sheet.child(
-                sidebar_sheet_entry(
+                sidebar_sheet_entry_with_icon(
                     format!("mobile-reschedule-{seconds}"),
                     mobile_reschedule_label(seconds),
+                    Some("icons/clock.svg"),
                     false,
                     false,
                 )
@@ -15965,9 +15986,10 @@ impl MobileApp {
         let absolute = mobile_absolute_deadline(self.sidebar_reschedule_day, &typed);
         let confirm_target = target.clone();
         sheet = sheet.child(
-            sidebar_sheet_entry(
+            sidebar_sheet_entry_with_icon(
                 "mobile-reschedule-confirm".to_string(),
                 mobile_absolute_deadline_label(self.sidebar_reschedule_day, &typed),
+                Some("icons/clock.svg"),
                 false,
                 false,
             )
@@ -16138,7 +16160,11 @@ impl MobileApp {
                                             cx.notify();
                                         }),
                                     )
-                                    .child(locale::common("Cancel")),
+                                    .child(sheet_action_content(
+                                        "icons/x.svg",
+                                        locale::common("Cancel"),
+                                        theme::text_secondary(),
+                                    )),
                             )
                             .child(
                                 div()
@@ -16158,7 +16184,11 @@ impl MobileApp {
                                         MouseButton::Left,
                                         cx.listener(Self::submit_folder_name),
                                     )
-                                    .child(locale::common("Confirm")),
+                                    .child(sheet_action_content(
+                                        "icons/check.svg",
+                                        locale::common("Confirm"),
+                                        theme::text_primary(),
+                                    )),
                             ),
                     ),
             )
@@ -16241,7 +16271,11 @@ impl MobileApp {
                             .cursor_pointer()
                             .active(|style| style.bg(theme::row_pressed_bg()))
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_batch_delete))
-                            .child(locale::common("Cancel")),
+                            .child(sheet_action_content(
+                                "icons/x.svg",
+                                locale::common("Cancel"),
+                                theme::text_secondary(),
+                            )),
                     )
                     .child(
                         div()
@@ -16259,7 +16293,11 @@ impl MobileApp {
                             .cursor_pointer()
                             .active(|style| style.opacity(0.8))
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::confirm_batch_delete))
-                            .child(locale::common("Delete")),
+                            .child(sheet_action_content(
+                                "icons/trash-2.svg",
+                                locale::common("Delete"),
+                                theme::bg_primary(),
+                            )),
                     ),
             );
         bottom_sheet_shell("mobile-batch-delete-confirmation", presentation)
@@ -16366,7 +16404,11 @@ impl MobileApp {
                                     )
                             })
                             .when(current.is_empty(), |button| button.opacity(0.5))
-                            .child(locale::common("Use this folder")),
+                            .child(sheet_action_content(
+                                "icons/check.svg",
+                                locale::common("Use this folder"),
+                                theme::primary_foreground(),
+                            )),
                     ),
             )
             .when(!roots.is_empty(), |sheet| {
@@ -16702,7 +16744,11 @@ impl MobileApp {
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.confirm_group_members(cx)),
                             )
-                            .child(locale::common("Save")),
+                            .child(sheet_action_content(
+                                "icons/check.svg",
+                                locale::common("Save"),
+                                theme::primary_foreground(),
+                            )),
                     ),
             );
         bottom_sheet_shell("mobile-group-members", presentation)
@@ -16797,7 +16843,11 @@ impl MobileApp {
                                     this.close_sheet(SheetKey::ProjectRemove, cx)
                                 }),
                             )
-                            .child(locale::common("Cancel")),
+                            .child(sheet_action_content(
+                                "icons/x.svg",
+                                locale::common("Cancel"),
+                                theme::text_secondary(),
+                            )),
                     )
                     .child(
                         div()
@@ -16820,7 +16870,11 @@ impl MobileApp {
                                     this.remove_project(target.clone(), cx)
                                 }),
                             )
-                            .child(locale::common("Remove")),
+                            .child(sheet_action_content(
+                                "icons/trash-2.svg",
+                                locale::common("Remove"),
+                                theme::bg_primary(),
+                            )),
                     ),
             );
         bottom_sheet_shell("mobile-project-remove-confirmation", presentation)
@@ -16845,7 +16899,7 @@ impl MobileApp {
                 .agent
                 .supports(BackendOperation::AgentManageSession)
         });
-        let (heading, detail, confirm_label, destructive) = match prompt.kind {
+        let (heading, detail, confirm_label, destructive, confirm_icon) = match prompt.kind {
             SessionActionKind::Rename => (
                 locale::text("Rename session", "重命名会话", "重新命名工作階段"),
                 locale::text(
@@ -16855,6 +16909,7 @@ impl MobileApp {
                 ),
                 locale::common("Rename"),
                 false,
+                "icons/pencil.svg",
             ),
             SessionActionKind::Delete => (
                 locale::text("Delete session", "删除会话", "刪除工作階段"),
@@ -16865,6 +16920,7 @@ impl MobileApp {
                 ),
                 locale::common("Delete"),
                 true,
+                "icons/trash-2.svg",
             ),
         };
         div()
@@ -16945,7 +17001,11 @@ impl MobileApp {
                                             cx.listener(Self::cancel_session_action),
                                         )
                                     })
-                                    .child(locale::common("Cancel")),
+                                    .child(sheet_action_content(
+                                        "icons/x.svg",
+                                        locale::common("Cancel"),
+                                        theme::text_secondary(),
+                                    )),
                             )
                             .child(
                                 div()
@@ -16973,11 +17033,15 @@ impl MobileApp {
                                         },
                                     )
                                     .when(!can_manage_session, |button| button.opacity(0.55))
-                                    .child(if self.session_action_busy {
-                                        locale::common("Working...")
-                                    } else {
-                                        confirm_label
-                                    }),
+                                    .child(sheet_action_content(
+                                        confirm_icon,
+                                        if self.session_action_busy {
+                                            locale::common("Working...").to_string()
+                                        } else {
+                                            confirm_label.to_string()
+                                        },
+                                        theme::bg_primary(),
+                                    )),
                             ),
                     ),
             )
@@ -17082,7 +17146,11 @@ impl MobileApp {
                                         MouseButton::Left,
                                         cx.listener(Self::cancel_workspace_action),
                                     )
-                                    .child(locale::common("Cancel")),
+                                    .child(sheet_action_content(
+                                        "icons/x.svg",
+                                        locale::common("Cancel"),
+                                        theme::text_secondary(),
+                                    )),
                             )
                             .child(
                                 div()
@@ -17107,13 +17175,21 @@ impl MobileApp {
                                         )
                                     })
                                     .when(self.workspace_action_busy, |button| button.opacity(0.55))
-                                    .child(if self.workspace_action_busy {
-                                        locale::common("Working...")
-                                    } else if rename {
-                                        locale::common("Rename")
-                                    } else {
-                                        locale::common("Delete")
-                                    }),
+                                    .child(sheet_action_content(
+                                        if rename {
+                                            "icons/pencil.svg"
+                                        } else {
+                                            "icons/trash-2.svg"
+                                        },
+                                        if self.workspace_action_busy {
+                                            locale::common("Working...").to_string()
+                                        } else if rename {
+                                            locale::common("Rename").to_string()
+                                        } else {
+                                            locale::common("Delete").to_string()
+                                        },
+                                        theme::bg_primary(),
+                                    )),
                             ),
                     ),
             )
@@ -22163,7 +22239,11 @@ impl MobileApp {
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.confirm_goal_objective(cx)),
                             )
-                            .child(locale::common("Save")),
+                            .child(sheet_action_content(
+                                "icons/check.svg",
+                                locale::common("Save"),
+                                theme::primary_foreground(),
+                            )),
                     ),
             );
         bottom_sheet_shell("mobile-goal-objective", presentation)
@@ -25080,8 +25160,8 @@ impl MobileApp {
         state: RuntimeStatus,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let button = |id: &'static str, label: &'static str| {
-            host_sheet_action_row(id, label, false).debug_selector(|| id.to_string())
+        let button = |id: &'static str, label: &'static str, icon: &'static str| {
+            host_sheet_action_row(id, label, Some(icon), false).debug_selector(|| id.to_string())
         };
         let mut row = div().flex().flex_col();
         match state {
@@ -25090,7 +25170,12 @@ impl MobileApp {
                 // back to the pairing screen, where this runtime's own card is
                 // what restores it, matching the cancel-connect flow here.
                 row = row.child(
-                    button("mobile-runtime-disconnect", locale::common("Disconnect")).on_mouse_up(
+                    button(
+                        "mobile-runtime-disconnect",
+                        locale::common("Disconnect"),
+                        "icons/plug-zap.svg",
+                    )
+                    .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, event, window, cx| {
                             cx.stop_propagation();
@@ -25101,7 +25186,12 @@ impl MobileApp {
             }
             RuntimeStatus::Connecting | RuntimeStatus::Reconnecting => {
                 row = row.child(
-                    button("mobile-runtime-cancel", locale::common("Cancel")).on_mouse_up(
+                    button(
+                        "mobile-runtime-cancel",
+                        locale::common("Cancel"),
+                        "icons/x.svg",
+                    )
+                    .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, event, window, cx| {
                             cx.stop_propagation();
@@ -25112,7 +25202,12 @@ impl MobileApp {
             }
             RuntimeStatus::Offline | RuntimeStatus::Revoked | RuntimeStatus::Incompatible => {
                 row = row.child(
-                    button("mobile-runtime-retry", locale::common("Retry")).on_mouse_up(
+                    button(
+                        "mobile-runtime-retry",
+                        locale::common("Retry"),
+                        "icons/rotate-ccw.svg",
+                    )
+                    .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, event, window, cx| {
                             cx.stop_propagation();
@@ -25128,7 +25223,12 @@ impl MobileApp {
                 // install. Re-installing the bundle is what reconnects, and the
                 // pairing screen's runtime cards do exactly the same thing.
                 row = row.child(
-                    button("mobile-runtime-connect", locale::common("Connect")).on_mouse_up(
+                    button(
+                        "mobile-runtime-connect",
+                        locale::common("Connect"),
+                        "icons/plug-zap.svg",
+                    )
+                    .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, event, window, cx| {
                             cx.stop_propagation();
@@ -25198,14 +25298,19 @@ impl MobileApp {
                 .child(self.render_active_host_actions(status.status, cx));
         } else {
             sheet = sheet.child(
-                host_sheet_action_row("mobile-runtime-switch", locale::common("Switch"), false)
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, event, window, cx| {
-                            cx.stop_propagation();
-                            this.switch_host(switch_id.clone(), event, window, cx);
-                        }),
-                    ),
+                host_sheet_action_row(
+                    "mobile-runtime-switch",
+                    locale::common("Switch"),
+                    Some("icons/refresh.svg"),
+                    false,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, event, window, cx| {
+                        cx.stop_propagation();
+                        this.switch_host(switch_id.clone(), event, window, cx);
+                    }),
+                ),
             );
         }
         // Every row stops the tap before it reaches the backdrop, whose own
@@ -25213,34 +25318,49 @@ impl MobileApp {
         // undone by the tap that opened it.
         sheet = sheet
             .child(
-                host_sheet_action_row("mobile-runtime-rename", locale::common("Rename"), false)
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, event, window, cx| {
-                            cx.stop_propagation();
-                            this.open_host_rename(event, window, cx);
-                        }),
-                    ),
+                host_sheet_action_row(
+                    "mobile-runtime-rename",
+                    locale::common("Rename"),
+                    Some("icons/pencil.svg"),
+                    false,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, event, window, cx| {
+                        cx.stop_propagation();
+                        this.open_host_rename(event, window, cx);
+                    }),
+                ),
             )
             .child(
-                host_sheet_action_row("mobile-runtime-details", locale::common("Details"), false)
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, event, window, cx| {
-                            cx.stop_propagation();
-                            this.open_host_detail(event, window, cx);
-                        }),
-                    ),
+                host_sheet_action_row(
+                    "mobile-runtime-details",
+                    locale::common("Details"),
+                    Some("icons/circle-question-mark.svg"),
+                    false,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, event, window, cx| {
+                        cx.stop_propagation();
+                        this.open_host_detail(event, window, cx);
+                    }),
+                ),
             )
             .child(
-                host_sheet_action_row("mobile-runtime-remove", locale::common("Remove"), true)
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, event, window, cx| {
-                            cx.stop_propagation();
-                            this.open_host_remove(event, window, cx);
-                        }),
-                    ),
+                host_sheet_action_row(
+                    "mobile-runtime-remove",
+                    locale::common("Remove"),
+                    Some("icons/trash-2.svg"),
+                    true,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, event, window, cx| {
+                        cx.stop_propagation();
+                        this.open_host_remove(event, window, cx);
+                    }),
+                ),
             );
         bottom_sheet_shell("mobile-runtime-actions-sheet", presentation)
             .on_dismiss(
@@ -25321,6 +25441,7 @@ impl MobileApp {
                                 runtime_sheet_action_button(
                                     "mobile-runtime-rename-cancel",
                                     locale::common("Cancel"),
+                                    "icons/x.svg",
                                     false,
                                 )
                                 .flex_1()
@@ -25338,6 +25459,7 @@ impl MobileApp {
                                 runtime_sheet_action_button(
                                     "mobile-runtime-rename-confirm",
                                     locale::common("Save"),
+                                    "icons/check.svg",
                                     true,
                                 )
                                 .flex_1()
@@ -25407,6 +25529,7 @@ impl MobileApp {
                                 runtime_sheet_action_button(
                                     "mobile-runtime-remove-cancel",
                                     locale::common("Cancel"),
+                                    "icons/x.svg",
                                     false,
                                 )
                                 .cursor_pointer()
@@ -25422,6 +25545,7 @@ impl MobileApp {
                                 runtime_sheet_action_button(
                                     "mobile-runtime-remove-confirm",
                                     locale::common("Remove"),
+                                    "icons/trash-2.svg",
                                     false,
                                 )
                                 .text_color(theme::accent_red())
@@ -26476,8 +26600,20 @@ impl MobileApp {
                             this.recall_composer_history(recall.clone(), window, cx)
                         }),
                     )
+                    .flex()
+                    .items_start()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        svg()
+                            .path("icons/rotate-ccw.svg")
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(theme::text_muted()),
+                    )
                     .child(
                         div()
+                            .min_w_0()
+                            .flex_1()
                             .text_size(theme::font_body())
                             .text_color(theme::text_primary())
                             .line_height(theme::line_height_for(theme::FONT_BODY))
@@ -26577,7 +26713,11 @@ impl MobileApp {
                                         this.show_older_composer_history(cx)
                                     }),
                                 )
-                                .child(locale::text("Show older", "显示更早", "顯示更早")),
+                                .child(sheet_action_content(
+                                    "icons/arrow-to-top.svg",
+                                    locale::text("Show older", "显示更早", "顯示更早"),
+                                    theme::primary(),
+                                )),
                         )
                     }),
             );
@@ -27086,6 +27226,17 @@ impl MobileApp {
             })
             .when(!supported, |row| row.opacity(0.45))
             .child(
+                svg()
+                    .path("icons/box.svg")
+                    .size(px(theme::ICON_SM))
+                    .flex_shrink_0()
+                    .text_color(if selected {
+                        theme::primary()
+                    } else {
+                        theme::text_muted()
+                    }),
+            )
+            .child(
                 div()
                     .flex_1()
                     .min_w_0()
@@ -27174,6 +27325,7 @@ impl MobileApp {
                 let id = project.id.clone();
                 new_session_picker_row(
                     format!("new-session-project:{}", project.id),
+                    "icons/folder.svg",
                     project.label,
                     subtitle,
                     selected,
@@ -27293,6 +27445,7 @@ impl MobileApp {
 
         let local_row = new_session_picker_row(
             "new-session-location:local",
+            "icons/folder-open.svg",
             locale::text("Local", "本地", "本機"),
             workspace_display,
             mode == WorkspaceMode::CurrentCheckout,
@@ -27304,6 +27457,7 @@ impl MobileApp {
         );
         let worktree_row = new_session_picker_row(
             "new-session-location:worktree",
+            "icons/git-branch.svg",
             locale::text("New worktree", "新建 Worktree", "新建 Worktree"),
             worktree_subtitle,
             mode == WorkspaceMode::VibexWorktree,
@@ -29921,6 +30075,7 @@ fn new_session_picker_header(
 /// changes where the session runs.
 fn new_session_picker_row(
     id: impl Into<ElementId>,
+    icon: &'static str,
     title: impl Into<String>,
     subtitle: impl Into<String>,
     selected: bool,
@@ -29941,6 +30096,17 @@ fn new_session_picker_row(
                 .active(|style| style.bg(theme::row_pressed_bg()))
         })
         .when(!enabled, |row| row.opacity(0.45))
+        .child(
+            svg()
+                .path(icon)
+                .size(px(theme::ICON_SM))
+                .flex_shrink_0()
+                .text_color(if selected {
+                    theme::primary()
+                } else {
+                    theme::text_muted()
+                }),
+        )
         .child(
             div()
                 .flex_1()
@@ -31018,8 +31184,14 @@ fn runtime_choice_button(
 fn runtime_sheet_action_button(
     id: impl Into<ElementId>,
     label: impl Into<String>,
+    icon: &'static str,
     primary: bool,
 ) -> gpui::Stateful<gpui::Div> {
+    let text_color = if primary {
+        theme::bg_primary()
+    } else {
+        theme::text_secondary()
+    };
     div()
         .id(id)
         .h(px(theme::TOUCH_TARGET))
@@ -31040,12 +31212,8 @@ fn runtime_sheet_action_button(
         .items_center()
         .justify_center()
         .text_size(theme::font_body())
-        .text_color(if primary {
-            theme::bg_primary()
-        } else {
-            theme::text_secondary()
-        })
-        .child(label.into())
+        .text_color(text_color)
+        .child(sheet_action_content(icon, label, text_color))
 }
 
 /// A status dot plus the words for the same state. Every runtime surface pairs
@@ -31077,10 +31245,12 @@ fn runtime_status_line(status: &RuntimeStatusView, text_color: gpui::Hsla) -> gp
 
 /// One full-width row of the runtime action sheet. The danger variant carries
 /// the destructive color used by the app's other remove actions, and the row
-/// uses the same metrics as the sidebar's per-row menu.
+/// uses the same metrics as the sidebar's per-row menu — including the leading
+/// glyph every other action sheet entry leads with.
 fn host_sheet_action_row(
     id: impl Into<ElementId>,
     label: impl Into<String>,
+    icon: Option<&'static str>,
     danger: bool,
 ) -> gpui::Stateful<gpui::Div> {
     div()
@@ -31090,6 +31260,7 @@ fn host_sheet_action_row(
         .rounded(px(theme::RADIUS_CONTROL))
         .flex()
         .items_center()
+        .gap(px(theme::SPACING_SM))
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
         .text_size(theme::font_body())
@@ -31098,7 +31269,27 @@ fn host_sheet_action_row(
         } else {
             theme::text_primary()
         })
-        .child(label.into())
+        .child(
+            div()
+                .size(px(theme::ICON_SM))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .when_some(icon, |slot, icon| {
+                    slot.child(
+                        svg()
+                            .path(icon)
+                            .size(px(theme::ICON_SM))
+                            .text_color(if danger {
+                                theme::accent_red()
+                            } else {
+                                theme::text_muted()
+                            }),
+                    )
+                }),
+        )
+        .child(div().min_w_0().child(label.into()))
 }
 
 /// The localized runtime-kind label for the detail page. `Unknown` keeps the
@@ -31231,6 +31422,82 @@ fn runtime_feature_input(input: &Entity<InputState>) -> gpui::Div {
         .px_1()
         .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
         .child(Input::new(input).appearance(false))
+}
+
+/// The glyph a sidebar row menu entry leads with.
+///
+/// The sheet's ids are static and describe the command, so the mark is resolved
+/// from the id in one place instead of being threaded through every closure that
+/// builds an entry. The dynamic ids — the one entry per group a session could
+/// join — share the `join-group` prefix and take its glyph. The paths are the
+/// desktop's own choice for the same command, so the two menus cannot drift.
+fn sidebar_row_menu_icon(id: &str) -> Option<&'static str> {
+    // A join entry is named after the group it joins, so it is matched by
+    // prefix rather than by a literal id.
+    if id.starts_with("mobile-row-menu-join-group-") {
+        return Some("icons/layers.svg");
+    }
+    Some(match id {
+        "mobile-row-menu-child-rename"
+        | "mobile-row-menu-rename"
+        | "mobile-row-menu-folder-rename"
+        | "mobile-row-menu-workspace-rename"
+        | "mobile-row-menu-group-rename" => "icons/pencil.svg",
+        "mobile-row-menu-child-delete"
+        | "mobile-row-menu-delete"
+        | "mobile-row-menu-folder-delete"
+        | "mobile-row-menu-project-remove"
+        | "mobile-row-menu-workspace-delete" => "icons/trash-2.svg",
+        "mobile-row-menu-archive" | "mobile-row-menu-folder-archive" => "icons/package.svg",
+        "mobile-row-menu-leave-group" | "mobile-row-menu-group-delete" => "icons/layers.svg",
+        "mobile-row-menu-cancel-scheduled" => "icons/x.svg",
+        "mobile-row-menu-reschedule-scheduled" => "icons/clock.svg",
+        "mobile-row-menu-resume-auto-continue"
+        | "mobile-row-menu-auto-continue"
+        | "mobile-row-menu-group-auto-continue" => "icons/rotate-ccw.svg",
+        "mobile-row-menu-fork" => "icons/git-branch.svg",
+        "mobile-row-menu-pin" | "mobile-row-menu-group-pin" => "icons/pin.svg",
+        "mobile-row-menu-folder-new-session" | "mobile-row-menu-project-new-session" => {
+            "icons/message-square.svg"
+        }
+        "mobile-row-menu-folder-new"
+        | "mobile-row-menu-project-new-folder"
+        | "mobile-row-menu-workspace-new-folder"
+        | "mobile-sidebar-root-menu-new-folder" => "icons/folder-plus.svg",
+        "mobile-row-menu-project-default-location" => "icons/git-branch.svg",
+        "mobile-row-menu-group-members" => "icons/user.svg",
+        "mobile-row-menu-move-up" => "icons/arrow-up.svg",
+        "mobile-row-menu-move-down" => "icons/arrow-down.svg",
+        _ => return None,
+    })
+}
+
+/// The contents of a sheet control: the glyph an action leads with, then its
+/// label.
+///
+/// The confirmation footers and the plain action buttons are hand-built rows
+/// that share no container, so the mark they lead with travels as content
+/// rather than as a wrapper. The glyph takes the control's own colour, so a
+/// destructive button's mark warns with its label instead of sitting grey
+/// beside it.
+pub(crate) fn sheet_action_content(
+    icon: &'static str,
+    label: impl Into<String>,
+    color: gpui::Hsla,
+) -> gpui::AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(theme::SPACING_XS))
+        .child(
+            svg()
+                .path(icon)
+                .size(px(theme::ICON_SM))
+                .flex_shrink_0()
+                .text_color(color),
+        )
+        .child(label.into())
+        .into_any_element()
 }
 
 /// The label a folder row's new-chat entry wears, in the desktop's own words.
@@ -32444,6 +32711,7 @@ fn bottom_sheet_header(
 fn pairing_sheet_header_action(
     id: impl Into<ElementId>,
     label: &'static str,
+    icon: &'static str,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -32453,11 +32721,19 @@ fn pairing_sheet_header_action(
         .flex()
         .items_center()
         .justify_center()
+        .gap(px(theme::SPACING_XS))
         .text_size(theme::font_detail())
         .font_weight(FontWeight::MEDIUM)
         .text_color(theme::text_primary())
         .cursor_pointer()
         .active(|style| style.opacity(0.7))
+        .child(
+            svg()
+                .path(icon)
+                .size(px(theme::ICON_SM))
+                .flex_shrink_0()
+                .text_color(theme::text_primary()),
+        )
         .child(label)
 }
 
@@ -33928,6 +34204,48 @@ mod tests {
             .expect("the sidebar Agent mark should stay inspectable");
         assert!(logo.contains("theme::sidebar_foreground(if active { 0.80 } else { 0.58 })"));
         assert!(logo.contains("theme::SIDEBAR_AGENT_LOGO_SIZE"));
+    }
+
+    /// Every icon path the mobile source draws must resolve through the asset
+    /// source.
+    ///
+    /// An unregistered path is silent: GPUI paints nothing and reports no
+    /// error, so a sheet entry can lose its glyph without a single failure
+    /// until someone looks at the screen. The scan is over the source literals
+    /// rather than one hand-kept table, because the sheets are hand-built and a
+    /// new `svg().path(...)` is exactly the change this has to catch.
+    #[test]
+    fn every_referenced_icon_path_loads() {
+        use gpui::AssetSource as _;
+
+        // The file-preview test feeds this literal to a kind classifier; it is
+        // not a path the app ever draws.
+        const NOT_DRAWN: &[&str] = &["icons/logo.svg"];
+        let source = concat!(
+            include_str!("app.rs"),
+            include_str!("workbench.rs"),
+            include_str!("timeline.rs"),
+            include_str!("sidebar.rs"),
+        );
+        let referenced = source
+            .split('"')
+            .filter(|piece| {
+                piece.starts_with("icons/") && piece.ends_with(".svg") && !NOT_DRAWN.contains(piece)
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !referenced.is_empty(),
+            "the scan must find the literals it is meant to check"
+        );
+        let assets = crate::assets::MobileAssets;
+        let missing: Vec<_> = referenced
+            .into_iter()
+            .filter(|path| assets.load(path).ok().flatten().is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "icon paths drawn by the mobile source but not served by the assets: {missing:?}"
+        );
     }
 
     /// Every brand path referenced by the model/Agent lookup tables must be
@@ -38677,7 +38995,7 @@ fn session_opened(cx: &mut Context<Self>) {
             "a folder made there belongs to the sidebar's root, not to a project"
         );
         assert!(
-            sheet.contains("sidebar_sheet_entry("),
+            sheet.contains("sidebar_sheet_entry_with_icon("),
             "and its entry is the same entry every other sheet draws"
         );
     }

@@ -43,6 +43,7 @@ const ICONS: &[&str] = &[
     "icons/grip-vertical.svg",
     "icons/folder.svg",
     "icons/folder-open.svg",
+    "icons/folder-plus.svg",
     "icons/triangle-alert.svg",
     "icons/circle-question-mark.svg",
     "icons/pause.svg",
@@ -512,6 +513,11 @@ impl AssetSource for MobileAssets {
             "icons/grip-vertical.svg" => Some(include_bytes!("../assets/icons/grip-vertical.svg")),
             "icons/folder.svg" => Some(include_bytes!("../assets/icons/folder.svg")),
             "icons/folder-open.svg" => Some(include_bytes!("../assets/icons/folder-open.svg")),
+            // The desktop's own folder-with-a-plus mark, so a "new folder" row
+            // and the desktop's identical menu entry cannot drift apart.
+            "icons/folder-plus.svg" => {
+                Some(include_bytes!("../../desktop/assets/icons/folder-plus.svg"))
+            }
             "icons/triangle-alert.svg" => {
                 Some(include_bytes!("../assets/icons/triangle-alert.svg"))
             }

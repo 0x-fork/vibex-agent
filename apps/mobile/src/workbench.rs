@@ -3746,13 +3746,14 @@ impl MobileWorkbench {
                     .justify_end()
                     .gap(px(theme::SPACING_SM))
                     .child(
-                        action_button("file-discard-cancel", locale::common("Cancel"))
+                        action_button("file-discard-cancel", locale::common("Cancel"), "icons/x.svg")
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_file_discard)),
                     )
                     .child(
                         action_button(
                             "file-discard-confirm",
                             locale::text("Discard", "放弃", "放棄"),
+                            "icons/rotate-ccw.svg",
                         )
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::confirm_file_discard)),
                     ),
@@ -4018,7 +4019,11 @@ impl MobileWorkbench {
                         has_conflict,
                         |actions| {
                             actions.child(
-                                action_button("reload-desktop-file", "Use desktop version")
+                                action_button(
+                                    "reload-desktop-file",
+                                    "Use desktop version",
+                                    "icons/download.svg",
+                                )
                                     .on_mouse_up(
                                         MouseButton::Left,
                                         cx.listener(Self::reload_desktop_file),
@@ -4191,7 +4196,7 @@ impl MobileWorkbench {
                     .child(input_element(self.file_goto_input.as_ref())),
             )
             .child(
-                action_button("file-goto-confirm", locale::common("Go"))
+                action_button("file-goto-confirm", locale::common("Go"), "icons/arrow-to-top.svg")
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::confirm_file_goto)),
             );
         bottom_sheet_shell("file-goto-prompt", presentation)
@@ -4681,7 +4686,11 @@ impl MobileWorkbench {
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.cancel_worktree_confirmation(cx)),
                             )
-                            .child(locale::common("Cancel")),
+                            .child(crate::app::sheet_action_content(
+                                "icons/x.svg",
+                                locale::common("Cancel"),
+                                theme::text_secondary(),
+                            )),
                     )
                     .child(
                         div()
@@ -4716,7 +4725,19 @@ impl MobileWorkbench {
                                     }
                                 }),
                             )
-                            .child(confirm_label),
+                            .child(crate::app::sheet_action_content(
+                                if merge {
+                                    "icons/git-branch.svg"
+                                } else {
+                                    "icons/trash-2.svg"
+                                },
+                                confirm_label,
+                                if merge {
+                                    theme::primary_foreground()
+                                } else {
+                                    theme::bg_primary()
+                                },
+                            )),
                     ),
             );
         bottom_sheet_shell("mobile-worktree-confirmation", presentation)
@@ -5807,7 +5828,11 @@ impl MobileWorkbench {
                                             .child(message),
                                     )
                                     .child(
-                                        action_button("git-retry-status", locale::common("Retry"))
+                                        action_button(
+                                            "git-retry-status",
+                                            locale::common("Retry"),
+                                            "icons/rotate-ccw.svg",
+                                        )
                                             .on_mouse_up(
                                                 MouseButton::Left,
                                                 cx.listener(|this, _, _, cx| {
@@ -5955,7 +5980,7 @@ impl MobileWorkbench {
                     .flex()
                     .gap(px(theme::SPACING_SM))
                     .child(
-                        action_button("git-revert-cancel", locale::common("Cancel"))
+                        action_button("git-revert-cancel", locale::common("Cancel"), "icons/x.svg")
                             .flex_1()
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::cancel_revert_git)),
                     )
@@ -5963,6 +5988,7 @@ impl MobileWorkbench {
                         action_button(
                             "git-revert-confirm",
                             locale::text("Roll back", "回滚", "回滾"),
+                            "icons/rotate-ccw.svg",
                         )
                         .flex_1()
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::confirm_revert_git)),
@@ -8886,7 +8912,15 @@ fn history_relative_time(authored_at_ms: Option<i64>) -> String {
 /// A secondary button on a sheet or a full-screen card's action bar. It keeps
 /// its frame because it stands alone rather than inside a toolbar row, and a
 /// lone word with no edge reads as a label instead of a control.
-fn action_button(id: impl Into<gpui::ElementId>, label: &'static str) -> gpui::Stateful<gpui::Div> {
+///
+/// Every one leads with the glyph its command wears on the desktop, so a
+/// confirmation reads as the same action whichever shell drew it.
+fn action_button(
+    id: impl Into<gpui::ElementId>,
+    label: &'static str,
+    icon: &'static str,
+) -> gpui::Stateful<gpui::Div> {
+    let color = theme::text_secondary();
     div()
         .id(id)
         .h(px(theme::TOUCH_TARGET))
@@ -8899,10 +8933,23 @@ fn action_button(id: impl Into<gpui::ElementId>, label: &'static str) -> gpui::S
         .items_center()
         .justify_center()
         .text_size(theme::font_detail())
-        .text_color(theme::text_secondary())
+        .text_color(color)
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
-        .child(locale::common(label))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(theme::SPACING_XS))
+                .child(
+                    svg()
+                        .path(icon)
+                        .size(px(theme::ICON_SM))
+                        .flex_shrink_0()
+                        .text_color(color),
+                )
+                .child(locale::common(label)),
+        )
 }
 
 /// The cell a point falls in, given the geometry the grid was painted at.
