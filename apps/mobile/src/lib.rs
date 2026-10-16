@@ -35,6 +35,7 @@ mod storage;
 mod test_support;
 mod theme;
 mod toast;
+mod touch_selection;
 mod update;
 mod workbench;
 

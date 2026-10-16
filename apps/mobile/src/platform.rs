@@ -151,6 +151,38 @@ pub fn resume_keyboard() {
     }
 }
 
+/// The tick a long press gets when it has something to show for itself.
+///
+/// The platform's own long-press feedback, not a raw vibration: it is the
+/// gesture the system already uses for this, it costs no permission, and a
+/// phone whose owner turned touch feedback off stays quiet, which a
+/// `Vibrator.vibrate` call would not honor.
+pub fn long_press_feedback() {
+    #[cfg(test)]
+    FEEDBACKS.with(|count| count.set(count.get() + 1));
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = gpui_mobile::packages::vibration::haptic_feedback(
+            gpui_mobile::packages::vibration::HapticFeedback::Heavy,
+        );
+    }
+}
+
+// How many times this thread has asked for a tick. A test harness gives every
+// test its own thread, so a test can count the ticks its own gestures cause;
+// on a device the call is the only visible effect, which is exactly what a
+// test cannot see.
+#[cfg(test)]
+thread_local! {
+    static FEEDBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The ticks [`long_press_feedback`] has been asked for on this thread.
+#[cfg(test)]
+pub fn feedbacks() -> usize {
+    FEEDBACKS.with(std::cell::Cell::get)
+}
+
 /// The window-inset API the rest of the app uses.
 ///
 /// Implemented for `Window` so call sites read like the desktop ones

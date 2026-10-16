@@ -23,6 +23,7 @@ impl Render for TimelineProbe {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_rem_size(px(self.rem));
         let turn = self.app.read(cx).timeline_turns.last().unwrap().clone();
+        let composer = self.app.read(cx).composer_input.clone();
         let content = self.app.update(cx, |app, cx| {
             app.render_turn(&turn, true, true, window, cx)
                 .into_any_element()
@@ -32,6 +33,8 @@ impl Render for TimelineProbe {
             .w(px(self.width))
             .min_w_0()
             .tab_group()
+            // The same release layer the app root mounts.
+            .child(crate::touch_selection::watch(composer))
             .child(content)
     }
 }
@@ -296,10 +299,16 @@ fn pressing_copy_in_the_touch_menu_reaches_the_clipboard(cx: &mut TestAppContext
         )],
     );
 
+    let ticks = crate::platform::feedbacks();
     assert_eq!(
         long_press_answer_word(cx).trim(),
         "quick",
         "the press should select the answer's first word"
+    );
+    assert_eq!(
+        crate::platform::feedbacks(),
+        ticks + 1,
+        "a long press that takes a selection is what asks for the tick"
     );
     // Read-only text offers Copy and Select All, in that order.
     let items = crate::test_support::touch_menu_items(cx);
@@ -309,8 +318,10 @@ fn pressing_copy_in_the_touch_menu_reaches_the_clipboard(cx: &mut TestAppContext
         "read-only text offers Copy and Select All: {:?}",
         items.iter().map(|(label, _)| label).collect::<Vec<_>>()
     );
+    let copied = items[0].1.center();
+    let elsewhere = items[1].1.center();
 
-    cx.simulate_click(items[0].1.center(), Modifiers::none());
+    cx.simulate_click(copied, Modifiers::none());
     draw(cx);
 
     assert_eq!(
@@ -322,6 +333,77 @@ fn pressing_copy_in_the_touch_menu_reaches_the_clipboard(cx: &mut TestAppContext
     assert!(
         crate::test_support::touch_menu_items(cx).is_empty(),
         "the menu should close once it has acted"
+    );
+    assert!(
+        cx.update(|window, cx| gpui_base::TextSelection::touch_selection(window, cx))
+            .is_none(),
+        "the selection should let go once Copy has taken what it wanted"
+    );
+
+    // Select All is the other item, and the one case that keeps what it made:
+    // the menu comes back over the whole answer, with the selection under it.
+    assert_eq!(long_press_answer_word(cx).trim(), "quick");
+    cx.simulate_click(elsewhere, Modifiers::none());
+    draw(cx);
+    let snapshot = cx
+        .update(|window, cx| gpui_base::TextSelection::touch_selection(window, cx))
+        .expect("Select All keeps the selection");
+    assert!(snapshot.is_menu_open());
+    assert_eq!(
+        cx.update(gpui_base::TextSelection::selected_text).trim(),
+        "quick select value"
+    );
+}
+
+/// A finger that scrolls the text under its selection is not a press on the
+/// toolbar: the menu steps aside for the gesture and comes back when the finger
+/// lifts, and neither end of it is a new selection asking for a tick.
+#[gpui::test]
+fn scrolling_under_a_selection_keeps_it(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (_app, _probe, cx) = open_timeline(
+        cx,
+        data_dir.path(),
+        vec![TimelinePayload::AgentMessage(
+            vibex_core::AgentMessagePayload {
+                text: "quick select value".into(),
+                is_final: true,
+            },
+        )],
+    );
+    assert_eq!(long_press_answer_word(cx).trim(), "quick");
+    let ticks = crate::platform::feedbacks();
+    let over_the_text = cx
+        .update(|window, cx| gpui_base::TextSelection::touch_selection(window, cx))
+        .and_then(|snapshot| snapshot.bounds())
+        .expect("the press selected text")
+        .center();
+
+    for phase in [
+        gpui::TouchPhase::Started,
+        gpui::TouchPhase::Moved,
+        gpui::TouchPhase::Ended,
+    ] {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: over_the_text,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-40.0))),
+            modifiers: Modifiers::none(),
+            touch_phase: phase,
+        });
+        draw(cx);
+    }
+
+    let snapshot = cx
+        .update(|window, cx| gpui_base::TextSelection::touch_selection(window, cx))
+        .expect("a scroll does not take the selection away");
+    assert!(
+        snapshot.is_menu_open(),
+        "the menu comes back with the finger up"
+    );
+    assert_eq!(
+        crate::platform::feedbacks(),
+        ticks,
+        "the same selection coming back is not a new gesture"
     );
 }
 

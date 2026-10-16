@@ -85,6 +85,7 @@ use crate::storage::{
     StoredHostEntry, StoredSessionTimeline,
 };
 use crate::toast::{Hint, Tone};
+use crate::touch_selection::TouchToolbar;
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{locale, markdown, notifications, power, scanner, theme, toast, update};
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -1367,6 +1368,9 @@ pub struct MobileApp {
     composer_input: Entity<TextareaState>,
     /// The long press selection toolbar and handles drawn over the composer.
     selection_menu: Entity<SelectionMenu>,
+    /// The kit's own touch selection, watched for its tick and for the press
+    /// that finishes with it.
+    touch_toolbar: TouchToolbar,
     /// Text to hand back to the composer if a send fails. The failure is
     /// observed in an async task with no window, so the check-and-write is
     /// deferred to the next paint.
@@ -3113,6 +3117,9 @@ impl MobileApp {
         // The selection toolbar is its own view: it floats over the whole
         // window, and the composer only hands it the long press that opens it.
         let selection_menu = cx.new(|cx| SelectionMenu::new(composer_input.clone(), cx));
+        // The kit draws both touch selections this app shows; the app is what
+        // makes them feel like a phone's.
+        let touch_toolbar = TouchToolbar::install(&composer_input, window, cx);
         // Typing is a change to the composer's un-sent work, and the phone can
         // be killed while it is in the background with no other notice.
         let composer_change_subscription = cx.subscribe_in(
@@ -3146,6 +3153,7 @@ impl MobileApp {
             workbench_open: false,
             composer_input,
             selection_menu,
+            touch_toolbar,
             pending_composer_restore: None,
             pending_shared_text: None,
             pending_launch_shortcut: None,
@@ -25403,6 +25411,9 @@ impl Render for MobileApp {
                 .pr(insets.right)
                 .pb(insets.bottom)
                 .pl(insets.left)
+                // Reads the release a touch menu leaves behind; it draws
+                // nothing and works from anywhere in the window.
+                .child(crate::touch_selection::watch(self.composer_input.clone()))
                 .child(match visible_mode {
                     RootMode::Pairing => self
                         .render_pairing(overlay_sheets, window, cx)
@@ -39286,6 +39297,14 @@ fn session_opened(cx: &mut Context<Self>) {
                 .and_then(|item| item.text())
                 .as_deref(),
             Some("select")
+        );
+        // Copy is done with the selection, so the highlight and handles go
+        // with the menu: pressing the button must not leave the word looking
+        // selected.
+        assert!(
+            app.read_with(cx, |app, cx| app.composer_input.read(cx).touch_selection())
+                .is_none(),
+            "the composer's selection should let go once Copy has taken it"
         );
     }
 }
