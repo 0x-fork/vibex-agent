@@ -888,6 +888,8 @@ strings! {
     config_empty => { "Nothing here yet", "这里还没有内容", "這裡還沒有內容" },
     config_no_matches => { "No matches", "没有匹配项", "沒有符合項目" },
     config_working => { "working…", "处理中…", "處理中…" },
+    config_col_name => { "Name", "名称", "名稱" },
+    config_col_status => { "Status", "状态", "狀態" },
     config_col_state => { "State", "状态", "狀態" },
     config_col_runtime => { "Runtime", "运行时", "執行階段" },
     config_col_source => { "Source", "来源", "來源" },

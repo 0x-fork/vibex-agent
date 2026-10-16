@@ -585,6 +585,103 @@ fn the_heading_row_sits_over_the_cells_it_names() {
     }
 }
 
+/// The heading row names every column the table draws.
+///
+/// The record's own name and its status chip are columns like any other: a
+/// heading row that left them blank would begin halfway across the table, which
+/// reads as a table whose first columns were lost rather than one whose first
+/// columns need no label.
+#[test]
+fn the_heading_row_names_every_column_the_table_draws() {
+    use ratatui::backend::TestBackend;
+
+    let mut app = loaded(160, 40);
+    let backend = TestBackend::new(160, 40);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| vibex_tui::view::render(frame, &mut app))
+        .expect("frame draws");
+    let buffer = terminal.backend().buffer().clone();
+
+    let heading_row = (0..buffer.area.height)
+        .find(|row| buffer_find(&buffer, *row, "Name").is_some())
+        .expect("the heading row names the record column");
+    let row = (0..buffer.area.width)
+        .map(|column| {
+            buffer
+                .cell((column, heading_row))
+                .map(|cell| cell.symbol().to_string())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let line = row.join("");
+    // The two columns the data list does not name are named here, and they do
+    // not sit after the last data heading: the heading row starts where the
+    // cells start.
+    assert!(
+        line.contains("Name") && line.contains("Status"),
+        "the heading row left a column unnamed:\n{line}"
+    );
+    assert!(
+        line.find("Name").unwrap_or(usize::MAX) < line.find("Install").unwrap_or(usize::MAX),
+        "the record column is not the first heading:\n{line}"
+    );
+    // Every heading the section declares is on the row, in order.
+    let headings = vibex_tui::config_center::columns(
+        app.config_center.module,
+        app.config_center.section,
+        app.strings,
+    );
+    let mut previous = 0usize;
+    for heading in headings {
+        let at = line
+            .find(heading)
+            .unwrap_or_else(|| panic!("{heading} is not on the heading row:\n{line}"));
+        assert!(at >= previous, "the headings are out of order:\n{line}");
+        previous = at;
+    }
+}
+
+/// An Agent the desktop does not expose is not one the TUI lists either.
+#[test]
+fn the_agent_list_hides_the_integrations_the_desktop_hides() {
+    let mut app = loaded(140, 40);
+    // A builtin the product policy keeps out of the user-facing catalog. The
+    // policy list is the same one the desktop reads, so this is exactly the
+    // row the two clients have to agree on.
+    let hidden = vibex_core::builtin_agent_definitions()
+        .into_iter()
+        .find(|definition| !vibex_core::is_user_visible_agent(&definition.id))
+        .map(|definition| definition.id)
+        .expect("the catalog keeps at least one integration out of the product");
+    let mut hidden_entry = agent();
+    hidden_entry.id = hidden.clone();
+    hidden_entry.label = format!("Hidden {}", hidden.as_str());
+    app.management_data.agents.push(hidden_entry);
+
+    // A Custom Agent with an id the policy does not know is still the reader's.
+    let mut custom = agent();
+    custom.id = vibex_core::AgentId::parse("my-own-agent").expect("custom id");
+    custom.label = "My own Agent".to_string();
+    custom.source_kind = vibex_core::AgentSourceKind::Custom;
+    app.management_data.agents.push(custom);
+
+    let rows = app
+        .config_center
+        .visible(&app.management_data, app.strings)
+        .into_iter()
+        .map(|row| row.key)
+        .collect::<Vec<_>>();
+    assert!(
+        !rows.iter().any(|key| key == hidden.as_str()),
+        "the list shows an Agent the desktop hides: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|key| key == "my-own-agent"),
+        "the list hid the reader's own Agent: {rows:?}"
+    );
+}
+
 /// The terminal column a word starts at in one drawn row, if it is there.
 ///
 /// A word is matched against the cells themselves rather than against a

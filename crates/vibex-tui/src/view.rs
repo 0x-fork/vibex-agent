@@ -5579,36 +5579,36 @@ fn render_config_table(
         crate::config_center::columns(app.config_center.module, app.config_center.section, strings);
     let layout = column_widths(area.width, &columns);
     if lines.len() < usize::from(area.height) {
+        // The heading style is shared by every column, including the two the
+        // table's data columns do not name: a heading row that starts halfway
+        // across the table reads as a table missing its first columns.
+        let heading_style = Style::default()
+            .fg(if focused {
+                theme.roles.text_secondary
+            } else {
+                theme.roles.gray_dim
+            })
+            .add_modifier(Modifier::BOLD);
         let mut spans = vec![
             // The focus bar, the status mark and a space — the same prefix the
             // cells carry, so every heading starts where its cells start.
             Span::styled(" ".repeat(TABLE_PREFIX), Style::default()),
-            // The record's own name column has no heading: the module and the
-            // area already say what the table is of. Its width is still spent,
-            // or every heading after it would sit under the wrong cell.
+            // The record's name column is a column like any other: it is named
+            // so the row of headings covers the whole table rather than
+            // beginning at the first fact column.
             Span::styled(
-                config_cell("", layout.title),
-                Style::default().add_modifier(Modifier::BOLD),
+                config_cell(strings.config_col_name(), layout.title),
+                heading_style,
             ),
-            // The status column is the same: its cells are chips, and a chip
-            // already says what it is.
+            // The status column holds the chip, and is named for it.
             Span::styled(
-                config_cell("", CHIP_COLUMN),
-                Style::default().add_modifier(Modifier::BOLD),
+                config_cell(strings.config_col_status(), CHIP_COLUMN),
+                heading_style,
             ),
         ];
         for (index, column) in columns.iter().enumerate() {
             let width = layout.cell(index);
-            spans.push(Span::styled(
-                config_cell(column, width),
-                Style::default()
-                    .fg(if focused {
-                        theme.roles.text_secondary
-                    } else {
-                        theme.roles.gray_dim
-                    })
-                    .add_modifier(Modifier::BOLD),
-            ));
+            spans.push(Span::styled(config_cell(column, width), heading_style));
         }
         lines.push(Line::from(spans));
     }
