@@ -674,7 +674,6 @@ pub use crate::settings::{SettingKind, SettingRow, SettingsMode, SettingsState};
 pub struct ManagementData {
     pub devices: Vec<RemoteDeviceDetail>,
     pub audit: Vec<vibex_core::RemoteAuditRecord>,
-    pub profiles: Vec<vibex_core::ProviderProfileSummary>,
     pub providers: Vec<vibex_core::ProviderProfileSummary>,
     /// Which built-in tool panels each Agent receives, as the authority holds
     /// them.

@@ -1136,9 +1136,7 @@ strings! {
     config_field_source => { "Source", "来源", "來源" },
     config_action_blocked => { "That record is already working — wait for it to answer", "该记录正在处理中，请等待结果", "該記錄正在處理中，請等待結果" },
 
-    config_action_actions => { "Actions", "操作", "操作" },
     config_action_save => { "Save", "保存", "儲存" },
-    config_action_cancel => { "Cancel", "取消", "取消" },
     config_actions_title => { "Actions", "操作", "操作" },
     config_state_enabled => { "Enabled", "已启用", "已啟用" },
     config_state_disabled => { "Disabled", "已停用", "已停用" },
@@ -1181,10 +1179,6 @@ strings! {
     config_source_manual => { "Manual", "手工编写", "手工撰寫" },
     config_source_folder => { "Local folder", "本地目录", "本地目錄" },
     config_source_git => { "Git repository", "Git 仓库", "Git 倉庫" },
-    config_event_permission => { "Permission request", "权限请求", "權限請求" },
-    config_event_session_start => { "Session start", "会话开始", "工作階段開始" },
-    config_event_session_stop => { "Session stop", "会话结束", "工作階段結束" },
-    config_event_terminal => { "Terminal activity", "终端活动", "終端機活動" },
     config_hint_env => {
         "One KEY=value per line",
         "每行一个 KEY=value",
