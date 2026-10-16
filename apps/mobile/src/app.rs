@@ -14,10 +14,10 @@ use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::StreamExt as _;
 use gpui::{
     Animation, AnimationExt as _, App, AppContext as _, Bounds, ClipboardItem, Context,
-    DispatchPhase, ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla, Image, ImageFormat,
-    IntoElement, KeyBinding, ListAlignment, ListOffset, ListState, LongPressEvent, MouseButton,
-    MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, Styled as _, Task, TouchDragEvent, TouchPhase, Transformation,
+    DispatchPhase, Edges, ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla, Image,
+    ImageFormat, IntoElement, KeyBinding, ListAlignment, ListOffset, ListState, LongPressEvent,
+    MouseButton, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render, ScrollDelta,
+    ScrollHandle, ScrollWheelEvent, Styled as _, Task, TouchDragEvent, TouchPhase, Transformation,
     UniformListScrollHandle, WeakEntity, Window, div, ease_in_out, ease_out_quint, img, list,
     percentage, point, prelude::*, px, relative, rgb, svg, uniform_list,
 };
@@ -13358,6 +13358,10 @@ impl MobileApp {
             .is_some_and(|controller| controller.state.selected_session_id.is_none());
         let turns_for_list = turns.clone();
         let drawer_page = visible_drawer_page(self.drawer_offset, self.drawer_snap);
+        // The window's insets are the band a side page brings into view with
+        // itself, and the band is measured per frame while the drawer moves, so
+        // the drawer branch below reads them as well as the root.
+        let insets = window.insets().effective();
         let workbench = self.workbench.clone();
         let session_action = self.session_action.clone();
         let row_menu = self.sidebar_row_menu.clone();
@@ -13572,7 +13576,17 @@ impl MobileApp {
                     }
                     .w(px(page_width))
                     .block_mouse_except_scroll();
-                    let (backdrop, drawer) = if let Some(snap) = self.drawer_snap {
+                    // The band the window's insets leave around the content box
+                    // belongs to whatever is under it, so it is painted by the
+                    // drawer itself and placed exactly like the panel: the strip
+                    // above the phone's status bar turns with the panel's edge
+                    // instead of flipping the whole width at once.
+                    let band =
+                        drawer_inset_band(page, self.drawer_offset, page_width, insets.clone());
+                    // The band is measured again on every animated frame, so
+                    // the closure owns the insets it measures with.
+                    let band_insets = insets;
+                    let (backdrop, band, drawer) = if let Some(snap) = self.drawer_snap {
                         let duration = drawer_animation(snap.from, snap.target);
                         let from_opacity = drawer_backdrop_opacity(snap.from);
                         let target_opacity = drawer_backdrop_opacity(snap.target);
@@ -13591,6 +13605,24 @@ impl MobileApp {
                                     },
                                 )
                                 .into_any_element(),
+                            band.with_animation(
+                                ElementId::NamedInteger(
+                                    "mobile-drawer-band".into(),
+                                    snap.animation_id,
+                                ),
+                                duration.clone(),
+                                move |element, delta| {
+                                    let offset = snap.from + (snap.target - snap.from) * delta;
+                                    let (left, width) = drawer_band_frame(
+                                        page,
+                                        offset,
+                                        page_width,
+                                        band_insets.clone(),
+                                    );
+                                    element.left(px(left)).w(px(width))
+                                },
+                            )
+                            .into_any_element(),
                             drawer_base
                                 .with_animation(
                                     ElementId::NamedInteger(
@@ -13610,12 +13642,13 @@ impl MobileApp {
                             backdrop_base
                                 .bg(theme::backdrop(drawer_backdrop_opacity(self.drawer_offset)))
                                 .into_any_element(),
+                            band.into_any_element(),
                             drawer_base
                                 .left(px(drawer_left(page, self.drawer_offset, page_width)))
                                 .into_any_element(),
                         )
                     };
-                    root.child(backdrop).child(drawer)
+                    root.child(backdrop).child(band).child(drawer)
                 })
                 .when_some(row_menu, |root, menu| match row_menu_sheet {
                     Some(presentation) => root.child(self.render_sidebar_row_menu(
@@ -25037,10 +25070,12 @@ impl Render for MobileApp {
             self.mode
         };
         let overlay_sheets = self.overlay_sheets(window);
-        let root_background = root_surface(
-            visible_mode,
-            visible_drawer_page(self.drawer_offset, self.drawer_snap),
-        );
+        // The root keeps the page's colour under the whole window. A side page
+        // paints the band the window's insets leave around the content box for
+        // itself (`drawer_inset_band`), so this colour never follows a drawer —
+        // following it is what used to wash the drawer's tone over the middle
+        // of the phone and flip the strip at the top of the screen.
+
         // The page under the phone's finger sees a touch pan before the lists
         // inside it consume the gesture, so a rightward swipe can leave a page
         // opened on top of another one. The wrapper forwards layout, so the page
@@ -25049,7 +25084,7 @@ impl Render for MobileApp {
             "mobile-app-swipe-back",
             div()
                 .size_full()
-                .bg(root_background)
+                .bg(theme::bg_primary())
                 .font_family("IBM Plex Sans")
                 .text_color(theme::text_secondary())
                 .pt(insets.top)
@@ -29352,25 +29387,63 @@ fn visible_drawer_page(offset: f32, snap: Option<DrawerSnap>) -> Option<DrawerPa
 
 /// The surface the conversation page paints for itself, inside the content box.
 ///
-/// The page owns this colour instead of letting the root's show through. The
-/// root follows a drawer, so the band the window's insets leave around the
-/// content box reads as part of an open side page; a page that borrowed that
-/// colour would take the drawer's tone over the whole middle of the phone the
-/// moment a swipe began.
+/// The page owns this colour instead of letting the root's show through: the
+/// root keeps one colour under the whole window, and a page that borrowed it
+/// would be repainted by anything the root ever decided to change.
 fn conversation_surface() -> Hsla {
     theme::bg_primary()
 }
 
-/// The root's own surface: everything no page paints over.
+/// The frame a drawer's inset band occupies at `offset`: its left edge in
+/// content-box coordinates and its width.
 ///
-/// In the workspace that is only the band the window's insets leave around the
-/// content box, and a side page takes the band over as soon as one is on
-/// screen. Pairing and connecting have no drawer, so the root is their page.
-fn root_surface(mode: RootMode, drawer: Option<DrawerPage>) -> Hsla {
-    match (mode, drawer) {
-        (RootMode::Pairing, _) | (_, None) => theme::bg_primary(),
-        (_, Some(_)) => theme::sidebar_bg(),
+/// The band is the panel's own surface extended into the insets the window
+/// leaves around the content box — above and below it always, into the strip it
+/// slides in from always, and into the far strip only once the panel has
+/// covered the content box. Before that the page is still beside the panel and
+/// keeps that strip, which is why the far side is part of the frame rather than
+/// a decision of its own.
+fn drawer_band_frame(
+    page: DrawerPage,
+    offset: f32,
+    page_width: f32,
+    insets: Edges<Pixels>,
+) -> (f32, f32) {
+    let reveal = (offset * page.open_offset()).clamp(0.0, 1.0);
+    let (near, far) = match page {
+        DrawerPage::Sessions => (insets.left, insets.right),
+        DrawerPage::Workbench => (insets.right, insets.left),
+    };
+    let near = f32::from(near);
+    let far = if reveal >= 1.0 { f32::from(far) } else { 0.0 };
+    let left = drawer_left(page, offset, page_width);
+    match page {
+        DrawerPage::Sessions => (left - near, page_width + near + far),
+        DrawerPage::Workbench => (left, page_width + near + far),
     }
+}
+
+/// The band the window's insets leave around the content box, painted by the
+/// side page that is taking it over.
+///
+/// The drawer brings its own band with it: the band is the panel's surface
+/// extended into the insets around it, and it is placed and animated exactly
+/// like the panel, so the strip above the phone's status bar turns with the
+/// panel's edge instead of flipping across the whole screen at once.
+fn drawer_inset_band(
+    page: DrawerPage,
+    offset: f32,
+    page_width: f32,
+    insets: Edges<Pixels>,
+) -> gpui::Div {
+    let (left, width) = drawer_band_frame(page, offset, page_width, insets);
+    div()
+        .absolute()
+        .top(-insets.top)
+        .bottom(-insets.bottom)
+        .left(px(left))
+        .w(px(width))
+        .bg(theme::sidebar_bg())
 }
 
 fn drawer_snap_target(
@@ -36303,16 +36376,17 @@ mod tests {
         assert_eq!(drawer_left(DrawerPage::Workbench, -1.0, width), 0.0);
     }
 
-    /// A drawer sliding over the conversation page never repaints it.
+    /// A drawer brings its own band and never repaints the page under it.
     ///
-    /// This is the reported bug: pulling a side page out turned the whole
-    /// middle of the phone the drawer's colour, because the conversation page
-    /// let the root's background through and the root follows the drawer so
-    /// the band the window's insets leave reads as part of an open side page.
-    /// The page now paints its own surface, so the root's colour only ever
-    /// reaches that band.
+    /// This is part of the reported bug: pulling a side page out turned the
+    /// whole middle of the phone the drawer's colour, because the conversation
+    /// page let the root's background through and the root followed the drawer.
+    /// The page now paints its own surface, the root keeps one colour under the
+    /// whole window, and the band the phone's insets leave around the page is
+    /// the drawer's own — measured with the panel, never flipped across the
+    /// whole screen at once.
     #[test]
-    fn a_drawer_never_repaints_the_page_it_slides_over() {
+    fn a_drawer_brings_its_own_band_and_never_repaints_the_page() {
         let source = include_str!("app.rs");
         let workspace = source
             .split_once("    fn render_workspace(")
@@ -36324,17 +36398,37 @@ mod tests {
             "the conversation page paints its own surface, not the root's"
         );
         assert_eq!(conversation_surface(), theme::bg_primary());
-        // The band around the page still follows the drawer, from the first
-        // frame of the swipe to the frame that closes it.
+
+        // The band around the page is the drawer's, and it travels with the
+        // panel: the strip above the phone's status bar turns with the panel's
+        // edge instead of flipping across the whole width the moment a swipe
+        // starts.
+        let insets = Edges {
+            top: px(24.0),
+            right: px(44.0),
+            bottom: px(8.0),
+            left: px(44.0),
+        };
+        let width = 390.0;
+        // Mid-swipe: the panel's own width, plus the strip it slides in from.
         assert_eq!(
-            root_surface(RootMode::Workspace, Some(DrawerPage::Sessions)),
-            theme::sidebar_bg()
+            drawer_band_frame(DrawerPage::Sessions, 0.5, width, insets),
+            (-195.0 - 44.0, width + 44.0)
         );
         assert_eq!(
-            root_surface(RootMode::Workspace, Some(DrawerPage::Workbench)),
-            theme::sidebar_bg()
+            drawer_band_frame(DrawerPage::Workbench, -0.5, width, insets),
+            (195.0, width + 44.0)
         );
-        assert_eq!(root_surface(RootMode::Workspace, None), theme::bg_primary());
+        // A panel that has finished covering the content box takes the far
+        // strip too, so the band is the whole window at that point.
+        assert_eq!(
+            drawer_band_frame(DrawerPage::Sessions, 1.0, width, insets),
+            (-44.0, width + 44.0 + 44.0)
+        );
+        assert_eq!(
+            drawer_band_frame(DrawerPage::Workbench, -1.0, width, insets),
+            (0.0, width + 44.0 + 44.0)
+        );
     }
 
     #[test]
