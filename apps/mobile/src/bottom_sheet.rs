@@ -924,13 +924,27 @@ mod tests {
             .expect("the sheet should be on screen")
     }
 
-    /// Two offsets are the same place within a pixel: a panel starts its
-    /// flight a few microseconds before the test gets to read it.
+    /// Two offsets are the same place within a pixel.
     fn assert_place(actual: f32, expected: f32, context: &str) {
         assert!(
             (actual - expected).abs() < 1.0,
             "{context}: {actual} is not {expected}"
         );
+    }
+
+    /// Where a panel's flight starts and where it ends.
+    ///
+    /// A test that reads the live offset is reading how much wall-clock time
+    /// passed since the motion began, which is how busy the machine is; the
+    /// two ends of the curve are what the flight actually promises.
+    fn flight_ends(presentation: &SheetPresentation) -> (f32, f32) {
+        match presentation.motion {
+            Some(motion) => (
+                motion.offset_at(Duration::ZERO),
+                motion.offset_at(motion.duration),
+            ),
+            None => (presentation.offset, presentation.offset),
+        }
     }
 
     /// A sheet that is up, with its rise already run: where the reader sees it
@@ -955,11 +969,9 @@ mod tests {
             "a sheet nobody opened is not drawn"
         );
 
-        assert_place(
-            up(&mut sheet, SheetKey::PairingFallback).offset,
-            TRAVEL,
-            "a sheet that is opened rises from the foot",
-        );
+        let (start, end) = flight_ends(&up(&mut sheet, SheetKey::PairingFallback));
+        assert_place(start, TRAVEL, "a sheet that is opened rises from the foot");
+        assert_place(end, 0.0, "and settles where it rests");
         assert_place(
             settled(&mut sheet, SheetKey::PairingFallback).offset,
             0.0,
@@ -1011,12 +1023,8 @@ mod tests {
         let resting = settled(&mut sheet, SheetKey::SidebarRowMenu);
         assert_place(resting.offset, 0.0, "the first sheet has settled");
 
-        let stacked = up(&mut sheet, SheetKey::FolderArchiveMenu);
-        assert_place(
-            stacked.offset,
-            TRAVEL,
-            "the sheet on top rises from the foot",
-        );
+        let (start, _) = flight_ends(&up(&mut sheet, SheetKey::FolderArchiveMenu));
+        assert_place(start, TRAVEL, "the sheet on top rises from the foot");
         assert_place(
             settled(&mut sheet, SheetKey::SidebarRowMenu).offset,
             0.0,
@@ -1276,7 +1284,9 @@ mod tests {
     fn a_panel_rises_from_the_foot_and_settles_at_its_rest() {
         let mut sheet = BottomSheet::default();
         let rising = up(&mut sheet, SheetKey::SettingsPalette);
-        assert_place(rising.offset, TRAVEL, "a fresh panel starts below the edge");
+        let (start, end) = flight_ends(&rising);
+        assert_place(start, TRAVEL, "a fresh panel starts below the edge");
+        assert_place(end, 0.0, "and comes to rest at the edge");
         assert!(rising.motion.is_some_and(|motion| !motion.falling));
 
         // A motion that is given time reaches its end.
