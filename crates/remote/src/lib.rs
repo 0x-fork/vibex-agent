@@ -506,6 +506,25 @@ pub trait RemoteLanPairingSource: Send + Sync {
         ttl_ms: u32,
     ) -> VibexResult<vibex_core::RemoteLanPairingWindowSnapshot>;
 
+    /// Opens a window that brings its own listener and handshake, so it does not
+    /// need a published Direct route first.
+    ///
+    /// Only the verbs differ: the window it returns is the one
+    /// [`Self::lan_pairing_window`] reports and the one
+    /// [`Self::decide_lan_pairing_request`] settles. A client opens one window
+    /// at a time, so a source with both bootstraps answers for whichever is up.
+    async fn start_zero_config_lan_pairing(
+        &self,
+        permission_level: vibex_core::RemoteDevicePermissionLevel,
+        ttl_ms: u32,
+    ) -> VibexResult<vibex_core::RemoteLanPairingWindowSnapshot>;
+
+    /// Whether this source can open the zero-config window at all.
+    ///
+    /// Asked so the gateway advertises the verb only where it exists, rather
+    /// than letting a client find out by being refused.
+    fn supports_zero_config_lan_pairing(&self) -> bool;
+
     /// The window being advertised, or `None` when there is none.
     async fn lan_pairing_window(
         &self,

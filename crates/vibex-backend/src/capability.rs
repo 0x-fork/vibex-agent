@@ -118,6 +118,14 @@ pub enum BackendOperation {
     /// pairing requests a device on that network sends. A runtime without it
     /// pairs by offer alone, which needs a camera on the other side.
     DeviceLanPairing,
+    /// The runtime can open a local-network window that brings its own listener
+    /// and handshake, so it does not need a published Direct route first.
+    ///
+    /// Separate from [`Self::DeviceLanPairing`] because the preconditions
+    /// differ: a runtime that publishes nothing can still pair a phone over the
+    /// local network this way, and a client that only knew the Direct-backed
+    /// window would hide a row that would have worked.
+    DeviceZeroConfigLanPairing,
     DeviceList,
     /// Reads which publishing methods behind pairing are up, degraded, or off.
     ///
@@ -355,6 +363,7 @@ impl BackendCapabilitySnapshot {
             device: DomainCapabilities::available([
                 DevicePairing,
                 DeviceLanPairing,
+                DeviceZeroConfigLanPairing,
                 DeviceList,
                 DevicePairingPublications,
                 DeviceRevoke,

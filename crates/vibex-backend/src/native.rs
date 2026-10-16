@@ -4281,19 +4281,38 @@ impl DeviceBackend for NativeBackend {
         })
     }
 
+    fn start_zero_config_lan_pairing(
+        &self,
+        request: MutationRequest<vibex_core::RemoteStartLanPairingRequest>,
+    ) -> BackendFuture<'_, vibex_core::RemoteLanPairingWindowSnapshot> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            let ttl_ms = request
+                .payload
+                .ttl_ms
+                .unwrap_or(vibex_core::DEFAULT_PAIRING_TTL_MS);
+            runtime
+                .remote_connectivity()
+                .start_zero_config_lan_pairing(request.payload.permission_level, ttl_ms)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
     fn lan_pairing_window(
         &self,
     ) -> BackendFuture<'_, Option<vibex_core::RemoteLanPairingWindowSnapshot>> {
         let runtime = self.runtime.clone();
         Box::pin(async move {
             runtime.ensure_accepting_actions()?;
-            match runtime.remote_connectivity().lan_pairing_window_status() {
-                Ok(window) => Ok(Some(window)),
-                // A window that expired or was claimed is the same answer as
-                // one that was never opened: this runtime is not looking.
-                Err(error) if error.code == "remote_lan_pairing_window_unavailable" => Ok(None),
-                Err(error) => Err(error.into()),
-            }
+            // The controller owns the rule about which bootstrap is up, so this
+            // and the gateway source cannot disagree about the window.
+            runtime
+                .remote_connectivity()
+                .active_lan_pairing_window()
+                .map_err(Into::into)
         })
     }
 
@@ -4305,13 +4324,10 @@ impl DeviceBackend for NativeBackend {
         Box::pin(async move {
             request.validate()?;
             runtime.ensure_accepting_actions()?;
-            let connectivity = runtime.remote_connectivity();
-            let decision = if request.payload.approve {
-                connectivity.approve_lan_pairing_request(&request.payload.request_id)
-            } else {
-                connectivity.reject_lan_pairing_request(&request.payload.request_id)
-            };
-            decision.map_err(Into::into)
+            runtime
+                .remote_connectivity()
+                .decide_active_lan_pairing(&request.payload.request_id, request.payload.approve)
+                .map_err(Into::into)
         })
     }
 
@@ -4321,7 +4337,8 @@ impl DeviceBackend for NativeBackend {
             runtime.ensure_accepting_actions()?;
             runtime
                 .remote_connectivity()
-                .cancel_lan_pairing_window()
+                .cancel_active_lan_pairing()
+                .await
                 .map_err(Into::into)
         })
     }

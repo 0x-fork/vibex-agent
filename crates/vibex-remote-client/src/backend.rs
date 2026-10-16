@@ -6629,6 +6629,37 @@ impl DeviceBackend for WebRemoteBackend {
         })
     }
 
+    fn start_zero_config_lan_pairing(
+        &self,
+        request: MutationRequest<vibex_core::RemoteStartLanPairingRequest>,
+    ) -> BackendFuture<'_, vibex_core::RemoteLanPairingWindowSnapshot> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteDeviceRequest::StartZeroConfigLanPairing(
+                vibex_core::RemoteDeviceStartZeroConfigLanPairingRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            // Widening a listener and raising a handshake is slower than a
+            // trust-store write, like the legacy window.
+            let value = this
+                .rpc(
+                    RemoteOperationKind::DeviceManagement,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            decode::<vibex_core::RemoteDeviceLanPairingResponse>(value)?
+                .window
+                .ok_or_else(lan_pairing_window_missing)
+        })
+    }
+
     fn lan_pairing_window(
         &self,
     ) -> BackendFuture<'_, Option<vibex_core::RemoteLanPairingWindowSnapshot>> {
@@ -7042,6 +7073,7 @@ fn remote_capabilities_for_grant(
     let has_recovery = features.contains("recovery");
     let has_device_pairing = features.contains("device_pairing");
     let has_lan_pairing = features.contains("device_lan_pairing");
+    let has_zero_config_lan_pairing = features.contains("device_zero_config_lan_pairing");
     // Not tied to `device_pairing`: a runtime with no published route is the one
     // whose publication list has to be readable, or the client cannot say why
     // there is nothing to pair with.
@@ -7442,6 +7474,11 @@ fn remote_capabilities_for_grant(
                 (
                     BackendOperation::DeviceLanPairing,
                     has_lan_pairing && permits(RemoteActionClass::MutateDeviceManagement),
+                ),
+                (
+                    BackendOperation::DeviceZeroConfigLanPairing,
+                    has_zero_config_lan_pairing
+                        && permits(RemoteActionClass::MutateDeviceManagement),
                 ),
                 (
                     BackendOperation::DeviceList,

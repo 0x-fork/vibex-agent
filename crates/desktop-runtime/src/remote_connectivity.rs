@@ -2240,6 +2240,74 @@ impl RemoteConnectivityController {
         advertiser.and(gateway)
     }
 
+    /// The zero-config window, when one is up.
+    ///
+    /// A window that has expired, been claimed, or never existed is the same
+    /// answer as no window at all, which is what the coordinator's own error
+    /// says.
+    fn zero_config_window(&self) -> VibexResult<Option<RemoteLanPairingWindowSnapshot>> {
+        match self.zero_config_lan_pairing_window_status() {
+            Ok(window) => Ok(Some(window)),
+            Err(error) if error.code == "remote_lan_pairing_window_unavailable" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The LAN window this runtime is advertising, whichever bootstrap opened it.
+    ///
+    /// There are two bootstraps and one window: the legacy one is advertised
+    /// over a published Direct route, and the zero-config one brings its own
+    /// listener. A client opens one at a time and asks about "the window", so
+    /// this is the answer it gets — the zero-config window first, because a
+    /// client that opened one could not have used the other path.
+    ///
+    /// Both the gateway source that serves a paired client and the in-process
+    /// backend that serves a client in this process answer through here, so the
+    /// two cannot disagree about which window is up.
+    pub fn active_lan_pairing_window(&self) -> VibexResult<Option<RemoteLanPairingWindowSnapshot>> {
+        if let Some(window) = self.zero_config_window()? {
+            return Ok(Some(window));
+        }
+        match self.lan_pairing_window_status() {
+            Ok(window) => Ok(Some(window)),
+            // A window that expired or was claimed is the same answer as one
+            // that was never opened: this runtime is not looking.
+            Err(error) if error.code == "remote_lan_pairing_window_unavailable" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Settles a request against the window that took it.
+    pub fn decide_active_lan_pairing(
+        &self,
+        request_id: &RequestId,
+        approve: bool,
+    ) -> VibexResult<RemoteLanPairingWindowSnapshot> {
+        // Only one window is open, and the request belongs to it: settling the
+        // request against the other one would answer something the reader never
+        // saw.
+        if self.zero_config_window()?.is_some() {
+            return if approve {
+                self.approve_zero_config_lan_pairing_request(request_id)
+            } else {
+                self.reject_zero_config_lan_pairing_request(request_id)
+            };
+        }
+        if approve {
+            self.approve_lan_pairing_request(request_id)
+        } else {
+            self.reject_lan_pairing_request(request_id)
+        }
+    }
+
+    /// Takes down whichever window is up.
+    pub async fn cancel_active_lan_pairing(&self) -> VibexResult<()> {
+        if self.zero_config_window()?.is_some() {
+            return self.cancel_zero_config_lan_pairing().await;
+        }
+        self.cancel_lan_pairing_window()
+    }
+
     pub fn pairing_offer_status(
         &self,
         offer_id: &RequestId,

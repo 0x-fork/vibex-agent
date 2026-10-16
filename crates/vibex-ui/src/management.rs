@@ -2067,6 +2067,13 @@ mod tests {
             error_future()
         }
 
+        fn start_zero_config_lan_pairing(
+            &self,
+            _request: MutationRequest<vibex_core::RemoteStartLanPairingRequest>,
+        ) -> BackendFuture<'_, vibex_core::RemoteLanPairingWindowSnapshot> {
+            error_future()
+        }
+
         fn lan_pairing_window(
             &self,
         ) -> BackendFuture<'_, Option<vibex_core::RemoteLanPairingWindowSnapshot>> {

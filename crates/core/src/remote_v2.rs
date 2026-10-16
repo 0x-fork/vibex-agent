@@ -1356,6 +1356,7 @@ pub enum RemoteDeviceOperationKind {
     CreatePairingOffer,
     CancelPairingOffer,
     StartLanPairing,
+    StartZeroConfigLanPairing,
     LanPairingStatus,
     DecideLanPairing,
     CancelLanPairing,
@@ -1443,6 +1444,33 @@ impl fmt::Debug for RemoteDeviceStartLanPairingRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RemoteDeviceStartLanPairingRequest")
+            .field("auth", &self.auth)
+            .field("permission_level", &self.request.permission_level)
+            .field("ttl_ms", &self.request.ttl_ms)
+            .finish()
+    }
+}
+
+/// Opens a pairing window that stands on its own.
+///
+/// The legacy window is advertised over a Direct route the runtime has already
+/// published and verified, which is why a runtime without one refuses to open
+/// it at all (`remote_lan_direct_unavailable`). This one brings its own
+/// temporary listener and encrypted handshake, so a reader whose runtime
+/// publishes nothing can still let a phone on the same network in. Same window,
+/// same verbs afterwards: the client that opened it reads, decides and cancels
+/// it through the LAN operations it already has.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceStartZeroConfigLanPairingRequest {
+    pub auth: RemoteAuthProof,
+    pub request: RemoteStartLanPairingRequest,
+}
+
+impl fmt::Debug for RemoteDeviceStartZeroConfigLanPairingRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteDeviceStartZeroConfigLanPairingRequest")
             .field("auth", &self.auth)
             .field("permission_level", &self.request.permission_level)
             .field("ttl_ms", &self.request.ttl_ms)
@@ -1778,6 +1806,8 @@ pub enum RemoteDeviceRequest {
     /// Opens a LAN pairing window, which is how a phone that can see this
     /// machine on its own network asks to pair without a camera.
     StartLanPairing(RemoteDeviceStartLanPairingRequest),
+    /// Opens a LAN pairing window that needs no published route.
+    StartZeroConfigLanPairing(RemoteDeviceStartZeroConfigLanPairingRequest),
     LanPairingStatus(RemoteDeviceLanPairingStatusRequest),
     DecideLanPairing(RemoteDeviceLanPairingDecisionRequest),
     CancelLanPairing(RemoteDeviceCancelLanPairingRequest),
@@ -1878,6 +1908,9 @@ impl RemoteDeviceRequest {
             Self::CreatePairingOffer(_) => RemoteDeviceOperationKind::CreatePairingOffer,
             Self::CancelPairingOffer(_) => RemoteDeviceOperationKind::CancelPairingOffer,
             Self::StartLanPairing(_) => RemoteDeviceOperationKind::StartLanPairing,
+            Self::StartZeroConfigLanPairing(_) => {
+                RemoteDeviceOperationKind::StartZeroConfigLanPairing
+            }
             Self::LanPairingStatus(_) => RemoteDeviceOperationKind::LanPairingStatus,
             Self::DecideLanPairing(_) => RemoteDeviceOperationKind::DecideLanPairing,
             Self::CancelLanPairing(_) => RemoteDeviceOperationKind::CancelLanPairing,
@@ -2467,6 +2500,27 @@ mod tests {
         // The proof is a secret: the request's debug line says it is there
         // without saying what it is.
         assert!(!format!("{start:?}").contains("device-auth-token-sentinel"));
+
+        // The window that needs no published route is its own request, because a
+        // runtime that cannot open the one above can still open this one.
+        let zero_config = RemoteDeviceRequest::StartZeroConfigLanPairing(
+            RemoteDeviceStartZeroConfigLanPairingRequest {
+                auth: auth.clone(),
+                request: RemoteStartLanPairingRequest {
+                    permission_level: RemoteDevicePermissionLevel::ReadOnly,
+                    ttl_ms: Some(DEFAULT_PAIRING_TTL_MS),
+                },
+            },
+        );
+        assert_eq!(
+            zero_config.operation_kind(),
+            RemoteDeviceOperationKind::StartZeroConfigLanPairing
+        );
+        let decoded: RemoteDeviceRequest =
+            serde_json::from_value(serde_json::to_value(&zero_config).expect("encode"))
+                .expect("decode");
+        assert_eq!(decoded, zero_config);
+        assert!(!format!("{zero_config:?}").contains("device-auth-token-sentinel"));
 
         // A refusal is a decision the waiting phone can render, so it travels
         // as one rather than as a cancellation.

@@ -33,6 +33,19 @@ pub trait DeviceBackend: BackendBound {
         request: MutationRequest<RemoteStartLanPairingRequest>,
     ) -> BackendFuture<'_, RemoteLanPairingWindowSnapshot>;
 
+    /// Opens a LAN pairing window that needs no published route.
+    ///
+    /// The window above stands on a Direct route the runtime already publishes
+    /// and verifies, so a runtime with nothing published cannot open it. This
+    /// one brings its own temporary listener and encrypted handshake, which is
+    /// what lets a reader pair a phone over the local network when Remote Access
+    /// has never been switched on. The window it returns is the same window:
+    /// read it, settle it and cancel it through the calls above.
+    fn start_zero_config_lan_pairing(
+        &self,
+        request: MutationRequest<vibex_core::RemoteStartLanPairingRequest>,
+    ) -> BackendFuture<'_, RemoteLanPairingWindowSnapshot>;
+
     /// The window this runtime is advertising, or `None` when there is none.
     fn lan_pairing_window(&self) -> BackendFuture<'_, Option<RemoteLanPairingWindowSnapshot>>;
 

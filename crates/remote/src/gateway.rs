@@ -4617,6 +4617,10 @@ async fn process_device_management_rpc(
             request.auth.clone(),
             RemoteActionClass::MutateDeviceManagement,
         ),
+        RemoteDeviceRequest::StartZeroConfigLanPairing(request) => (
+            request.auth.clone(),
+            RemoteActionClass::MutateDeviceManagement,
+        ),
         RemoteDeviceRequest::LanPairingStatus(request) => (
             request.auth.clone(),
             RemoteActionClass::ReadDeviceManagement,
@@ -4716,6 +4720,20 @@ async fn process_device_management_rpc(
             let _ = request;
             let window = lan_pairing_source(state)?
                 .start_lan_pairing_window(
+                    request.request.permission_level,
+                    request
+                        .request
+                        .ttl_ms
+                        .unwrap_or(vibex_core::DEFAULT_PAIRING_TTL_MS),
+                )
+                .await?;
+            serde_json::to_value(RemoteDeviceLanPairingResponse {
+                window: Some(window),
+            })
+        }
+        RemoteDeviceRequest::StartZeroConfigLanPairing(request) => {
+            let window = lan_pairing_source(state)?
+                .start_zero_config_lan_pairing(
                     request.request.permission_level,
                     request
                         .request
@@ -5909,6 +5927,7 @@ fn gateway_capabilities() -> Vec<String> {
 fn pairing_features(
     has_routes: bool,
     has_lan_source: bool,
+    has_zero_config_lan_source: bool,
     has_route_source: bool,
 ) -> Vec<&'static str> {
     let mut features = Vec::new();
@@ -5917,6 +5936,13 @@ fn pairing_features(
     }
     if has_lan_source {
         features.push("device_lan_pairing");
+    }
+    // Advertised separately because the two LAN bootstraps have different
+    // preconditions: the legacy window stands on a published Direct route and
+    // this one brings its own listener, so a client that only knew the first
+    // would hide a row that would have worked.
+    if has_zero_config_lan_source {
+        features.push("device_zero_config_lan_pairing");
     }
     if has_route_source {
         features.push("device_pairing_publications");
@@ -5967,6 +5993,10 @@ fn gateway_features(state: &GatewayState) -> Vec<String> {
                 .map(|routes| !routes.is_empty())
                 .unwrap_or(false),
             state.dispatcher.has_lan_pairing_source(),
+            state
+                .dispatcher
+                .lan_pairing_source()
+                .is_some_and(|source| source.supports_zero_config_lan_pairing()),
             state.dispatcher.has_pairing_route_source(),
         )
         .into_iter()
@@ -6118,25 +6148,32 @@ mod tests {
         // A runtime with a source but no published route: it can pair nothing,
         // and it is exactly the runtime that has to answer "why not".
         assert_eq!(
-            pairing_features(false, true, true),
+            pairing_features(false, true, false, true),
             vec!["device_lan_pairing", "device_pairing_publications"]
         );
         // A peer that predates the read advertises neither the read nor a route.
-        assert!(pairing_features(false, false, false).is_empty());
-        // A runtime with a route keeps all three: the read is additive, never a
-        // replacement for the verb.
+        assert!(pairing_features(false, false, false, false).is_empty());
+        // A runtime with a route keeps all of them: the read is additive, never
+        // a replacement for the verb.
         assert_eq!(
-            pairing_features(true, true, true),
+            pairing_features(true, true, true, true),
             vec![
                 "device_pairing",
                 "device_lan_pairing",
+                "device_zero_config_lan_pairing",
                 "device_pairing_publications"
             ]
         );
         // The read does not drag the pairing verb in behind it.
         assert_eq!(
-            pairing_features(false, false, true),
+            pairing_features(false, false, false, true),
             vec!["device_pairing_publications"]
+        );
+        // The zero-config window brings its own listener, so it is a fact about
+        // the runtime rather than about the routes it publishes.
+        assert_eq!(
+            pairing_features(false, false, true, false),
+            vec!["device_zero_config_lan_pairing"]
         );
     }
 
@@ -8021,6 +8058,23 @@ mod tests {
                 let window = window();
                 *self.window.lock().unwrap() = Some(window.clone());
                 Ok(window)
+            }
+
+            async fn start_zero_config_lan_pairing(
+                &self,
+                permission_level: RemoteDevicePermissionLevel,
+                ttl_ms: u32,
+            ) -> VibexResult<vibex_core::RemoteLanPairingWindowSnapshot> {
+                self.calls.lock().unwrap().push("start_zero_config");
+                assert_eq!(permission_level, RemoteDevicePermissionLevel::FullControl);
+                assert_eq!(ttl_ms, vibex_core::DEFAULT_PAIRING_TTL_MS);
+                let window = window();
+                *self.window.lock().unwrap() = Some(window.clone());
+                Ok(window)
+            }
+
+            fn supports_zero_config_lan_pairing(&self) -> bool {
+                true
             }
 
             async fn lan_pairing_window(

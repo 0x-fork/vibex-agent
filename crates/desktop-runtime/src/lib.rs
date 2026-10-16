@@ -1502,16 +1502,31 @@ impl vibex_remote::RemoteLanPairingSource for LanPairingSource {
             .await
     }
 
+    async fn start_zero_config_lan_pairing(
+        &self,
+        permission_level: vibex_core::RemoteDevicePermissionLevel,
+        ttl_ms: u32,
+    ) -> VibexResult<vibex_core::RemoteLanPairingWindowSnapshot> {
+        self.connectivity()?
+            .start_zero_config_lan_pairing(permission_level, ttl_ms)
+            .await
+    }
+
+    fn supports_zero_config_lan_pairing(&self) -> bool {
+        // The controller is the same one the Remote Access page drives, and it
+        // always owns the zero-config coordinator. A runtime that never got as
+        // far as installing the controller answers `false` through the missing
+        // source rather than through this, so there is nothing to check here.
+        self.connectivity.get().is_some()
+    }
+
     async fn lan_pairing_window(
         &self,
     ) -> VibexResult<Option<vibex_core::RemoteLanPairingWindowSnapshot>> {
-        // A window that has expired, been claimed, or never existed is the same
-        // answer to the client: this runtime is not looking for a device.
-        match self.connectivity()?.lan_pairing_window_status() {
-            Ok(window) => Ok(Some(window)),
-            Err(error) if error.code == "remote_lan_pairing_window_unavailable" => Ok(None),
-            Err(error) => Err(error),
-        }
+        // Whichever bootstrap opened the window, this is where it is reported:
+        // a client opens one at a time, and the controller owns the rule about
+        // which one that is.
+        self.connectivity()?.active_lan_pairing_window()
     }
 
     async fn decide_lan_pairing_request(
@@ -1519,17 +1534,13 @@ impl vibex_remote::RemoteLanPairingSource for LanPairingSource {
         request_id: &vibex_core::RequestId,
         approve: bool,
     ) -> VibexResult<vibex_core::RemoteLanPairingWindowSnapshot> {
-        let connectivity = self.connectivity()?;
-        if approve {
-            connectivity.approve_lan_pairing_request(request_id)
-        } else {
-            connectivity.reject_lan_pairing_request(request_id)
-        }
+        self.connectivity()?
+            .decide_active_lan_pairing(request_id, approve)
     }
 
     async fn cancel_lan_pairing_window(&self) -> VibexResult<()> {
         match self.connectivity() {
-            Ok(connectivity) => connectivity.cancel_lan_pairing_window(),
+            Ok(connectivity) => connectivity.cancel_active_lan_pairing().await,
             // No controller means no advertisement was ever started, which is
             // the state the caller asked for.
             Err(_) => Ok(()),
