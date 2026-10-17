@@ -29,7 +29,6 @@ use sha2::{Digest, Sha256};
 use vibex_desktop_model::{
     BackgroundImageFit, BackgroundImageUiState, background_image_file_name_is_valid,
 };
-use vibex_ui::WallpaperSurfaces;
 
 /// Directory under the app's data directory that holds imported wallpapers.
 pub(crate) const BACKGROUND_IMAGE_DIRECTORY: &str = "backgrounds";
@@ -232,18 +231,6 @@ pub(crate) fn thumbnail(path: &Path) -> AnyElement {
 pub(crate) fn wallpaper_veil(is_dark: bool, dim_percent: u16) -> gpui::Hsla {
     let alpha = f32::from(dim_percent.min(100)) / 100.0;
     crate::theme::page_plate(is_dark).alpha(alpha)
-}
-
-/// The page color at full opacity, which the wallpaper is painted over.
-///
-/// While a wallpaper is behind them the theme's containers fade, so the page's
-/// own fill turns translucent — and a `Contain` fit's letterbox would then show
-/// the window's plate instead of the page. Mixing the veil from the authored
-/// color is what keeps the two reading as one surface.
-pub(crate) fn surface_alpha(role: &str, is_dark: bool) -> Option<f32> {
-    let surfaces = WallpaperSurfaces::for_appearance(is_dark);
-    let _ = surfaces;
-    vibex_ui::wallpaper_surface_alpha(role, is_dark)
 }
 
 #[cfg(test)]
