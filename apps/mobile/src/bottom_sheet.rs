@@ -407,6 +407,17 @@ impl BottomSheet {
         self.panel(key).is_some_and(|panel| panel.closing)
     }
 
+    /// Whether any panel is on screen for this page.
+    ///
+    /// A sheet is modal: its scrim covers the page, and the page's own gestures
+    /// are watched from ancestors the scrim cannot occlude, so a page that
+    /// would move under it has to ask. A panel on its way out still counts —
+    /// until it has cleared the screen it is the thing the reader is looking
+    /// at, and the page behind it must not answer the same finger.
+    pub fn is_up(&self) -> bool {
+        !self.panels.is_empty()
+    }
+
     /// Whether a pull of this sheet let go recently enough that the lift it
     /// ended must not be read as a tap on the scrim it landed on.
     pub fn pull_just_released(&self, key: SheetKey) -> bool {

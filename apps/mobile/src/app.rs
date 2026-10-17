@@ -12507,7 +12507,14 @@ impl MobileApp {
                 // The new touch owns whatever momentum follows it.
                 self.drawer_fling_owned = false;
                 self.drawer_pan_last_at = Some(now);
-                if self.drawer_snap.is_some()
+                // A sheet is modal. Its scrim covers the page, but the pan
+                // capture feeding this handler sits above the scrim, so a swipe
+                // on the page behind an open panel arrives here all the same —
+                // and would switch screens under the panel the reader is
+                // answering. Stand down while any panel is on screen; the pan
+                // is not stopped, so the sheet's own pull still gets it.
+                if self.sheet.is_up()
+                    || self.drawer_snap.is_some()
                     || self.session_action.is_some()
                     || self.runtime_options_open
                     || self.runtime_option_page.is_some()
@@ -36813,6 +36820,53 @@ mod tests {
         assert!(
             cx.debug_bounds("mobile-agent-question").is_none(),
             "and the panel stays down"
+        );
+    }
+
+    /// The page behind an open question panel is not the reader's to touch.
+    ///
+    /// The capture that moves the drawer sits above the sheet's scrim, so a
+    /// swipe across the open panel still reached it and switched screens under
+    /// the question being answered. The page stands down while a panel is up,
+    /// without stopping the pan: the sheet's own pull still gets it.
+    #[gpui::test]
+    fn an_open_question_panel_holds_the_page_still(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = app_with_a_parked_question(cx, data_dir.path());
+
+        let position = point(px(120.0), px(120.0));
+        for (phase, dx) in [(TouchPhase::Started, 24.0), (TouchPhase::Moved, 80.0)] {
+            cx.simulate_event(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(dx), px(0.0))),
+                modifiers: Default::default(),
+                touch_phase: phase,
+            });
+        }
+        assert_eq!(
+            app.read_with(cx, |app, _| app.drawer_offset),
+            0.0,
+            "a swipe over the open panel must not move the page behind it"
+        );
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, 0.0)),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Ended,
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| (
+                app.drawer_offset,
+                app.drawer_open,
+                app.workbench_open
+            )) == (0.0, false, false),
+            "and lifting the finger must not settle the phone on another page"
+        );
+        assert!(
+            cx.debug_bounds("mobile-agent-question").is_some(),
+            "the panel the reader is answering stays where it was"
         );
     }
 
