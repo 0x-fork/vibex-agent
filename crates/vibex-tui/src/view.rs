@@ -3922,7 +3922,7 @@ fn render_status_band(
     // know a key the draft has taken.
     let mut entry: Option<(u16, u16)> = None;
     if app.page.is_session_page() {
-        let label = strings.nav_sessions();
+        let label = strings.sessions_title();
         // The chord that answers *here*: the composer owns the plain digits
         // the global binding uses, so while it has the keyboard the page names
         // its own chord rather than one that would type a digit.

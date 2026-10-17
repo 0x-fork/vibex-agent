@@ -308,7 +308,7 @@ fn startup_paints_a_first_frame() {
         "the prompt does not name what the message goes through:\n{screen}"
     );
     assert!(
-        screen.contains("Sessions"),
+        screen.contains("Session list"),
         "the corner entry to the session list is missing:\n{screen}"
     );
 }
@@ -576,7 +576,7 @@ fn a_resize_storm_does_not_lose_the_frame() {
         session.pump(Duration::from_millis(150));
     }
     let screen = session.wait_for_first_frame();
-    assert!(screen.contains("Sessions"), "{screen}");
+    assert!(screen.contains("Session list"), "{screen}");
 }
 
 #[test]
@@ -599,7 +599,7 @@ fn shrinking_into_a_tiny_size_keeps_the_composer() {
     // a few rows must keep the place the reader types, with the bands around it
     // giving their rows back.
     let mut session = Session::start(120, 40);
-    session.wait_for(|screen| screen.contains("Sessions"));
+    session.wait_for(|screen| screen.contains("Session list"));
     session.resize(24, 5);
     let screen = session.wait_for(|screen| screen.contains('❯'));
     assert!(

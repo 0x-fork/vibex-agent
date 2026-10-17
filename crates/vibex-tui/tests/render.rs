@@ -239,7 +239,7 @@ fn every_supported_size_produces_a_full_frame() {
             "{width}x{height} lost the version line"
         );
         assert!(
-            screen.contains("Sessions"),
+            screen.contains("Session list"),
             "{width}x{height} lost the navigation"
         );
         assert!(
@@ -292,7 +292,7 @@ fn the_prompt_offers_the_session_list_in_its_corner() {
     let buffer = render_buffer(&mut app, 120, 40);
     let status = display_row(&buffer, 1, 120);
     assert!(
-        status.contains("Sessions") && status.contains("Ctrl+L"),
+        status.contains("Session list") && status.contains("Ctrl+L"),
         "the corner entry is missing from the status band: {status:?}"
     );
     // The entry is a control, not a label: its rect is on the status row, at
@@ -315,7 +315,7 @@ fn the_prompt_offers_the_session_list_in_its_corner() {
         .map(|column| buffer.cell((column, 1)).expect("cell").symbol())
         .collect::<String>();
     assert!(
-        entry.contains("Sessions"),
+        entry.contains("Session list"),
         "the clickable rect is not over the entry: {entry:?}"
     );
 }
@@ -349,14 +349,14 @@ fn the_session_page_offers_the_session_list_in_its_corner() {
     );
     let status = display_row(&buffer, rect.y, 120);
     assert!(
-        status.trim_end().ends_with("Sessions Ctrl+L"),
+        status.trim_end().ends_with("Session list Ctrl+L"),
         "the composer's entry named the wrong chord: {status:?}"
     );
     let entry = (rect.x..rect.x + rect.width)
         .map(|column| buffer.cell((column, rect.y)).expect("cell").symbol())
         .collect::<String>();
     assert!(
-        entry.contains("Sessions"),
+        entry.contains("Session list"),
         "the clickable rect is not over the entry: {entry:?}"
     );
 
@@ -366,7 +366,7 @@ fn the_session_page_offers_the_session_list_in_its_corner() {
     let buffer = render_buffer(&mut app, 120, 40);
     let status = display_row(&buffer, rect.y, 120);
     assert!(
-        status.trim_end().ends_with("Sessions 1"),
+        status.trim_end().ends_with("Session list 1"),
         "the transcript's entry named a chord it does not answer: {status:?}"
     );
 
@@ -399,7 +399,7 @@ fn the_corner_entry_yields_to_the_status_beside_it() {
         "the entry pushed the status off a narrow terminal: {status:?}"
     );
     assert!(
-        !status.contains("Sessions"),
+        !status.contains("Session list"),
         "the entry was drawn where it did not fit: {status:?}"
     );
     assert!(
@@ -417,7 +417,7 @@ fn the_corner_entry_yields_to_the_status_beside_it() {
     let buffer = render_buffer(&mut wider, 60, 24);
     let status = display_row(&buffer, 1, 60);
     assert!(
-        status.trim_end().ends_with("Sessions Ctrl+L"),
+        status.trim_end().ends_with("Session list Ctrl+L"),
         "the entry did not come back where it fits: {status:?}"
     );
 }
@@ -4695,6 +4695,18 @@ fn the_palette_files_its_sections_in_reading_order() {
         drawn,
         expected[..drawn.len()],
         "the palette drew its sections out of order"
+    );
+
+    // The destinations under `Feature view` are named for what the reader
+    // finds there, so the list's command carries the page's own name.
+    let view = entries
+        .iter()
+        .filter(|listing| listing.group == PaletteGroup::View)
+        .map(|listing| listing.entry.label(Strings::for_locale(Locale::ZhCn)))
+        .collect::<Vec<_>>();
+    assert!(
+        view.contains(&"会话列表"),
+        "the session command did not take the page's name: {view:?}"
     );
 
     // Pairing and managing the devices are one page, so the heading has one

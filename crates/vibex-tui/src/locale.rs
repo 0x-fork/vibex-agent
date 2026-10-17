@@ -1973,7 +1973,7 @@ strings! {
     // The palette's own names and one-line explanations. They are longer than
     // the key bar's labels because the palette is read as a menu rather than
     // glanced at as a legend.
-    palette_cmd_sessions => { "Sessions", "会话", "工作階段" },
+    palette_cmd_sessions => { "Session list", "会话列表", "工作階段清單" },
     palette_hint_sessions => { "Open the session list", "打开会话列表", "開啟工作階段清單" },
     palette_cmd_management => { "Configuration centre", "配置中心", "配置中心" },
     palette_hint_management => {

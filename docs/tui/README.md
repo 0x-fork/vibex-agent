@@ -381,7 +381,7 @@ The workspace appears on the left. Connection warnings and the current mode
 appear on the right. A ready connection does not label a running turn as
 complete; the turn status row reports whether work is active. On the
 session pages the group's last segment is a control rather than a status: the
-clickable **Sessions** entry, which names the chord that answers where the
+clickable **Session list** entry, which names the chord that answers where the
 keyboard is.
 
 The location is chrome, not a status: it is drawn in the bright grey a secondary
@@ -593,7 +593,7 @@ The workspace is the directory the client was started in — the answer they
 already gave by choosing where to run the command — and the runtime is the one
 last used here, so both are named and ready before a key is pressed. The
 sessions that already exist are one gesture away: the status band's top-right
-corner holds a clickable **Sessions** entry naming the chord that answers where
+corner holds a clickable **Session list** entry naming the chord that answers where
 the reader is (`Ctrl+L` while the composer holds the keyboard, the global `1`
 otherwise). `n` opens the same page from the list.
 
@@ -708,7 +708,7 @@ line — `Ctrl+J` does the same on a terminal that cannot report `Shift+Enter`,
 see [Terminal ownership](#terminal-ownership) — `Ctrl+O` hands the draft to
 `$EDITOR`, and `Ctrl+S` steers a running turn. `Ctrl+C` clears the draft, then
 interrupts, then offers to quit. The status band's corner keeps the prompt's
-**Sessions** entry, so another session is one gesture away without leaving the
+**Session list** entry, so another session is one gesture away without leaving the
 draft behind.
 
 `/` on the transcript opens a search: a regular expression, case-insensitive
