@@ -222,7 +222,10 @@ fn the_baked_ground_reproduces_the_floor_palette_behind_a_clamped_border() {
         for (x, y) in [
             (GROUND_SUPERSAMPLE, GROUND_SUPERSAMPLE),
             (width / 2, height / 2),
-            (width - GROUND_SUPERSAMPLE - 1, height - GROUND_SUPERSAMPLE - 1),
+            (
+                width - GROUND_SUPERSAMPLE - 1,
+                height - GROUND_SUPERSAMPLE - 1,
+            ),
         ] {
             let sx = x / GROUND_SUPERSAMPLE - GROUND_BORDER;
             let sy = y / GROUND_SUPERSAMPLE - GROUND_BORDER;
@@ -246,4 +249,3 @@ fn the_baked_ground_reproduces_the_floor_palette_behind_a_clamped_border() {
         assert_eq!(edge, just_inside, "{guardian:?} top edge");
     }
 }
-
