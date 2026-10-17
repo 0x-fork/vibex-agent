@@ -28,7 +28,24 @@ use jni::{Env, EnvUnowned};
 
 use crate::android_insets;
 use crate::assets::MobileAssets;
+use crate::host_liveness;
 use crate::platform;
+
+/// Whether a callback may be handed to the host.
+///
+/// Everything below reaches `gpui_mobile::android::host`, whose entry points
+/// post onto the process-lived render thread and wake its `ALooper`. That wake
+/// reads a looper which only lives as long as the thread that created it, so
+/// once the thread is gone the call aborts the process rather than returning.
+/// [`host_liveness`] is the wall against it; see that module for the whole
+/// story.
+///
+/// Call this on the Java UI thread, as every entry point here is, and before
+/// doing any work worth skipping — a refused `nativeSurfaceDestroyed` also
+/// spares the two-second wait for a render thread that will never answer.
+fn host_reachable(callback: &str) -> bool {
+    host_liveness::reachable(callback)
+}
 
 /// Records the Activity and starts the process-lived render thread.
 ///
@@ -67,7 +84,11 @@ pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeStart<'caller
     gpui_mobile::android::host::on_open_window(move |_host, cx| {
         crate::open_root_window(data_dir.clone(), cx);
     });
-    gpui_mobile::android::host::start_with_assets(MobileAssets, |_cx| {});
+    // The one call that spawns the render thread, so it is also the one that can
+    // say which tid that thread is; every callback below is checked against it.
+    host_liveness::start_host(|| {
+        gpui_mobile::android::host::start_with_assets(MobileAssets, |_cx| {});
+    });
 }
 
 /// Points the platform TLS verifier at this Activity's application context.
@@ -103,6 +124,9 @@ pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeSurfaceCreate
 ) {
     unowned_env
         .with_env(|env| -> jni::errors::Result<()> {
+            if !host_reachable("nativeSurfaceCreated") {
+                return Ok(());
+            }
             // SAFETY: `surface` is the `android.view.Surface` the callback was
             // handed, and the NDK conversion takes its own reference to the
             // matching `ANativeWindow`.
@@ -132,6 +156,9 @@ pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeSurfaceDestro
 ) {
     unowned_env
         .with_env(|_| -> jni::errors::Result<()> {
+            if !host_reachable("nativeSurfaceDestroyed") {
+                return Ok(());
+            }
             gpui_mobile::android::host::surface_destroyed(host.max(0) as u64);
             Ok(())
         })
@@ -149,12 +176,19 @@ pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeOnAppLifecycl
     unowned_env
         .with_env(|_| -> jni::errors::Result<()> {
             let host = host.max(0) as u64;
+            // The app's own lifecycle state keeps following the Activity even
+            // when the host cannot be told: the haptic gate reads it, and it
+            // does not depend on the render thread.
             if foreground {
-                gpui_mobile::android::host::resumed(host);
+                if host_reachable("nativeOnAppLifecycle") {
+                    gpui_mobile::android::host::resumed(host);
+                }
                 platform::notify_lifecycle(AppLifecyclePhase::Active);
             } else {
                 platform::notify_lifecycle(AppLifecyclePhase::Background);
-                gpui_mobile::android::host::paused(host);
+                if host_reachable("nativeOnAppLifecycle") {
+                    gpui_mobile::android::host::paused(host);
+                }
             }
             Ok(())
         })
@@ -240,6 +274,9 @@ pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeTouch<'caller
 ) {
     unowned_env
         .with_env(|_| -> jni::errors::Result<()> {
+            if !host_reachable("nativeTouch") {
+                return Ok(());
+            }
             // GPUI wants physical pixels relative to the surface, which is
             // what `MotionEvent` reports for a full-window view.
             gpui_mobile::android::host::motion_event(
@@ -267,6 +304,9 @@ pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeKey<'caller>(
 ) {
     unowned_env
         .with_env(|_| -> jni::errors::Result<()> {
+            if !host_reachable("nativeKey") {
+                return Ok(());
+            }
             gpui_mobile::android::host::key(key_code, action, meta_state);
             Ok(())
         })

@@ -18,6 +18,8 @@ mod bottom_sheet;
 mod device;
 mod discovery;
 mod file_diff;
+#[cfg(any(target_os = "android", test))]
+mod host_liveness;
 mod lifecycle;
 mod locale;
 mod markdown;
