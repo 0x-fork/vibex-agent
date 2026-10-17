@@ -241,7 +241,6 @@ mod android {
             AttachmentKind::Image => jni::jni_str!("gpuiPickImageAttachment"),
             AttachmentKind::File => jni::jni_str!("gpuiPickFileAttachment"),
             AttachmentKind::Camera => jni::jni_str!("gpuiCapturePhotoAttachment"),
-            AttachmentKind::Background => jni::jni_str!("gpuiPickBackgroundImage"),
         };
         crate::android_bridge::with_activity(|env, activity| {
             env.call_method(activity, method, jni::jni_sig!(() -> ()), &[])?;
