@@ -2370,11 +2370,18 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
 - Inline attachment marker ranges contain only non-breaking word characters;
   insertion padding stays outside the marker and is removed from the submitted
   text. Root-level token overlays render only when the marker's buffer row is in
-  `InputState::visible_row_range` and its complete bounds remain inside the
-  tracked input viewport. Never trust `range_to_bounds` alone for an offset above
-  the visible prefix, and never let a marker range include a wrapping space. The
-  opaque token covers the complete horizontal marker bounds without an inset, so
-  raw marker glyphs cannot remain visible at either rounded edge.
+  `InputState::visible_row_range` and its bounds still overlap the textarea's
+  viewport. It is a mistake to require the complete box to fit: the textarea
+  paints marker text for every row with even one pixel in view, so a row clipped
+  by the top or bottom edge would keep its raw `attachment_…_vbx` glyphs while
+  losing the chip that covers them. Test overlap, not containment. Measure the
+  box against the frame `range_to_bounds` reports in — `InputState::input_bounds`,
+  which is the textarea's own unscrolled frame — not against a separately tracked
+  wrapper slot, whose padding and scrolling make it a different origin. Never
+  trust `range_to_bounds` alone for an offset above the visible prefix, and never
+  let a marker range include a wrapping space. The opaque token covers the
+  complete horizontal marker bounds without an inset, so raw marker glyphs
+  cannot remain visible at either rounded edge.
 - New-session text, attachments, workspace, Agent, and runtime options are one
   view-local draft. Navigating to an existing session hides but does not reset
   that draft; reopening restores it. Clear it only on explicit Cancel or after

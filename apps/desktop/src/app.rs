@@ -54749,6 +54749,20 @@ impl VibexWorkbench {
 
         let text = input.read(cx).value().to_string();
         let visible_rows = input.read(cx).visible_row_range();
+        // `range_to_bounds` reports a box measured inside the textarea's own
+        // frame, so the viewport it is clipped against has to be that frame. The
+        // tracked `input_bounds` belongs to the slot wrapping the textarea: a
+        // different box with its own padding, which scrolls and grows with the
+        // surface. Comparing the two offsets made a marker that is plainly on
+        // screen fail the test, drop its chip and leave the raw `attachment_…_vbx`
+        // marker showing. The slot stays as the fallback for the frame before the
+        // textarea has laid itself out.
+        let textarea_bounds = input.read(cx).input_bounds();
+        let viewport_bounds = if textarea_bounds.is_empty() {
+            input_bounds
+        } else {
+            textarea_bounds
+        };
         let (preview_width, preview_height) = composer_image_hover_preview_max_size(
             self.last_visibility.layout.viewport_width as f32,
             self.last_visibility.layout.viewport_height as f32,
@@ -54765,7 +54779,7 @@ impl VibexWorkbench {
                     return None;
                 }
                 let bounds = input.read(cx).range_to_bounds(&range)?;
-                if !composer_attachment_bounds_are_visible(bounds, input_bounds) {
+                if !composer_attachment_bounds_are_visible(bounds, viewport_bounds) {
                     return None;
                 }
                 let attachment = inline_attachment.attachment;
@@ -69945,13 +69959,20 @@ fn composer_buffer_row_for_offset(text: &str, offset: usize) -> usize {
         .count()
 }
 
+/// Whether a marker's laid-out box still has any pixel inside the input viewport.
+///
+/// The overlay paints over the marker text, so the two must appear together:
+/// whenever the textarea has a row partially in view, the chip has to be
+/// painted over it. Requiring the whole box to fit inside the viewport made a
+/// row clipped by the top or bottom edge drop its chip while its marker text was
+/// still painted, which showed the raw `attachment_…_vbx` marker instead. Any
+/// overlap means some of the text is on screen, so it is exactly the condition
+/// under which the chip must be drawn too.
 fn composer_attachment_bounds_are_visible(
     bounds: Bounds<Pixels>,
     input_bounds: Bounds<Pixels>,
 ) -> bool {
     bounds.intersects(&input_bounds)
-        && bounds.top() >= input_bounds.top()
-        && bounds.bottom() <= input_bounds.bottom()
 }
 
 /// The `@` references one composer document carries, in reading order.
@@ -97423,6 +97444,81 @@ mod tests {
         });
     }
 
+    /// A marker pasted onto a row clipped by the viewport keeps its chip.
+    ///
+    /// This is the shape of the reported failure: the textarea paints the marker
+    /// text for a row that is only partly on screen, so if the overlay drops the
+    /// chip for that row the user reads the raw `attachment_…_vbx` marker. The
+    /// chip has to exist whenever the marker's box has any overlap with the
+    /// textarea's own viewport.
+    #[gpui::test]
+    fn composer_paste_keeps_the_chip_on_a_row_clipped_by_the_viewport(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let input_slot = Rc::new(RefCell::new(None));
+        let input_slot_for_view = input_slot.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            // A short auto-grow cap, so the fixture's draft is taller than the
+            // frame and its last row is clipped by the bottom edge.
+            let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 2));
+            *input_slot_for_view.borrow_mut() = Some(input.clone());
+            let probe = cx.new(|_| ComposerPasteScrollProbe { input });
+            gpui_component::Root::new(probe, window, cx)
+        });
+        let input = input_slot
+            .borrow()
+            .clone()
+            .expect("composer input should be created with the root view");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let marker = inline_composer_attachment_marker(1);
+        // Seven filler rows plus the marker row: the textarea's frame shows part
+        // of the eighth row, so the marker sits on the clipped bottom edge.
+        let mut rows = (0..7)
+            .map(|row| format!("filler row {row}"))
+            .collect::<Vec<_>>();
+        rows.push(marker.clone());
+        let text = rows.join("\n");
+        let start = text.find(&marker).expect("marker should be present");
+        let range = start..start + marker.len();
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.set_value(text.clone(), window, cx));
+        });
+
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                let _ = window.draw(cx);
+            });
+        }
+
+        input.read_with(cx, |input, _| {
+            let viewport = input.input_bounds();
+            let bounds = input
+                .range_to_bounds(&range)
+                .expect("a marker in the painted text should be laid out");
+
+            // The fixture has to reproduce the reported shape, or it would keep
+            // passing without the fix: the last row hangs over the bottom edge.
+            assert!(
+                bounds.bottom() > viewport.bottom(),
+                "the marker row should be clipped by the viewport: \
+                 marker {bounds:?} viewport {viewport:?}"
+            );
+            // The row is on screen, so its chip has to be painted too. The old
+            // strict-containment test rejected exactly this case, leaving the
+            // raw marker glyphs exposed.
+            assert!(
+                composer_attachment_bounds_are_visible(bounds, viewport),
+                "a partly visible marker row must keep its chip: \
+                 marker {bounds:?} viewport {viewport:?}"
+            );
+        });
+    }
+
     #[test]
     fn composer_queue_send_mode_defaults_to_auto_and_manual_keeps_force_send_available() {
         let session = VibexSessionId::parse("session_queue_mode").unwrap();
@@ -100175,6 +100271,57 @@ mod tests {
             input_bounds
         ));
         assert!(!composer_attachment_bounds_are_visible(above, input_bounds));
+    }
+
+    /// A marker whose row is only partly on screen still paints its text, so it
+    /// must still paint its chip.
+    ///
+    /// The overlay draws over the marker, and the marker is plain text the
+    /// textarea paints for any row that is even partly inside the viewport. A
+    /// row clipped by the top or bottom edge therefore used to keep the text and
+    /// lose the chip, which is the raw `attachment_…_vbx` marker a user saw. Any
+    /// vertical overlap is enough to require the chip, and only a box completely
+    /// outside the viewport may drop it.
+    #[test]
+    fn inline_composer_attachment_overlay_covers_rows_clipped_by_the_viewport() {
+        let input_bounds = Bounds {
+            origin: point(px(20.0), px(40.0)),
+            size: Size {
+                width: px(400.0),
+                height: px(80.0),
+            },
+        };
+        let clipped_at_top = Bounds {
+            origin: point(px(32.0), px(28.0)),
+            size: Size {
+                width: px(160.0),
+                height: px(20.0),
+            },
+        };
+        let clipped_at_bottom = Bounds {
+            origin: point(px(32.0), px(112.0)),
+            size: Size {
+                width: px(160.0),
+                height: px(20.0),
+            },
+        };
+        let below = Bounds {
+            origin: point(px(32.0), px(208.0)),
+            size: Size {
+                width: px(160.0),
+                height: px(20.0),
+            },
+        };
+
+        assert!(composer_attachment_bounds_are_visible(
+            clipped_at_top,
+            input_bounds
+        ));
+        assert!(composer_attachment_bounds_are_visible(
+            clipped_at_bottom,
+            input_bounds
+        ));
+        assert!(!composer_attachment_bounds_are_visible(below, input_bounds));
     }
 
     #[test]
