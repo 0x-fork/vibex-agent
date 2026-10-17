@@ -1700,6 +1700,25 @@ pub struct MobileApp {
     nearby_discovery_generation: u64,
     lan_pairing_task: Option<Task<()>>,
     operation_busy: bool,
+    /// How many prompts this phone has submitted whose turn has not finished.
+    ///
+    /// The wire call for a submit resolves only when the whole turn does, so
+    /// this is what keeps that round trip from being mistaken for "the composer
+    /// is busy". It is the phone's own proof that a turn is live even before
+    /// the authority's `Running` snapshot lands — and the reason a prompt typed
+    /// during one waits in the queue instead of being dropped. It is a count
+    /// rather than a flag because stopping a turn can hand the queue the next
+    /// prompt while the interrupted submission is still on the wire.
+    turn_submissions_in_flight: usize,
+    /// A stop this phone has asked for, and the queued prompt waiting on it.
+    ///
+    /// There is no native steering on the wire, so "send now" means what it
+    /// means on the desktop: stop the running turn, then submit this message as
+    /// a resend so the transcript keeps the history of what it interrupted. The
+    /// entry stays in the queue until the stop lands, so a refused interrupt
+    /// costs the reader nothing.
+    turn_interrupt_in_flight: bool,
+    composer_queue_after_interrupt: Option<u64>,
     fork_session_busy: bool,
     new_session_busy: bool,
     new_session_open: bool,
@@ -3847,6 +3866,9 @@ impl MobileApp {
             nearby_discovery_generation: 0,
             lan_pairing_task: None,
             operation_busy: false,
+            turn_submissions_in_flight: 0,
+            turn_interrupt_in_flight: false,
+            composer_queue_after_interrupt: None,
             fork_session_busy: false,
             new_session_busy: false,
             new_session_open: false,
@@ -11346,7 +11368,13 @@ impl MobileApp {
     }
 
     fn send_message(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.operation_busy || self.runtime_switch_busy_generation.is_some() {
+        // A prompt is judged against the *turn*, not against the composer's own
+        // bookkeeping. `operation_busy` used to cover both, and because the
+        // wire call that submits a prompt answers only when the whole turn
+        // does, the phone spent every turn believing its composer was busy: the
+        // field looked idle, the tap did nothing, and the message that should
+        // have been waiting in the queue was never taken.
+        if self.composer_busy() || self.runtime_switch_busy_generation.is_some() {
             return;
         }
         // An armed edit owns the field: the same button means "replace" until
@@ -11366,11 +11394,7 @@ impl MobileApp {
             return;
         }
         self.composer_armed_command = None;
-        let running = self
-            .controller
-            .as_ref()
-            .and_then(|controller| controller.state.active_session.value.as_ref())
-            .is_some_and(|session| session.state == AgentSessionState::Running);
+        let running = self.session_turn_live();
         let mentions = self.armed_mentions(cx);
         let attachments = std::mem::take(&mut self.composer_attachments);
         self.composer_armed_mentions.clear();
@@ -11389,6 +11413,40 @@ impl MobileApp {
             Some(window),
             cx,
         );
+    }
+
+    /// Whether the composer is holding an operation that owns it outright.
+    ///
+    /// A live turn is deliberately *not* one of those: writing while the Agent
+    /// works is what the queue is for, and stopping a turn has to stay reachable
+    /// for the whole time the turn runs. What this covers is the work that
+    /// really does take the field away — a rewrite, a command, a connection, a
+    /// runtime switch, a goal change.
+    fn composer_busy(&self) -> bool {
+        self.operation_busy
+    }
+
+    /// Whether the open session has a turn occupying the Agent.
+    ///
+    /// The phone knows this two ways: the authority's own live snapshot, and a
+    /// submit of its own still on the wire. The second one is why this cannot
+    /// just read the session: the RPC that sends a prompt resolves when the turn
+    /// does, so for the whole length of a turn the client that started it is
+    /// waiting on a call that has not answered yet. Treating that wait as "the
+    /// screen is busy" is what made a second prompt unsendable from the phone.
+    fn session_turn_live(&self) -> bool {
+        if self.turn_submissions_in_flight > 0 {
+            return true;
+        }
+        self.controller
+            .as_ref()
+            .and_then(|controller| controller.state.active_session.value.as_ref())
+            .is_some_and(|session| {
+                matches!(
+                    session.state,
+                    AgentSessionState::Running | AgentSessionState::NeedsInput
+                )
+            })
     }
 
     /// Holds a prompt until the open session's turn settles.
@@ -11464,6 +11522,26 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// Drops every prompt waiting for the open session.
+    ///
+    /// Scoped to the session on screen, the way the rows above it are: clearing
+    /// here must not reach into another session's queue, which the reader
+    /// cannot even see.
+    fn clear_composer_queue(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        self.composer_queue
+            .retain(|message| message.session_id != session_id);
+        self.composer_queue_drag = None;
+        self.mark_composer_state_dirty(cx);
+        cx.notify();
+    }
+
     /// Takes a queued prompt back into the field so it can be rewritten.
     fn edit_queued_message(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self
@@ -11481,8 +11559,89 @@ impl MobileApp {
         cx.notify();
     }
 
-    /// Pushes one queued prompt into the live turn instead of waiting.
+    /// Pushes one queued prompt out ahead of the turn that is holding it back.
+    ///
+    /// The wire has no native steering: `send_message` on a session whose turn
+    /// is live is refused by the authority with `agent_turn_already_running`,
+    /// so a steered delivery is not something this client can ask for. "Now"
+    /// therefore means what the desktop's own resend action means — stop the
+    /// running turn, then submit this message as the turn's `Resend`, so the
+    /// transcript records that it interrupted one instead of reading as an
+    /// ordinary prompt. The entry only leaves the queue once that interrupt has
+    /// actually landed, so a refused stop costs the reader nothing.
     fn send_queued_message_now(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.composer_queue.iter().all(|message| message.id != id) {
+            return;
+        }
+        if self.composer_busy() {
+            return;
+        }
+        // A settled session has nothing to interrupt: the message simply goes.
+        if !self.session_turn_live() {
+            self.dispatch_queued_message_now(id, UserMessageDelivery::Prompt, cx);
+            return;
+        }
+        if self.turn_interrupt_in_flight {
+            return;
+        }
+        let Some(controller) = self.controller.as_mut() else {
+            return;
+        };
+        let Some(session_id) = controller.state.selected_session_id.clone() else {
+            return;
+        };
+        let request = MutationRequest::new(session_id);
+        let ticket = match controller.begin_interrupt(&request) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.fail(error);
+                cx.notify();
+                return;
+            }
+        };
+        let future = controller.interrupt(request);
+        // The marker is what turns a successful stop into the submission. It is
+        // installed before the call is spawned so a fast answer cannot arrive
+        // before the queue knows what it stopped for.
+        self.composer_queue_after_interrupt = Some(id);
+        self.turn_interrupt_in_flight = true;
+        let runner = gpui_tokio::Tokio::spawn(cx, future);
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.turn_interrupt_in_flight = false;
+                let mutation_error = this.controller.as_mut().and_then(|controller| {
+                    controller.apply_simple_mutation(&ticket, outcome);
+                    controller.state.latest_mutation.error.clone()
+                });
+                let stopped = mutation_error.is_none();
+                if let Some(error) = mutation_error {
+                    // The turn is still running, so the entry stays where the
+                    // reader left it and the message is still theirs to place.
+                    this.composer_queue_after_interrupt = None;
+                    this.fail(error);
+                }
+                if stopped && let Some(id) = this.composer_queue_after_interrupt.take() {
+                    this.dispatch_queued_message_now(id, UserMessageDelivery::Resend, cx);
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Sends one queued prompt that the caller has already decided may go.
+    ///
+    /// This is the queue's own release: the entry is taken out first so the
+    /// dispatch cannot see it as still waiting, and put back if the submission
+    /// is refused before it left.
+    fn dispatch_queued_message_now(
+        &mut self,
+        id: u64,
+        delivery: UserMessageDelivery,
+        cx: &mut Context<Self>,
+    ) {
         let Some(index) = self
             .composer_queue
             .iter()
@@ -11492,18 +11651,6 @@ impl MobileApp {
         };
         let message = self.composer_queue.remove(index);
         self.mark_composer_state_dirty(cx);
-        let running = self
-            .controller
-            .as_ref()
-            .and_then(|controller| controller.state.active_session.value.as_ref())
-            .is_some_and(|session| session.state == AgentSessionState::Running);
-        // An explicit "now" means the same thing the old Send meant while a turn
-        // was live: steer into that turn rather than queue behind it.
-        let delivery = if running {
-            UserMessageDelivery::Steer
-        } else {
-            UserMessageDelivery::Prompt
-        };
         self.submit_prompt(
             message.text,
             message.attachments,
@@ -11932,7 +12079,13 @@ impl MobileApp {
     /// Called wherever the state can have settled: an event batch, a finished
     /// mutation, or a fresh session snapshot.
     fn maybe_dispatch_next_queued_message(&mut self, cx: &mut Context<Self>) {
-        if self.operation_busy || self.runtime_switch_busy_generation.is_some() {
+        if self.composer_busy() || self.runtime_switch_busy_generation.is_some() {
+            return;
+        }
+        // A turn still on the wire is a turn still running, even when the last
+        // snapshot the phone has says otherwise: releasing the head now would
+        // hand the authority a second prompt it can only refuse.
+        if self.turn_submissions_in_flight > 0 {
             return;
         }
         let Some(controller) = self.controller.as_ref() else {
@@ -11988,7 +12141,10 @@ impl MobileApp {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        if self.operation_busy || self.runtime_switch_busy_generation.is_some() {
+        // Every prompt leaves by this one path, including the queue's own
+        // releases, so this is where "the composer is busy" has to mean work
+        // that owns the field — never the turn the prompt is being sent into.
+        if self.composer_busy() || self.runtime_switch_busy_generation.is_some() {
             return;
         }
         let Some(controller) = self.controller.as_mut() else {
@@ -12105,7 +12261,12 @@ impl MobileApp {
         restore_composer: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.operation_busy = true;
+        // This call answers when the turn it started is over, so its whole wait
+        // is one live turn — not a busy composer. Recording it separately is
+        // what lets the reader keep writing into the queue while it runs, and
+        // what keeps the queue from releasing its head into a turn the
+        // authority would refuse.
+        self.turn_submissions_in_flight += 1;
         self.rebuild_timeline_turns();
         self.timeline_list.scroll_to_end();
         let runner = gpui_tokio::Tokio::spawn(cx, future);
@@ -12113,7 +12274,7 @@ impl MobileApp {
             let outcome = flatten_join(runner.await);
             let failed = outcome.is_err();
             let _ = entity.update(cx, |this, cx| {
-                this.operation_busy = false;
+                this.turn_submissions_in_flight = this.turn_submissions_in_flight.saturating_sub(1);
                 let mutation_error = this.controller.as_mut().and_then(|controller| {
                     controller.apply_timeline_mutation(&ticket, outcome);
                     controller.state.latest_mutation.error.clone()
@@ -12129,8 +12290,10 @@ impl MobileApp {
                 if failed && let Some(text) = restore_composer {
                     this.pending_composer_restore = Some(text);
                 }
-                // A send that worked may have been the head of the queue, and a
-                // turn that has settled is exactly what releases the next one.
+                // The turn this submission was waiting on has settled, so the
+                // next queued prompt is exactly what may go now. A send the
+                // controller rejected cannot have settled anything, so it
+                // leaves the queue armed for the event that does.
                 if !mutation_failed {
                     this.maybe_dispatch_next_queued_message(cx);
                 }
@@ -12142,7 +12305,7 @@ impl MobileApp {
     }
 
     fn interrupt(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.operation_busy {
+        if self.operation_busy || self.turn_interrupt_in_flight {
             return;
         }
         let Some(controller) = self.controller.as_mut() else {
@@ -12161,18 +12324,25 @@ impl MobileApp {
             }
         };
         let future = controller.interrupt(request);
-        self.operation_busy = true;
+        self.turn_interrupt_in_flight = true;
         let runner = gpui_tokio::Tokio::spawn(cx, future);
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
-                this.operation_busy = false;
+                this.turn_interrupt_in_flight = false;
                 let mutation_error = this.controller.as_mut().and_then(|controller| {
                     controller.apply_simple_mutation(&ticket, outcome);
                     controller.state.latest_mutation.error.clone()
                 });
+                let stopped = mutation_error.is_none();
                 if let Some(error) = mutation_error {
                     this.fail(error);
+                }
+                // The turn is gone, so whatever the reader wrote ahead may go
+                // now. A stop that failed settled nothing and leaves the queue
+                // armed for the completion that does.
+                if stopped {
+                    this.maybe_dispatch_next_queued_message(cx);
                 }
                 cx.notify();
             });
@@ -21141,16 +21311,23 @@ impl MobileApp {
         // An image on its own is a prompt: the manager takes a message whose
         // text is empty as long as it carries an attachment.
         let has_content = has_text || !self.composer_attachments.is_empty();
-        let send_enabled = has_content && state.is_some() && !self.operation_busy;
+        // A live turn does not close the composer. It changes what Send means:
+        // the prompt is held in the queue above the field and goes out when the
+        // turn settles, which is the only way a phone can write ahead.
+        let turn_live = running || self.turn_submissions_in_flight > 0;
+        let send_enabled = has_content && state.is_some() && !self.composer_busy();
         let attach_enabled = state.is_some()
-            && !self.operation_busy
+            && !self.composer_busy()
             && self.composer_attachments.len() < MOBILE_MAX_COMPOSER_ATTACHMENTS;
         let editing_message = self.composer_message_edit.is_some();
-        let stop_enabled = state.is_some() && !self.operation_busy && !runtime_switch_pending;
+        let stop_enabled = state.is_some()
+            && !self.composer_busy()
+            && !self.turn_interrupt_in_flight
+            && !runtime_switch_pending;
         // The single primary control is Stop only while a turn runs and there
         // is nothing to send; the moment the reader writes anything it is Send
         // again, so the field and the button never disagree about the action.
-        let primary_stop = running && !has_content;
+        let primary_stop = turn_live && !has_content;
         // The clock is a permanent resident of the card's top-right corner
         // whenever a session is open, so the field's clearance and the control
         // itself do not jump as the reader types. It only becomes armed — and
@@ -21487,11 +21664,15 @@ impl MobileApp {
                                     if editing_message {
                                         locale::text("Replace message", "替换消息", "取代訊息")
                                             .to_string()
-                                    } else if running {
+                                    } else if turn_live {
+                                        // A live turn cannot take a prompt over
+                                        // the wire, so this is not a steer: the
+                                        // message is held and goes out when the
+                                        // turn settles.
                                         locale::text(
-                                            "Steer the turn",
-                                            "引导当前回合",
-                                            "引導目前回合",
+                                            "Queue for the turn",
+                                            "排入队列，回合结束后发送",
+                                            "排入佇列，回合結束後傳送",
                                         )
                                         .to_string()
                                     } else {
@@ -22684,13 +22865,17 @@ impl MobileApp {
     /// The prompts waiting for the running turn to finish.
     ///
     /// One row per message: tapping the row puts it back in the field to edit,
-    /// the arrow pushes it into the live turn now, the cross drops it.
+    /// the arrow sends it now — stopping the turn if one is live, the way the
+    /// desktop's resend does — and the cross drops it. The heading above the
+    /// rows is what tells the reader the list exists at all; the phone has no
+    /// hover, and a bare stack of cards used to read as part of the field.
     fn render_composer_queue(
         &self,
         queued: &[MobileQueuedMessage],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let drag = self.composer_queue_drag;
+        let count = queued.len();
         div()
             .id("mobile-composer-queue")
             .debug_selector(|| "mobile-composer-queue".to_string())
@@ -22698,83 +22883,11 @@ impl MobileApp {
             .flex()
             .flex_col()
             .gap(px(theme::SPACING_XS))
-            // The rows are one fixed pitch, so recording the list's own top
-            // edge is enough to resolve a touch to a row without threading
-            // per-row bounds through paint.
-            .child({
-                let frame = self.composer_queue_frame.clone();
-                let drag_entity = cx.weak_entity();
-                gpui::canvas(
-                    move |bounds, _, _| {
-                        frame.set((f32::from(bounds.origin.y), f32::from(bounds.size.height)));
-                    },
-                    move |bounds, _, window, _| {
-                        window.on_mouse_event({
-                            let entity = drag_entity.clone();
-                            move |event: &LongPressEvent,
-                                  phase: DispatchPhase,
-                                  _: &mut Window,
-                                  cx: &mut gpui::App| {
-                                if phase != DispatchPhase::Bubble
-                                    || !bounds.contains(&event.position)
-                                {
-                                    return;
-                                }
-                                if let Some(entity) = entity.upgrade() {
-                                    entity.update(cx, |this, cx| {
-                                        this.on_queue_row_long_press(event, cx)
-                                    });
-                                }
-                            }
-                        });
-                    },
-                )
-                .absolute()
-                .size_full()
-            })
-            .children(queued.iter().enumerate().map(|(index, message)| {
-                let edit_id = message.id;
-                let send_id = message.id;
-                let remove_id = message.id;
-                let position = index + 1;
-                let summary = if message.text.trim().is_empty() {
-                    format!(
-                        "{} ({})",
-                        locale::common("Image"),
-                        message.attachments.len()
-                    )
-                } else {
-                    message.text.clone()
-                };
-                let lifted = drag.is_some_and(|drag| drag.id == message.id);
-                let drop_gap =
-                    drag.is_some_and(|drag| drag.id != message.id && drag.target_index == index);
+            .child(
                 div()
-                    .id(format!("mobile-composer-queue-row-{}", message.id))
-                    .min_h(px(theme::TOUCH_TARGET))
-                    .rounded(px(theme::RADIUS_CARD))
-                    .border_1()
-                    .border_color(if lifted {
-                        theme::primary()
-                    } else {
-                        theme::border_default()
-                    })
-                    .when(drop_gap, |row| row.border_color(theme::primary()))
-                    .bg(theme::bg_card())
-                    .when(lifted, |row| row.opacity(0.75))
                     .flex()
                     .items_center()
                     .gap(px(theme::SPACING_XS))
-                    .pl(px(theme::SPACING_MD))
-                    .pr(px(theme::SPACING_XS))
-                    .cursor_pointer()
-                    .active(|style| style.bg(theme::row_pressed_bg()))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            this.edit_queued_message(edit_id, window, cx)
-                        }),
-                    )
                     .child(
                         svg()
                             .path("icons/clock.svg")
@@ -22784,90 +22897,235 @@ impl MobileApp {
                     )
                     .child(
                         div()
-                            .min_w_0()
                             .flex_1()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_size(theme::font_caption())
-                                    .text_color(theme::text_secondary())
-                                    .child(summary),
-                            )
-                            .child(
-                                div()
-                                    .text_size(theme::font_micro())
-                                    .text_color(theme::text_muted())
-                                    .child(format!(
-                                        "#{position} · {}",
-                                        locale::text("Queued", "已排队", "已排隊")
-                                    )),
-                            ),
+                            .min_w_0()
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_muted())
+                            .child(if count == 1 {
+                                locale::text(
+                                    "1 message waiting for this turn",
+                                    "1 条消息等待当前回合结束",
+                                    "1 則訊息等待目前回合結束",
+                                )
+                                .to_string()
+                            } else {
+                                format!(
+                                    "{} {}",
+                                    count,
+                                    locale::text(
+                                        "messages waiting for this turn",
+                                        "条消息等待当前回合结束",
+                                        "則訊息等待目前回合結束",
+                                    )
+                                )
+                            }),
                     )
                     .child(
                         div()
-                            .id(format!("mobile-composer-queue-send-{}", message.id))
-                            .size(px(36.0))
+                            .id("mobile-composer-queue-clear")
+                            .debug_selector(|| "mobile-composer-queue-clear".to_string())
                             .flex_shrink_0()
+                            .h(px(28.0))
+                            .px(px(theme::SPACING_SM))
                             .rounded(px(theme::RADIUS_CONTROL))
                             .flex()
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
                             .aria_label(
-                                locale::text(
-                                    "Send into the turn now",
-                                    "立即插入当前回合",
-                                    "立即插入目前回合",
-                                )
-                                .to_string(),
+                                locale::text("Clear the queue", "清空队列", "清空佇列").to_string(),
                             )
                             .active(|style| style.bg(theme::row_pressed_bg()))
                             .on_mouse_up(
                                 MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.send_queued_message_now(send_id, cx);
+                                cx.listener(|this, _, _, cx| {
+                                    this.clear_composer_queue(cx);
                                 }),
                             )
                             .child(
-                                svg()
-                                    .path("icons/arrow-to-top.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::accent_blue()),
+                                div()
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_muted())
+                                    .child(locale::text("Clear", "清空", "清空")),
                             ),
-                    )
-                    .child(
+                    ),
+            )
+            // The rows live in their own box so the frame the drag resolves a
+            // touch against starts at the first row, not at the heading.
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::SPACING_XS))
+                    // The rows are one fixed pitch, so recording the list's own
+                    // top edge is enough to resolve a touch to a row without
+                    // threading per-row bounds through paint.
+                    .child({
+                        let frame = self.composer_queue_frame.clone();
+                        let drag_entity = cx.weak_entity();
+                        gpui::canvas(
+                            move |bounds, _, _| {
+                                frame.set((
+                                    f32::from(bounds.origin.y),
+                                    f32::from(bounds.size.height),
+                                ));
+                            },
+                            move |bounds, _, window, _| {
+                                window.on_mouse_event({
+                                    let entity = drag_entity.clone();
+                                    move |event: &LongPressEvent,
+                                          phase: DispatchPhase,
+                                          _: &mut Window,
+                                          cx: &mut gpui::App| {
+                                        if phase != DispatchPhase::Bubble
+                                            || !bounds.contains(&event.position)
+                                        {
+                                            return;
+                                        }
+                                        if let Some(entity) = entity.upgrade() {
+                                            entity.update(cx, |this, cx| {
+                                                this.on_queue_row_long_press(event, cx)
+                                            });
+                                        }
+                                    }
+                                });
+                            },
+                        )
+                        .absolute()
+                        .size_full()
+                    })
+                    .children(queued.iter().enumerate().map(|(index, message)| {
+                        let edit_id = message.id;
+                        let send_id = message.id;
+                        let remove_id = message.id;
+                        let position = index + 1;
+                        let summary = if message.text.trim().is_empty() {
+                            format!(
+                                "{} ({})",
+                                locale::common("Image"),
+                                message.attachments.len()
+                            )
+                        } else {
+                            message.text.clone()
+                        };
+                        let lifted = drag.is_some_and(|drag| drag.id == message.id);
+                        let drop_gap = drag.is_some_and(|drag| {
+                            drag.id != message.id && drag.target_index == index
+                        });
                         div()
-                            .id(format!("mobile-composer-queue-remove-{}", message.id))
-                            .size(px(36.0))
-                            .flex_shrink_0()
-                            .rounded(px(theme::RADIUS_CONTROL))
+                            .id(format!("mobile-composer-queue-row-{}", message.id))
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .rounded(px(theme::RADIUS_CARD))
+                            .border_1()
+                            .border_color(if lifted {
+                                theme::primary()
+                            } else {
+                                theme::border_default()
+                            })
+                            .when(drop_gap, |row| row.border_color(theme::primary()))
+                            .bg(theme::bg_card())
+                            .when(lifted, |row| row.opacity(0.75))
                             .flex()
                             .items_center()
-                            .justify_center()
+                            .gap(px(theme::SPACING_XS))
+                            .pl(px(theme::SPACING_MD))
+                            .pr(px(theme::SPACING_XS))
                             .cursor_pointer()
-                            .aria_label(locale::common("Remove").to_string())
                             .active(|style| style.bg(theme::row_pressed_bg()))
                             .on_mouse_up(
                                 MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.remove_queued_message(remove_id, cx);
+                                cx.listener(move |this, _, window, cx| {
+                                    this.edit_queued_message(edit_id, window, cx)
                                 }),
                             )
                             .child(
-                                svg()
-                                    .path("icons/x.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .text_color(theme::text_muted()),
-                            ),
-                    )
-            }))
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_size(theme::font_caption())
+                                            .text_color(theme::text_secondary())
+                                            .child(summary),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(theme::font_micro())
+                                            .text_color(theme::text_muted())
+                                            .child(format!(
+                                                "#{position} · {}",
+                                                locale::text("Queued", "已排队", "已排隊")
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("mobile-composer-queue-send-{}", message.id))
+                                    .size(px(36.0))
+                                    .flex_shrink_0()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .aria_label(
+                                        locale::text(
+                                            "Send this message now",
+                                            "立即发送这条消息",
+                                            "立即傳送這則訊息",
+                                        )
+                                        .to_string(),
+                                    )
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.send_queued_message_now(send_id, cx);
+                                        }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/arrow-to-top.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::accent_blue()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("mobile-composer-queue-remove-{}", message.id))
+                                    .size(px(36.0))
+                                    .flex_shrink_0()
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .aria_label(locale::common("Remove").to_string())
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.remove_queued_message(remove_id, cx);
+                                        }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/x.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_muted()),
+                                    ),
+                            )
+                    })),
+            )
             .into_any_element()
     }
 
@@ -36042,6 +36300,96 @@ mod tests {
         });
     }
 
+    /// A prompt written while a turn is live is taken, shown, and held — not
+    /// dropped.
+    ///
+    /// This is the bug the queue was invisible for. The RPC that submits a
+    /// prompt answers only when the whole turn does, so the phone spent every
+    /// turn with an operation in flight. The composer read that as "busy": the
+    /// field looked idle, Send did nothing, and the message that should have
+    /// been waiting above it was never enqueued.
+    #[gpui::test]
+    fn a_prompt_written_during_a_turn_waits_in_the_visible_queue(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().unwrap();
+        let session_id = VibexSessionId::parse("session_mobile_queue_visibility").unwrap();
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            // The composer only exists on the workspace page.
+            app.mode = RootMode::Workspace;
+            let backend = vibex_backend::DisconnectedBackend::facade();
+            let mut controller =
+                AgentWorkflowController::new(backend.agent().clone(), backend.capabilities().agent);
+            controller.state.selected_session_id = Some(session_id.clone());
+            controller.state.active_session.resolve(AgentSession {
+                id: session_id.clone(),
+                title: "Queue visibility".to_string(),
+                project_id: vibex_core::ProjectId::parse("project_queue").unwrap(),
+                workspace_id: vibex_core::WorkspaceId::parse("workspace_queue").unwrap(),
+                workspace_root: "/tmp/queue".to_string(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                agent_id: AgentId::parse("claude").unwrap(),
+                state: AgentSessionState::Running,
+                safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                last_message_at_ms: 0,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            });
+            app.controller = Some(controller);
+            app
+        });
+        cx.run_until_parked();
+
+        // The exact production state while a turn runs: this phone has already
+        // submitted the prompt that started it, and that RPC has not answered
+        // because it only answers when the turn does. The old gate read this as
+        // a busy composer and returned without taking the message.
+        app.update(cx, |app, _| {
+            app.turn_submissions_in_flight = 1;
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.session_turn_live(), "a running session is a live turn");
+            assert!(
+                !app.composer_busy(),
+                "a turn on the wire must not close the composer"
+            );
+        });
+
+        // Write, then send. Send must take the prompt rather than refuse it.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.composer_input.update(cx, |input, cx| {
+                    input.set_value("and then one more", window, cx);
+                });
+            });
+            let _ = window.draw(cx);
+        });
+        click_mobile_control(cx, "send-message");
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.composer_queue.len(),
+                1,
+                "the prompt was taken instead of dropped"
+            );
+            assert_eq!(app.composer_queue[0].text, "and then one more");
+            assert_eq!(app.composer_queue[0].session_id, session_id);
+        });
+        // The queue is on screen while the turn it waits for is still running.
+        assert!(
+            cx.debug_bounds("mobile-composer-queue").is_some(),
+            "a held prompt is visible above the composer"
+        );
+        assert!(
+            cx.debug_bounds("mobile-composer-queue-clear").is_some(),
+            "the queue names itself and offers to be cleared"
+        );
+    }
+
     /// A repaint is where the Android keyboard is told what the focused field
     /// holds, so a held Backspace has something to repeat against.
     #[gpui::test]
@@ -41278,6 +41626,49 @@ fn session_opened(cx: &mut Context<Self>) {
         ] {
             assert!(empty, "{text:?} is no longer typing the trigger");
         }
+    }
+
+    /// A live turn never closes the composer it is written from.
+    ///
+    /// The submit RPC answers only when the turn it started does, so a phone
+    /// that treated "an operation is in flight" as "the composer is busy" spent
+    /// every turn unable to take a second prompt — the queue above the field
+    /// stayed empty because nothing was ever put in it. The two states are
+    /// separate now, and this pins that apart at the source level so the next
+    /// edit to the send path cannot quietly merge them again.
+    #[test]
+    fn a_live_turn_does_not_close_the_composer() {
+        let source = include_str!("app.rs");
+        let send = renderer_source(source, "send_message");
+        assert!(
+            send.contains("self.composer_busy()"),
+            "Send gates on the composer's own work, not on the turn"
+        );
+        assert!(
+            send.contains("self.session_turn_live()"),
+            "and it asks the turn separately, because a live turn means queue"
+        );
+        assert!(
+            !send.contains("self.operation_busy ||"),
+            "the turn's own submission must not read as a busy composer"
+        );
+
+        let submit = renderer_source(source, "submit_prompt");
+        assert!(
+            submit.contains("self.composer_busy()"),
+            "the one exit a prompt leaves by uses the same split"
+        );
+
+        let spawn = renderer_source(source, "spawn_timeline_mutation");
+        assert!(
+            spawn.contains("self.turn_submissions_in_flight += 1")
+                && spawn.contains("saturating_sub(1)"),
+            "a submit on the wire is counted as a live turn, and released when it answers"
+        );
+        assert!(
+            !spawn.contains("self.operation_busy = true"),
+            "a turn is not the composer's busy state"
+        );
     }
 
     /// Send and Stop are one control, and Stop is the fallback state.
