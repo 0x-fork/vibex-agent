@@ -30626,11 +30626,10 @@ fn new_session_slogan_words(locale: Locale) -> (&'static str, &'static str, &'st
 /// The page's chips name the model and the mode it will run with, and neither
 /// names the Agent — the Agent is the choice the page exists to make, so the
 /// sentence carries its mark, in the place the reader's language leaves for it.
-/// The connector and the phrase share the title's ink, because the line is one
-/// sentence rather than a label with a footnote; the weight alone separates the
-/// words from the grammar between them. The mark is the shortest way into the
-/// Agent's own settings, so it keeps a full touch target of its own inside the
-/// line.
+/// The whole line is one voice: the connector is part of the sentence, so it is
+/// drawn at the same size, weight and ink as the words it joins, and only the
+/// Agent's mark stands out of it. The mark is the shortest way into the Agent's
+/// own settings, so it keeps a full touch target of its own inside the line.
 ///
 /// A page with no Agent chosen yet says only the sentence: naming one before
 /// the reader has picked it would answer a question the page is still asking.
@@ -30638,23 +30637,17 @@ fn new_session_slogan_line(
     agent: Option<(&AgentId, &str)>,
     cx: &mut Context<MobileApp>,
 ) -> gpui::AnyElement {
-    let phrase = |text: &'static str| {
+    let words = |text: &'static str| {
         div()
             .text_size(theme::font_title())
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme::text_primary())
             .child(text)
     };
-    let connector = |text: &'static str| {
-        div()
-            .text_size(theme::font_title())
-            .text_color(theme::text_primary())
-            .child(text)
-    };
     let Some((agent_id, agent_label)) = agent else {
         return div()
             .debug_selector(|| "mobile-new-session-slogan".to_string())
-            .child(phrase(locale::text(
+            .child(words(locale::text(
                 "Start something new",
                 "开始新的工作",
                 "開始新的工作",
@@ -30693,14 +30686,14 @@ fn new_session_slogan_line(
         ));
     let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(4);
     if !lead.is_empty() {
-        children.push(phrase(lead).into_any_element());
+        children.push(words(lead).into_any_element());
     }
     if !connector_text.is_empty() {
-        children.push(connector(connector_text).into_any_element());
+        children.push(words(connector_text).into_any_element());
     }
     children.push(mark.into_any_element());
     if !trail.is_empty() {
-        children.push(phrase(trail).into_any_element());
+        children.push(words(trail).into_any_element());
     }
     div()
         .id("mobile-new-session-slogan")
@@ -39692,6 +39685,19 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             line.contains("theme::scaled_px(theme::NEW_SESSION_AGENT_LOGO_SIZE)"),
             "the mark tracks the title it stands in, not a frozen pixel box"
+        );
+        // One voice for the whole line: every word goes through the one closure,
+        // so no part of the sentence is set in a different ink or weight.
+        assert_eq!(
+            line.matches(".font_weight(FontWeight::SEMIBOLD)").count(),
+            1,
+            "the sentence's words share one weight"
+        );
+        assert!(
+            line.contains("words(connector_text)")
+                && line.contains("words(lead)")
+                && line.contains("words(trail)"),
+            "the connector is drawn exactly like the words it joins"
         );
         assert!(
             !line.contains("text_muted()"),
