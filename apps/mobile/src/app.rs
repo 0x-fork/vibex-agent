@@ -19474,7 +19474,6 @@ impl MobileApp {
                                 "mobile-session-group-tab:{}",
                                 tab.session_id.as_str()
                             ))
-                            .relative()
                             .flex_shrink_0()
                             .max_w(px(180.0))
                             .h(px(36.0))
@@ -19523,19 +19522,6 @@ impl MobileApp {
                                     .child(title),
                             )
                             .child(status)
-                            // The top bar the desktop's selected tab wears.
-                            .when(active, |tab| {
-                                tab.child(
-                                    div()
-                                        .absolute()
-                                        .left_0()
-                                        .right_0()
-                                        .top_0()
-                                        .h(px(2.0))
-                                        .rounded_full()
-                                        .bg(theme::accent_green().opacity(0.80)),
-                                )
-                            })
                     })),
             )
             .into_any_element()
@@ -42317,6 +42303,17 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(
             !strip.contains("session_state_color"),
             "the old bare state dot is gone"
+        );
+        // The selection already says itself with the green border and plate.
+        // The desktop's top bar was a second statement of the same fact, and
+        // on a phone it read as a stray rule above the tab.
+        assert!(
+            !strip.contains("desktop's selected tab wears"),
+            "a selected tab carries no top bar of its own"
+        );
+        assert!(
+            !strip.contains("h(px(2.0))"),
+            "and no hairline is drawn across it"
         );
     }
 
