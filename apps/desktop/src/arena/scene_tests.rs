@@ -202,3 +202,48 @@ fn authored_guardian_colors_are_identical_on_light_and_dark_home_surfaces(
         }
     });
 }
+#[test]
+fn the_baked_ground_reproduces_the_floor_palette_behind_a_clamped_border() {
+    for guardian in Guardian::ALL {
+        let raster = art::floor(guardian);
+        let colors = palette::material_colors(guardian).map(Rgba::from);
+        let image = bake_ground(guardian);
+        let frame = image
+            .as_bytes(0)
+            .expect("a baked ground image holds one frame");
+        let (width, height) = (
+            (raster.width + 2 * GROUND_BORDER) * GROUND_SUPERSAMPLE,
+            (raster.height + 2 * GROUND_BORDER) * GROUND_SUPERSAMPLE,
+        );
+        assert_eq!(frame.len(), width * height * 4, "{guardian:?}");
+        // The screen-space mapping `paint_ground` builds treats the border as
+        // `GROUND_BORDER` raster pixels, so every interior texel must resolve
+        // back to the ink at that raster pixel.
+        for (x, y) in [
+            (GROUND_SUPERSAMPLE, GROUND_SUPERSAMPLE),
+            (width / 2, height / 2),
+            (width - GROUND_SUPERSAMPLE - 1, height - GROUND_SUPERSAMPLE - 1),
+        ] {
+            let sx = x / GROUND_SUPERSAMPLE - GROUND_BORDER;
+            let sy = y / GROUND_SUPERSAMPLE - GROUND_BORDER;
+            let color = colors[raster.pixels[sy * raster.width + sx] as usize];
+            let pixel = &frame[(y * width + x) * 4..(y * width + x) * 4 + 4];
+            assert_eq!(
+                [
+                    (color.r * 255.0).round() as u8,
+                    (color.g * 255.0).round() as u8,
+                    (color.b * 255.0).round() as u8,
+                ],
+                [pixel[2], pixel[1], pixel[0]],
+                "{guardian:?} at ({x}, {y})"
+            );
+            assert_eq!(pixel[3], 255, "{guardian:?} at ({x}, {y})");
+        }
+        // The border repeats the edge so the linear sampler cannot bleed a
+        // neighbouring atlas tile in at the seam.
+        let edge = &frame[..4];
+        let just_inside = &frame[(GROUND_SUPERSAMPLE * 4)..(GROUND_SUPERSAMPLE * 4 + 4)];
+        assert_eq!(edge, just_inside, "{guardian:?} top edge");
+    }
+}
+
