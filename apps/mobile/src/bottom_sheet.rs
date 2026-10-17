@@ -1472,7 +1472,11 @@ mod tests {
 
         // A downward pull that is let go short of a dismissal goes back to the
         // resting height, which is where it already was.
-        let _ = sheet.pull(SheetKey::AgentQuestion, SheetPan::Started { dy: 60.0 }, SIZE);
+        let _ = sheet.pull(
+            SheetKey::AgentQuestion,
+            SheetPan::Started { dy: 60.0 },
+            SIZE,
+        );
         let _ = sheet.pull(SheetKey::AgentQuestion, SheetPan::Ended, SIZE);
         assert!(
             !sheet.settled_at_a_new_height(SheetKey::AgentQuestion),
