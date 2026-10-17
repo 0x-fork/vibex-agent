@@ -1111,3 +1111,36 @@ fn the_turn_answer_carries_no_left_rail() {
         "the conclusion is still its own block in the turn"
     );
 }
+
+/// The turn header reads `logo · Worked for 20s · ▸`, as the desktop's does.
+///
+/// The Agent's mark leads the line rather than trailing it: it answers "who did
+/// this?" before the reader reads how long it took, and it is what the desktop
+/// paints at the start of the same header.
+#[test]
+fn the_turn_header_leads_with_the_agent_mark() {
+    let source = include_str!("timeline.rs");
+    let (_, tail) = source
+        .split_once("fn render_turn_process_header(")
+        .expect("the turn header should stay inspectable");
+    let body = &tail[..tail.find("\n    pub(super) fn ").unwrap_or(tail.len())];
+
+    let logo = body
+        .find("turn-process-agent:")
+        .expect("the header should carry the Agent's mark");
+    let label = body
+        .find(".child(label)")
+        .expect("the header should carry the duration label");
+    let chevron = body
+        .find("disclosure_icon(expanded)")
+        .expect("the header should carry its disclosure chevron");
+
+    assert!(
+        logo < label,
+        "the mark leads the label: the reader learns who ran the turn first"
+    );
+    assert!(
+        label < chevron,
+        "the chevron closes the line, the way the desktop's does"
+    );
+}
