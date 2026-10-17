@@ -3,6 +3,7 @@
 //! opens covers the session page exactly as the home page covers its own.
 
 use super::*;
+use crate::arena::combat::Phase;
 use crate::arena::guardian::IDLE_LOOP;
 use crate::arena::init as arena_init;
 use gpui::{
@@ -60,9 +61,10 @@ struct Harness {
     companion: Entity<Companion>,
     input: Entity<InputState>,
     reward: Option<&'static str>,
+    best_ms: Option<u64>,
     running: bool,
     reduced: bool,
-    awakened: Vec<&'static str>,
+    awakened: Vec<(&'static str, u64)>,
     _observed: Subscription,
     _awakened: Subscription,
 }
@@ -72,13 +74,14 @@ impl Harness {
         let companion = cx.new(|_| Companion::new());
         let observed = cx.observe(&companion, |_, _, cx| cx.notify());
         let awakened = cx.subscribe(&companion, |this, _, event: &Awakened, cx| {
-            this.awakened.push(event.key);
+            this.awakened.push((event.key, event.clear_ms));
             cx.notify();
         });
         Self {
             companion,
             input,
             reward: Some("claude"),
+            best_ms: None,
             running: true,
             reduced: false,
             awakened: Vec::new(),
@@ -95,9 +98,10 @@ impl Harness {
 }
 impl Render for Harness {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let lane = lane(
+        let lane = lane_with_best(
             &self.companion,
             self.reward,
+            self.best_ms,
             self.running,
             Some(self.input.read(cx).focus_handle(cx)),
             self.reduced,
@@ -158,6 +162,23 @@ fn drive(
         cx.notify();
     });
     draw(cx);
+}
+
+/// The duel the lane opens shows the persisted pace to beat, not a blank clock:
+/// the session page has UI state, so it hands the record down with the lane.
+#[gpui::test]
+fn the_duel_shows_the_best_time_the_session_page_hands_down(cx: &mut TestAppContext) {
+    let (harness, cx) = open(cx);
+    harness.update(cx, |harness, cx| {
+        harness.best_ms = Some(64_200);
+        cx.notify();
+    });
+    draw(cx);
+    double_click(cx, "composer-companion");
+    let battle = harness.read_with(cx, |harness, cx| {
+        harness.companion.read(cx).battle.clone().unwrap()
+    });
+    assert_eq!(battle.read_with(cx, |view, _| view.best_ms), Some(64_200));
 }
 
 /// The model is fitted to the lane, and the lane is the composer's strip: a
@@ -388,6 +409,7 @@ fn a_won_duel_reports_the_unlock_it_was_reached_through(cx: &mut TestAppContext)
     });
     battle.update(cx, |view, cx| {
         view.clock = None;
+        view.arena.run_time = 42.5;
         view.arena.phase = Phase::Victory;
         view.arena.phase_time = 3.2;
         cx.notify();
@@ -399,7 +421,7 @@ fn a_won_duel_reports_the_unlock_it_was_reached_through(cx: &mut TestAppContext)
     assert!(battle.read_with(cx, |view, _| view.closed));
     assert_eq!(
         harness.read_with(cx, |harness, _| harness.awakened.clone()),
-        vec!["claude"]
+        vec![("claude", 42_500)]
     );
     assert!(cx.debug_bounds("composer-companion-duel").is_none());
 }

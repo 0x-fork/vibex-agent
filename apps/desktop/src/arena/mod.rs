@@ -2,6 +2,7 @@
 //! in that exact surface. Session drafts and Agent runtime state stay untouched.
 
 mod art;
+mod clock;
 mod combat;
 mod companion;
 mod copy;
@@ -14,15 +15,19 @@ mod scene;
 mod scenery;
 mod sculpture;
 
-pub(crate) use companion::{Companion, lane as companion_lane, session_surface};
+pub(crate) use companion::{Companion, lane_with_best as companion_lane, session_surface};
 
-/// A won encounter: the guardian whose reward effect is now unlocked.
+/// A won encounter: the guardian whose reward effect is now unlocked, and the
+/// clear time the win recorded.
 ///
 /// It is emitted by every surface that can end a duel, so a victory on the home
 /// page and a victory over a session reach the same persisted state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Awakened {
     pub key: &'static str,
+    /// The winning run, in whole milliseconds. It is the record this victory
+    /// offers; a slower win leaves the stored best untouched.
+    pub clear_ms: u64,
 }
 
 /// The guardian key an Agent's reward is stored under, if it has one.
@@ -85,6 +90,10 @@ pub(crate) struct HomeArena {
     selected: Option<Guardian>,
     agent_id: Option<String>,
     completed: bool,
+    /// The fastest recorded win for the selected guardian, as the workbench last
+    /// read it from persisted state. The duel shows it as the pace to beat, and
+    /// a faster win updates it here so a replay sees the new record.
+    best_ms: Option<u64>,
 }
 impl EventEmitter<Awakened> for HomeArena {}
 impl HomeArena {
@@ -99,17 +108,31 @@ impl HomeArena {
             selected: Some(Guardian::Claude),
             agent_id: None,
             completed: false,
+            best_ms: None,
         }
     }
     /// Called from draft selection events, never as a side effect of rendering.
-    pub(crate) fn select_agent(&mut self, id: Option<&str>, cx: &mut Context<Self>) {
+    ///
+    /// `best_ms` is the persisted fastest win for the Agent's guardian, read by
+    /// the workbench. The arena never reads UI state itself.
+    pub(crate) fn select_agent(
+        &mut self,
+        id: Option<&str>,
+        best_ms: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
         if self.agent_id.as_deref() == id {
+            if self.best_ms != best_ms {
+                self.best_ms = best_ms;
+                cx.notify();
+            }
             return;
         }
         self.close(cx);
         self.agent_id = id.map(str::to_owned);
         self.selected = id.and_then(Guardian::from_agent);
         self.completed = false;
+        self.best_ms = best_ms;
         self.preview_seed = 0.0;
         if let Some(guardian) = self.selected {
             self.preview.set(scene::PreviewSample::at(
@@ -130,17 +153,19 @@ impl HomeArena {
         }
         init(cx);
         let sample = self.preview.get();
-        let battle = cx.new(|cx| ArenaView::new(sample, window, cx));
+        let best_ms = self.best_ms;
+        let battle = cx.new(|cx| ArenaView::new(sample, best_ms, window, cx));
         self.dismissal = Some(cx.subscribe_in(
             &battle,
             window,
             |this, battle, _: &DismissEvent, window, cx| {
-                this.completed = battle.read(cx).arena.phase == Phase::Victory;
-                if this.completed
-                    && let Some(guardian) = this.selected
-                {
+                let clear_ms = battle.read(cx).arena.clear_millis();
+                this.completed = clear_ms.is_some();
+                if let (Some(clear_ms), Some(guardian)) = (clear_ms, this.selected) {
+                    this.best_ms = Some(this.best_ms.map_or(clear_ms, |best| best.min(clear_ms)));
                     cx.emit(Awakened {
                         key: guardian.key(),
+                        clear_ms,
                     });
                 }
                 this.close(cx);
@@ -285,6 +310,10 @@ fn banner(state: &Entity<HomeArena>, window: &mut Window, cx: &mut App) -> AnyEl
 struct ArenaView {
     arena: Arena,
     entry: Option<scene::PreviewViewport>,
+    /// The pace to beat when this duel began. It stays fixed for the whole
+    /// duel: the clock derives what to display from it, so a faster win shows
+    /// itself while a slower replay keeps the stored record on screen.
+    best_ms: Option<u64>,
     focus: FocusHandle,
     keys: BTreeSet<String>,
     mouse_shoot: bool,
@@ -302,7 +331,12 @@ struct ArenaView {
 }
 impl EventEmitter<DismissEvent> for ArenaView {}
 impl ArenaView {
-    fn new(sample: scene::PreviewSample, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        sample: scene::PreviewSample,
+        best_ms: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
         let blur = cx.on_blur(&focus, window, |view, _, cx| view.pause(cx));
         let activation = cx.observe_window_activation(window, |view, window, cx| {
@@ -317,6 +351,7 @@ impl ArenaView {
         Self {
             arena: Arena::from_preview(sample.boss, sample.time, seed),
             entry: sample.viewport,
+            best_ms,
             focus,
             keys: BTreeSet::new(),
             mouse_shoot: false,
@@ -558,6 +593,7 @@ impl Render for ArenaView {
             motion::reduced_motion(cx),
             self.paused && self.started,
         );
+        let clock = clock::face(&self.arena, self.best_ms);
         div()
             .id("unbound-game")
             .debug_selector(|| "unbound-game".into())
@@ -596,6 +632,12 @@ impl Render for ArenaView {
                     .on_mouse_move(cx.listener(Self::mouse_move))
                     .child(board),
             )
+            .child(crate::arena::clock::clock_overlay(
+                clock,
+                // The clock arrives and leaves with the field it times.
+                self.arena.ground_visibility(),
+                cx,
+            ))
             .child(
                 div()
                     .debug_selector(|| "unbound-hint".into())

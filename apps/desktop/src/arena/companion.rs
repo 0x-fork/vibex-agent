@@ -8,7 +8,7 @@
 
 use super::{
     ArenaView, Awakened, art,
-    combat::{Boss, Guardian, Phase, smoothstep},
+    combat::{Boss, Guardian, smoothstep},
     copy,
     map::CENTER,
     motion, palette,
@@ -84,6 +84,9 @@ pub(crate) struct Companion {
     sample: Rc<Cell<Option<PreviewSample>>>,
     /// Where the keyboard returns when a duel ends.
     composer_focus: Option<FocusHandle>,
+    /// The pace to beat for the guardian whose duel is about to open. The
+    /// session page reads persisted state and hands it down with the lane.
+    best_ms: Option<u64>,
     battle: Option<Entity<ArenaView>>,
     dismissal: Option<Subscription>,
 }
@@ -99,6 +102,7 @@ impl Companion {
             roam: Rc::new(Cell::new(0.0)),
             sample: Rc::new(Cell::new(None)),
             composer_focus: None,
+            best_ms: None,
             battle: None,
             dismissal: None,
         }
@@ -192,20 +196,24 @@ impl Companion {
         let Some(sample) = self.sample.get() else {
             return;
         };
-        let battle = cx.new(|cx| ArenaView::new(sample, window, cx));
+        let best_ms = self.best_ms;
+        let battle = cx.new(|cx| ArenaView::new(sample, best_ms, window, cx));
         let focus = self.composer_focus.clone();
         self.dismissal = Some(cx.subscribe_in(
             &battle,
             window,
             move |this, battle, _: &DismissEvent, window, cx| {
-                if battle.read(cx).arena.phase == Phase::Victory
+                if let Some(clear_ms) = battle.read(cx).arena.clear_millis()
                     && let Some(guardian) = this.guardian
                 {
                     // The duel was only reachable because this reward was
                     // already unlocked, so a replayed victory only ever
-                    // re-reports the same fact.
+                    // re-reports the same unlock — but its clear time can still
+                    // be a new record.
+                    this.best_ms = Some(this.best_ms.map_or(clear_ms, |best| best.min(clear_ms)));
                     cx.emit(Awakened {
                         key: guardian.key(),
+                        clear_ms,
                     });
                 }
                 this.battle = None;
@@ -280,9 +288,15 @@ fn lane_x(lane_width: f32, badge_width: f32, across: f32) -> f32 {
 ///
 /// The lane is built here as the strip it always was; where it is mounted — in
 /// flow, or absolutely above the composer's own edge — is the page's decision.
-pub(crate) fn lane(
+/// `lane`, with the persisted best clear time for the reward's guardian.
+///
+/// The session page owns UI state, so it passes the record down rather than
+/// letting the arena read it: a duel opened over a session must show the same
+/// pace to beat as one opened from the home page.
+pub(crate) fn lane_with_best(
     state: &Entity<Companion>,
     reward: Option<&str>,
+    best_ms: Option<u64>,
     running: bool,
     focus: Option<FocusHandle>,
     reduced: bool,
@@ -292,6 +306,7 @@ pub(crate) fn lane(
     // workbench, and a roaming model is exactly the motion it turns off. The
     // companion is still told the turn ended, so nothing is left half-dived.
     state.update(cx, |companion, cx| {
+        companion.best_ms = best_ms;
         companion.track(reward, running && !reduced, focus, cx)
     });
     let (guardian, stage, frames, sample, lane_width, roam) = {

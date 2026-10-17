@@ -140,8 +140,9 @@ impl Render for Home {
                                 .debug_selector(move || format!("home-agent-{id}"))
                                 .label(id)
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.arena
-                                        .update(cx, |arena, cx| arena.select_agent(Some(id), cx))
+                                    this.arena.update(cx, |arena, cx| {
+                                        arena.select_agent(Some(id), None, cx)
+                                    })
                                 }))
                         }),
                     ),
@@ -513,4 +514,87 @@ fn the_battle_fills_the_home_at_narrow_widths_and_zoom_levels(cx: &mut TestAppCo
         let projection = view.read_with(cx, |v, _| v.projection.get().unwrap());
         assert!(projection.unit > px(0.0));
     }
+}
+
+/// The clock sits in the field's top-left corner, never in the corner the exit
+/// mark owns, and a win reports the time it took so the workbench can record it.
+#[gpui::test]
+fn the_pixel_clock_runs_in_the_corner_and_a_win_reports_its_clear_time(cx: &mut TestAppContext) {
+    let (home, cx) = open_home(cx);
+    click(cx, "unbound-boss-entry");
+    let view = battle_view(&home, cx);
+    let page = cx.debug_bounds("new-session-home").unwrap();
+    let clock = cx.debug_bounds("unbound-clock").unwrap();
+    assert!(
+        clock.left() >= page.left(),
+        "the clock stays inside the field"
+    );
+    assert!(clock.top() >= page.top());
+    assert!(
+        clock.right() < page.center().x,
+        "the clock keeps to the top-left corner"
+    );
+    assert!(
+        cx.debug_bounds("unbound-exit").unwrap().left() > clock.right(),
+        "the exit mark keeps its own corner"
+    );
+    awaken(&view, cx);
+    view.update(cx, |view, cx| {
+        view.clock = None;
+        view.arena.run_time = 21.75;
+        view.arena.phase = Phase::Victory;
+        view.arena.phase_time = 3.2;
+        cx.notify();
+    });
+    draw(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.arena.clear_millis()),
+        Some(21_750),
+        "the winning run is what the record is taken from"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.best_ms),
+        None,
+        "the duel never rewrites the pace it was opened with"
+    );
+    for _ in 0..24 {
+        view.update(cx, |view, cx| view.step(view.controls(), cx));
+        draw(cx);
+    }
+    assert!(view.read_with(cx, |view, _| view.closed));
+    assert!(
+        home.read_with(cx, |home, cx| home.arena.read(cx).completed),
+        "a won run still completes the encounter"
+    );
+}
+
+/// A duel handed an existing record shows it, and a slower win never replaces
+/// it; only a faster one does.
+#[gpui::test]
+fn a_replay_keeps_the_faster_record_and_a_faster_run_replaces_it(cx: &mut TestAppContext) {
+    let (home, cx) = open_home(cx);
+    home.update(cx, |home, cx| {
+        home.arena.update(cx, |arena, cx| {
+            arena.select_agent(Some("claude"), Some(12_000), cx)
+        });
+    });
+    draw(cx);
+    click(cx, "unbound-boss-entry");
+    let view = battle_view(&home, cx);
+    assert_eq!(view.read_with(cx, |view, _| view.best_ms), Some(12_000));
+    view.update(cx, |view, cx| {
+        view.clock = None;
+        view.arena.run_time = 30.0;
+        view.arena.phase = Phase::Victory;
+        view.arena.phase_time = 3.2;
+        cx.notify();
+    });
+    draw(cx);
+    let slower = view.read_with(cx, |view, _| clock::face(&view.arena, view.best_ms));
+    assert_eq!(slower.record_ms(), Some(12_000));
+    assert!(!slower.improved(), "a slower win leaves the record alone");
+    view.update(cx, |view, _| view.arena.run_time = 9.5);
+    let faster = view.read_with(cx, |view, _| clock::face(&view.arena, view.best_ms));
+    assert_eq!(faster.record_ms(), Some(9_500));
+    assert!(faster.improved(), "a faster win becomes the new record");
 }

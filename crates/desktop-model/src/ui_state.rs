@@ -507,20 +507,33 @@ pub fn background_image_file_name_is_valid(file_name: &str) -> bool {
         && BACKGROUND_IMAGE_EXTENSIONS.contains(&extension)
 }
 
-/// The AI Souls encounters this user has already won.
+/// The AI Souls encounters this user has already won, and their best clear
+/// times.
 ///
 /// A victory is permanent: it unlocks the defeated guardian's reward effect —
 /// the small companion that roams the strip above an Agent session's composer —
 /// and that unlock is never taken back, so re-entering an encounter can only
 /// ever add to this set. Guardians are stored by their canonical Agent key, the
 /// same token a session's Agent id resolves to.
+///
+/// A clear time only ever improves: a slower win leaves the stored record
+/// untouched, and the record is displayed in the duel's top-left clock so a
+/// replay shows the pace to beat.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArenaUiState {
     /// Canonical Agent keys whose guardian has been defeated at least once.
     #[serde(default)]
     pub unlocked: BTreeSet<String>,
+    /// The fastest recorded win against each guardian, in milliseconds, keyed by
+    /// the same canonical Agent key as `unlocked`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub best_times: BTreeMap<String, u64>,
 }
+
+/// The longest clear time a record may store. An encounter cannot plausibly run
+/// for a day, so anything longer is corrupt state rather than a slow victory.
+pub const ARENA_BEST_TIME_LIMIT_MS: u64 = 24 * 60 * 60 * 1_000;
 
 impl ArenaUiState {
     /// Whether this guardian's reward effect is unlocked.
@@ -538,6 +551,36 @@ impl ArenaUiState {
         self.unlocked.insert(guardian.to_string())
     }
 
+    /// The fastest clear time recorded for this guardian, in milliseconds.
+    pub fn best_time(&self, guardian: &str) -> Option<u64> {
+        self.best_times.get(guardian.trim()).copied()
+    }
+
+    /// Offers a clear time for this guardian. Returns whether it became the new
+    /// record, so a caller only has to persist the state when it changed.
+    ///
+    /// A record must be a positive, plausible duration; a slower or equal win
+    /// never replaces the one already stored.
+    pub fn record_best(&mut self, guardian: &str, millis: u64) -> bool {
+        let guardian = guardian.trim();
+        if guardian.is_empty()
+            || guardian.chars().count() > 64
+            || millis == 0
+            || millis > ARENA_BEST_TIME_LIMIT_MS
+        {
+            return false;
+        }
+        if self
+            .best_times
+            .get(guardian)
+            .is_some_and(|best| *best <= millis)
+        {
+            return false;
+        }
+        self.best_times.insert(guardian.to_string(), millis);
+        true
+    }
+
     fn normalize(&mut self) {
         // The same bound `unlock` enforces: Agent keys are short, so anything
         // longer than one is not a key this state ever wrote.
@@ -546,6 +589,18 @@ impl ArenaUiState {
             .filter_map(|key| {
                 let key = key.trim();
                 (!key.is_empty() && key.chars().count() <= 64).then(|| key.to_string())
+            })
+            .take(16)
+            .collect();
+        self.best_times = std::mem::take(&mut self.best_times)
+            .into_iter()
+            .filter_map(|(key, millis)| {
+                let key = key.trim();
+                (!key.is_empty()
+                    && key.chars().count() <= 64
+                    && millis > 0
+                    && millis <= ARENA_BEST_TIME_LIMIT_MS)
+                    .then(|| (key.to_string(), millis))
             })
             .take(16)
             .collect();
@@ -4174,6 +4229,96 @@ mod tests {
             state.arena.unlocked,
             BTreeSet::from(["claude".to_string()]),
             "only a bounded, non-empty key survives normalization"
+        );
+    }
+
+    /// A clear time only ever improves, and it survives a save and load.
+    #[test]
+    fn the_fastest_clear_time_is_kept_and_only_a_faster_win_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = UiStateStore::new(&dir.path().join("desktop-ui-state.json"));
+
+        let mut state = DesktopUiStateV1::default();
+        assert_eq!(state.arena.best_time("claude"), None);
+        assert!(state.arena.record_best("claude", 21_500));
+        assert_eq!(state.arena.best_time("claude"), Some(21_500));
+        assert!(
+            !state.arena.record_best("claude", 30_000),
+            "a slower win is not a change"
+        );
+        assert!(
+            !state.arena.record_best("claude", 21_500),
+            "an equal win is not a change"
+        );
+        assert_eq!(state.arena.best_time("claude"), Some(21_500));
+        assert!(state.arena.record_best("claude", 18_250));
+        assert_eq!(state.arena.best_time("claude"), Some(18_250));
+        assert_eq!(
+            state.arena.best_time("codex"),
+            None,
+            "records do not leak between guardians"
+        );
+        assert!(
+            !state.arena.record_best("   ", 9_000),
+            "a blank key is not a win"
+        );
+        assert!(
+            !state.arena.record_best("claude", 0),
+            "a zero-length run is not a time"
+        );
+        assert!(
+            !state
+                .arena
+                .record_best("claude", ARENA_BEST_TIME_LIMIT_MS + 1),
+            "an implausible duration is rejected"
+        );
+        store.save(&state).unwrap();
+
+        let loaded = store.load_or_default(2_000).unwrap().state;
+        assert_eq!(loaded.arena.best_time("claude"), Some(18_250));
+    }
+
+    /// State written before clear times were recorded must keep loading, and
+    /// must land on "no pace to beat".
+    #[test]
+    fn best_times_default_to_empty_when_state_predates_them() {
+        let mut state = DesktopUiStateV1::default();
+        state.arena.unlock("claude");
+        let mut value = serde_json::to_value(&state).unwrap();
+        value
+            .as_object_mut()
+            .and_then(|value| value.get_mut("arena"))
+            .and_then(|arena| arena.as_object_mut())
+            .expect("arena state should serialize")
+            .remove("bestTimes");
+        let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(decoded.arena.best_times.is_empty());
+        assert_eq!(decoded.arena.best_time("claude"), None);
+        assert!(
+            decoded.arena.is_unlocked("claude"),
+            "the unlock that predates the record still stands"
+        );
+    }
+
+    #[test]
+    fn best_times_normalize_their_keys_and_values() {
+        let mut state = DesktopUiStateV1::default();
+        state
+            .arena
+            .best_times
+            .insert("  claude  ".to_string(), 12_000);
+        state.arena.best_times.insert("   ".to_string(), 9_000);
+        state.arena.best_times.insert("a".repeat(200), 9_000);
+        state.arena.best_times.insert("codex".to_string(), 0);
+        state
+            .arena
+            .best_times
+            .insert("pi".to_string(), ARENA_BEST_TIME_LIMIT_MS + 1);
+        state.normalize().unwrap();
+        assert_eq!(
+            state.arena.best_times,
+            BTreeMap::from([("claude".to_string(), 12_000)]),
+            "only a bounded key and a plausible duration survive normalization"
         );
     }
 

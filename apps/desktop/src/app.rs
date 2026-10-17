@@ -10089,11 +10089,15 @@ impl VibexWorkbench {
             // fought on the home page or over a session.
             cx.subscribe(
                 &home_arena,
-                |this, _, event: &crate::arena::Awakened, cx| this.unlock_companion(event.key, cx),
+                |this, _, event: &crate::arena::Awakened, cx| {
+                    this.unlock_companion(event.key, event.clear_ms, cx)
+                },
             ),
             cx.subscribe(
                 &session_companion,
-                |this, _, event: &crate::arena::Awakened, cx| this.unlock_companion(event.key, cx),
+                |this, _, event: &crate::arena::Awakened, cx| {
+                    this.unlock_companion(event.key, event.clear_ms, cx)
+                },
             ),
             cx.subscribe_in(
                 &command_palette_input,
@@ -34012,23 +34016,73 @@ impl VibexWorkbench {
 
     fn sync_home_arena_agent(&mut self, cx: &mut Context<Self>) {
         let agent = self.new_session_agent_id.as_ref().map(AgentId::as_str);
+        // The arena shows the pace to beat; the persisted record lives here, so
+        // it is read on the way in and never from the arena's render path.
+        let best = agent
+            .and_then(crate::arena::reward_key)
+            .and_then(|key| self.ui_state.arena.best_time(key));
         self.home_arena
-            .update(cx, |arena, cx| arena.select_agent(agent, cx));
+            .update(cx, |arena, cx| arena.select_agent(agent, best, cx));
     }
 
     /// Draft-local Agent switch shared by the new-session home chips and the
     /// provider/model Agent row, so both surfaces derive the same provider and
     /// model preference for the chosen Agent.
     fn apply_new_session_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let previous = self.new_session_agent_id.clone();
         let preferred = self.preferred_new_session_runtime_for_agent(&agent_id);
         let selection = self.runtime_catalog.as_ref().and_then(|catalog| {
             new_session_runtime_selection_for_agent(catalog, Some(&agent_id), preferred.as_ref())
         });
         self.set_new_session_runtime_selection(selection);
-        self.new_session_agent_id = Some(agent_id);
+        self.new_session_agent_id = Some(agent_id.clone());
+        self.begin_new_session_logo_swap(previous.as_ref(), &agent_id, cx);
         self.sync_home_arena_agent(cx);
         self.new_session_error = None;
         self.refresh_active_suggestions(ComposerTarget::NewSession, cx);
+    }
+
+    /// Start the sentence's mark crossing to the Agent just chosen.
+    ///
+    /// The page is only drawn while a new session is being written, so a switch
+    /// on a page nobody is looking at begins no animation: the mark the reader
+    /// next sees is the right one, at rest, rather than the tail of a cut that
+    /// played to an empty room. Choosing the Agent already chosen is not a
+    /// change and gets no cut either — pressing the active chip twice must not
+    /// make the mark leave and come back.
+    fn begin_new_session_logo_swap(
+        &mut self,
+        previous: Option<&AgentId>,
+        chosen: &AgentId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(previous) = previous.filter(|previous| *previous != chosen) else {
+            self.new_session_logo_swap = None;
+            return;
+        };
+        if !self.new_session_open || motion::reduced_motion(cx) {
+            self.new_session_logo_swap = None;
+            return;
+        }
+        let (Some(previous), Some(chosen)) = (
+            self.agent_snapshot(previous),
+            self.agent_snapshot(chosen),
+        ) else {
+            self.new_session_logo_swap = None;
+            return;
+        };
+        self.new_session_logo_swap = Some(NewSessionLogoSwap {
+            from: agent_brand_identity(&previous),
+            to: agent_brand_identity(&chosen),
+        });
+    }
+
+    /// The Agent snapshot this catalogue entry describes, if any.
+    fn agent_snapshot(&self, agent_id: &AgentId) -> Option<AgentSnapshotEntry> {
+        self.agent_snapshots
+            .iter()
+            .find(|agent| agent.id == *agent_id)
+            .cloned()
     }
 
     fn submit_new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -41121,8 +41175,13 @@ impl VibexWorkbench {
     ///
     /// The unlock is permanent: it is written once and never removed, so a
     /// replayed duel only ever re-states a fact the state already holds.
-    fn unlock_companion(&mut self, guardian: &str, cx: &mut Context<Self>) {
-        if !self.ui_state.arena.unlock(guardian) {
+    fn unlock_companion(&mut self, guardian: &str, clear_ms: u64, cx: &mut Context<Self>) {
+        // A victory always unlocks; a faster one also replaces the record. Both
+        // return whether anything actually changed, so a slower replay never
+        // rewrites the state file.
+        let unlocked = self.ui_state.arena.unlock(guardian);
+        let recorded = self.ui_state.arena.record_best(guardian, clear_ms);
+        if !unlocked && !recorded {
             return;
         }
         self.queue_ui_state();
@@ -63428,11 +63487,16 @@ impl VibexWorkbench {
             .as_ref()
             .and_then(|selection| crate::arena::reward_key(selection.agent_id.as_str()))
             .filter(|key| self.ui_state.arena.is_unlocked(key));
+        // The duel this lane can open shows the same pace to beat as the home
+        // page's: the best clear time is read here, where UI state lives, and
+        // handed down through the lane.
+        let companion_best = companion_reward.and_then(|key| self.ui_state.arena.best_time(key));
         let reduced_motion = motion::reduced_motion(cx);
         let composer_companion = if enabled {
             crate::arena::companion_lane(
                 &self.session_companion,
                 companion_reward,
+                companion_best,
                 session_running,
                 Some(companion_focus),
                 reduced_motion,
@@ -91554,13 +91618,19 @@ mod tests {
         );
 
         assert!(
-            source
-                .contains("fn unlock_companion(&mut self, guardian: &str, cx: &mut Context<Self>)"),
+            source.contains(
+                "fn unlock_companion(&mut self, guardian: &str, clear_ms: u64, cx: &mut Context<Self>)"
+            ),
             "a victory is recorded through one unlock path"
         );
         assert!(
-            source.contains("this.unlock_companion(event.key, cx)"),
-            "both duel surfaces report their victories"
+            source.contains("this.unlock_companion(event.key, event.clear_ms, cx)"),
+            "both duel surfaces report their victories, and their clear times"
+        );
+        assert!(
+            composer.contains("self.ui_state.arena.best_time(key)")
+                && composer.contains("companion_best,"),
+            "a duel opened over a session shows the same pace to beat as the home page"
         );
     }
 

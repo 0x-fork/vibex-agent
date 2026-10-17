@@ -190,6 +190,10 @@ pub(super) struct Arena {
     pub effects: Vec<Effect>,
     pub hazards: Vec<Hazard>,
     pub elapsed: f32,
+    /// The duel's own wall clock: it starts when the intro ends, keeps counting
+    /// through deaths and rebirths, and freezes on victory so the recorded
+    /// clear time is the one the reader saw.
+    pub run_time: f32,
     pub visual_time: f32,
     pub phase_time: f32,
     pub camera: Vec2,
@@ -232,6 +236,7 @@ impl Arena {
             effects: Vec::with_capacity(MAX_EFFECTS),
             hazards: Vec::with_capacity(MAX_HAZARDS),
             elapsed: 0.0,
+            run_time: 0.0,
             visual_time: idle_time,
             phase_time: 0.0,
             camera: boss.position,
@@ -246,6 +251,22 @@ impl Arena {
     }
     pub fn outcome_ready(&self) -> bool {
         self.phase == Phase::Victory && self.phase_time >= VICTORY_DURATION
+    }
+    /// The clear time this run records, in whole milliseconds, once it has been
+    /// won. `None` while the duel is still running.
+    ///
+    /// The run clock starts as the intro hands control to the archer and keeps
+    /// counting through deaths, so a clear time measures the whole attempt
+    /// rather than one life. It freezes on victory, and it rounds up so a run
+    /// can never claim a tenth of a second it did not spend.
+    pub fn clear_millis(&self) -> Option<u64> {
+        if self.phase != Phase::Victory {
+            return None;
+        }
+        // A millisecond is the finest resolution the clock shows, so a run that
+        // has barely begun still records the smallest positive time instead of
+        // claiming an impossible zero.
+        Some(((self.run_time.max(0.0) * 1000.0).ceil() as u64).max(1))
     }
     pub fn home_opacity(&self) -> f32 {
         match self.phase {
@@ -287,12 +308,16 @@ impl Arena {
                 return;
             }
             Phase::Defeat => {
+                // Dying and coming back are part of the attempt, so the run
+                // clock keeps moving while the archer is down.
+                self.run_time += STEP;
                 if self.phase_time >= 1.0 {
                     self.respawn();
                 }
                 return;
             }
             Phase::Rebirth => {
+                self.run_time += STEP;
                 if self.phase_time >= 0.7 {
                     self.phase = Phase::Battle;
                     self.phase_time = 0.0;
@@ -305,6 +330,10 @@ impl Arena {
             }
             Phase::Battle => {}
         }
+        // The run clock belongs to the duel, not to one life: it is stepped for
+        // every live frame, before hit pauses and deaths can return early, so
+        // the recorded clear time measures the whole attempt.
+        self.run_time += STEP;
         if self.hit_pause > 0.0 {
             self.hit_pause -= STEP;
             return;

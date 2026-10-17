@@ -14,13 +14,16 @@ or network services.
 ```rust
 AppearanceUiState::show_home_arena: bool
 ArenaUiState::unlocked: BTreeSet<String> // canonical Agent keys of won encounters
+ArenaUiState::best_times: BTreeMap<String, u64> // fastest clear per key, in ms
 ArenaUiState::is_unlocked(&str) -> bool
 ArenaUiState::unlock(&str) -> bool // true only when the victory was new
+ArenaUiState::best_time(&str) -> Option<u64>
+ArenaUiState::record_best(&str, u64) -> bool // true only when it beat the stored record
 Guardian::key() -> &'static str // canonical Agent id an unlock is stored under
 arena::reward_key(&str) -> Option<&'static str> // Agent id, aliases included, to that key
-arena::Awakened { key: &'static str } // emitted by either duel surface on victory
+arena::Awakened { key: &'static str, clear_ms: u64 } // emitted by either duel surface on victory
 Companion::new() -> Companion
-arena::companion_lane(&Entity<Companion>, Option<&str>, bool, Option<FocusHandle>, bool, &mut App) -> Option<AnyElement>
+arena::companion_lane(&Entity<Companion>, Option<&str>, Option<u64>, bool, Option<FocusHandle>, bool, &mut App) -> Option<AnyElement>
 arena::session_surface(&Entity<Companion>, impl IntoElement, &mut App) -> AnyElement
 art::companion_box(Guardian) -> (i32, i32, i32, i32) // crop window around the ground anchor
 art::companion_height(Guardian) -> i32 // median idle pose height, in raster pixels
@@ -36,6 +39,7 @@ Arena::release_shot(Option<Vec2>)
 Arena::roll(Vec2)
 Arena::respawn()
 Arena::outcome_ready() -> bool
+Arena::clear_millis() -> Option<u64> // the winning run's time; None until victory
 Arena::brazier_lit() -> bool
 Boss::idle(Guardian, f32, bool) -> Boss // each form's own gait
 Boss::articulated(f32, f32, f32) -> Vec2 // model point after pivoted tilt
@@ -64,6 +68,11 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
   ever adds to it: replaying a duel, and losing one, never remove an unlock.
   Both duel surfaces emit `Awakened`, and the workbench writes the unlock
   through one path.
+- `arena.bestTimes` is the persisted pace to beat, keyed by the same canonical
+  Agent id and stored in milliseconds. It only ever improves: a slower or equal
+  win is not a change and does not rewrite the state file. Absent values decode
+  to "no record yet". `Awakened.clear_ms` carries the winning run, so the
+  workbench can both unlock and record through one event.
 - `HomeArena` owns Agent identity, the completed flag, an optional `ArenaView`,
   composer focus, and the last displayed `PreviewSample`. Catalog refresh,
   draft initialization, runtime choice, and Agent choice call
@@ -126,13 +135,37 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
   Flight height remains continuous; rolls, banks, squash and an open lid settle
   through the nearest upright pose. Reduced motion skips camera travel.
 - Battle fills the home area and remains clipped to it. There is no dialog,
-  header, instruction panel, selector, or result card. Only two overlays sit on
-  the field: a faint single line at the bottom with the game name and controls
-  (`copy::battle_hint`), and a small pixel-drawn exit mark in the top-right
-  corner that leaves like Escape and never fires an arrow. Neither gives a
-  guardian-specific clue; players discover each encounter themselves. The
-  roaming entry has an accessible label but no hover tooltip. Workbench
-  navigation remains available; the canvas has an accessible name.
+  header, instruction panel, selector, or result card. Only three overlays sit
+  on the field: a pixel clock in the top-left corner (see below), a faint single
+  line at the bottom with the game name and controls (`copy::battle_hint`), and
+  a small pixel-drawn exit mark in the top-right corner that leaves like Escape
+  and never fires an arrow. None gives a guardian-specific clue; players
+  discover each encounter themselves. The roaming entry has an accessible label
+  but no hover tooltip. Workbench navigation remains available; the canvas has
+  an accessible name.
+- The clock's live face shows `Arena::run_time`, the duel's own clock, not the
+  per-life `elapsed` counter: it starts as the intro hands control to the
+  archer and keeps counting through a death and its rebirth, because an attempt
+  is the whole duel. It freezes on victory and rounds up to whole milliseconds,
+  so a run never claims a tenth it did not spend and a barely-started win still
+  records a positive time. `Arena::clear_millis` is the only source a victory's
+  record is taken from.
+- The record is shown beneath the live face as the localized "Best …" line, or
+  "New best!" in the record ink on the victory that beat it. Before the first
+  win the line reads "No best yet". The clock derives the displayed record from
+  the pace it was opened with, so a slower replay keeps that pace on screen and
+  never replaces it, while a faster win shows itself. `HomeArena` retains the
+  win's time and the workbench persists it, so the next duel opens with it.
+- The clock face is authored raster content, not a font: a 3 × 5 cell face per
+  digit, a one-cell colon, and a one-cell period for the tenths, painted as
+  merged rectangles on whole pixels with a one-cell drop shadow
+  (`clock::clock_overlay`). It is pointer-transparent and never takes an aim
+  from the field. Its numbers are exposed as one accessible label. It fades
+  with the field's reveal so it cannot outlive the encounter.
+- The workbench owns the record. It reads `ArenaUiState::best_time` when it
+  syncs the home Agent (`select_agent(id, best_ms)`) and when it renders a
+  session composer's lane, and hands the value down; the arena never reads UI
+  state from a render path.
 - Death plays for one second, chooses a random clear spawn at a safe distance
   from the guardian, then materializes the archer for 0.7 seconds. It clears
   threats and input and starts a fresh opening delay without replaying entry.
@@ -321,6 +354,10 @@ rebirth, without a damage override.
 | Archer dies | Clear threats; random safe rebirth; no result card |
 | Guardian defeated | Finite departure, restored draft/focus, hidden preview until Agent changes |
 | Won encounter, first time | Persist the unlock under the canonical Agent key; later losses never remove it |
+| Won encounter, faster than the record | Replace the stored best and show "New best!" in the clock |
+| Won encounter, slower or equal to the record | Keep the stored best; unlock still persists |
+| State predates clear times | No best line, and a win still records one |
+| Duel started with a stored best | The clock shows it as the pace to beat on the home page and over a session |
 | Session Agent has no unlocked guardian | No lane, no badge, no reserved row |
 | Session turn not running | No lane; a turn that just ended dives once and then leaves |
 | Companion double-clicked | Duel over the session page, session elements gone, Escape returns |
@@ -375,7 +412,14 @@ rebirth, without a damage override.
   the crop to the same drawing, and that no idle pose reaches its window edge.
 - Preference tests retain legacy decoding and persisted opt-out coverage.
   Progress tests retain "absent state decodes to nothing defeated" and
-  "a repeat win is not a change".
+  "a repeat win is not a change". Clear-time tests retain "only a faster win
+  replaces the record", "an absent record decodes to none", and key/value
+  normalization on load.
+- Clock tests retain the `mm:ss.t` format, a square face for every character
+  the format can emit, the reserved row matching the painted digits, and the
+  run clock freezing on the victory it records. GPUI tests retain the clock's
+  top-left placement away from the exit mark, the winning run becoming the pace
+  to beat, and a slower replay keeping a faster record.
 - Run `cargo test -p vibex-desktop --lib arena:: --locked`,
   `cargo test -p vibex-desktop-model --locked`, formatting, and scoped Clippy.
   Measure dynamic rasterization and rectangle counts after artwork changes;
@@ -407,4 +451,11 @@ let pixel = unit / art::SCALE; // ~0.3px: quads collapse into noise
 
 // Correct: resample the crop to whole screen pixels, one ink each.
 let frame = art::companion(&boss, time, false).resample(fit.columns, fit.rows);
+
+// Wrong: timing one life instead of the attempt, or letting the clock restart.
+let elapsed = self.elapsed; // resets on respawn
+
+// Correct: the duel's own clock, frozen by victory and recorded from there.
+self.run_time += STEP; // through Battle, Defeat and Rebirth
+let clear_ms = self.clear_millis();
 ```
