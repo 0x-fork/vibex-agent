@@ -5247,34 +5247,7 @@ impl MobileWorkbench {
                     .items_center()
                     .gap(px(TOOLBAR_GAP))
                     .child(
-                        div()
-                            .h(px(WORKBENCH_CONTROL_SIZE))
-                            .min_w_0()
-                            .flex_1()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .bg(theme::workbench_panel_bg())
-                            .pl(px(theme::SPACING_SM))
-                            .pr(px(theme::SPACING_XS))
-                            .flex()
-                            .items_center()
-                            .gap(px(theme::SPACING_XS))
-                            .child(
-                                svg()
-                                    .path("icons/search.svg")
-                                    .size(px(theme::ICON_SM))
-                                    .flex_shrink_0()
-                                    .text_color(theme::text_muted()),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        crate::app::resume_keyboard_on_tap,
-                                    )
-                                    .child(input_element(self.file_search_input.as_ref())),
-                            )
+                        search_field(self.file_search_input.as_ref())
                             .when(search_loading, |bar| {
                                 bar.child(
                                     svg()
@@ -5796,59 +5769,29 @@ impl MobileWorkbench {
                     })
                     .when(history_active, |row| {
                         row.child(
-                            div()
-                                .h(px(WORKBENCH_CONTROL_SIZE))
-                                .min_w_0()
-                                .flex_1()
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .bg(theme::workbench_panel_bg())
-                                .pl(px(theme::SPACING_SM))
-                                .pr(px(theme::SPACING_XS))
-                                .flex()
-                                .items_center()
-                                .gap(px(theme::SPACING_XS))
-                                .child(
-                                    svg()
-                                        .path("icons/search.svg")
-                                        .size(px(theme::ICON_SM))
-                                        .flex_shrink_0()
-                                        .text_color(theme::text_muted()),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .on_mouse_down(
+                            search_field(self.git_history_query_input.as_ref()).when(
+                                !input_value(&self.git_history_query_input, cx)
+                                    .trim()
+                                    .is_empty(),
+                                |bar| {
+                                    bar.child(
+                                        inline_icon_button(
+                                            "clear-git-history-search",
+                                            "icons/x.svg",
+                                            "Clear commit search",
+                                        )
+                                        // Drawn without a handler, like the
+                                        // file search's own clear glyph: a
+                                        // reader who mistyped a hash had to
+                                        // erase it by hand to get back to
+                                        // the unfiltered list.
+                                        .on_mouse_up(
                                             MouseButton::Left,
-                                            crate::app::resume_keyboard_on_tap,
-                                        )
-                                        .child(input_element(
-                                            self.git_history_query_input.as_ref(),
-                                        )),
-                                )
-                                .when(
-                                    !input_value(&self.git_history_query_input, cx)
-                                        .trim()
-                                        .is_empty(),
-                                    |bar| {
-                                        bar.child(
-                                            inline_icon_button(
-                                                "clear-git-history-search",
-                                                "icons/x.svg",
-                                                "Clear commit search",
-                                            )
-                                            // Drawn without a handler, like the
-                                            // file search's own clear glyph: a
-                                            // reader who mistyped a hash had to
-                                            // erase it by hand to get back to
-                                            // the unfiltered list.
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(Self::clear_git_history_search),
-                                            ),
-                                        )
-                                    },
-                                ),
+                                            cx.listener(Self::clear_git_history_search),
+                                        ),
+                                    )
+                                },
+                            ),
                         )
                     })
                     // Fetch before pull: the phone has no terminal habit to
@@ -7762,40 +7705,14 @@ impl MobileWorkbench {
             .id("mobile-terminal-search")
             .flex_shrink_0()
             .h(px(WORKBENCH_CONTEXT_HEIGHT))
-            .px(px(theme::SPACING_SM))
+            .px(px(theme::SPACING_XS))
             .overflow_hidden()
             .flex()
             .items_center()
             .gap(px(theme::SPACING_XS))
             .border_b_1()
             .border_color(theme::border_subtle())
-            .child(
-                div()
-                    .h(px(WORKBENCH_CONTROL_SIZE))
-                    .min_w_0()
-                    .flex_1()
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .bg(theme::workbench_panel_bg())
-                    .pl(px(theme::SPACING_SM))
-                    .pr(px(theme::SPACING_XS))
-                    .flex()
-                    .items_center()
-                    .gap(px(theme::SPACING_XS))
-                    .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
-                    .child(
-                        svg()
-                            .path("icons/search.svg")
-                            .size(px(theme::ICON_SM))
-                            .flex_shrink_0()
-                            .text_color(theme::text_muted()),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .child(input_element(self.terminal_search_input.as_ref())),
-                    ),
-            )
+            .child(search_field(self.terminal_search_input.as_ref()))
             .child(
                 div()
                     .flex_shrink_0()
@@ -8461,6 +8378,41 @@ fn input_element(input: Option<&Entity<InputState>>) -> gpui::AnyElement {
         Some(input) => Input::new(input).appearance(false).into_any_element(),
         None => div().into_any_element(),
     }
+}
+
+/// The field half of one of the rail's search rows.
+///
+/// The row *is* the field. It used to be a rounded plate inset in the row, so
+/// each surface drew a second rectangle inside the one its own hairline already
+/// drew, and the bar read as an object resting on the row rather than as the
+/// row itself. A search bar on a phone is a full-width band under the header:
+/// it runs from the surface's edge to the surface's edge, and the glyph and the
+/// state controls sit at the same insets every other row of the rail uses.
+///
+/// The caller keeps its own trailing controls — a spinner while the query is
+/// running, a clear glyph while there is something to clear, the position of a
+/// match — because those belong to the query rather than to the field.
+fn search_field(input: Option<&Entity<InputState>>) -> gpui::Div {
+    div()
+        // The row has a definite height, so the field is as tall as the band it
+        // fills: the whole row answers a tap, not a plate inside it.
+        .h_full()
+        .min_w_0()
+        .flex_1()
+        .pl(px(theme::SPACING_SM))
+        .pr(px(theme::SPACING_XS))
+        .flex()
+        .items_center()
+        .gap(px(theme::SPACING_XS))
+        .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
+        .child(
+            svg()
+                .path("icons/search.svg")
+                .size(px(theme::ICON_SM))
+                .flex_shrink_0()
+                .text_color(theme::text_muted()),
+        )
+        .child(div().min_w_0().flex_1().child(input_element(input)))
 }
 
 /// How far the current branch stands from its upstream, as `(behind, ahead)`.
