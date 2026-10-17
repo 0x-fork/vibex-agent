@@ -12,7 +12,7 @@ use qrcode::QrCode;
 use qrcode::render::unicode::Dense1x2;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_segmentation::UnicodeSegmentation;
@@ -8952,6 +8952,14 @@ fn render_agent_auth(
     };
     let catalog = app.management_data.agent_auth_catalog.as_ref();
     let (status, tone) = cc::agent_auth_status(catalog, strings);
+    // A sign-in terminal takes the panel over. The account lines are still the
+    // truth about the account, but while a login flow owns the PTY the reader's
+    // eyes — and keys — belong to it, and drawing both would put a list of
+    // verbs beside a prompt that answers them.
+    if app.auth_terminal.is_some() {
+        render_agent_auth_terminal(frame, layout.content, app, theme);
+        return;
+    }
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled("  ", Style::default()),
@@ -8964,7 +8972,7 @@ fn render_agent_auth(
         format!("  {}", strings.config_auth_hint()),
         Style::default().fg(theme.roles.gray_dim),
     )));
-    let rows = cc::agent_auth_rows(catalog, strings);
+    let rows = view.rows(catalog, strings);
     if rows.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(
@@ -9054,6 +9062,210 @@ fn render_agent_auth(
         )));
     }
     frame.render_widget(Paragraph::new(lines), layout.content);
+}
+
+/// The live grid of a sign-in terminal.
+///
+/// The terminal's own colours are used where the emulator reports them, because
+/// the program inside chose them: a login flow that draws its selected provider
+/// in reverse video is telling the reader something, and repainting it in the
+/// client's palette would erase that. An unknown or default colour falls back to
+/// the panel's foreground on its own background, which is what makes an
+/// unstyled program readable in either appearance.
+fn render_agent_auth_terminal(
+    frame: &mut Frame<'_>,
+    content: Rect,
+    app: &mut App,
+    theme: &TuiTheme,
+) {
+    let strings = app.strings;
+    let Some(terminal) = app.auth_terminal.as_ref() else {
+        return;
+    };
+    let Some(snapshot) = terminal.snapshot() else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  {}", strings.config_auth_terminal_reading()),
+                Style::default().fg(theme.roles.gray_dim),
+            ))),
+            content,
+        );
+        return;
+    };
+    let title = terminal.title.clone();
+    // The header names the terminal and says what the keys do; the grid starts
+    // under it, and the footer is the same hint the panel would have drawn.
+    let header = Rect {
+        height: content.height.min(1),
+        ..content
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("  {} ", strings.config_auth_method_terminal()),
+                chip_style(crate::config_center::ConfigTone::Ok, theme),
+            ),
+            Span::styled(
+                title,
+                Style::default()
+                    .fg(theme.roles.gray_bright)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        header,
+    );
+    let footer_rows = u16::from(content.height > 3);
+    let grid = Rect {
+        y: content.y + 1,
+        height: content.height.saturating_sub(1 + footer_rows),
+        ..content
+    };
+    let visible_rows = usize::from(grid.height).min(usize::from(snapshot.rows));
+    let visible_columns = usize::from(grid.width).min(usize::from(snapshot.columns));
+    let mut rows: Vec<Line<'static>> = Vec::with_capacity(visible_rows);
+    for row in 0..visible_rows as u16 {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(visible_columns);
+        for column in 0..visible_columns as u16 {
+            // A cell's own glyph is what the program drew. A wide character
+            // occupies two cells and its second is a spacer the emulator marks,
+            // so the spacer is skipped rather than drawn as a second glyph.
+            let Some(cell) = snapshot
+                .cells
+                .iter()
+                .find(|cell| cell.row == row && cell.column == column)
+            else {
+                spans.push(Span::raw(" "));
+                continue;
+            };
+            if cell.wide_spacer {
+                continue;
+            }
+            let text = if cell.text.is_empty() {
+                " ".to_string()
+            } else {
+                cell.text.clone()
+            };
+            spans.push(Span::styled(text, terminal_cell_style(cell, theme)));
+        }
+        rows.push(Line::from(spans));
+    }
+    // Blank rows the program has not written to still belong to the grid: the
+    // panel is a fixed box, and leaving the page behind it visible would make
+    // the terminal look like it had holes.
+    while rows.len() < usize::from(grid.height) {
+        rows.push(Line::from(""));
+    }
+    app.regions.agent_auth_terminal = Some(grid);
+    frame.render_widget(Paragraph::new(rows), grid);
+    if footer_rows == 1 {
+        let footer = Rect {
+            y: grid.bottom(),
+            height: 1,
+            ..content
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  {}", strings.config_auth_terminal_hint()),
+                Style::default().fg(theme.roles.gray_dim),
+            ))),
+            footer,
+        );
+    }
+}
+
+/// One terminal cell, in the colour the program inside asked for.
+fn terminal_cell_style(cell: &vibex_terminal_ui::TerminalCellSnapshot, theme: &TuiTheme) -> Style {
+    use vibex_terminal_ui::TerminalCellColor;
+    let foreground = match cell.foreground {
+        TerminalCellColor::Named { index } => named_terminal_color(index),
+        TerminalCellColor::Indexed { index } => indexed_terminal_color(index),
+        TerminalCellColor::Rgb { red, green, blue } => Some(Color::Rgb(red, green, blue)),
+    };
+    let foreground = foreground.unwrap_or(theme.roles.foreground);
+    let background = match cell.background {
+        TerminalCellColor::Named { index } => named_terminal_color(index),
+        TerminalCellColor::Indexed { index } => indexed_terminal_color(index),
+        TerminalCellColor::Rgb { red, green, blue } => Some(Color::Rgb(red, green, blue)),
+    }
+    .unwrap_or(theme.roles.surface_raised);
+    // Inverse is the one attribute a program cannot be drawn without: a
+    // selected row and a plain one would otherwise look the same.
+    let (foreground, background) = if cell.inverse {
+        (background, foreground)
+    } else {
+        (foreground, background)
+    };
+    let mut style = Style::default().fg(foreground).bg(background);
+    if cell.bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if cell.dim {
+        style = style.add_modifier(Modifier::DIM);
+    }
+    if cell.italic {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if cell.underline {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    if cell.strikeout {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if cell.hidden {
+        // A hidden cell is invisible but still occupies its position, which is
+        // how a password field draws its dots.
+        style = style.add_modifier(Modifier::HIDDEN);
+    }
+    style
+}
+
+/// The sixteen ANSI slots, in the order a terminal numbers them.
+///
+/// `None` for a slot outside the sixteen: a program that indexed `default` is
+/// asking for the terminal's own colour rather than a palette entry, and the
+/// caller decides what that means for the surface it is on.
+fn named_terminal_color(index: u16) -> Option<Color> {
+    let palette: [Color; 16] = [
+        Color::Rgb(0, 0, 0),
+        Color::Rgb(205, 49, 49),
+        Color::Rgb(13, 188, 121),
+        Color::Rgb(229, 229, 16),
+        Color::Rgb(36, 114, 200),
+        Color::Rgb(188, 63, 188),
+        Color::Rgb(17, 168, 205),
+        Color::Rgb(229, 229, 229),
+        Color::Rgb(102, 102, 102),
+        Color::Rgb(241, 76, 76),
+        Color::Rgb(35, 209, 139),
+        Color::Rgb(245, 245, 67),
+        Color::Rgb(59, 142, 234),
+        Color::Rgb(214, 112, 214),
+        Color::Rgb(41, 184, 219),
+        Color::Rgb(255, 255, 255),
+    ];
+    palette.get(usize::from(index)).copied()
+}
+
+/// A 256-colour index, resolved the way every terminal resolves it: the first
+/// sixteen are the named slots, the next two hundred and sixteen are a 6×6×6
+/// cube, and the last twenty-four are a grey ramp.
+fn indexed_terminal_color(index: u8) -> Option<Color> {
+    match index {
+        0..=15 => named_terminal_color(u16::from(index)),
+        16..=231 => {
+            let cube = index - 16;
+            let step = |value: u8| -> u8 { if value == 0 { 0 } else { 55 + value * 40 } };
+            Some(Color::Rgb(
+                step(cube / 36),
+                step((cube % 36) / 6),
+                step(cube % 6),
+            ))
+        }
+        232..=255 => {
+            let level = 8 + (index - 232) * 10;
+            Some(Color::Rgb(level, level, level))
+        }
+    }
 }
 
 /// One profile, offered to another tool's own settings.

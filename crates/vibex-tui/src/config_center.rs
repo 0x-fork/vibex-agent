@@ -756,21 +756,29 @@ impl PendingWrite {
                 }
                 .replace("{count}", &found.to_string()),
             ),
-            Outcome::AuthWaiting { location, detail } => {
+            Outcome::AuthWaiting {
+                location, detail, ..
+            } => {
+                // `RemoteAttachableTerminal` is what the runtime reports for a
+                // terminal method: it is a PTY the authority opened, which a
+                // client attaches to by id. It belongs on the same line as
+                // `HostTerminal` — a terminal the reader finishes in — and a
+                // branch that only matched the latter sent every real sign-in to
+                // the catch-all "still signing in", which names nothing.
                 let template = match location {
-                    vibex_core::AgentAuthExecutionLocation::HostTerminal => {
+                    vibex_core::AgentAuthExecutionLocation::HostTerminal
+                    | vibex_core::AgentAuthExecutionLocation::RemoteAttachableTerminal => {
                         strings.config_auth_waiting_host_terminal()
                     }
-                    vibex_core::AgentAuthExecutionLocation::HostBrowser
-                    | vibex_core::AgentAuthExecutionLocation::ClientBrowserWithDeviceCode => {
-                        match location {
-                            vibex_core::AgentAuthExecutionLocation::ClientBrowserWithDeviceCode => {
-                                strings.config_auth_waiting_device_code()
-                            }
-                            _ => strings.config_auth_waiting_host_browser(),
-                        }
+                    vibex_core::AgentAuthExecutionLocation::HostBrowser => {
+                        strings.config_auth_waiting_host_browser()
                     }
-                    _ => strings.config_auth_waiting_elsewhere(),
+                    vibex_core::AgentAuthExecutionLocation::ClientBrowserWithDeviceCode => {
+                        strings.config_auth_waiting_device_code()
+                    }
+                    vibex_core::AgentAuthExecutionLocation::CompletedOnHost => {
+                        strings.config_auth_waiting_elsewhere()
+                    }
                 };
                 let rendered = match detail {
                     Some(command) if !command.trim().is_empty() => template.replace(
@@ -1437,12 +1445,24 @@ pub fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                 (true, false) => strings.config_roster_added_disabled(),
                 (false, _) => strings.config_roster_not_added(),
             };
-            let mut actions = vec![
-                ConfigAction::Toggle,
-                ConfigAction::RefreshSnapshot,
-                ConfigAction::Auth,
-                ConfigAction::Logout,
-            ];
+            // The authentication the runtime advertises for this Agent, when
+            // the reader has asked for it: the row says "not signed in" rather
+            // than leaving the sign-in verb looking like it did nothing. It is
+            // read here rather than beside the cells because the verbs below
+            // depend on it.
+            let auth = auth_state(data, &agent.id);
+            let mut actions = vec![ConfigAction::Toggle, ConfigAction::RefreshSnapshot];
+            // Signing in is the way in, so the verb stays on the row whether or
+            // not an account exists yet: the panel behind it is what reads the
+            // methods and says there are none, which is a better answer than a
+            // key that does nothing. Signing out is the other half — it ends a
+            // context, so without one there is nothing for it to end, and a
+            // verb drawn over an Agent nobody signed into is a verb pressed to
+            // be told so.
+            actions.push(ConfigAction::Auth);
+            if auth.has_context() {
+                actions.push(ConfigAction::Logout);
+            }
             // Joining and leaving are the roster's own two verbs: taking an
             // Agent out is not an uninstall, and adding one is not an install —
             // the reader is saying what they want to see, not what is on disk.
@@ -1496,7 +1516,6 @@ pub fn agent_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
             // The authentication the runtime advertises for this Agent, when
             // the reader has asked for it: the row says "not signed in" rather
             // than leaving the sign-in verb looking like it did nothing.
-            let auth = auth_state(data, &agent.id);
             let mut row = ConfigRow::new(agent.id.as_str().to_string(), agent.label.clone())
                 .cell(install)
                 .cell(version_label(agent, strings))
@@ -1669,6 +1688,16 @@ impl AuthState {
                 .clone()
                 .unwrap_or_else(|| strings.config_result_signed_in().to_string()),
         }
+    }
+
+    /// Whether the authority holds an account for this Agent at all.
+    ///
+    /// A context is created the first time an Agent is asked for its methods,
+    /// so `Unknown` after that read means "no account" rather than "not asked":
+    /// it is the answer for an Agent this client has not opened the panel on,
+    /// which is also an Agent there is nothing to sign out of.
+    const fn has_context(&self) -> bool {
+        !matches!(self, Self::Unknown)
     }
 }
 
@@ -3852,6 +3881,8 @@ pub enum AgentAuthAction {
     Verify,
     RefreshModels,
     SignOut,
+    /// Call off the sign-in the authority is still running.
+    Cancel,
     /// Open the page the method named for getting credentials.
     Credentials {
         url: String,
@@ -4217,6 +4248,20 @@ pub fn agent_auth_rows(
     catalog: Option<&vibex_core::AgentAuthCatalog>,
     strings: Strings,
 ) -> Vec<AgentAuthRow> {
+    agent_auth_rows_with_sign_in(catalog, false, strings)
+}
+
+/// The account panel's lines, knowing whether a sign-in is still running.
+///
+/// Kept as a second entry point rather than a field on the catalogue because the
+/// operation is the client's to know: the catalogue is a read the authority
+/// answered, and whether a sign-in it started is still open is what this client
+/// is holding, not what the Agent advertised.
+pub fn agent_auth_rows_with_sign_in(
+    catalog: Option<&vibex_core::AgentAuthCatalog>,
+    pending_sign_in: bool,
+    strings: Strings,
+) -> Vec<AgentAuthRow> {
     let Some(catalog) = catalog else {
         return Vec::new();
     };
@@ -4286,6 +4331,20 @@ pub fn agent_auth_rows(
             hint: method.credential_link.clone(),
         });
     }
+    // A sign-in the authority is still running is a process: it opened a
+    // browser, or a terminal the client may have closed, and it is holding a
+    // context revision. Offering to call it off is the only way the reader can
+    // stop waiting on one that went nowhere.
+    if pending_sign_in {
+        rows.push(AgentAuthRow {
+            action: Some(AgentAuthAction::Cancel),
+            label: strings.config_auth_action_cancel().to_string(),
+            chip: strings.config_auth_waiting_eyebrow().to_string(),
+            tone: ConfigTone::Warn,
+            detail: Vec::new(),
+            hint: None,
+        });
+    }
     rows.push(AgentAuthRow {
         action: Some(AgentAuthAction::RefreshMethods),
         label: strings.config_auth_action_refresh().to_string(),
@@ -4343,6 +4402,46 @@ pub fn agent_auth_status(
     }
 }
 
+/// Fold the account the authority holds into the catalogue it advertised.
+///
+/// The catalogue answers what an Agent *can* sign in with; the context answers
+/// whether it *is* signed in. They are two reads, and a panel that only kept the
+/// first said "Not checked" over an account the reader had just signed into —
+/// and hid the verbs that need an account, because the panel gates them on the
+/// status this returns. The context is the authority's own word, so it wins.
+///
+/// `None` while the catalogue belongs to another Agent, which is how a panel
+/// left open across a navigation avoids wearing the previous Agent's methods.
+pub fn merge_agent_auth_context(
+    catalog: &mut vibex_core::AgentAuthCatalog,
+    contexts: &[vibex_core::AgentAuthContext],
+) {
+    let mine = contexts
+        .iter()
+        .filter(|context| context.agent_id == catalog.agent_id);
+    let mut authenticated = false;
+    let mut required = false;
+    for context in mine {
+        match context.status {
+            vibex_core::AgentAuthContextStatus::Authenticated => authenticated = true,
+            vibex_core::AgentAuthContextStatus::AuthenticationRequired => required = true,
+            // A verification in flight, or an account the Agent's own CLI
+            // manages, is not evidence either way: leaving the catalogue alone
+            // keeps what the last settled read said.
+            vibex_core::AgentAuthContextStatus::Unverified
+            | vibex_core::AgentAuthContextStatus::Verifying
+            | vibex_core::AgentAuthContextStatus::Unavailable => {}
+        }
+    }
+    catalog.status = if authenticated {
+        vibex_core::AgentAuthStatus::Authenticated
+    } else if required {
+        vibex_core::AgentAuthStatus::AuthenticationRequired
+    } else {
+        vibex_core::AgentAuthStatus::Unknown
+    };
+}
+
 /// Which Agent's account the panel is on, and what it last said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentAuthView {
@@ -4356,6 +4455,50 @@ pub struct AgentAuthView {
     /// also ends the reader's sessions is not a decision to make blind.
     pub confirming_sign_out: bool,
     pub notice: Option<(String, ConfigTone)>,
+    /// The line the verb that opened the panel was about, applied once the
+    /// catalogue arrives — the lines are the catalogue's, so where they are is
+    /// not known until it lands.
+    pub want_line: AgentAuthLine,
+    /// The sign-in the authority is still running, if one is.
+    ///
+    /// It is the client's own memory of a request it started: the answer that
+    /// opened the browser or the terminal came back with an operation, and
+    /// nothing else will say whether it is still open. Holding it here is what
+    /// lets the panel offer to call it off.
+    pub pending_sign_in: Option<vibex_core::AgentAuthenticationOperation>,
+}
+
+impl AgentAuthView {
+    /// The lines to draw, with the one the panel asked for already selected.
+    pub fn rows(
+        &self,
+        catalog: Option<&vibex_core::AgentAuthCatalog>,
+        strings: Strings,
+    ) -> Vec<AgentAuthRow> {
+        agent_auth_rows_with_sign_in(catalog, self.pending_sign_in.is_some(), strings)
+    }
+}
+
+/// The line a verb asked the account panel to land on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentAuthLine {
+    /// The row's `Auth`: the first line, which is the first way in.
+    First,
+    /// The row's `Logout`: the sign-out line, wherever it ended up.
+    SignOut,
+}
+
+impl AgentAuthLine {
+    /// The index to move the cursor to, once the lines are known.
+    pub fn index(self, rows: &[AgentAuthRow]) -> usize {
+        match self {
+            Self::First => 0,
+            Self::SignOut => rows
+                .iter()
+                .position(|row| row.action == Some(AgentAuthAction::SignOut))
+                .unwrap_or(0),
+        }
+    }
 }
 
 /// Where a native export writes, in the order the picker cycles them.

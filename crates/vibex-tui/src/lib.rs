@@ -47,6 +47,7 @@
 pub mod action;
 pub mod app;
 pub mod attachment;
+pub mod auth_terminal;
 pub mod auto_continue;
 pub mod children;
 pub mod composer;

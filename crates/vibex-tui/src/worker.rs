@@ -205,6 +205,28 @@ pub enum AppMessage {
         result: BackendResult<Vec<vibex_core::AgentAuthContext>>,
         open: bool,
     },
+    /// The bytes a sign-in terminal produced, in order.
+    ///
+    /// The bytes stay bytes: a frame can split a UTF-8 character, and the
+    /// emulator that has to hold the tail lives on the client side.
+    AgentAuthTerminalFrame {
+        agent_id: vibex_core::AgentId,
+        terminal_id: vibex_core::TerminalId,
+        bytes: Vec<u8>,
+    },
+    /// The terminal a sign-in method opened, and what the authority says about
+    /// it. An error means the client could not attach, which the panel says
+    /// rather than claiming a terminal it is not drawing.
+    AgentAuthTerminal {
+        agent_id: vibex_core::AgentId,
+        terminal_id: vibex_core::TerminalId,
+        title: String,
+        result: BackendResult<()>,
+    },
+    /// A sign-in terminal's frame stream ended.
+    AgentAuthTerminalEnded {
+        terminal_id: vibex_core::TerminalId,
+    },
     Mcp(BackendResult<Vec<vibex_core::McpServer>>),
     Skills(BackendResult<Vec<vibex_core::Skill>>),
     Prompts(BackendResult<Vec<vibex_core::Prompt>>),
@@ -485,6 +507,15 @@ struct Dispatch {
 impl Dispatch {
     fn send(&self, message: AppMessage) {
         let _ = self.sender.send(message);
+    }
+
+    /// Hand one message back, saying whether the interface is still listening.
+    ///
+    /// A frame pump loops until the receiver goes away, and it needs to tell
+    /// "sent" from "dropped": the client closed, so the loop must stop rather
+    /// than keep reading a terminal nobody is looking at.
+    fn try_send(&self, message: AppMessage) -> bool {
+        self.sender.send(message).is_ok()
     }
 
     /// Search one registry and hand the page back.
@@ -1847,6 +1878,165 @@ impl Dispatch {
                 };
                 self.send(AppMessage::AgentAuthCatalog(result));
             }
+            Effect::AttachAgentAuthTerminal {
+                agent_id,
+                terminal_id,
+                title,
+            } => {
+                // The session is read before the frames are subscribed to: the
+                // subscription starts at the sequence the snapshot reached, so a
+                // client that subscribed first would either repeat bytes it
+                // already has or drop the ones between the two calls.
+                let snapshot = self
+                    .facade
+                    .terminal()
+                    .terminal_snapshot(terminal_id.clone())
+                    .await;
+                let session = match snapshot {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        self.send(AppMessage::AgentAuthTerminal {
+                            agent_id,
+                            terminal_id,
+                            title,
+                            result: Err(error),
+                        });
+                        return;
+                    }
+                };
+                let next = session.next_sequence;
+                let mut subscription = match self
+                    .facade
+                    .terminal()
+                    .subscribe_terminal(terminal_id.clone(), next)
+                {
+                    Ok(subscription) => subscription,
+                    Err(error) => {
+                        self.send(AppMessage::AgentAuthTerminal {
+                            agent_id,
+                            terminal_id,
+                            title,
+                            result: Err(error),
+                        });
+                        return;
+                    }
+                };
+                self.send(AppMessage::AgentAuthTerminal {
+                    agent_id: agent_id.clone(),
+                    terminal_id: terminal_id.clone(),
+                    title,
+                    result: Ok(()),
+                });
+                // The first snapshot is what a terminal that has already
+                // printed something looks like: the login prompt is usually
+                // there before the reader attaches.
+                let initial = session
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.data.as_str())
+                    .collect::<String>();
+                if !initial.is_empty() {
+                    self.send(AppMessage::AgentAuthTerminalFrame {
+                        agent_id: agent_id.clone(),
+                        terminal_id: terminal_id.clone(),
+                        bytes: initial.into_bytes(),
+                    });
+                }
+                // Frames arrive on this worker's own task rather than through
+                // the agent event subscription: a terminal is a different
+                // stream with a different lifetime, and one that ends when the
+                // sign-in does rather than when the connection does.
+                // A subscription that ends or fails ends the view: the process
+                // is gone, and a frozen grid over a finished sign-in reads as a
+                // hung client.
+                while let Ok(Some(batch)) = subscription.next().await {
+                    let bytes = batch
+                        .frames
+                        .iter()
+                        .flat_map(|frame| frame.bytes.iter().copied())
+                        .collect::<Vec<_>>();
+                    if self.sender.is_closed() {
+                        break;
+                    }
+                    if !bytes.is_empty()
+                        && !self.try_send(AppMessage::AgentAuthTerminalFrame {
+                            agent_id: agent_id.clone(),
+                            terminal_id: terminal_id.clone(),
+                            bytes,
+                        })
+                    {
+                        break;
+                    }
+                    // A reset is the authority telling the client to forget the
+                    // grid and start again; the emulator keeps its own state, so
+                    // what there is to do is go on reading.
+                    if batch.reset_required {
+                        continue;
+                    }
+                }
+                self.send(AppMessage::AgentAuthTerminalEnded { terminal_id });
+            }
+            Effect::WriteAgentAuthTerminal { terminal_id, data } => {
+                let request =
+                    MutationRequest::new(vibex_core::TerminalWriteRequest { terminal_id, data });
+                if let Err(error) = self.facade.terminal().write_terminal(request).await {
+                    // A key that cannot be delivered is not worth a toast: the
+                    // reader is typing into a terminal, and the terminal is
+                    // about to be gone. The answer that matters is the sign-in's.
+                    let _ = error;
+                }
+            }
+            Effect::ResizeAgentAuthTerminal {
+                terminal_id,
+                rows,
+                columns,
+            } => {
+                let request = MutationRequest::new(vibex_core::TerminalResizeRequest {
+                    terminal_id,
+                    rows,
+                    cols: columns,
+                });
+                if let Err(error) = self.facade.terminal().resize_terminal(request).await {
+                    let _ = error;
+                }
+            }
+            Effect::CancelAgentAuth {
+                agent_id,
+                operation_id,
+            } => {
+                let record = agent_id.as_str().to_string();
+                let context = self.default_auth_context(&agent_id).await;
+                let Some((context_id, revision)) = context else {
+                    self.failure_for(
+                        "agent_auth_cancel",
+                        Some(record),
+                        BackendError::failed(
+                            "agent_auth_context_unknown",
+                            "this Agent holds no account to cancel a sign-in for",
+                        ),
+                    );
+                    return;
+                };
+                let request =
+                    MutationRequest::new(vibex_core::AgentAuthContextCancelAuthenticationRequest {
+                        operation_id,
+                        auth_context_id: context_id,
+                        expected_context_revision: revision,
+                    });
+                match self
+                    .facade
+                    .agent()
+                    .cancel_agent_context_authentication(request)
+                    .await
+                {
+                    Ok(_) => self.ok_with(
+                        "agent_auth_cancel",
+                        Some(record),
+                        crate::app::MutationOutcome::Plain,
+                    ),
+                    Err(error) => self.failure_for("agent_auth_cancel", Some(record), error),
+                }
+            }
             Effect::VerifyAgentAuth { agent_id } => {
                 let record = agent_id.as_str().to_string();
                 let context = self.default_auth_context(&agent_id).await;
@@ -2243,8 +2433,19 @@ impl Dispatch {
                 }
             }
             Effect::ListAgentAuth { agent_id, open } => {
-                let record = agent_id.as_str().to_string();
                 let result = self.facade.agent().list_agent_auth_contexts().await;
+                // A read that refreshes the Agents table has no record to file
+                // under and no verb to report: it is the column's source, not an
+                // answer to a key. The row it fills is the whole table, so the
+                // message is all it says.
+                let Some(agent_id) = agent_id else {
+                    self.send(AppMessage::AgentAuth {
+                        result,
+                        open: false,
+                    });
+                    return;
+                };
+                let record = agent_id.as_str().to_string();
                 // The answer is filed under the Agent the reader asked about,
                 // which is not the whole list the authority returns: the row
                 // says how many ways in *this* Agent has.
@@ -2743,23 +2944,22 @@ impl Dispatch {
                         authenticated: true,
                     });
                 }
-                // The runtime keeps the operation open and names where the
-                // reader has to finish it. This client has no terminal of its
-                // own, so it says where rather than reporting a sign-in that
-                // did not happen.
+                // The runtime keeps the operation open and names where the reader
+                // has to finish it. The command a terminal method runs is
+                // redacted at the authority boundary — the descriptor carries
+                // the terminal's own title and its id instead — so what can be
+                // said is where to look, not what was run there.
                 let detail = result
                     .terminal
                     .as_ref()
-                    .map(|terminal| {
-                        std::iter::once(terminal.command.clone())
-                            .chain(terminal.args.iter().cloned())
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })
+                    .map(|terminal| terminal.title.clone())
+                    .filter(|title| !title.trim().is_empty())
                     .or_else(|| result.context.account_hint.clone());
                 Ok(crate::app::MutationOutcome::AuthWaiting {
                     location: result.execution_location,
                     detail,
+                    operation: Some(Box::new(result.operation)),
+                    terminal: result.terminal.map(Box::new),
                 })
             }
             Err(error) => Err(error),

@@ -21,7 +21,9 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use vibex_backend::{BackendError, BackendResult};
 
-use crate::app::{App, ClipboardWanted, Focus, LiveState, Overlay, Page, PromptField, Toast};
+use crate::app::{
+    App, ClipboardWanted, Effect, Focus, LiveState, Overlay, Page, PromptField, Toast,
+};
 use crate::keymap::Chord;
 use crate::reduce::Outcome;
 use crate::terminal::{TerminalGuard, with_terminal_restored};
@@ -163,6 +165,29 @@ fn event_loop(
                     }
                     Event::Resize(columns, rows) => {
                         app.resize(columns, rows);
+                        // A sign-in terminal is a PTY with its own idea of how
+                        // wide it is, and the login flow reflows when it is
+                        // told. The panel changed size with the window, so the
+                        // terminal behind it has to change with the panel.
+                        // The local grid is resized here rather than waiting
+                        // for the round trip: the next frame is drawn at the
+                        // new size, and a grid still believing it is the old
+                        // one would paint the wrong number of rows into it.
+                        let (rows, columns) = app.auth_terminal_size();
+                        if let Some(terminal) = app.auth_terminal.as_mut() {
+                            terminal.resize(rows, columns);
+                            let terminal_id = terminal.terminal_id.clone();
+                            dispatch_all(
+                                worker,
+                                &crate::reduce::Outcome::effects(vec![
+                                    Effect::ResizeAgentAuthTerminal {
+                                        terminal_id,
+                                        rows,
+                                        columns,
+                                    },
+                                ]),
+                            );
+                        }
                         dirty = true;
                     }
                     // The notifier is told whether the reader is at the
@@ -443,6 +468,71 @@ fn normalized_key(key: KeyEvent) -> KeyEvent {
 }
 
 /// Reduce one key press. Returns `true` when the program should exit.
+/// The bytes a key sends to a terminal, or `None` when the key is not the
+/// terminal's to take.
+///
+/// The encoding is the one a terminal actually receives, because the program
+/// inside is reading its own stdin through a PTY: a name, a run of text, or an
+/// escape sequence. Anything the client keeps for itself — a global chord, an
+/// unbound function key — returns `None` and falls through to the binding
+/// table.
+fn terminal_keys_bytes(key: KeyEvent) -> Option<String> {
+    // A control chord is the terminal's when the terminal has a byte for it:
+    // `Ctrl+C` interrupts the login, `Ctrl+D` ends its input, and a program
+    // that offers those is a program the reader can drive.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if let KeyCode::Char(character) = key.code {
+            let lower = character.to_ascii_lowercase();
+            if lower.is_ascii_lowercase() {
+                // Ctrl+A is 0x01 through Ctrl+Z is 0x1a, in alphabet order.
+                return Some((((lower as u8) - b'a' + 1) as char).to_string());
+            }
+            if character == ' ' {
+                return Some("\0".to_string());
+            }
+        }
+        return None;
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        // Alt+<char> is `Esc` followed by the character, which is exactly how
+        // a terminal reports it.
+        if let KeyCode::Char(character) = key.code {
+            return Some(format!("\x1b{character}"));
+        }
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(character) => Some(character.to_string()),
+        KeyCode::Enter => Some("\r".to_string()),
+        KeyCode::Tab => Some("\t".to_string()),
+        KeyCode::BackTab => Some("\x1b[Z".to_string()),
+        KeyCode::Backspace => Some("\x7f".to_string()),
+        KeyCode::Esc => Some("\x1b".to_string()),
+        KeyCode::Up => Some("\x1b[A".to_string()),
+        KeyCode::Down => Some("\x1b[B".to_string()),
+        KeyCode::Right => Some("\x1b[C".to_string()),
+        KeyCode::Left => Some("\x1b[D".to_string()),
+        KeyCode::Home => Some("\x1b[H".to_string()),
+        KeyCode::End => Some("\x1b[F".to_string()),
+        KeyCode::PageUp => Some("\x1b[5~".to_string()),
+        KeyCode::PageDown => Some("\x1b[6~".to_string()),
+        KeyCode::Insert => Some("\x1b[2~".to_string()),
+        KeyCode::Delete => Some("\x1b[3~".to_string()),
+        // A function key or a media key is not something a login prompt reads.
+        KeyCode::F(_)
+        | KeyCode::Null
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_) => None,
+    }
+}
+
 fn handle_key(
     app: &mut App,
     worker: &Worker,
@@ -465,6 +555,24 @@ fn handle_key(
         let outcome = app.perform(intent);
         dispatch_all(worker, &outcome);
         return Ok(app.should_quit);
+    }
+    // A sign-in terminal owns the keyboard while it is attached: the program
+    // inside is an interactive login, and a key that ran a client binding
+    // instead would be a key the login never saw. `Esc` is the one exception —
+    // it gives the panel back — and the global chords above have already had
+    // their chance, so a reader can still leave the surface.
+    if let Some(terminal_id) = app.auth_terminal_key_target() {
+        let bytes = terminal_keys_bytes(key);
+        if let Some(bytes) = bytes {
+            dispatch_all(
+                worker,
+                &crate::reduce::Outcome::effects(vec![Effect::WriteAgentAuthTerminal {
+                    terminal_id,
+                    data: bytes,
+                }]),
+            );
+            return Ok(false);
+        }
     }
     // The transcript search bar is a text field, so it takes printable keys
     // before the binding table sees them — the same rule the list filter uses.
@@ -2335,6 +2443,22 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                         let message = app.strings.management_saved().to_string();
                         app.toast(Toast::success(message));
                     }
+                    // The answer to a sign-in is what the panel remembers: a
+                    // method that opened a browser or a terminal is still
+                    // running, and the operation it named is what "cancel"
+                    // would end. A sign-in that finished clears it, because
+                    // there is nothing left to call off.
+                    if key == "agent_auth_sign_in"
+                        && let Some(Overlay::AgentAuth { view }) = app.overlay.as_mut()
+                    {
+                        view.pending_sign_in = match &outcome {
+                            crate::app::MutationOutcome::AuthWaiting {
+                                operation: Some(operation),
+                                ..
+                            } => Some((**operation).clone()),
+                            _ => None,
+                        };
+                    }
                     if key == "switch_runtime" {
                         // The switch is durable and asynchronous: the runtime
                         // reports `Switching…` until the new Agent is up, so the
@@ -2342,6 +2466,32 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                         // session has already moved.
                         let message = app.strings.runtime_switching().to_string();
                         app.toast(Toast::info(message));
+                    }
+                    // A sign-in that opened a terminal is a sign-in this client
+                    // can follow: attach to the PTY the authority created and
+                    // draw it. The attach is issued before the re-read below so
+                    // the frame pump is already listening when the first bytes
+                    // land — a login prompt printed before the subscription
+                    // would otherwise have to arrive twice.
+                    if let crate::app::MutationOutcome::AuthWaiting {
+                        terminal: Some(terminal),
+                        ..
+                    } = &outcome
+                        && let Some(terminal_id) = terminal.terminal_id.clone()
+                        && let Some(agent_id) = record
+                            .as_deref()
+                            .and_then(|record| vibex_core::AgentId::parse(record).ok())
+                    {
+                        dispatch_all(
+                            worker,
+                            &crate::reduce::Outcome::effects(vec![
+                                Effect::AttachAgentAuthTerminal {
+                                    agent_id,
+                                    terminal_id,
+                                    title: terminal.title.clone(),
+                                },
+                            ]),
+                        );
                     }
                     // A write is only half the story: every record on screen
                     // is the one from before it. Re-read what the write
@@ -2545,9 +2695,25 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 },
             };
             match result {
-                Ok(catalog) => {
+                Ok(mut catalog) => {
+                    // The catalogue says what the ways in are; the contexts the
+                    // authority already answered say whether one of them was
+                    // used. Folding them in here is what keeps the panel from
+                    // saying "Not checked" over an account the reader is signed
+                    // into, and what lets the verbs that need an account appear
+                    // without a second round trip.
+                    crate::config_center::merge_agent_auth_context(
+                        &mut catalog,
+                        &app.management_data.agent_auth,
+                    );
                     app.management_data.agent_auth_catalog = Some(*catalog);
+                    // The lines are the catalogue's, so where the verb that
+                    // opened the panel points is known only now.
+                    let landed = app.management_data.agent_auth_catalog.as_ref();
+                    let strings = app.strings;
                     if let Some(Overlay::AgentAuth { view }) = app.overlay.as_mut() {
+                        let rows = view.rows(landed, strings);
+                        view.selected = view.want_line.index(&rows);
                         view.loading = false;
                         view.notice = None;
                     }
@@ -2773,6 +2939,16 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         AppMessage::AgentAuth { result, open } => match result {
             Ok(contexts) => {
                 app.management_data.agent_auth = contexts;
+                // The catalogue and the contexts answer one question between
+                // them, and either read can move the account: a sign-out lands
+                // here, and a panel left open must not go on claiming the
+                // status the previous read earned.
+                if let Some(catalog) = app.management_data.agent_auth_catalog.as_mut() {
+                    crate::config_center::merge_agent_auth_context(
+                        catalog,
+                        &app.management_data.agent_auth,
+                    );
+                }
                 if open {
                     let body =
                         app.management_data
@@ -2795,6 +2971,60 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
+        AppMessage::AgentAuthTerminal {
+            agent_id,
+            terminal_id,
+            title,
+            result,
+        } => match result {
+            Ok(()) => {
+                let opening = app.auth_terminal.is_none();
+                // The terminal is the size of the panel it will be drawn in, not
+                // the size the authority opened it at: a login flow that wraps
+                // at a hundred columns draws badly in a seventy-column modal, and
+                // the emulator reflowing is what keeps the two honest.
+                let (rows, columns) = app.auth_terminal_size();
+                app.auth_terminal = Some(crate::auth_terminal::AuthTerminal::new(
+                    agent_id,
+                    terminal_id,
+                    title,
+                    rows,
+                    columns,
+                ));
+                if opening {
+                    app.toast(Toast::info(
+                        app.strings.config_auth_terminal_opened().to_string(),
+                    ));
+                }
+            }
+            // The panel says why it is not drawing a terminal rather than
+            // leaving a blank box where the sign-in should be.
+            Err(error) => {
+                app.auth_terminal = None;
+                if let Some(Overlay::AgentAuth { view }) = app.overlay.as_mut() {
+                    view.notice = Some((error.message, crate::config_center::ConfigTone::Warn));
+                }
+            }
+        },
+        AppMessage::AgentAuthTerminalFrame {
+            terminal_id, bytes, ..
+        } => {
+            // A frame for a terminal this client is no longer attached to is
+            // dropped: a second sign-in may already own the panel.
+            if let Some(terminal) = app.auth_terminal.as_mut()
+                && terminal.terminal_id == terminal_id
+            {
+                terminal.advance(&bytes);
+                terminal.refresh();
+            }
+        }
+        AppMessage::AgentAuthTerminalEnded { terminal_id } => {
+            // The process is gone but the grid it left is not: the last frame
+            // stays on screen so the reader can read what it said. The account
+            // is re-read by the sign-in's own answer, which is the authority's
+            // word on whether it worked.
+            let _ = terminal_id;
+        }
         AppMessage::ConfigSources { module, mcp, skill } => {
             if module == crate::config_center::ConfigModule::Mcp {
                 match mcp {

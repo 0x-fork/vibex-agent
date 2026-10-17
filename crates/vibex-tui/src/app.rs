@@ -1122,6 +1122,13 @@ pub struct App {
     /// back through: the order pages were opened in, not a fixed hierarchy.
     pub page_history: Vec<PageVisit>,
     pub overlay: Option<Overlay>,
+    /// A sign-in terminal the authority opened and this client attached to.
+    ///
+    /// A terminal method runs the Agent's own login flow in a PTY the authority
+    /// owns. The client is a viewer by id: it draws the frames the runtime
+    /// emits and writes the reader's keys back, because the process itself
+    /// belongs to the authority and never to the client.
+    pub auth_terminal: Option<crate::auth_terminal::AuthTerminal>,
     pub toast: Option<Toast>,
     /// Frames the reader's first `Ctrl+C` is still waiting for a second one.
     ///
@@ -1685,6 +1692,12 @@ pub struct FrameRegions {
     /// to. A button acts on its own row, which is not always the cursor's — the
     /// pointer is what chose it — so the row index rides with the rect.
     pub row_actions: Vec<RowActionRegion>,
+    /// The grid a sign-in terminal was drawn into, when one is attached.
+    ///
+    /// A click inside it is a click into the terminal: the cell the pointer is
+    /// over is where the program's own cursor goes, which is the only way a
+    /// reader with a mouse can answer a prompt that wants a position.
+    pub agent_auth_terminal: Option<ratatui::layout::Rect>,
 }
 
 impl FrameRegions {
@@ -2014,6 +2027,7 @@ impl App {
             focus: Focus::Main,
             page_history: Vec::new(),
             overlay: None,
+            auth_terminal: None,
             toast: None,
             quit_armed: 0,
             settings: SettingsState {
@@ -4785,6 +4799,40 @@ impl App {
     /// Whether the terminal is narrow enough that chrome must give way.
     pub fn is_compact(&self) -> bool {
         self.shell == ShellKind::Compact
+    }
+
+    /// The grid a sign-in terminal should be sized to.
+    ///
+    /// It is the modal's content area rather than the client's whole viewport:
+    /// the terminal is drawn inside the account panel, and a login flow that
+    /// believed it had the whole screen would print its prompt somewhere the
+    /// panel cannot show. The numbers mirror the panel's `ModalSizing` — the
+    /// modal keeps two rows and two columns of margin and one row of padding on
+    /// each side, and its footer takes three rows.
+    pub fn auth_terminal_size(&self) -> (u16, u16) {
+        let (columns, rows) = self.viewport;
+        let panel_columns = (columns.saturating_mul(64) / 100)
+            .clamp(40, 96)
+            .saturating_sub(2 * 2 + 2);
+        let panel_rows = rows
+            .saturating_sub(2 * 2 + 1 + 3)
+            .clamp(4, crate::auth_terminal::AUTH_TERMINAL_ROWS);
+        (panel_rows.max(1), panel_columns.max(1))
+    }
+
+    /// The terminal that should receive this key, when one is attached.
+    ///
+    /// A key belongs to the terminal only while the account panel is what is on
+    /// screen: a reader who opened the panel, attached, and then opened a form
+    /// over it is typing into the form, and a terminal that swallowed those
+    /// keys would answer a prompt nobody was looking at.
+    pub fn auth_terminal_key_target(&self) -> Option<vibex_core::TerminalId> {
+        if !matches!(self.overlay, Some(Overlay::AgentAuth { .. })) {
+            return None;
+        }
+        self.auth_terminal
+            .as_ref()
+            .map(|terminal| terminal.terminal_id.clone())
     }
 
     /// Which glyph tier the terminal can render.
@@ -9191,6 +9239,13 @@ pub enum MutationOutcome {
     AuthWaiting {
         location: vibex_core::AgentAuthExecutionLocation,
         detail: Option<String>,
+        /// The operation the authority is still running, so the reader can call
+        /// it off. A sign-in that opened a browser on the host and then went
+        /// nowhere is otherwise a process nobody can stop from this client.
+        operation: Option<Box<vibex_core::AgentAuthenticationOperation>>,
+        /// The PTY the method opened, when it opened one. Present means this
+        /// client can draw the sign-in rather than only name where it is.
+        terminal: Option<Box<vibex_core::TerminalAuthActionDescriptor>>,
     },
     /// A default was set, and at which scope it applies.
     DefaultScope { workspace: bool },
@@ -9457,7 +9512,12 @@ pub enum Effect {
         agent_id: vibex_core::AgentId,
     },
     ListAgentAuth {
-        agent_id: vibex_core::AgentId,
+        /// The account to read, or every Agent's when a list needs the column.
+        ///
+        /// The authority answers with the whole catalogue of contexts either
+        /// way; naming the Agent is what lets the answer be filed under the row
+        /// the verb was pressed on, and what a re-read after a write reports.
+        agent_id: Option<vibex_core::AgentId>,
         /// Whether the answer should be put in front of the reader. The verb
         /// asks for that; a re-read that only refreshes the row does not.
         open: bool,
@@ -9533,6 +9593,32 @@ pub enum Effect {
     /// Ask an Agent's own runtime to verify the account it holds.
     VerifyAgentAuth {
         agent_id: vibex_core::AgentId,
+    },
+    /// Attach to the terminal a sign-in method opened, and follow its frames.
+    ///
+    /// The terminal belongs to the authority; this client draws it and writes
+    /// the reader's keys back. Attaching is a read plus a subscription, which is
+    /// why it is an effect rather than something the view does when it paints.
+    AttachAgentAuthTerminal {
+        agent_id: vibex_core::AgentId,
+        terminal_id: vibex_core::TerminalId,
+        title: String,
+    },
+    /// Write the reader's keys into the attached sign-in terminal.
+    WriteAgentAuthTerminal {
+        terminal_id: vibex_core::TerminalId,
+        data: String,
+    },
+    /// Resize the attached sign-in terminal to the grid it is drawn in.
+    ResizeAgentAuthTerminal {
+        terminal_id: vibex_core::TerminalId,
+        rows: u16,
+        columns: u16,
+    },
+    /// Call off the sign-in the authority is still running.
+    CancelAgentAuth {
+        agent_id: vibex_core::AgentId,
+        operation_id: vibex_core::AgentAuthenticationOperationId,
     },
     /// Read the model catalogue the Agent's account can reach.
     RefreshAgentAuthModels {
@@ -9648,6 +9734,10 @@ impl Effect {
             Effect::PreviewAgentAuthLogout { .. } => "agent_auth_logout_preview",
             Effect::OpenUrl { .. } => "open_url",
             Effect::VerifyAgentAuth { .. } => "agent_auth_verify",
+            Effect::AttachAgentAuthTerminal { .. } => "agent_auth_terminal",
+            Effect::WriteAgentAuthTerminal { .. } => "agent_auth_terminal_write",
+            Effect::ResizeAgentAuthTerminal { .. } => "agent_auth_terminal_resize",
+            Effect::CancelAgentAuth { .. } => "agent_auth_cancel",
             Effect::RefreshAgentAuthModels { .. } => "agent_auth_models",
             Effect::DiscoverLocalAgents => "agent_discovery",
             Effect::LoadAgentTools => "agent_tools",

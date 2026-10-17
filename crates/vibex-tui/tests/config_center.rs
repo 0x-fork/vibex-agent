@@ -2706,6 +2706,8 @@ fn an_agents_account_is_read_as_one_list() {
             loading: false,
             confirming_sign_out: false,
             notice: None,
+            want_line: vibex_tui::config_center::AgentAuthLine::First,
+            pending_sign_in: None,
         },
     });
     let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
@@ -2740,6 +2742,8 @@ fn signing_in_collects_what_the_method_needs() {
             loading: false,
             confirming_sign_out: false,
             notice: None,
+            want_line: vibex_tui::config_center::AgentAuthLine::First,
+            pending_sign_in: None,
         },
     });
 
@@ -2837,6 +2841,8 @@ fn a_methods_credential_page_is_opened_by_its_own_line() {
             loading: false,
             confirming_sign_out: false,
             notice: None,
+            want_line: vibex_tui::config_center::AgentAuthLine::First,
+            pending_sign_in: None,
         },
     });
     let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
@@ -2872,6 +2878,8 @@ fn signing_out_is_asked_about_with_what_it_ends() {
             loading: false,
             confirming_sign_out: false,
             notice: None,
+            want_line: vibex_tui::config_center::AgentAuthLine::First,
+            pending_sign_in: None,
         },
     });
 
@@ -2937,6 +2945,8 @@ fn signing_out_is_asked_about_with_what_it_ends() {
             loading: false,
             confirming_sign_out: true,
             notice: None,
+            want_line: vibex_tui::config_center::AgentAuthLine::First,
+            pending_sign_in: None,
         },
     });
     app.perform(vibex_tui::action::Intent::Back);
@@ -2965,18 +2975,37 @@ fn a_sign_in_that_finishes_elsewhere_says_where() {
     };
     let message = |outcome: &vibex_tui::app::MutationOutcome| pending.message(strings, outcome);
 
+    // The runtime reports a terminal method as `RemoteAttachableTerminal`, not
+    // `HostTerminal`: it is a PTY the authority opened, which a client attaches
+    // to by id. Both are "a terminal to finish in", and the line has to say so —
+    // a branch that matched only `HostTerminal` sent every real sign-in to the
+    // catch-all, which named nothing at all.
     let terminal = message(&vibex_tui::app::MutationOutcome::AuthWaiting {
-        location: vibex_core::AgentAuthExecutionLocation::HostTerminal,
-        detail: Some("codex login".to_string()),
+        location: vibex_core::AgentAuthExecutionLocation::RemoteAttachableTerminal,
+        detail: Some("Sign in to Codex".to_string()),
+        operation: None,
+        terminal: None,
     });
     assert!(
-        terminal.contains("terminal") && terminal.contains("codex login"),
-        "the terminal answer named neither the place nor the command: {terminal}"
+        terminal.contains("terminal") && terminal.contains("Sign in to Codex"),
+        "the terminal answer named neither the place nor the sign-in: {terminal}"
+    );
+    let host_terminal = message(&vibex_tui::app::MutationOutcome::AuthWaiting {
+        location: vibex_core::AgentAuthExecutionLocation::HostTerminal,
+        detail: None,
+        operation: None,
+        terminal: None,
+    });
+    assert!(
+        host_terminal.contains("terminal"),
+        "a terminal on the host did not name the terminal: {host_terminal}"
     );
 
     let browser = message(&vibex_tui::app::MutationOutcome::AuthWaiting {
         location: vibex_core::AgentAuthExecutionLocation::HostBrowser,
         detail: None,
+        operation: None,
+        terminal: None,
     });
     assert!(
         browser.contains("browser"),
@@ -2986,6 +3015,8 @@ fn a_sign_in_that_finishes_elsewhere_says_where() {
     let device = message(&vibex_tui::app::MutationOutcome::AuthWaiting {
         location: vibex_core::AgentAuthExecutionLocation::ClientBrowserWithDeviceCode,
         detail: None,
+        operation: None,
+        terminal: None,
     });
     assert!(
         device.contains("code"),
@@ -4338,5 +4369,269 @@ fn a_switch_answers_the_press_before_the_authority_does() {
             .agent_tools
             .enabled("codex", vibex_core::AgentBuiltinTool::Browser),
         "the panel waited for the authority"
+    );
+}
+
+/// The Agents table reads the account column, and the row offers the verbs that
+/// account actually has.
+///
+/// The complaint this covers: the column read "Not checked" for every Agent
+/// forever, because nothing ever asked for the contexts, and the sign-out verb
+/// was drawn over Agents nobody had signed into.
+#[test]
+fn the_agent_table_reads_the_account_it_draws() {
+    let mut app = loaded(140, 40);
+    app.capabilities.agent = vibex_backend::DomainCapabilities::available([
+        vibex_backend::BackendOperation::AgentAuthRead,
+        vibex_backend::BackendOperation::AgentAuthManage,
+    ]);
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Agents));
+
+    // Opening the area is what asks for the contexts: the column has no other
+    // source, and a verb that reads nothing is a verb that reports nothing.
+    let effects = app.config_section_effects();
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, vibex_tui::app::Effect::ListAgentAuth { .. })),
+        "the Agents area never asked for the accounts it draws: {effects:?}"
+    );
+
+    // Nobody signed in: there is no account to sign out of, so the verb is not
+    // offered. The sign-in verb stays — the panel behind it can still say there
+    // is no way in.
+    let rows = vibex_tui::config_center::agent_rows(&app.management_data, app.strings);
+    let row = rows
+        .iter()
+        .find(|row| row.key == "codex")
+        .expect("the fixture Agent");
+    assert!(
+        row.actions.contains(&ConfigAction::Auth),
+        "the way in was withdrawn: {:?}",
+        row.actions
+    );
+    assert!(
+        !row.actions.contains(&ConfigAction::Logout),
+        "sign-out was offered with no account to end: {:?}",
+        row.actions
+    );
+
+    // Once the authority holds a context, the account has something to end.
+    app.management_data.agent_auth = vec![
+        serde_json::from_value(serde_json::json!({
+            "id": "agent_auth_context_codex",
+            "agentId": "codex",
+            "status": "authenticated",
+            "accountHint": "work@example.com",
+            "revision": 3,
+            "createdAtMs": 1,
+            "updatedAtMs": 1
+        }))
+        .expect("auth context fixture"),
+    ];
+    let rows = vibex_tui::config_center::agent_rows(&app.management_data, app.strings);
+    let row = rows
+        .iter()
+        .find(|row| row.key == "codex")
+        .expect("the fixture Agent");
+    assert!(
+        row.actions.contains(&ConfigAction::Logout),
+        "an account existed and sign-out was not offered: {:?}",
+        row.actions
+    );
+    assert!(
+        row.cells.iter().any(|cell| cell == "work@example.com"),
+        "the account column did not name the account: {:?}",
+        row.cells
+    );
+}
+
+/// The account panel's status is the authority's answer about the account, not
+/// the catalogue's guess about the Agent.
+///
+/// The runtime only ever reports `Unknown` or `AuthenticationRequired` for a
+/// freshly read catalogue: whether one of the advertised methods was used is the
+/// context's answer. A panel that ignored it said "Not checked" over an account
+/// the reader was signed into, and hid the verbs gated on being signed in.
+#[test]
+fn the_account_status_follows_the_context_the_authority_holds() {
+    let mut catalog = agent_auth_catalog();
+    // What an ACP handshake actually produces.
+    catalog.status = vibex_core::AgentAuthStatus::Unknown;
+
+    let signed_in: vibex_core::AgentAuthContext = serde_json::from_value(serde_json::json!({
+        "id": "agent_auth_context_codex",
+        "agentId": "codex",
+        "status": "authenticated",
+        "revision": 3,
+        "createdAtMs": 1,
+        "updatedAtMs": 1
+    }))
+    .expect("auth context fixture");
+    vibex_tui::config_center::merge_agent_auth_context(&mut catalog, &[signed_in]);
+    assert_eq!(catalog.status, vibex_core::AgentAuthStatus::Authenticated);
+
+    // The same account, ended.
+    let required: vibex_core::AgentAuthContext = serde_json::from_value(serde_json::json!({
+        "id": "agent_auth_context_codex",
+        "agentId": "codex",
+        "status": "authentication_required",
+        "revision": 4,
+        "createdAtMs": 1,
+        "updatedAtMs": 1
+    }))
+    .expect("auth context fixture");
+    vibex_tui::config_center::merge_agent_auth_context(&mut catalog, &[required]);
+    assert_eq!(
+        catalog.status,
+        vibex_core::AgentAuthStatus::AuthenticationRequired
+    );
+
+    // Another Agent's account is not this Agent's answer.
+    let mut catalog = agent_auth_catalog();
+    catalog.status = vibex_core::AgentAuthStatus::Unknown;
+    let other: vibex_core::AgentAuthContext = serde_json::from_value(serde_json::json!({
+        "id": "agent_auth_context_claude",
+        "agentId": "claude",
+        "status": "authenticated",
+        "revision": 1,
+        "createdAtMs": 1,
+        "updatedAtMs": 1
+    }))
+    .expect("auth context fixture");
+    vibex_tui::config_center::merge_agent_auth_context(&mut catalog, &[other]);
+    assert_eq!(
+        catalog.status,
+        vibex_core::AgentAuthStatus::Unknown,
+        "another Agent's account was worn by this one"
+    );
+}
+
+/// An account write re-reads the account, so the panel is not the before-picture.
+#[test]
+fn a_sign_in_or_out_re_reads_the_account_it_changed() {
+    let mut app = loaded(140, 40);
+    app.management_data.agent_auth_catalog = Some(agent_auth_catalog());
+
+    for key in ["agent_auth_sign_in", "agent_auth_sign_out"] {
+        let outcome = app.refresh_after_mutation(key);
+        assert!(
+            outcome
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, vibex_tui::app::Effect::ListAgentAuth { .. })),
+            "{key} did not re-read the contexts: {:?}",
+            outcome.effects
+        );
+        assert!(
+            outcome.effects.iter().any(|effect| matches!(
+                effect,
+                vibex_tui::app::Effect::LoadAgentAuthCatalog { .. }
+            )),
+            "{key} did not re-read the catalogue: {:?}",
+            outcome.effects
+        );
+    }
+}
+
+/// The row's sign-out verb lands the panel on the line it was pressed for.
+///
+/// It is the same destructive write the panel itself asks about, so the row must
+/// not be a second, quieter way to end an account.
+#[test]
+fn the_rows_sign_out_opens_the_panel_on_the_line_it_meant() {
+    let mut app = loaded(140, 40);
+    app.capabilities.agent = vibex_backend::DomainCapabilities::available([
+        vibex_backend::BackendOperation::AgentAuthRead,
+        vibex_backend::BackendOperation::AgentAuthManage,
+    ]);
+    app.management_data.agent_auth_catalog = Some(agent_auth_catalog());
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Agents));
+
+    let outcome = app.run_config_action_by_key("codex", ConfigAction::Logout);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::LoadAgentAuthCatalog { agent_id }] => {
+            assert_eq!(agent_id.as_str(), "codex");
+        }
+        other => panic!("the row's sign-out did not open the account: {other:?}"),
+    }
+    let Some(Overlay::AgentAuth { view }) = &app.overlay else {
+        panic!("the row's sign-out did not open the account panel");
+    };
+    assert_eq!(
+        view.want_line,
+        vibex_tui::config_center::AgentAuthLine::SignOut,
+        "the panel opened somewhere other than the line the row meant"
+    );
+}
+
+/// A sign-in the authority is still running can be called off.
+///
+/// A browser or a terminal the client cannot follow is otherwise a process
+/// nobody can stop from here, and the panel had no line for it at all.
+#[test]
+fn a_running_sign_in_is_offered_and_its_cancel_is_asked_for() {
+    let mut app = loaded(140, 40);
+    app.capabilities.agent = vibex_backend::DomainCapabilities::available([
+        vibex_backend::BackendOperation::AgentAuthRead,
+        vibex_backend::BackendOperation::AgentAuthManage,
+    ]);
+    app.management_data.agent_auth_catalog = Some(agent_auth_catalog());
+    let operation: vibex_core::AgentAuthenticationOperation =
+        serde_json::from_value(serde_json::json!({
+            "operationId": "agent_auth_operation_codex",
+            "authContextId": "agent_auth_context_codex",
+            "expectedContextRevision": 7,
+            "methodId": "chatgpt",
+            "state": "awaiting_user",
+            "createdAtMs": 1,
+            "updatedAtMs": 2
+        }))
+        .expect("operation fixture");
+    app.overlay = Some(Overlay::AgentAuth {
+        view: vibex_tui::config_center::AgentAuthView {
+            agent_id: "codex".to_string(),
+            title: "Codex".to_string(),
+            selected: 0,
+            loading: false,
+            confirming_sign_out: false,
+            notice: None,
+            want_line: vibex_tui::config_center::AgentAuthLine::First,
+            pending_sign_in: Some(operation),
+        },
+    });
+
+    let rows = vibex_tui::config_center::agent_auth_rows_with_sign_in(
+        app.management_data.agent_auth_catalog.as_ref(),
+        true,
+        app.strings,
+    );
+    let cancel = rows
+        .iter()
+        .position(|row| row.action == Some(vibex_tui::config_center::AgentAuthAction::Cancel))
+        .expect("a running sign-in offered no way to stop it");
+
+    if let Some(Overlay::AgentAuth { view }) = app.overlay.as_mut() {
+        view.selected = cancel;
+    }
+    let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    match outcome.effects.as_slice() {
+        [
+            vibex_tui::app::Effect::CancelAgentAuth {
+                agent_id,
+                operation_id,
+            },
+        ] => {
+            assert_eq!(agent_id.as_str(), "codex");
+            assert_eq!(operation_id.as_str(), "agent_auth_operation_codex");
+        }
+        other => panic!("the cancel produced {other:?}"),
+    }
+    let Some(Overlay::AgentAuth { view }) = &app.overlay else {
+        panic!("the panel closed instead of dropping the finished sign-in");
+    };
+    assert!(
+        view.pending_sign_in.is_none(),
+        "the panel went on offering to cancel a sign-in it had already called off"
     );
 }

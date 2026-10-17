@@ -1255,7 +1255,18 @@ impl App {
     pub fn config_section_effects(&mut self) -> Vec<Effect> {
         use crate::config_center::ConfigSection;
         match (self.config_center.module, self.config_center.section) {
-            (_, ConfigSection::Agents) => vec![Effect::ListAgents, Effect::LoadAgentTools],
+            (_, ConfigSection::Agents) => vec![
+                Effect::ListAgents,
+                Effect::LoadAgentTools,
+                // The account column is a read of its own: the Agent list says
+                // what an Agent is, and the authorization contexts say whether
+                // it is signed in. Without this the column had no source at all
+                // and read "Not checked" for every Agent forever.
+                Effect::ListAgentAuth {
+                    agent_id: None,
+                    open: false,
+                },
+            ],
             (_, ConfigSection::Providers) => {
                 let mut effects = vec![Effect::ListProfiles];
                 // The arrangement is a record of its own, read per Agent: a
@@ -1787,18 +1798,14 @@ impl App {
             (ConfigSection::Agents, ConfigAction::MoveUp) => self.move_agent(key, -1),
             (ConfigSection::Agents, ConfigAction::MoveDown) => self.move_agent(key, 1),
             (ConfigSection::Agents, ConfigAction::Auth) => self.open_agent_auth(key),
+            // Signing out is the account panel's own verb, not a second call
+            // shape behind a different key: the panel is where the impact of
+            // ending an account is read out and confirmed, and an Agent row that
+            // signed out on one press would be the same destructive write with
+            // none of that. The row opens the panel and lands the cursor on the
+            // line it was pressed for.
             (ConfigSection::Agents, ConfigAction::Logout) => {
-                let Some(agent_id) = self.agent_id(key) else {
-                    return Outcome::quiet();
-                };
-                let subject = self.config_row_subject(key);
-                self.guard_record(
-                    BackendOperation::AgentAuthManage,
-                    key,
-                    subject,
-                    crate::config_center::ConfigVerb::SignOut,
-                    Effect::LogoutAgent { agent_id },
-                )
+                self.open_agent_auth_at(key, crate::config_center::AgentAuthLine::SignOut)
             }
             (ConfigSection::Providers, ConfigAction::Activate) => {
                 let Some(profile_id) = self.provider_id(key) else {
@@ -2176,6 +2183,21 @@ impl App {
     /// the things that can be done with the account the Agent holds, are one
     /// decision, and `Enter` on a line is the whole vocabulary.
     fn open_agent_auth(&mut self, key: &str) -> Outcome {
+        self.open_agent_auth_at(key, crate::config_center::AgentAuthLine::First)
+    }
+
+    /// The same panel, with the cursor put on the line the verb was for.
+    ///
+    /// The line is chosen once the catalogue lands, because the lines are the
+    /// catalogue's; until then the panel says it is reading. A verb pressed on
+    /// the row and a verb pressed inside the panel must lead to the same place,
+    /// or the row's key is a second, quieter way to do the same destructive
+    /// thing — which is exactly what "sign out" without the impact readout was.
+    fn open_agent_auth_at(
+        &mut self,
+        key: &str,
+        line: crate::config_center::AgentAuthLine,
+    ) -> Outcome {
         let Some(agent_id) = self.agent_id(key) else {
             return Outcome::quiet();
         };
@@ -2193,12 +2215,20 @@ impl App {
                 loading: true,
                 confirming_sign_out: false,
                 notice: None,
+                want_line: line,
+                pending_sign_in: None,
             },
         });
+        let verb = match line {
+            crate::config_center::AgentAuthLine::SignOut => {
+                crate::config_center::ConfigVerb::SignOut
+            }
+            crate::config_center::AgentAuthLine::First => crate::config_center::ConfigVerb::SignIn,
+        };
         self.begin_record_work(
             key.to_string(),
             subject,
-            crate::config_center::ConfigVerb::SignIn,
+            verb,
             vec![Effect::LoadAgentAuthCatalog { agent_id }],
         )
     }
@@ -2210,7 +2240,7 @@ impl App {
         mut view: crate::config_center::AgentAuthView,
     ) -> Outcome {
         use crate::config_center::AgentAuthAction;
-        let rows = crate::config_center::agent_auth_rows(
+        let rows = view.rows(
             self.management_data.agent_auth_catalog.as_ref(),
             self.strings,
         );
@@ -2244,6 +2274,7 @@ impl App {
                 };
                 let agent_id_str = view.agent_id.clone();
                 let confirming_sign_out = view.confirming_sign_out;
+                let pending_sign_in = view.pending_sign_in.clone();
                 self.overlay = Some(Overlay::AgentAuth { view });
                 match action {
                     AgentAuthAction::RefreshMethods => {
@@ -2275,6 +2306,25 @@ impl App {
                     }
                     AgentAuthAction::Credentials { url } => {
                         Outcome::effects(vec![Effect::OpenUrl { url }])
+                    }
+                    // Calling off a sign-in ends the operation the authority
+                    // is holding and the terminal or browser it opened. The
+                    // panel drops its memory of it either way: a cancel that
+                    // arrived after the sign-in finished is not an error, and
+                    // a panel still offering it afterwards would be offering
+                    // to cancel something that is over.
+                    AgentAuthAction::Cancel => {
+                        let Some(operation) = pending_sign_in.clone() else {
+                            return Outcome::quiet();
+                        };
+                        if let Some(Overlay::AgentAuth { view }) = self.overlay.as_mut() {
+                            view.pending_sign_in = None;
+                            view.confirming_sign_out = false;
+                        }
+                        Outcome::effects(vec![Effect::CancelAgentAuth {
+                            agent_id,
+                            operation_id: operation.operation_id,
+                        }])
                     }
                     // Signing out is asked about first: a sign-out that also
                     // ends the reader's sessions is not a decision to make
@@ -2310,7 +2360,14 @@ impl App {
             }
             Intent::CloseOverlay | Intent::Back => {
                 self.overlay = None;
-                Outcome::effects(vec![])
+                // Closing the panel does not cancel the sign-in: the operation
+                // belongs to the authority, and a browser the reader is still
+                // finishing in is not abandoned because they looked away. What
+                // is given up is the client's view of it, which is also what
+                // stops the keys going anywhere.
+                let mut outcome = Outcome::effects(vec![]);
+                outcome.dirty = true;
+                outcome
             }
             _ => {
                 self.overlay = Some(Overlay::AgentAuth { view });
@@ -7715,6 +7772,23 @@ impl App {
             "toggle_entry" | "install_agent" | "uninstall_agent" | "logout_agent"
             | "update_entry" | "rename_profile" | "select_profile" | "provider_secret" => {
                 Outcome::effects(self.management_record_effects())
+            }
+            // An account is two reads: the contexts that say who is signed in,
+            // and the catalogue that says with what. A sign-in or a sign-out
+            // moves both, and the panel draws both — so answering the press
+            // without re-reading is how the reader ends up looking at the
+            // account as it was before the key they just pressed.
+            "agent_auth_sign_in" | "agent_auth_sign_out" => {
+                let mut effects = vec![Effect::ListAgentAuth {
+                    agent_id: None,
+                    open: false,
+                }];
+                if let Some(catalog) = self.management_data.agent_auth_catalog.as_ref() {
+                    effects.push(Effect::LoadAgentAuthCatalog {
+                        agent_id: catalog.agent_id.clone(),
+                    });
+                }
+                Outcome::effects(effects)
             }
             "revoke_device" => Outcome::effects(vec![Effect::ListDevices]),
             _ => Outcome::quiet(),
