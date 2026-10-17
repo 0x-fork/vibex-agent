@@ -1446,12 +1446,33 @@ pub struct MobileApp {
     /// What the platform was last told about the display, so the flag is only
     /// written when it changes.
     keep_screen_on_applied: bool,
-    /// The slash commands the open session's Agent offers. Discovered once per
-    /// session and filtered locally, so typing `/p` never waits on the wire.
+    /// The lists of the trigger the open field is typing: the Agent's slash
+    /// commands, the workspace files, or its Skills, whichever the trigger
+    /// asked for. One request answers every tab of that trigger, and the rows
+    /// are filtered locally, so typing `/p` never waits on the wire.
     composer_commands: Vec<AgentCommandEntry>,
+    /// The reusable Prompts of the `/` popup's second tab, from the same read.
+    composer_quick_phrases: Vec<AgentCommandEntry>,
+    /// The collaborators and conversations of the `@` popup's second tab.
+    composer_delegations: Vec<AgentCommandEntry>,
+    /// Which trigger the three lists above answer. A trigger's own request is
+    /// what keeps the authority's own bound on each list: asking for all three
+    /// at once let the workspace file tree fill the reply and starve the
+    /// Skills, which is what made `$` open an empty panel.
+    composer_suggestions_trigger: Option<AgentCommandTrigger>,
+    /// The trigger whose lists are on the wire right now, so the frame that
+    /// asked for them does not ask again before they land.
+    composer_suggestions_in_flight: Option<AgentCommandTrigger>,
     /// The generation of the in-flight command discovery, so a late answer for
     /// a session the user has left is dropped.
     composer_commands_generation: u64,
+    /// The `/` or `@` tab the open session's panel shows. Clamped into the
+    /// open trigger's own tabs, so one trigger's last tab never leaks into
+    /// the next.
+    composer_suggestion_tab: ComposerSuggestionTab,
+    /// The same, for the new-session page's first message. The two pages'
+    /// fields can be on screen at once, and each remembers its own tab.
+    new_session_suggestion_tab: ComposerSuggestionTab,
     /// The executable command the current draft has been armed with. A slash
     /// command is not a message: the desktop runs it through the authority, and
     /// so does the phone — otherwise `/plan` was just text the Agent ignored.
@@ -2002,6 +2023,12 @@ fn slash_command_prefix(text: &str) -> Option<&str> {
 const COMPOSER_AGENT_REFERENCE_KEY: &str = "vibexUseAgentReference";
 const COMPOSER_SELECTION_REFERENCE_KEY: &str = "vibexUseSelectionReference";
 const COMPOSER_SESSION_REFERENCE_KEY: &str = "vibexUseSessionReference";
+/// Metadata key marking a row as the desktop's direct "delegate now" action.
+///
+/// The phone reads it only to leave the row out: its own composer arms the
+/// reference and offers a Delegate control once a draft names a collaborator,
+/// so a row that promised to hand the task over on the tap would not be true.
+const COMPOSER_DELEGATE_NOW_KEY: &str = "vibexUseDelegateNow";
 
 /// The partial `@` reference a draft is currently typing, if any.
 ///
@@ -2035,38 +2062,198 @@ enum AttachmentTarget {
     NewSession,
 }
 
-/// Which of the composer's three trigger lists a panel is showing.
+/// Which of a trigger's own lists the suggestion panel is showing.
 ///
-/// The gesture is the same for all of them, and so is the panel; only what a
-/// chosen row does differs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ComposerSuggestionKind {
-    Command,
-    Mention,
-    Skill,
-    /// The same lists drawn for the new-session page's first message. They have
-    /// their own identity because both pages' fields can be on screen at once,
-    /// and two elements may not share an id.
-    NewSessionMention,
-    NewSessionCommand,
-    NewSessionSkill,
+/// The desktop's popup carries the same four: `/` opens on the Agent's
+/// commands and keeps the reusable Prompts on a second tab, `@` opens on the
+/// workspace files and keeps the collaborators on a second. `$` has one list
+/// — the Skills — and so draws no tab header at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ComposerSuggestionTab {
+    #[default]
+    Commands,
+    Phrases,
+    Files,
+    Delegation,
 }
 
-impl ComposerSuggestionKind {
-    fn element_id(self) -> &'static str {
-        match self {
-            Self::Command => "mobile-composer-commands",
-            Self::Mention => "mobile-composer-mentions",
-            Self::Skill => "mobile-composer-skills",
-            Self::NewSessionMention => "mobile-new-session-mentions",
-            Self::NewSessionCommand => "mobile-new-session-commands",
-            Self::NewSessionSkill => "mobile-new-session-skills",
+impl ComposerSuggestionTab {
+    /// The tabs a trigger opens, in header order.
+    fn tabs(trigger: AgentCommandTrigger) -> &'static [Self] {
+        match trigger {
+            AgentCommandTrigger::Slash => &[Self::Commands, Self::Phrases],
+            AgentCommandTrigger::Mention => &[Self::Files, Self::Delegation],
+            AgentCommandTrigger::Dollar => &[Self::Commands],
         }
     }
 
-    /// Whether a chosen row is an `@` reference, wherever it was typed.
-    fn is_mention(self) -> bool {
-        matches!(self, Self::Mention | Self::NewSessionMention)
+    /// Stable element-id fragment for this tab's header button.
+    fn id(self) -> &'static str {
+        match self {
+            Self::Commands => "commands",
+            Self::Phrases => "phrases",
+            Self::Files => "files",
+            Self::Delegation => "delegation",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Commands => locale::text("Commands", "命令", "命令"),
+            Self::Phrases => locale::text("Quick phrases", "快捷短语", "快捷短語"),
+            Self::Files => locale::text("Workspace files", "工作区文件", "工作區檔案"),
+            Self::Delegation => locale::text("Agent delegation", "Agent 委派", "Agent 委派"),
+        }
+    }
+
+    /// The rows this tab shows, given every list one discovery returned.
+    fn rows<'a>(
+        self,
+        commands: &'a [AgentCommandEntry],
+        phrases: &'a [AgentCommandEntry],
+        files: &'a [AgentCommandEntry],
+        delegation: &'a [AgentCommandEntry],
+    ) -> &'a [AgentCommandEntry] {
+        match self {
+            Self::Commands => commands,
+            Self::Phrases => phrases,
+            Self::Files => files,
+            Self::Delegation => delegation,
+        }
+    }
+}
+
+/// What a tap on a suggestion row does.
+///
+/// The tab decides it, not the row: the commands tab arms or inserts, the
+/// phrases tab inserts its own words, the two `@` tabs name a reference, and
+/// the one `$` list inserts the skill's invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerSuggestionAction {
+    Command,
+    Phrase,
+    Skill,
+    Mention,
+}
+
+/// The action a tab of one trigger performs.
+fn suggestion_action(
+    trigger: AgentCommandTrigger,
+    tab: ComposerSuggestionTab,
+) -> ComposerSuggestionAction {
+    match (trigger, tab) {
+        (AgentCommandTrigger::Slash, ComposerSuggestionTab::Phrases) => {
+            ComposerSuggestionAction::Phrase
+        }
+        (AgentCommandTrigger::Slash, _) => ComposerSuggestionAction::Command,
+        (AgentCommandTrigger::Dollar, _) => ComposerSuggestionAction::Skill,
+        (AgentCommandTrigger::Mention, _) => ComposerSuggestionAction::Mention,
+    }
+}
+
+/// Which page's suggestion panel is being drawn.
+///
+/// Both pages' fields can be on screen at once, and two elements may not share
+/// an id, so the page is part of the panel's identity — its own and every row
+/// inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerSuggestionTarget {
+    Session,
+    NewSession,
+}
+
+impl ComposerSuggestionTarget {
+    fn element_id(self) -> &'static str {
+        match self {
+            Self::Session => "mobile-composer-suggestions",
+            Self::NewSession => "mobile-new-session-suggestions",
+        }
+    }
+
+    fn scroll_id(self) -> &'static str {
+        match self {
+            Self::Session => "mobile-composer-suggestions-scroll",
+            Self::NewSession => "mobile-new-session-suggestions-scroll",
+        }
+    }
+
+    /// The tab the page's own field last chose.
+    fn tab(self, app: &MobileApp) -> ComposerSuggestionTab {
+        match self {
+            Self::Session => app.composer_suggestion_tab,
+            Self::NewSession => app.new_session_suggestion_tab,
+        }
+    }
+}
+
+/// The trigger a draft is typing, if it is typing one.
+///
+/// The three characters are mutually exclusive at the point of the draft they
+/// are read from, so this is the same answer the three list helpers give,
+/// asked once and carried as the list the panel belongs to.
+fn composer_suggestion_trigger(text: &str) -> Option<AgentCommandTrigger> {
+    if slash_command_prefix(text).is_some() {
+        Some(AgentCommandTrigger::Slash)
+    } else if mention_prefix(text).is_some() {
+        Some(AgentCommandTrigger::Mention)
+    } else if skill_prefix(text).is_some() {
+        Some(AgentCommandTrigger::Dollar)
+    } else {
+        None
+    }
+}
+
+/// The four lists one trigger opens, already narrowed to what the draft is
+/// typing.
+///
+/// One struct rather than four locals because the panel shows them as tabs of
+/// one popup: the header needs to know how many there are, the body which one
+/// is showing, and both need the trigger that opened them.
+struct ComposerSuggestions {
+    trigger: AgentCommandTrigger,
+    /// What has been typed after the trigger character, lowercased.
+    query: String,
+    commands: Vec<AgentCommandEntry>,
+    phrases: Vec<AgentCommandEntry>,
+    files: Vec<AgentCommandEntry>,
+    delegation: Vec<AgentCommandEntry>,
+    /// The lists this trigger opens have not arrived yet.
+    loading: bool,
+}
+
+impl ComposerSuggestions {
+    /// The panel a trigger draws while its lists are still on the wire.
+    fn loading(trigger: AgentCommandTrigger) -> Self {
+        Self {
+            trigger,
+            query: String::new(),
+            commands: Vec::new(),
+            phrases: Vec::new(),
+            files: Vec::new(),
+            delegation: Vec::new(),
+            loading: true,
+        }
+    }
+
+    fn tabs(&self) -> &'static [ComposerSuggestionTab] {
+        ComposerSuggestionTab::tabs(self.trigger)
+    }
+
+    /// The tab the panel is showing, clamped into the open trigger's tabs so a
+    /// leftover quick-phrase tab from an earlier `/` cannot leak into `@`.
+    fn active_tab(&self, chosen: ComposerSuggestionTab) -> ComposerSuggestionTab {
+        let tabs = self.tabs();
+        if tabs.contains(&chosen) {
+            chosen
+        } else {
+            tabs.first()
+                .copied()
+                .unwrap_or(ComposerSuggestionTab::Commands)
+        }
+    }
+
+    fn rows(&self, tab: ComposerSuggestionTab) -> &[AgentCommandEntry] {
+        tab.rows(&self.commands, &self.phrases, &self.files, &self.delegation)
     }
 }
 
@@ -2083,7 +2270,57 @@ fn skill_prefix(text: &str) -> Option<&str> {
     (!remainder.contains('$')).then_some(remainder)
 }
 
-/// The `/` entries one draft should offer, from an already-loaded catalogue.
+/// How many rows one suggestion list offers a thumb.
+///
+/// The panel scrolls, so this is what a tap can reach without a swipe: the
+/// desktop's own bound, kept smaller because a phone's list shares the screen
+/// with the keyboard.
+const COMPOSER_SUGGESTION_ROWS: usize = 8;
+
+/// Whether one row answers what the reader has typed after the trigger.
+///
+/// A row is matched on everything it shows or inserts: its name, the path a
+/// file reference carries, the description under it, and the text a choice
+/// writes into the field. Matching only the name hid a file whose directory
+/// the reader named, and a phrase whose words they typed.
+fn suggestion_entry_matches(entry: &AgentCommandEntry, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let name = entry
+        .command_name
+        .clone()
+        .unwrap_or_else(|| entry.label.clone())
+        .trim_start_matches(['/', '$', '@'])
+        .to_lowercase();
+    entry.label.to_lowercase().contains(needle)
+        || name.contains(needle)
+        || entry.insertion_text.to_lowercase().contains(needle)
+        || entry
+            .reference_path
+            .as_deref()
+            .is_some_and(|path| path.to_lowercase().contains(needle))
+        || entry
+            .description
+            .as_deref()
+            .is_some_and(|description| description.to_lowercase().contains(needle))
+}
+
+/// The leading rows of one list that match, in the order the authority sent
+/// them.
+fn suggestion_rows<'a>(
+    entries: impl Iterator<Item = &'a AgentCommandEntry>,
+    needle: &str,
+) -> Vec<AgentCommandEntry> {
+    entries
+        .filter(|entry| suggestion_entry_matches(entry, needle))
+        .take(COMPOSER_SUGGESTION_ROWS)
+        .cloned()
+        .collect()
+}
+
+/// The `/` commands — the Agent's own and the executable Prompts — one draft
+/// should offer.
 ///
 /// Free rather than a method because both pages ask the same question of their
 /// own field and the same catalogue; only the field differs.
@@ -2091,23 +2328,30 @@ fn command_suggestions_for(catalogue: &[AgentCommandEntry], draft: &str) -> Vec<
     let Some(prefix) = slash_command_prefix(draft) else {
         return Vec::new();
     };
-    let needle = prefix.to_lowercase();
-    catalogue
-        .iter()
-        .filter(|entry| entry.trigger == AgentCommandTrigger::Slash)
-        .filter(|entry| {
-            let name = entry
-                .command_name
-                .clone()
-                .unwrap_or_else(|| entry.label.clone())
-                .to_lowercase();
-            needle.is_empty()
-                || name.contains(&needle)
-                || entry.label.to_lowercase().contains(&needle)
-        })
-        .take(8)
-        .cloned()
-        .collect()
+    suggestion_rows(
+        catalogue
+            .iter()
+            .filter(|entry| entry.trigger == AgentCommandTrigger::Slash),
+        &prefix.to_lowercase(),
+    )
+}
+
+/// The reusable Prompts the `/` popup's second tab offers.
+///
+/// They travel beside the commands in one discovery, stamped with the slash
+/// trigger because that is the character that opens them; what separates them
+/// from a command is that choosing one inserts its text rather than running
+/// it.
+fn phrase_suggestions_for(phrases: &[AgentCommandEntry], draft: &str) -> Vec<AgentCommandEntry> {
+    let Some(prefix) = slash_command_prefix(draft) else {
+        return Vec::new();
+    };
+    suggestion_rows(
+        phrases
+            .iter()
+            .filter(|entry| entry.trigger == AgentCommandTrigger::Slash),
+        &prefix.to_lowercase(),
+    )
 }
 
 /// The `$` skill entries one draft should offer.
@@ -2115,66 +2359,83 @@ fn skill_suggestions_for(catalogue: &[AgentCommandEntry], draft: &str) -> Vec<Ag
     let Some(prefix) = skill_prefix(draft) else {
         return Vec::new();
     };
-    let needle = prefix.to_lowercase();
-    catalogue
-        .iter()
-        .filter(|entry| entry.trigger == AgentCommandTrigger::Dollar)
-        .filter(|entry| {
-            let name = entry
-                .command_name
-                .clone()
-                .unwrap_or_else(|| entry.label.clone())
-                .trim_start_matches('$')
-                .to_lowercase();
-            needle.is_empty()
-                || name.contains(&needle)
-                || entry.label.to_lowercase().contains(&needle)
-        })
-        .take(8)
-        .cloned()
-        .collect()
+    suggestion_rows(
+        catalogue
+            .iter()
+            .filter(|entry| entry.trigger == AgentCommandTrigger::Dollar),
+        &prefix.to_lowercase(),
+    )
 }
 
-/// The `@` reference entries one draft should offer.
+/// The workspace files the `@` popup's first tab offers.
 ///
-/// A row is offered when choosing it does something: a collaborator or session
-/// becomes a typed reference, and a workspace file inserts its path. Only an
-/// entry that resolves to neither is dropped, so the list is never a row of
-/// labels that would do nothing when tapped.
-fn mention_suggestions_for(catalogue: &[AgentCommandEntry], draft: &str) -> Vec<AgentCommandEntry> {
+/// A file reference resolves to no `VibexUseMention`: choosing it inserts its
+/// own path. Files and collaborators are two tabs now, so the split is also
+/// what keeps a file row out of the list that promises a person.
+fn file_suggestions_for(catalogue: &[AgentCommandEntry], draft: &str) -> Vec<AgentCommandEntry> {
     let Some(prefix) = mention_prefix(draft) else {
         return Vec::new();
     };
     let needle = prefix.to_lowercase();
-    let mut mentions: Vec<AgentCommandEntry> = Vec::new();
-    for entry in catalogue
-        .iter()
-        .filter(|entry| entry.trigger == AgentCommandTrigger::Mention)
-    {
-        if composer_entry_mention(entry).is_none() && entry.reference_path.is_none() {
+    let mut files: Vec<AgentCommandEntry> = Vec::new();
+    for entry in catalogue.iter().filter(|entry| {
+        entry.trigger == AgentCommandTrigger::Mention && entry.reference_path.is_some()
+    }) {
+        if !suggestion_entry_matches(entry, &needle) {
             continue;
         }
-        let label = entry.label.trim_start_matches('@').to_lowercase();
-        let name = entry
-            .command_name
-            .clone()
-            .unwrap_or_else(|| entry.label.clone())
-            .to_lowercase();
-        if !needle.is_empty() && !label.contains(&needle) && !name.contains(&needle) {
+        // The tree can list the same file name in two directories; on a phone
+        // one row per name is what fits.
+        if files.iter().any(|existing| existing.label == entry.label) {
             continue;
         }
-        if mentions
-            .iter()
-            .any(|existing| existing.label == entry.label)
-        {
-            continue;
-        }
-        mentions.push(entry.clone());
-        if mentions.len() >= 8 {
+        files.push(entry.clone());
+        if files.len() >= COMPOSER_SUGGESTION_ROWS {
             break;
         }
     }
-    mentions
+    files
+}
+
+/// The collaborators and conversations the `@` popup's second tab offers.
+///
+/// Each row carries the reference the send resolves; what it does not carry is
+/// the desktop's direct "delegate now" action. The phone arms the reference
+/// instead and shows its own Delegate control once the draft names a
+/// collaborator, so a row promising to hand the work over on the tap would be
+/// a promise this composer cannot keep.
+fn delegation_suggestions_for(
+    delegation: &[AgentCommandEntry],
+    draft: &str,
+) -> Vec<AgentCommandEntry> {
+    let Some(prefix) = mention_prefix(draft) else {
+        return Vec::new();
+    };
+    let needle = prefix.to_lowercase();
+    let mut rows: Vec<AgentCommandEntry> = Vec::new();
+    for entry in delegation {
+        if entry
+            .metadata
+            .iter()
+            .any(|metadata| metadata.key == COMPOSER_DELEGATE_NOW_KEY)
+            || composer_entry_mention(entry).is_none()
+        {
+            continue;
+        }
+        if !suggestion_entry_matches(entry, &needle) {
+            continue;
+        }
+        // The same collaborator is offered once per configuration; on a phone
+        // screen one row per collaborator is what fits.
+        if rows.iter().any(|existing| existing.label == entry.label) {
+            continue;
+        }
+        rows.push(entry.clone());
+        if rows.len() >= COMPOSER_SUGGESTION_ROWS {
+            break;
+        }
+    }
+    rows
 }
 
 /// The `@` reference behind one suggestion entry, when it has one.
@@ -2866,21 +3127,17 @@ enum ComposerChipAction {
 /// The composer's placeholder, shared by the session page and the new-session
 /// page.
 ///
-/// It is the desktop's composer hint in the desktop's own vocabulary — / for
-/// commands, @ for workspace files, $ for skills — with the trailing ↑/↓
-/// history shortcut dropped, because a phone recalls history from a button
-/// rather than a key. The desktop's *new-session* sentence is too long for a
-/// phone field: with "描述你的任务，或…" in front it truncates mid-word, which is
-/// exactly what the mobile field used to do.
-///
-/// The session field used to say only "Message Vibex", which named the object
-/// but never the triggers. One short, shared line teaches the same three
-/// characters on both pages and reads as the same product as the desktop.
+/// It is the desktop's three triggers in the shortest form that still teaches
+/// them — the character, then the word for what it opens — because a phone
+/// field is one line and anything longer truncates mid-word. The session field
+/// used to say only "Message Vibex", which named the object but never the
+/// triggers; one short, shared line teaches the same three characters on both
+/// pages and reads as the same product as the desktop.
 fn composer_placeholder() -> &'static str {
     locale::text(
-        "Type / for commands, @ for workspace files, $ for skills",
-        "输入 / 唤出命令，@ 引用工作区文件，$ 调用 Skill",
-        "輸入 / 喚出命令，@ 引用工作區檔案，$ 呼叫 Skill",
+        "/ commands @files $skills",
+        "/ 命令 @文件 $技能",
+        "/ 命令 @檔案 $技能",
     )
 }
 
@@ -2923,11 +3180,10 @@ fn focused_document(
 /// name a choice that opens a list, and the mark is what says so before the
 /// thumb finds out.
 ///
-/// `spells_value` is the room the row has for the value: a chip that cannot
-/// draw it whole draws the glyph alone rather than a fragment ending in an
-/// ellipsis, which is the shape the desktop takes when its window is narrow.
-/// The value stays the chip's own label either way, so nothing that names the
-/// choice is lost — it is only the drawing that is given up.
+/// `spells_value` draws the value's name beside the glyph. It is a parameter
+/// rather than a rule because a chip that is all the reader has to know what is
+/// chosen must spell it; the value stays the chip's own label either way, so
+/// the name is never lost to the drawing.
 #[allow(clippy::too_many_arguments)]
 fn composer_chip(
     id: &'static str,
@@ -3040,86 +3296,6 @@ fn composer_option_button(
                     theme::text_secondary()
                 }),
         )
-}
-
-/// What a composer's control row has left for the model's name.
-///
-/// Every other control on the row is as wide whether or not a name is drawn:
-/// the plus against the card's leading edge, one glyph per option the Agent
-/// offers, the usage ring on the page that has a session to measure, and the
-/// send plate. The row is what is left of the window once the card's own
-/// padding is taken out, and this is what is left of the row.
-fn model_chip_share(row_width: f32, option_buttons: usize, usage_ring: bool) -> f32 {
-    let fixed = theme::TOUCH_TARGET - theme::SPACING_MD
-        + theme::COMPOSER_OPTION_SIZE * option_buttons as f32
-        + if usage_ring {
-            theme::COMPOSER_OPTION_SIZE
-        } else {
-            0.0
-        }
-        + theme::COMPOSER_SEND_SIZE;
-    (row_width - fixed).max(0.0)
-}
-
-/// Whether a name of a drawn width fits the share of the row its chip was
-/// given.
-///
-/// The chip carries a glyph, a gap on either side of its label and the row's
-/// own gap after it, so the name only has what is left of the share. A name
-/// that does not fit is not drawn at all: a model id cut short names nothing.
-fn model_label_fits(label_width: f32, share: f32) -> bool {
-    const CHIP_CHROME: f32 = theme::ICON_MD + theme::SPACING_XS * 3.0;
-    // A hair of slack: a shaped line and a laid-out one can differ in the last
-    // fraction of a pixel, and a name that only just fits must still be whole.
-    const SLACK: f32 = 1.0;
-    label_width <= (share - CHIP_CHROME - SLACK).max(0.0)
-}
-
-/// How wide a model's name draws, measured in the face it will be drawn with.
-///
-/// The row is laid out in one pass and the name is either drawn whole or not at
-/// all, so whether it fits has to be answered before the frame is built. The
-/// answer comes from the window's own text system — the same shaping the label
-/// itself goes through — because an estimate is wrong by a few pixels on the
-/// names that sit closest to the edge, and being wrong there is exactly what
-/// draws a model id ending in an ellipsis.
-fn model_label_width(label: &str, window: &Window) -> f32 {
-    let run = gpui::TextRun {
-        len: label.len(),
-        font: gpui::Font {
-            family: theme::UI_FONT_FAMILY.into(),
-            ..Default::default()
-        },
-        color: theme::text_secondary(),
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-    f32::from(
-        window
-            .text_system()
-            .shape_line(
-                label.to_owned().into(),
-                theme::scaled_px(theme::FONT_CAPTION),
-                &[run],
-                None,
-            )
-            .width(),
-    )
-}
-
-/// What a composer's control row can spend on a model's name.
-///
-/// The row is the window minus the card's own padding, and the two pages that
-/// build one pad it differently; what the name may take of the row is decided
-/// by [`model_chip_share`].
-fn composer_row_width(window: &Window, padding: f32) -> f32 {
-    let insets = window.insets().effective();
-    (f32::from(window.viewport_size().width)
-        - f32::from(insets.left)
-        - f32::from(insets.right)
-        - padding)
-        .max(0.0)
 }
 
 /// A bare icon control in a prompt card's control row: something the reader
@@ -3543,7 +3719,13 @@ impl MobileApp {
             keep_screen_on_applied: false,
             composer_drafts: restored_composer.drafts,
             composer_commands: Vec::new(),
+            composer_quick_phrases: Vec::new(),
+            composer_delegations: Vec::new(),
+            composer_suggestions_trigger: None,
+            composer_suggestions_in_flight: None,
             composer_commands_generation: 0,
+            composer_suggestion_tab: ComposerSuggestionTab::default(),
+            new_session_suggestion_tab: ComposerSuggestionTab::default(),
             composer_armed_command: None,
             composer_armed_mentions: Vec::new(),
             composer_attachments: Vec::new(),
@@ -5949,6 +6131,11 @@ impl MobileApp {
                                 })
                                 .map(|option| option.selection.clone())
                         });
+                    // The trigger lists are scoped by the Agent behind the
+                    // field, and the page had none when the catalogue landed.
+                    // Whatever `/`, `@` or `$` was typed against the old scope
+                    // is read again for the Agent the page now names.
+                    this.invalidate_composer_commands();
                 }
                 if applied && this.runtime_options_open {
                     this.sync_runtime_feature_inputs();
@@ -6314,7 +6501,7 @@ impl MobileApp {
     /// The new-session page has no session to apply a draft to, so a choice made
     /// while its drawer is open *is* the choice: the draft lands on the page as
     /// it changes.
-    fn commit_new_session_runtime_draft(&mut self, cx: &mut Context<Self>) {
+    fn commit_new_session_runtime_draft(&mut self, _cx: &mut Context<Self>) {
         if self.runtime_options_target != RuntimeOptionsTarget::NewSession {
             return;
         }
@@ -6323,10 +6510,10 @@ impl MobileApp {
             self.new_session_runtime = Some(draft);
             // The catalogue belongs to the Agent, so a new choice re-scopes the
             // `/`, `@` and `$` lists on the page along with the model list. Only
-            // a real change re-reads it; re-setting the same draft would ask the
-            // authority the same question again.
+            // a real change drops it; the next frame reads the trigger the
+            // field is typing against the Agent that just became current.
             if changed {
-                self.refresh_composer_commands(cx);
+                self.invalidate_composer_commands();
             }
         }
     }
@@ -6981,11 +7168,12 @@ impl MobileApp {
         if needs_runtime_catalog {
             self.refresh_runtime_options(cx);
         }
-        // The page's first message opens the same `/`, `@` and `$` lists the
-        // session composer does, and those lists come from the Agent's
-        // catalogue. There is no session yet to trigger the usual load, so the
-        // page asks for it here.
-        self.refresh_composer_commands(cx);
+        // The page's first message opens the same trigger panels the session
+        // composer does, and those lists come from the Agent's catalogue. The
+        // catalogue on hand belongs to the Agent behind the page under this
+        // one, so it goes; the first frame that types a trigger reads the
+        // page's own.
+        self.invalidate_composer_commands();
         cx.notify();
     }
 
@@ -7700,9 +7888,10 @@ impl MobileApp {
         self.timeline_follow = true;
         self.token_usage = None;
         // The command catalogue belongs to the Agent behind this session, so it
-        // is re-read with it. The armed command never survives a switch: it
-        // names a command the new Agent may not have.
-        self.composer_commands.clear();
+        // goes with the session. The armed command never survives a switch
+        // either: it names a command the new Agent may not have. The next frame
+        // reads the lists the new session's draft is typing.
+        self.invalidate_composer_commands();
         self.composer_armed_command = None;
         self.composer_armed_mentions.clear();
         // The rewrite itself is dropped above, with the reader's own draft
@@ -7711,7 +7900,6 @@ impl MobileApp {
         self.composer_history_open = false;
         self.composer_goal_expanded = false;
         self.refresh_token_usage(cx);
-        self.refresh_composer_commands(cx);
         self.expanded_process.clear();
         self.expanded_timeline_rows.clear();
         self.collapsed_timeline_rows.clear();
@@ -8029,8 +8217,15 @@ impl MobileApp {
         (members.len() >= 2).then_some(members)
     }
 
-    /// Loads the `/` commands, `@` references and `$` skills the relevant
-    /// Agent advertises.
+    /// Loads the lists one trigger opens for the Agent behind the field being
+    /// written.
+    ///
+    /// One request answers both tabs of a trigger — the desktop's own shape —
+    /// so switching between commands and quick phrases, or files and
+    /// collaborators, never waits on the wire. Only the trigger that opened is
+    /// asked for: the authority bounds each list by the request's own limit,
+    /// and asking for all three at once let the workspace file tree fill the
+    /// reply and starve the Skills, which is what made `$` open an empty panel.
     ///
     /// A runtime that does not implement discovery simply answers with nothing,
     /// so a failure here is silent: the composer just has no suggestions. What
@@ -8044,7 +8239,7 @@ impl MobileApp {
     /// without one is answered with nothing. That omission is why `/` and `$`
     /// opened an empty panel on a paired phone while the same Agent listed its
     /// commands on the desktop.
-    fn refresh_composer_commands(&mut self, cx: &mut Context<Self>) {
+    fn refresh_composer_commands(&mut self, trigger: AgentCommandTrigger, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
@@ -8095,6 +8290,14 @@ impl MobileApp {
         };
         self.composer_commands_generation = self.composer_commands_generation.wrapping_add(1);
         let generation = self.composer_commands_generation;
+        self.composer_suggestions_in_flight = Some(trigger);
+        // The lists on screen belonged to the trigger being left, so they go
+        // with it: a `/` typed over an `@` must not draw a row that inserts a
+        // reference into what is now a command.
+        self.composer_commands.clear();
+        self.composer_quick_phrases.clear();
+        self.composer_delegations.clear();
+        self.composer_suggestions_trigger = None;
         // The catalogue is a remote read, so it belongs on the Tokio runtime:
         // a `vibex-remote-client` future builds its timer from the runtime
         // context it is polled in, and the GPUI foreground executor has none.
@@ -8107,9 +8310,10 @@ impl MobileApp {
                     provider_profile_id,
                     session_id: session_id.clone(),
                     workspace_id,
-                    // Both triggers in one read: the suggestion panel decides
-                    // which list to show from the character being typed.
-                    trigger: None,
+                    // The one trigger being typed: its own limit bounds the
+                    // list that trigger opens, and the other two travel beside
+                    // it as the popup's second tab.
+                    trigger: Some(trigger),
                     query: None,
                     limit: Some(64),
                 })
@@ -8121,8 +8325,12 @@ impl MobileApp {
                 if generation != this.composer_commands_generation {
                     return;
                 }
+                this.composer_suggestions_in_flight = None;
                 if let Ok(discovery) = discovery {
                     this.composer_commands = discovery.response.entries;
+                    this.composer_quick_phrases = discovery.quick_phrases;
+                    this.composer_delegations = discovery.delegation_entries;
+                    this.composer_suggestions_trigger = Some(trigger);
                     cx.notify();
                 }
             });
@@ -8130,46 +8338,92 @@ impl MobileApp {
         self.tasks.push(task);
     }
 
-    /// The suggestion panel's contents for the draft on screen, if the user is
-    /// typing a command name.
-    fn composer_command_suggestions(&self, cx: &gpui::App) -> Vec<AgentCommandEntry> {
-        let draft = self.composer_input.read(cx).value().to_string();
-        command_suggestions_for(&self.composer_commands, &draft)
-    }
-
-    /// The suggestion panel's contents for a `$` being typed.
+    /// Forgets the trigger lists on hand, so the next frame reads again for
+    /// whichever trigger the field is typing.
     ///
-    /// Skills are the Agent's own repertoire rather than this client's, so the
-    /// list is whatever the runtime advertised with the dollar trigger — the
-    /// phone adds no vocabulary of its own.
-    fn composer_skill_suggestions(&self, cx: &gpui::App) -> Vec<AgentCommandEntry> {
-        let draft = self.composer_input.read(cx).value().to_string();
-        skill_suggestions_for(&self.composer_commands, &draft)
+    /// Used when the Agent behind the field changed — a runtime switch, the
+    /// new-session page opening or closing — because the vocabulary belongs to
+    /// the Agent, and a list discovered for the old one would offer commands
+    /// the new one does not have.
+    fn invalidate_composer_commands(&mut self) {
+        self.composer_commands_generation = self.composer_commands_generation.wrapping_add(1);
+        self.composer_commands.clear();
+        self.composer_quick_phrases.clear();
+        self.composer_delegations.clear();
+        self.composer_suggestions_trigger = None;
+        self.composer_suggestions_in_flight = None;
     }
 
-    /// The new-session page's `/` list.
+    /// Reads the lists again if the field has started typing a trigger whose
+    /// lists are not on hand.
     ///
-    /// The page's first message can open a command the same way a session's can
-    /// — `/plan` and `/permission` are provider commands, and the desktop lets
-    /// the reader reach them before a session exists. The phone did not, so a
-    /// `/` typed on this page did nothing at all.
-    fn new_session_command_suggestions(&self, cx: &gpui::App) -> Vec<AgentCommandEntry> {
-        let draft = self.new_session_prompt_input.read(cx).value().to_string();
-        command_suggestions_for(&self.composer_commands, &draft)
+    /// Called from the frame, because the field is written by more than the
+    /// keyboard: a restored draft, a shared line and a page opening all put
+    /// text there, and every one of them can carry a `/`, `@` or `$`.
+    fn sync_composer_suggestion_catalogue(&mut self, cx: &mut Context<Self>) {
+        if self.new_session_open {
+            let draft = self.new_session_prompt_input.read(cx).value().to_string();
+            if let Some(trigger) = composer_suggestion_trigger(&draft) {
+                self.ensure_composer_commands(trigger, cx);
+            }
+        } else {
+            let draft = self.composer_input.read(cx).value().to_string();
+            if let Some(trigger) = composer_suggestion_trigger(&draft) {
+                self.ensure_composer_commands(trigger, cx);
+            }
+        }
     }
 
-    /// The new-session page's `$` list, from the same catalogue as the session
-    /// composer's.
-    fn new_session_skill_suggestions(&self, cx: &gpui::App) -> Vec<AgentCommandEntry> {
-        let draft = self.new_session_prompt_input.read(cx).value().to_string();
-        skill_suggestions_for(&self.composer_commands, &draft)
+    /// Reads one trigger's lists unless they are already on hand or already on
+    /// the wire.
+    fn ensure_composer_commands(&mut self, trigger: AgentCommandTrigger, cx: &mut Context<Self>) {
+        if self.composer_suggestions_trigger == Some(trigger)
+            || self.composer_suggestions_in_flight == Some(trigger)
+        {
+            return;
+        }
+        self.refresh_composer_commands(trigger, cx);
     }
 
-    /// The suggestion panel's contents for an `@` typed in the new-session
-    /// page's first message.
-    fn new_session_mention_suggestions(&self, cx: &gpui::App) -> Vec<AgentCommandEntry> {
+    /// The four lists the draft on screen opens, if it is typing a trigger.
+    ///
+    /// The catalogue on hand answers one trigger; a draft asking for another
+    /// gets the panel with the loading row in it, because the fetch it needs
+    /// was already started by the frame that first saw the character.
+    fn composer_suggestions_in(&self, draft: &str) -> Option<ComposerSuggestions> {
+        let trigger = composer_suggestion_trigger(draft)?;
+        if self.composer_suggestions_trigger != Some(trigger) {
+            return (self.composer_suggestions_in_flight == Some(trigger))
+                .then(|| ComposerSuggestions::loading(trigger));
+        }
+        let query = match trigger {
+            AgentCommandTrigger::Slash => slash_command_prefix(draft),
+            AgentCommandTrigger::Mention => mention_prefix(draft),
+            AgentCommandTrigger::Dollar => skill_prefix(draft),
+        }
+        .unwrap_or_default()
+        .to_lowercase();
+        Some(ComposerSuggestions {
+            trigger,
+            query,
+            commands: command_suggestions_for(&self.composer_commands, draft),
+            phrases: phrase_suggestions_for(&self.composer_quick_phrases, draft),
+            files: file_suggestions_for(&self.composer_commands, draft),
+            delegation: delegation_suggestions_for(&self.composer_delegations, draft),
+            loading: false,
+        })
+    }
+
+    /// The session composer's four lists for the draft it holds.
+    fn composer_suggestions(&self, cx: &gpui::App) -> Option<ComposerSuggestions> {
+        let draft = self.composer_input.read(cx).value().to_string();
+        self.composer_suggestions_in(&draft)
+    }
+
+    /// The new-session page's four lists for the first message being written.
+    fn new_session_suggestions(&self, cx: &gpui::App) -> Option<ComposerSuggestions> {
         let draft = self.new_session_prompt_input.read(cx).value().to_string();
-        mention_suggestions_for(&self.composer_commands, &draft)
+        self.composer_suggestions_in(&draft)
     }
 
     /// Applies one `@` reference to the new-session first message.
@@ -8303,47 +8557,6 @@ impl MobileApp {
         }
         crate::platform::show_keyboard();
         cx.notify();
-    }
-
-    /// The suggestion panel's contents for an `@` being typed.
-    fn composer_mention_suggestions(&self, cx: &gpui::App) -> Vec<AgentCommandEntry> {
-        let draft = self.composer_input.read(cx).value().to_string();
-        let Some(prefix) = mention_prefix(&draft) else {
-            return Vec::new();
-        };
-        let needle = prefix.to_lowercase();
-        let mut mentions: Vec<AgentCommandEntry> = Vec::new();
-        for entry in self
-            .composer_commands
-            .iter()
-            .filter(|entry| entry.trigger == AgentCommandTrigger::Mention)
-        {
-            if composer_entry_mention(entry).is_none() {
-                continue;
-            }
-            let label = entry.label.trim_start_matches('@').to_lowercase();
-            let name = entry
-                .command_name
-                .clone()
-                .unwrap_or_else(|| entry.label.clone())
-                .to_lowercase();
-            if !needle.is_empty() && !label.contains(&needle) && !name.contains(&needle) {
-                continue;
-            }
-            // The same collaborator is offered once per configuration; on a
-            // phone screen one row per collaborator is what fits.
-            if mentions
-                .iter()
-                .any(|existing| existing.label == entry.label)
-            {
-                continue;
-            }
-            mentions.push(entry.clone());
-            if mentions.len() >= 8 {
-                break;
-            }
-        }
-        mentions
     }
 
     /// Applies one mention: the typed `@` token becomes the reference's label,
@@ -10530,7 +10743,7 @@ impl MobileApp {
             // The catalogue on screen belonged to the page's Agent. Closing the
             // page hands the composer back to the session, so the session's own
             // vocabulary is read again rather than left as the page's.
-            self.refresh_composer_commands(cx);
+            self.invalidate_composer_commands();
         }
         self.overlay = None;
         self.overlay_returns_to_drawer = false;
@@ -11217,6 +11430,9 @@ impl MobileApp {
             .update(cx, |input, cx| input.set_value("", window, cx));
         // The keyboard stays up: the next line is usually already in mind.
         crate::platform::show_keyboard();
+        // A line handed to the queue is not a draft either, so the write that
+        // keeps drafts is made now rather than with the debounced one.
+        self.flush_composer_state(cx);
         self.send_sidebar_mutation(
             RemoteSidebarOrganizationMutation::EnqueueQueuedSend {
                 session_id: session_id.as_str().to_string(),
@@ -12008,6 +12224,12 @@ impl MobileApp {
             self.composer_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
         }
+        // The draft goes to disk now rather than with the debounced write that
+        // follows a keystroke. A sent line is not a draft, and a phone killed
+        // between the send and that write would bring it back as one — the
+        // message already in the conversation and its text waiting in the field
+        // again.
+        self.flush_composer_state(cx);
         self.spawn_timeline_mutation(ticket, future, Some(restore_text), cx);
     }
 
@@ -12066,12 +12288,39 @@ impl MobileApp {
                 if let Some(error) = mutation_error {
                     this.fail(error);
                 }
+                // Whether the authority already has the message. A send's call
+                // answers only when the whole turn is over, so a dropped
+                // connection or a client timeout can report a failure for a
+                // prompt the conversation shows as sent; the text belongs back
+                // in the field only when it never arrived.
+                let confirmed = this.pending_user_message.as_ref().is_some_and(|pending| {
+                    this.display_timeline()
+                        .is_some_and(|timeline| pending.is_confirmed_by(timeline))
+                });
                 if failed {
                     this.pending_user_message = None;
                 }
                 this.rebuild_timeline_turns();
-                if failed && let Some(text) = restore_composer {
-                    this.pending_composer_restore = Some(text);
+                if failed
+                    && !confirmed
+                    && let Some(text) = restore_composer
+                {
+                    // The field only takes the line back while it is the field
+                    // that sent it. A failure that lands after the reader moved
+                    // to another session parks the text with the conversation it
+                    // was written in, where opening it again finds it — rather
+                    // than into whichever draft happens to be on screen.
+                    let open_session = this
+                        .controller
+                        .as_ref()
+                        .and_then(|controller| controller.state.selected_session_id.clone());
+                    if open_session.as_ref() == Some(&ticket.session_id) {
+                        this.pending_composer_restore = Some(text);
+                    } else {
+                        this.composer_drafts
+                            .insert(ticket.session_id.as_str().to_string(), text);
+                        this.mark_composer_state_dirty(cx);
+                    }
                 }
                 // The turn this submission was waiting on has settled, which is
                 // the Desktop's cue to release the next queued prompt. The
@@ -18573,7 +18822,12 @@ impl MobileApp {
                                 cx.listener({
                                     let selection = selection.clone();
                                     move |this, _, _, cx| {
-                                        this.choose_runtime_selection(selection.clone(), cx)
+                                        this.choose_runtime_selection(selection.clone(), cx);
+                                        // A chosen model is the end of this
+                                        // drawer's visit: the chip under it
+                                        // names the answer, and the list would
+                                        // only cover the page that shows it.
+                                        this.close_sheet(SheetKey::RuntimeOptions, cx);
                                     }
                                 }),
                             )
@@ -18645,12 +18899,18 @@ impl MobileApp {
                 .active(|style| style.bg(theme::row_pressed_bg()))
                 .on_mouse_up(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| match page {
-                        RuntimeOptionPage::Reasoning => this.choose_default_runtime_reasoning(cx),
-                        RuntimeOptionPage::Mode => this.choose_default_runtime_mode(cx),
-                        // The options page has no default row of its own: each
-                        // of the Agent's options resets by its own default.
-                        RuntimeOptionPage::Options => {}
+                    cx.listener(move |this, _, _, cx| {
+                        match page {
+                            RuntimeOptionPage::Reasoning => {
+                                this.choose_default_runtime_reasoning(cx)
+                            }
+                            RuntimeOptionPage::Mode => this.choose_default_runtime_mode(cx),
+                            // The options page has no default row of its own: each
+                            // of the Agent's options resets by its own default.
+                            RuntimeOptionPage::Options => {}
+                        }
+                        // The tap is the save; the panel folds away with it.
+                        this.collapse_agent_option_drawer(cx);
                     }),
                 )
         });
@@ -18688,11 +18948,26 @@ impl MobileApp {
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
-                        this.choose_runtime_selection(selection.clone(), cx)
+                        this.choose_runtime_selection(selection.clone(), cx);
+                        // The tap is the save; the panel folds away with it.
+                        this.collapse_agent_option_drawer(cx);
                     }),
                 )
         })
         .into_any_element()
+    }
+
+    /// Closes the Agent-option drawer a choice was just made in.
+    ///
+    /// There is no footer and no apply control on these drawers: the tap is the
+    /// save, and the panel leaves the screen with it so the page under it shows
+    /// the answer rather than the list that gave it. The draft is already on its
+    /// way — [`Self::finish_runtime_drawer`] commits on the way out — so this is
+    /// only the fold.
+    fn collapse_agent_option_drawer(&mut self, cx: &mut Context<Self>) {
+        if self.runtime_option_page.is_some() {
+            self.close_sheet(SheetKey::RuntimeOption, cx);
+        }
     }
 
     fn render_runtime_feature(
@@ -18788,7 +19063,10 @@ impl MobileApp {
                                                     selected_feature_id.clone(),
                                                     selected_value.clone(),
                                                     cx,
-                                                )
+                                                );
+                                                // The tap is the save; the panel
+                                                // folds away with it.
+                                                this.collapse_agent_option_drawer(cx);
                                             }),
                                         )
                                 },
@@ -19790,10 +20068,11 @@ impl MobileApp {
                 div()
                     .w(gpui::relative(0.78))
                     .max_w(px(520.0))
-                    // The same plate the composer draws: one square corner at
-                    // the top-right, the other three round, filled a step above
-                    // the page. A sent message and the field it was written in
-                    // are the same object at two moments.
+                    // The plate a sent message wears: filled a step above the
+                    // page, and cut square at the top-right so the reader's own
+                    // side is the one it leaves from. The field that wrote it
+                    // keeps all four corners round; a message is read, and a
+                    // field is written in.
                     .rounded(px(theme::RADIUS_COMPOSER))
                     .rounded_tr(px(0.0))
                     .border_1()
@@ -21274,7 +21553,7 @@ impl MobileApp {
         running: bool,
         state: Option<AgentSessionState>,
         turns: &[TimelineConversationTurn],
-        window: &Window,
+        _window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let latest_ended_normally = turns
@@ -21319,9 +21598,7 @@ impl MobileApp {
             _ => theme::text_muted(),
         };
         let usage_reported = self.token_usage.is_some();
-        let command_suggestions = self.composer_command_suggestions(cx);
-        let mention_suggestions = self.composer_mention_suggestions(cx);
-        let skill_suggestions = self.composer_skill_suggestions(cx);
+        let suggestions = self.composer_suggestions(cx);
         let composer_plan = self.render_composer_plan(cx);
         let composer_goal = self.render_composer_goal(cx);
         let delegation_target = self.composer_delegation_target(cx);
@@ -21371,32 +21648,18 @@ impl MobileApp {
         let mode_set = runtime_selection.is_some_and(|selection| selection.mode_id.is_some());
         let options_set =
             runtime_selection.is_some_and(|selection| !selection.config_values.is_empty());
-        // The model's name is drawn in full or not at all: the row's other
-        // controls are the width they are, and what is left decides.
-        let option_buttons = [reasoning_offered, modes_offered, features_offered]
-            .into_iter()
-            .filter(|offered| *offered)
-            .count();
-        let model_share = model_chip_share(
-            composer_row_width(window, theme::SPACING_MD * 4.0),
-            option_buttons,
-            true,
-        );
-        let spells_model = model_label_fits(model_label_width(&model_label, window), model_share);
         div()
             .flex_shrink_0()
             .bg(theme::bg_primary())
             .p(px(theme::SPACING_MD))
-            // Slash-command suggestions sit directly above the field they are
+            // The trigger's panel sits directly above the field it is
             // completing, the way a phone keyboard's own suggestion strip does.
-            .when(!command_suggestions.is_empty(), |composer| {
-                composer.child(self.render_composer_command_panel(&command_suggestions, cx))
-            })
-            .when(!mention_suggestions.is_empty(), |composer| {
-                composer.child(self.render_composer_mention_panel(&mention_suggestions, cx))
-            })
-            .when(!skill_suggestions.is_empty(), |composer| {
-                composer.child(self.render_composer_skill_panel(&skill_suggestions, cx))
+            .when_some(suggestions, |composer, suggestions| {
+                composer.child(self.render_composer_suggestion_panel(
+                    &suggestions,
+                    ComposerSuggestionTarget::Session,
+                    cx,
+                ))
             })
             // What the Agent is working through, then what the reader has
             // written ahead: both sit between the suggestions and the field.
@@ -21456,12 +21719,12 @@ impl MobileApp {
                     .id("mobile-composer-card")
                     .relative()
                     .min_h(px(52.0))
-                    // The card is a message being written, and its one square
-                    // corner sits at the top-right where the reader's own
-                    // actions live: the other three stay round so the card
-                    // still reads as a message rather than a panel.
+                    // The card is a message being written, so it wears the
+                    // message plate's fill and radius. Its corners are all
+                    // round: the one square corner it used to carry at the
+                    // top-right read as a cut-off edge on a phone rather than
+                    // as an affordance.
                     .rounded(px(theme::RADIUS_COMPOSER))
-                    .rounded_tr(px(0.0))
                     .border_1()
                     .border_color(theme::border_default())
                     .bg(theme::composer_surface())
@@ -21534,7 +21797,11 @@ impl MobileApp {
                             // The model is the chip's whole story here: the mode
                             // the session is running under was chosen when it
                             // started, and the drawer behind this chip is where
-                            // either one is read or changed.
+                            // either one is read or changed. Its name is always
+                            // spelled: the chip takes what the row has left and
+                            // is the first thing to give way when the Agent's own
+                            // glyphs need it, rather than the reader being told
+                            // only which brand answered.
                             .child(
                                 composer_chip(
                                     "composer-runtime-options",
@@ -21546,7 +21813,7 @@ impl MobileApp {
                                     model_label,
                                     !runtime_summary.available,
                                     false,
-                                    spells_model,
+                                    true,
                                     ComposerChipAction::SessionModel,
                                     cx,
                                 )
@@ -21721,49 +21988,35 @@ impl MobileApp {
             )
     }
 
-    /// The `/` suggestion list. Choosing an entry either arms the draft with an
-    /// executable command or inserts reusable text, matching the desktop's two
-    /// kinds of slash entry.
-    fn render_composer_command_panel(
-        &self,
-        entries: &[AgentCommandEntry],
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        self.render_composer_suggestion_panel(entries, ComposerSuggestionKind::Command, cx)
-    }
-
-    /// The `@` suggestion list: same shape as the command list, because it is
-    /// the same gesture with a different character in front of it.
-    fn render_composer_mention_panel(
-        &self,
-        entries: &[AgentCommandEntry],
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        self.render_composer_suggestion_panel(entries, ComposerSuggestionKind::Mention, cx)
-    }
-
-    /// The `$` skill list, the third character with the same gesture behind it.
-    fn render_composer_skill_panel(
-        &self,
-        entries: &[AgentCommandEntry],
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        self.render_composer_suggestion_panel(entries, ComposerSuggestionKind::Skill, cx)
-    }
-
-    /// The `/`, `@`, and `$` suggestion list. Choosing a command either arms
-    /// the draft with something executable or inserts reusable text; choosing a
-    /// mention inserts the reference's label and remembers the reference; a
-    /// skill inserts its own `$name` invocation.
+    /// The `/`, `@`, and `$` suggestion panel, drawn as the tabs its trigger
+    /// opens.
+    ///
+    /// One panel serves both pages and all three characters: the header is what
+    /// says which trigger opened it, and each tab is one of the lists that
+    /// trigger carries. Choosing a command either arms the draft with something
+    /// executable or inserts reusable text; choosing a reference inserts its
+    /// label and remembers the reference; a skill inserts its own `$name`
+    /// invocation.
     fn render_composer_suggestion_panel(
         &self,
-        entries: &[AgentCommandEntry],
-        kind: ComposerSuggestionKind,
+        suggestions: &ComposerSuggestions,
+        target: ComposerSuggestionTarget,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let tabs = suggestions.tabs();
+        let active = suggestions.active_tab(target.tab(self));
+        let rows = suggestions.rows(active);
+        let action = suggestion_action(suggestions.trigger, active);
+        let muted_note = if suggestions.loading {
+            locale::text("Loading…", "加载中…", "載入中…").to_string()
+        } else if active == ComposerSuggestionTab::Phrases && suggestions.query.is_empty() {
+            locale::text("No quick phrases yet", "还没有快捷短语", "還沒有快捷短語").to_string()
+        } else {
+            locale::text("No matches", "没有匹配项", "沒有符合項目").to_string()
+        };
         div()
-            .id(kind.element_id())
-            .debug_selector(move || kind.element_id().to_string())
+            .id(target.element_id())
+            .debug_selector(move || target.element_id().to_string())
             .mb(px(theme::SPACING_SM))
             .max_h(px(200.0))
             .rounded(px(theme::RADIUS_CARD))
@@ -21773,138 +22026,255 @@ impl MobileApp {
             .overflow_hidden()
             .flex()
             .flex_col()
+            // A trigger with one list wears no header: `$` is a list, not a
+            // pair of lists, and a tab bar with one tab is furniture.
+            .when(tabs.len() > 1, |panel| {
+                panel.child(self.render_composer_suggestion_tabs(suggestions, target, active, cx))
+            })
             .child(
                 div()
-                    .id("mobile-composer-suggestions-scroll")
+                    .id(target.scroll_id())
                     .overflow_y_scroll()
                     .restrict_scroll_to_axis()
-                    .children(entries.iter().map(|entry| {
-                        let entry = entry.clone();
-                        let mention = kind.is_mention();
-                        let executable = matches!(
-                            kind,
-                            ComposerSuggestionKind::Command
-                                | ComposerSuggestionKind::NewSessionCommand
-                        ) && is_executable_command_source(&entry);
-                        let destructive = entry.destructive;
-                        let label = entry.label.clone();
-                        // A file reference shows the path behind its name; every
-                        // other reference shows the description the authority
-                        // wrote — a collaborator's account and model, a
-                        // session's Agent — because those have no path and the
-                        // configurations of one Agent are otherwise identical
-                        // rows. The same split the desktop draws.
-                        let description = entry
-                            .reference_path
-                            .clone()
-                            .filter(|_| entry.source_kind == AgentCommandSourceKind::Reference)
-                            .or_else(|| entry.description.as_deref().map(runtime_attribution_line));
-                        let name = entry
-                            .command_name
-                            .clone()
-                            .unwrap_or_else(|| entry.label.clone());
-                        let leading = match kind {
-                            ComposerSuggestionKind::Mention
-                            | ComposerSuggestionKind::NewSessionMention => entry.label.clone(),
-                            ComposerSuggestionKind::Skill
-                            | ComposerSuggestionKind::NewSessionSkill => {
-                                format!("${}", name.trim_start_matches('$'))
-                            }
-                            ComposerSuggestionKind::Command
-                            | ComposerSuggestionKind::NewSessionCommand => format!("/{name}"),
-                        };
-                        div()
-                            .id(format!("composer-suggestion:{}", entry.id))
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .px(px(theme::SPACING_MD))
-                            .flex()
-                            .items_center()
-                            .gap(px(theme::SPACING_SM))
-                            .border_b_1()
-                            .border_color(theme::border_subtle())
-                            .cursor_pointer()
-                            .aria_label(name.clone())
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| match kind {
-                                    ComposerSuggestionKind::Mention => {
-                                        this.choose_composer_mention(entry.clone(), window, cx)
-                                    }
-                                    ComposerSuggestionKind::NewSessionMention => {
-                                        this.choose_new_session_mention(entry.clone(), window, cx)
-                                    }
-                                    ComposerSuggestionKind::Skill => {
-                                        this.choose_composer_skill(entry.clone(), window, cx)
-                                    }
-                                    ComposerSuggestionKind::NewSessionSkill => {
-                                        this.choose_new_session_skill(entry.clone(), window, cx)
-                                    }
-                                    ComposerSuggestionKind::Command => {
-                                        this.choose_composer_command(entry.clone(), window, cx)
-                                    }
-                                    ComposerSuggestionKind::NewSessionCommand => {
-                                        this.choose_new_session_command(entry.clone(), window, cx)
-                                    }
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .font_family(theme::MONO_FONT_FAMILY)
-                                    .text_size(theme::font_caption())
-                                    .text_color(if destructive {
-                                        theme::accent_red()
-                                    } else {
-                                        theme::accent_blue()
-                                    })
-                                    .child(leading),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .text_size(theme::font_micro())
-                                            .text_color(theme::text_primary())
-                                            .child(label.clone()),
-                                    )
-                                    .when_some(description.clone(), |labels, description| {
-                                        labels.child(
-                                            div()
-                                                .min_w_0()
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .whitespace_nowrap()
-                                                .text_size(theme::font_micro())
-                                                .text_color(theme::text_muted())
-                                                .child(description),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(theme::font_micro())
-                                    .text_color(theme::text_muted())
-                                    .child(if mention {
-                                        locale::text("Refers", "引用", "引用")
-                                    } else if executable {
-                                        locale::text("Runs", "执行", "執行")
-                                    } else {
-                                        locale::text("Inserts", "插入", "插入")
-                                    }),
-                            )
+                    .when(rows.is_empty(), |body| {
+                        body.child(
+                            div()
+                                .min_h(px(theme::TOUCH_TARGET))
+                                .px(px(theme::SPACING_MD))
+                                .flex()
+                                .items_center()
+                                .text_size(theme::font_micro())
+                                .text_color(theme::text_muted())
+                                .child(muted_note),
+                        )
+                    })
+                    .children(rows.iter().map(|entry| {
+                        self.render_composer_suggestion_row(entry, action, target, cx)
                     })),
             )
             .into_any_element()
+    }
+
+    /// The tab header of a trigger that opens more than one list.
+    ///
+    /// The tabs are text with the accent's underline on the open one, the way
+    /// the desktop's popup draws them: a bar of pills would compete with the
+    /// rows under it, and the rows are what the reader came for.
+    fn render_composer_suggestion_tabs(
+        &self,
+        suggestions: &ComposerSuggestions,
+        target: ComposerSuggestionTarget,
+        active: ComposerSuggestionTab,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .flex_shrink_0()
+            .h(px(theme::TOUCH_TARGET))
+            .px(px(theme::SPACING_SM))
+            .flex()
+            .items_center()
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .children(suggestions.tabs().iter().copied().map(|tab| {
+                let selected = tab == active;
+                div()
+                    .id(format!("{}-tab:{}", target.element_id(), tab.id()))
+                    .debug_selector(move || format!("{}-tab:{}", target.element_id(), tab.id()))
+                    .h_full()
+                    .px(px(theme::SPACING_SM))
+                    .flex()
+                    .items_center()
+                    .border_b_2()
+                    .border_color(if selected {
+                        theme::accent_blue()
+                    } else {
+                        theme::border_subtle().opacity(0.0)
+                    })
+                    .text_size(theme::font_caption())
+                    .text_color(if selected {
+                        theme::text_primary()
+                    } else {
+                        theme::text_muted()
+                    })
+                    .cursor_pointer()
+                    .aria_label(tab.label())
+                    .aria_selected(selected)
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.select_composer_suggestion_tab(target, tab, cx)
+                        }),
+                    )
+                    .child(tab.label())
+            }))
+            .into_any_element()
+    }
+
+    /// One row of the suggestion panel.
+    ///
+    /// What the row reads as follows the tab it belongs to: a command leads with
+    /// the `/name` the draft will become, a skill with its `$name`, a reference
+    /// with the `@name` it inserts, and a quick phrase — which has no trigger
+    /// character — with its own name. The line beside the token is what the row
+    /// is: the authority's description, the path behind a file, the account and
+    /// model behind a collaborator.
+    fn render_composer_suggestion_row(
+        &self,
+        entry: &AgentCommandEntry,
+        action: ComposerSuggestionAction,
+        target: ComposerSuggestionTarget,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let entry = entry.clone();
+        let destructive = entry.destructive;
+        let executable =
+            action == ComposerSuggestionAction::Command && is_executable_command_source(&entry);
+        let refers = action == ComposerSuggestionAction::Mention;
+        // A file reference shows the path behind its name; every other
+        // reference shows the description the authority wrote — a
+        // collaborator's account and model, a session's Agent — because those
+        // have no path and the configurations of one Agent are otherwise
+        // identical rows. The same split the desktop draws.
+        let description = entry
+            .reference_path
+            .clone()
+            .filter(|_| entry.source_kind == AgentCommandSourceKind::Reference)
+            .or_else(|| entry.description.as_deref().map(runtime_attribution_line));
+        let name = entry
+            .command_name
+            .clone()
+            .unwrap_or_else(|| entry.label.clone());
+        // The token is what the field will hold; the line beside it says what
+        // the row is. A row the authority described no further stands on its
+        // token alone rather than repeating it: `/review` over "review" would
+        // tell the reader nothing twice.
+        let (leading, detail) = match action {
+            ComposerSuggestionAction::Phrase => (entry.label.clone(), description.clone()),
+            ComposerSuggestionAction::Command => (
+                format!("/{}", name.trim_start_matches('/')),
+                description.clone(),
+            ),
+            ComposerSuggestionAction::Skill => (
+                format!("${}", name.trim_start_matches('$')),
+                description.clone(),
+            ),
+            ComposerSuggestionAction::Mention => (entry.label.clone(), description.clone()),
+        };
+        let aria_label = match detail.as_deref() {
+            Some(detail) => format!("{leading}, {detail}"),
+            None => leading.clone(),
+        };
+        let row_id = format!("composer-suggestion:{}:{}", target.element_id(), entry.id);
+        div()
+            .id(row_id)
+            .min_h(px(theme::TOUCH_TARGET))
+            .px(px(theme::SPACING_MD))
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACING_SM))
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .cursor_pointer()
+            .aria_label(aria_label)
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    let entry = entry.clone();
+                    match (target, action) {
+                        (ComposerSuggestionTarget::Session, ComposerSuggestionAction::Command) => {
+                            this.choose_composer_command(entry, window, cx)
+                        }
+                        (ComposerSuggestionTarget::Session, ComposerSuggestionAction::Skill) => {
+                            this.choose_composer_skill(entry, window, cx)
+                        }
+                        (ComposerSuggestionTarget::Session, ComposerSuggestionAction::Mention) => {
+                            this.choose_composer_mention(entry, window, cx)
+                        }
+                        (ComposerSuggestionTarget::Session, ComposerSuggestionAction::Phrase) => {
+                            this.choose_composer_command(entry, window, cx)
+                        }
+                        (
+                            ComposerSuggestionTarget::NewSession,
+                            ComposerSuggestionAction::Command,
+                        ) => this.choose_new_session_command(entry, window, cx),
+                        (ComposerSuggestionTarget::NewSession, ComposerSuggestionAction::Skill) => {
+                            this.choose_new_session_skill(entry, window, cx)
+                        }
+                        (
+                            ComposerSuggestionTarget::NewSession,
+                            ComposerSuggestionAction::Mention,
+                        ) => this.choose_new_session_mention(entry, window, cx),
+                        (
+                            ComposerSuggestionTarget::NewSession,
+                            ComposerSuggestionAction::Phrase,
+                        ) => this.choose_new_session_command(entry, window, cx),
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .max_w(px(140.0))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .font_family(theme::MONO_FONT_FAMILY)
+                    .text_size(theme::font_caption())
+                    .text_color(if destructive {
+                        theme::accent_red()
+                    } else {
+                        theme::accent_blue()
+                    })
+                    .child(leading),
+            )
+            .child(div().flex_1().min_w_0().flex().flex_col().when_some(
+                detail,
+                |labels, detail| {
+                    labels.child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(theme::font_micro())
+                            .text_color(theme::text_primary())
+                            .child(detail),
+                    )
+                },
+            ))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(theme::font_micro())
+                    .text_color(theme::text_muted())
+                    .child(if refers {
+                        locale::text("Refers", "引用", "引用")
+                    } else if executable {
+                        locale::text("Runs", "执行", "執行")
+                    } else {
+                        locale::text("Inserts", "插入", "插入")
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// Switches the panel to `tab` from a tap on its header.
+    fn select_composer_suggestion_tab(
+        &mut self,
+        target: ComposerSuggestionTarget,
+        tab: ComposerSuggestionTab,
+        cx: &mut Context<Self>,
+    ) {
+        let current = match target {
+            ComposerSuggestionTarget::Session => &mut self.composer_suggestion_tab,
+            ComposerSuggestionTarget::NewSession => &mut self.new_session_suggestion_tab,
+        };
+        if *current == tab {
+            return;
+        }
+        *current = tab;
+        cx.notify();
     }
 
     /// The plan bar above the composer.
@@ -26445,6 +26815,11 @@ impl Render for MobileApp {
         if composer_text != self.composer_text_seen {
             self.record_composer_text(composer_text, cx);
         }
+        // The suggestion panels read their lists from the trigger the field is
+        // typing. The field is written by more than the keyboard — a restored
+        // draft, a shared line, a page opening — so the read is asked for here,
+        // where every one of those writes has landed.
+        self.sync_composer_suggestion_catalogue(cx);
         self.sync_elicitation_form(window, cx);
         self.sync_question_form();
         // Notices recorded by paths that have no window. The toast layer needs
@@ -28323,7 +28698,7 @@ impl MobileApp {
     /// that project is worked. The desktop's creation panel draws the same
     /// split, which is the point: the phone used to open on a stack of cards and
     /// a button at the far end of the screen.
-    fn render_new_session(&self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_new_session(&self, _window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         // The chip names the answer rather than the question: a temporary
         // session has no project, and saying so is more use than leaving the
         // chip on "Choose project" while the session is ready to start.
@@ -28354,9 +28729,7 @@ impl MobileApp {
         });
         let runtime_summary = runtime_selection_summary(runtime_catalog, runtime_selection);
         let prompt = self.new_session_prompt_input.read(cx).value();
-        let new_session_mentions = self.new_session_mention_suggestions(cx);
-        let new_session_commands = self.new_session_command_suggestions(cx);
-        let new_session_skills = self.new_session_skill_suggestions(cx);
+        let new_session_suggestions = self.new_session_suggestions(cx);
         // A first message may be a file on its own, the same way a prompt in
         // the composer may be: the field being empty is not the same as there
         // being nothing to send.
@@ -28432,16 +28805,6 @@ impl MobileApp {
         let mode_set = runtime_selection.is_some_and(|selection| selection.mode_id.is_some());
         let options_set =
             runtime_selection.is_some_and(|selection| !selection.config_values.is_empty());
-        // The model's name is drawn in full or not at all: the page's own
-        // controls are the width they are, and what is left decides. The last
-        // glyph — the title and the model's options — is always on this row.
-        let option_buttons = 1 + usize::from(reasoning_offered) + usize::from(modes_offered);
-        let model_share = model_chip_share(
-            composer_row_width(window, (theme::SPACING_LG + theme::SPACING_MD) * 2.0),
-            option_buttons,
-            false,
-        );
-        let spells_model = model_label_fits(model_label_width(&model_label, window), model_share);
 
         div()
             .absolute()
@@ -28520,12 +28883,10 @@ impl MobileApp {
                                 div()
                                     .w_full()
                                     // The first message's field is the same
-                                    // card as the session composer's: one
-                                    // square corner at the top-right, the
-                                    // other three round, and a fill a step
-                                    // above the page.
+                                    // card as the session composer's: the same
+                                    // radius on all four corners, and a fill a
+                                    // step above the page.
                                     .rounded(px(theme::RADIUS_COMPOSER))
-                                    .rounded_tr(px(0.0))
                                     .border_1()
                                     .border_color(theme::border_default())
                                     .bg(theme::composer_surface())
@@ -28548,29 +28909,16 @@ impl MobileApp {
                                                     .text_color(theme::text_primary()),
                                             ),
                                     )
-                                    // The first message opens the same three lists
-                                    // the session composer does — `/` commands, `@`
-                                    // references, `$` skills — so a trigger typed
-                                    // before the session exists behaves the way it
-                                    // will once it does.
-                                    .when(!new_session_commands.is_empty(), |card| {
+                                    // The first message opens the same trigger
+                                    // panels the session composer does — `/`
+                                    // commands and quick phrases, `@` files and
+                                    // collaborators, `$` skills — so a trigger
+                                    // typed before the session exists behaves
+                                    // the way it will once it does.
+                                    .when_some(new_session_suggestions, |card, suggestions| {
                                         card.child(self.render_composer_suggestion_panel(
-                                            &new_session_commands,
-                                            ComposerSuggestionKind::NewSessionCommand,
-                                            cx,
-                                        ))
-                                    })
-                                    .when(!new_session_mentions.is_empty(), |card| {
-                                        card.child(self.render_composer_suggestion_panel(
-                                            &new_session_mentions,
-                                            ComposerSuggestionKind::NewSessionMention,
-                                            cx,
-                                        ))
-                                    })
-                                    .when(!new_session_skills.is_empty(), |card| {
-                                        card.child(self.render_composer_suggestion_panel(
-                                            &new_session_skills,
-                                            ComposerSuggestionKind::NewSessionSkill,
+                                            &suggestions,
+                                            ComposerSuggestionTarget::NewSession,
                                             cx,
                                         ))
                                     })
@@ -28617,7 +28965,7 @@ impl MobileApp {
                                                     model_label,
                                                     !runtime_ready,
                                                     false,
-                                                    spells_model,
+                                                    true,
                                                     ComposerChipAction::NewSessionModel,
                                                     cx,
                                                 )
@@ -35329,44 +35677,66 @@ mod tests {
         });
     }
 
-    /// The model's name is drawn whole or not at all, and the row's own rules
-    /// decide which: the same answer the desktop reaches with a window-width
-    /// breakpoint, reached here from the room the row has.
+    /// The model's name is always spelled beside the Agent's mark.
+    ///
+    /// The chip used to fall back to the glyph alone whenever the row could not
+    /// hold the whole name, which on a phone meant the reader could not tell
+    /// which model was answering without opening the drawer behind it. The name
+    /// is the chip's point, so both composer cards draw it and the chip is
+    /// allowed to shorten instead.
     #[test]
-    fn a_model_name_is_spelled_out_only_when_the_row_can_hold_it() {
-        // A phone's row: the window with the composer's and the card's padding
-        // taken out, then the plus, one glyph for each of the Agent's three
-        // option groups, the usage ring and the send plate.
-        let phone = model_chip_share(360.0 - theme::SPACING_MD * 4.0, 3, true);
-        // The chip keeps its glyph, a gap on either side of the label and the
-        // row's gap after it, so that is what the name is asked to leave.
-        let room = phone - (theme::ICON_MD + theme::SPACING_XS * 3.0);
+    fn the_model_chip_always_spells_the_chosen_model() {
+        let source = include_str!("app.rs");
+        for (page, chip) in [
+            ("render_composer", "composer-runtime-options"),
+            ("render_new_session", "mobile-new-session-model"),
+        ] {
+            let body = renderer_source(source, page);
+            assert!(body.contains(chip), "{page} should draw its model chip");
+            assert!(
+                !body.contains("spells_model"),
+                "the {page} chip must not be gated on the row's room"
+            );
+        }
+        // Split so this test's own text cannot stand in for the rule it is
+        // asking about.
+        let fit_rule = ["fn model_label", "_fits"].concat();
         assert!(
-            model_label_fits(room - 1.0, phone),
-            "a name that fits is drawn"
+            !source.contains(&fit_rule),
+            "the fit rule is what used to leave the glyph alone"
         );
+    }
+
+    /// A sent line is not a draft, and a failure that arrives late does not put
+    /// it back.
+    ///
+    /// The submit call answers only when the whole turn is over, so a phone that
+    /// lost the connection for the length of one turn can be told a send failed
+    /// for a message the conversation already shows. The field takes the text
+    /// back only when the timeline does not hold it and the conversation it was
+    /// written in is still the one on screen; otherwise it waits as that
+    /// conversation's draft instead of appearing in whatever field is open.
+    #[test]
+    fn a_sent_message_cannot_return_to_the_composer() {
+        let source = include_str!("app.rs");
+        let submit = renderer_source(source, "submit_prompt");
         assert!(
-            !model_label_fits(room + 1.0, phone),
-            "a name that does not is left to the glyph rather than cut short"
-        );
-        assert!(
-            !model_label_fits(phone, phone),
-            "a name wider than the whole chip is not drawn at all"
+            submit.contains("self.flush_composer_state(cx);"),
+            "the draft goes to disk with the send, not with the next debounced write"
         );
 
-        // A tablet's row holds the longest id the catalogue publishes.
-        let tablet = model_chip_share(820.0 - theme::SPACING_MD * 4.0, 3, true);
-        assert!(tablet > phone + 400.0, "a wider row leaves a wider name");
-
-        // Every glyph the row carries is paid for by the name, so an Agent with
-        // one option group has more room for it than one with three.
+        let settle = renderer_source(source, "spawn_timeline_mutation");
         assert!(
-            model_chip_share(360.0, 1, true) > model_chip_share(360.0, 3, true),
-            "the option glyphs come out of the model's share"
+            settle.contains("is_confirmed_by(timeline)"),
+            "a message the timeline already holds is not restored"
         );
         assert!(
-            model_chip_share(360.0, 3, true) < model_chip_share(360.0, 3, false),
-            "the usage ring comes out of it too"
+            settle.contains("!confirmed"),
+            "and the restore is gated on that answer"
+        );
+        assert!(
+            settle.contains("composer_drafts"),
+            "a failure for another conversation waits there as its draft"
         );
     }
 
@@ -35473,37 +35843,6 @@ mod tests {
         assert!(
             panel.top() < bar.top(),
             "the rows the fold adds go above the bar, not below it"
-        );
-    }
-
-    /// Whether a name fits is answered by the width it really draws at, not by
-    /// an estimate: a wrong answer is a model id ending in an ellipsis.
-    #[gpui::test]
-    fn a_models_name_is_measured_in_the_face_it_is_drawn_with(cx: &mut TestAppContext) {
-        init_kit_globals(cx);
-        let measured: Rc<Cell<(f32, f32, f32)>> = Rc::new(Cell::new((0.0, 0.0, 0.0)));
-        let slot = measured.clone();
-        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
-        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
-            theme::apply_component_theme(Some(window), cx);
-            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
-            let short = model_label_width("gpt-5", window);
-            let long = model_label_width("deepseek-v4.1-flash", window);
-            // The row the chip is measured against: the window with the
-            // composer's and the card's padding removed.
-            let row = composer_row_width(window, theme::SPACING_MD * 4.0);
-            slot.set((short, long, row));
-            MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
-        });
-        cx.run_until_parked();
-        let _ = app;
-
-        let (short, long, row) = measured.get();
-        assert!(row > 0.0, "the window reports a row to measure against");
-        assert!(short > 0.0, "the face is found and the name has width");
-        assert!(
-            long > short,
-            "a longer id measures longer, so the row's answer follows the name"
         );
     }
 
@@ -36038,23 +36377,83 @@ mod tests {
         assert_eq!(skill_prefix("$a$b"), None);
     }
 
+    /// A panel and every row in it are identified by the page that drew them.
+    ///
+    /// Both pages' fields can be on screen at once — the new-session overlay
+    /// over the session it was opened from — and GPUI elements may not share an
+    /// id, so the panel, its scroll body and its rows all carry the page.
     #[test]
-    fn each_suggestion_list_has_its_own_element_id() {
-        // Two panels may be laid out in one frame — the composer's and the
-        // new-session page's — and GPUI elements may not share an id.
+    fn every_suggestion_panel_has_its_own_element_id() {
         let ids = [
-            ComposerSuggestionKind::Command.element_id(),
-            ComposerSuggestionKind::Mention.element_id(),
-            ComposerSuggestionKind::Skill.element_id(),
-            ComposerSuggestionKind::NewSessionMention.element_id(),
-            ComposerSuggestionKind::NewSessionCommand.element_id(),
-            ComposerSuggestionKind::NewSessionSkill.element_id(),
+            ComposerSuggestionTarget::Session.element_id(),
+            ComposerSuggestionTarget::Session.scroll_id(),
+            ComposerSuggestionTarget::NewSession.element_id(),
+            ComposerSuggestionTarget::NewSession.scroll_id(),
         ];
         let unique = ids.iter().collect::<BTreeSet<_>>();
         assert_eq!(unique.len(), ids.len());
-        assert!(ComposerSuggestionKind::NewSessionMention.is_mention());
-        assert!(!ComposerSuggestionKind::Skill.is_mention());
-        assert!(!ComposerSuggestionKind::NewSessionSkill.is_mention());
+    }
+
+    /// Each trigger opens the tabs the desktop's popup opens.
+    ///
+    /// `/` carries the Agent's commands and the reusable Prompts, `@` the
+    /// workspace files and the collaborators, and `$` its single Skills list —
+    /// which is why the last one draws no header at all.
+    #[test]
+    fn each_trigger_opens_the_desktops_tabs() {
+        use AgentCommandTrigger::{Dollar, Mention, Slash};
+        assert_eq!(
+            ComposerSuggestionTab::tabs(Slash),
+            [
+                ComposerSuggestionTab::Commands,
+                ComposerSuggestionTab::Phrases
+            ]
+        );
+        assert_eq!(
+            ComposerSuggestionTab::tabs(Mention),
+            [
+                ComposerSuggestionTab::Files,
+                ComposerSuggestionTab::Delegation
+            ]
+        );
+        assert_eq!(
+            ComposerSuggestionTab::tabs(Dollar),
+            [ComposerSuggestionTab::Commands]
+        );
+
+        // A tab left over from another trigger is clamped into the open one's
+        // own list rather than showing rows the trigger does not carry.
+        let at = ComposerSuggestions::loading(Mention);
+        assert_eq!(
+            at.active_tab(ComposerSuggestionTab::Phrases),
+            ComposerSuggestionTab::Files
+        );
+        assert_eq!(
+            at.active_tab(ComposerSuggestionTab::Delegation),
+            ComposerSuggestionTab::Delegation
+        );
+
+        // The tap's meaning follows the tab, not the row.
+        assert_eq!(
+            suggestion_action(Slash, ComposerSuggestionTab::Commands),
+            ComposerSuggestionAction::Command
+        );
+        assert_eq!(
+            suggestion_action(Slash, ComposerSuggestionTab::Phrases),
+            ComposerSuggestionAction::Phrase
+        );
+        assert_eq!(
+            suggestion_action(Mention, ComposerSuggestionTab::Files),
+            ComposerSuggestionAction::Mention
+        );
+        assert_eq!(
+            suggestion_action(Mention, ComposerSuggestionTab::Delegation),
+            ComposerSuggestionAction::Mention
+        );
+        assert_eq!(
+            suggestion_action(Dollar, ComposerSuggestionTab::Commands),
+            ComposerSuggestionAction::Skill
+        );
     }
 
     #[test]
@@ -42154,31 +42553,30 @@ fn agent_icon_path(",
         );
     }
 
-    /// The new-session page offers all three trigger lists, not just `@`.
+    /// The new-session page offers all three triggers, not just `@`.
     ///
     /// The page's first message had only a mention list, so a `/` or `$` typed
     /// before the session existed opened nothing. The desktop reaches provider
-    /// commands from this page, and the phone now does too.
+    /// commands from this page, and the phone now does too — through the same
+    /// tabbed panel the session composer draws.
     #[test]
     fn the_new_session_page_opens_every_trigger_list() {
         let source = include_str!("app.rs");
         let page = renderer_source(source, "render_new_session");
-        for kind in [
-            "ComposerSuggestionKind::NewSessionCommand",
-            "ComposerSuggestionKind::NewSessionMention",
-            "ComposerSuggestionKind::NewSessionSkill",
-        ] {
-            assert!(
-                page.contains(kind),
-                "the new-session page should draw {kind}"
-            );
-        }
-
-        // The catalogue is fetched for the page and for a runtime change, or
-        // the lists above would always be empty.
         assert!(
-            source.contains("self.refresh_composer_commands(cx);"),
-            "the page has to load the Agent's catalogue"
+            page.contains("ComposerSuggestionTarget::NewSession"),
+            "the new-session page should draw the trigger panel under its own name"
+        );
+
+        // The catalogue is read for whichever trigger the field is typing, or
+        // the panel above would always be empty.
+        assert!(
+            source.contains("self.ensure_composer_commands(trigger, cx);"),
+            "the field has to load the Agent's catalogue for its trigger"
+        );
+        assert!(
+            source.contains("fn invalidate_composer_commands"),
+            "a runtime change has to drop the catalogue the old Agent answered"
         );
     }
 
@@ -42308,15 +42706,15 @@ fn agent_icon_path(",
         );
     }
 
-    /// A trigger offers its own kind of entry, and `@` keeps workspace files.
+    /// Each tab of a trigger offers its own kind of entry.
     ///
-    /// The three lists are the same gesture with a different character in
-    /// front, and `@` is the one that carries both references and files. A file
-    /// entry has no `VibexUseMention` — it inserts its own path — so a filter
-    /// that only accepted mention-shaped rows silently dropped every file, and
-    /// `@` looked broken for the case it is used most.
+    /// `/` carries the commands and the quick phrases, `@` the workspace files
+    /// and the collaborators, `$` the Skills. A file entry has no
+    /// `VibexUseMention` — it inserts its own path — so it belongs to the files
+    /// tab alone; a filter that only accepted mention-shaped rows silently
+    /// dropped every file, and `@` looked broken for the case it is used most.
     #[test]
-    fn each_trigger_selects_its_own_entries() {
+    fn each_tab_selects_its_own_entries() {
         let entry = |id: &str, trigger: AgentCommandTrigger, label: &str| AgentCommandEntry {
             id: id.to_string(),
             trigger,
@@ -42324,7 +42722,7 @@ fn agent_icon_path(",
             label: label.to_string(),
             description: None,
             insertion_text: format!("{label} "),
-            command_name: Some(label.trim_start_matches(['/', '$']).to_string()),
+            command_name: Some(label.trim_start_matches(['/', '$', '@']).to_string()),
             provider_kind: None,
             prompt_id: None,
             skill_id: None,
@@ -42340,8 +42738,14 @@ fn agent_icon_path(",
         let catalogue = vec![
             entry("cmd", AgentCommandTrigger::Slash, "/review"),
             entry("skill", AgentCommandTrigger::Dollar, "$deploy"),
-            file,
+            file.clone(),
         ];
+        let mut phrase = entry("phrase", AgentCommandTrigger::Slash, "Review my diff");
+        phrase.source_kind = AgentCommandSourceKind::Prompt;
+        phrase.command_name = None;
+        phrase.description = Some("Read the diff and report".to_string());
+        phrase.execution_behavior = vibex_core::AgentCommandExecutionBehavior::None;
+        let phrases = vec![phrase];
 
         assert_eq!(
             command_suggestions_for(&catalogue, "/re").len(),
@@ -42349,16 +42753,72 @@ fn agent_icon_path(",
             "a slash lists the commands"
         );
         assert_eq!(
+            phrase_suggestions_for(&phrases, "/re").len(),
+            1,
+            "the second tab lists the reusable phrases"
+        );
+        assert_eq!(
             skill_suggestions_for(&catalogue, "$de").len(),
             1,
             "a dollar lists the skills"
         );
-        let mentions = mention_suggestions_for(&catalogue, "@li");
-        assert_eq!(mentions.len(), 1, "an at-sign lists the references");
+        let files = file_suggestions_for(&catalogue, "@li");
+        assert_eq!(files.len(), 1, "an at-sign opens on the workspace files");
         assert_eq!(
-            mentions[0].reference_path.as_deref(),
+            files[0].reference_path.as_deref(),
             Some("crates/lib.rs"),
-            "the workspace file is what the at-sign is for"
+            "the workspace file is what the first tab is for"
+        );
+
+        // The collaborator tab is the delegation list, and the desktop's
+        // direct "delegate now" action is not a row the phone can keep: it
+        // arms the reference and offers its own Delegate control instead.
+        let mut agent = entry("agent", AgentCommandTrigger::Mention, "@Codex");
+        agent.source_kind = AgentCommandSourceKind::Reference;
+        agent.description = Some("Account · gpt-5".to_string());
+        agent.metadata = vec![
+            vibex_core::ProviderBindingMetadata {
+                key: COMPOSER_AGENT_REFERENCE_KEY.to_string(),
+                value: "codex".to_string(),
+            },
+            vibex_core::ProviderBindingMetadata {
+                key: COMPOSER_SELECTION_REFERENCE_KEY.to_string(),
+                value: VibexUseRef::runtime_option("codex:gpt-5").as_uri(),
+            },
+        ];
+        let mut delegate_now = entry(
+            "delegate",
+            AgentCommandTrigger::Mention,
+            "Delegate now to Codex",
+        );
+        delegate_now.metadata = agent.metadata.clone();
+        delegate_now
+            .metadata
+            .push(vibex_core::ProviderBindingMetadata {
+                key: COMPOSER_DELEGATE_NOW_KEY.to_string(),
+                value: "1".to_string(),
+            });
+        let mut session = entry("session", AgentCommandTrigger::Mention, "@Nightly run");
+        session.metadata = vec![vibex_core::ProviderBindingMetadata {
+            key: COMPOSER_SESSION_REFERENCE_KEY.to_string(),
+            value: VibexUseRef::session(&VibexSessionId::parse("session_nightly").unwrap())
+                .as_uri(),
+        }];
+        let delegation = vec![agent, delegate_now, session];
+        let rows = delegation_suggestions_for(&delegation, "@co");
+        assert_eq!(rows.len(), 1, "the collaborator the query names");
+        assert_eq!(rows[0].label, "@Codex");
+        assert!(
+            delegation_suggestions_for(&delegation, "@night").len() == 1,
+            "a conversation is a reference the draft may name"
+        );
+        assert!(
+            delegation_suggestions_for(&catalogue, "@li").is_empty(),
+            "a workspace file is not a collaborator"
+        );
+        assert!(
+            file_suggestions_for(&delegation, "@co").is_empty(),
+            "and a collaborator is not a workspace file"
         );
 
         // A token that has been completed with a space is prose, not a trigger.
@@ -42368,12 +42828,20 @@ fn agent_icon_path(",
                 command_suggestions_for(&catalogue, "/re done").is_empty(),
             ),
             (
+                "/re done",
+                phrase_suggestions_for(&phrases, "/re done").is_empty(),
+            ),
+            (
                 "$de done",
                 skill_suggestions_for(&catalogue, "$de done").is_empty(),
             ),
             (
                 "@li done",
-                mention_suggestions_for(&catalogue, "@li done").is_empty(),
+                file_suggestions_for(&catalogue, "@li done").is_empty(),
+            ),
+            (
+                "@co done",
+                delegation_suggestions_for(&delegation, "@co done").is_empty(),
             ),
         ] {
             assert!(empty, "{text:?} is no longer typing the trigger");
