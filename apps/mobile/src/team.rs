@@ -239,6 +239,7 @@ impl MobileApp {
                 theme::font_heading(),
                 Some(refresh),
                 true,
+                OverlayHeaderRule::Ruled,
                 cx,
             ))
             .when(count == 0, |root| {

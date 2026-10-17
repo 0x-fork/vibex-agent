@@ -4543,15 +4543,23 @@ impl MobileApp {
         cx.notify();
     }
 
-    /// Steps the text size through its three settings.
+    /// Steps the text size through its four settings.
+    ///
+    /// Tapping the row reaches the next larger step and wraps at the top, so
+    /// the smallest step is one more tap from the largest rather than the only
+    /// way to reverse the cycle. A stored value that is not on the ladder — an
+    /// older build's step, a hand-edited file — enters the ladder at its
+    /// nearest rung instead of jumping back to the default.
     fn cycle_text_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let steps = theme::FONT_SCALE_STEPS;
         let current = self.app_settings.font_scale_percent;
-        let next = steps
-            .iter()
-            .position(|step| *step == current)
-            .map(|index| steps[(index + 1) % steps.len()])
-            .unwrap_or(100);
+        let next = match steps.iter().position(|step| *step == current) {
+            Some(index) => steps[(index + 1) % steps.len()],
+            None => *steps
+                .iter()
+                .min_by_key(|step| step.abs_diff(current))
+                .unwrap_or(&theme::FONT_SCALE_DEFAULT),
+        };
         self.app_settings.font_scale_percent = next;
         // A step has to move the kit's base and the window rem together with
         // the ladder, or half the screen keeps the old size.
@@ -25131,6 +25139,21 @@ impl MobileApp {
     }
 }
 
+/// Whether an overlay's title bar is ruled off from the page under it.
+///
+/// A page that is a list or a form reads as a band with content under it, and
+/// the hairline is what says so. A page that is one open composition — the new
+/// session's wordmark, its sentence, and the field it is asking the reader to
+/// write in — is a single surface rather than a bar over one, and a rule across
+/// it would draw a line the page does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayHeaderRule {
+    /// A hairline under the bar, in the page's border ink.
+    Ruled,
+    /// No hairline: the bar sits in the page instead of over it.
+    Open,
+}
+
 impl MobileApp {
     /// The bar that names an overlay page.
     ///
@@ -25143,6 +25166,13 @@ impl MobileApp {
     /// close mark says the page is not somewhere the reader will come back to.
     /// A page that is a stack of topics, where every tap leads further in, has
     /// only the one way back out: the chevron that got them there.
+    ///
+    /// `rule` is whether the bar is drawn as a band over the page. See
+    /// [`OverlayHeaderRule`].
+    // Each of the bar's optional pieces — the trailing control, the second way
+    // out, the rule — is the caller's own choice, and the five call sites read
+    // better as flags than as a struct built for one line each.
+    #[allow(clippy::too_many_arguments)]
     fn render_overlay_header(
         &self,
         id: &'static str,
@@ -25150,13 +25180,15 @@ impl MobileApp {
         title_size: gpui::Rems,
         trailing: Option<gpui::AnyElement>,
         closes: bool,
+        rule: OverlayHeaderRule,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         div()
             .h(px(theme::DRAWER_HEADER_HEIGHT))
             .flex_shrink_0()
-            .border_b_1()
-            .border_color(theme::border_subtle())
+            .when(rule == OverlayHeaderRule::Ruled, |header| {
+                header.border_b_1().border_color(theme::border_subtle())
+            })
             .px(px(theme::SPACING_LG))
             .flex()
             .items_center()
@@ -25650,6 +25682,7 @@ impl MobileApp {
                 theme::font_heading(),
                 None,
                 true,
+                OverlayHeaderRule::Ruled,
                 cx,
             ))
             .child(
@@ -27693,6 +27726,7 @@ impl MobileApp {
                 theme::font_heading(),
                 None,
                 true,
+                OverlayHeaderRule::Open,
                 cx,
             ))
             .child(
@@ -28180,6 +28214,7 @@ impl MobileApp {
                 theme::font_heading(),
                 None,
                 true,
+                OverlayHeaderRule::Ruled,
                 cx,
             ))
             .child(
@@ -28700,6 +28735,7 @@ impl MobileApp {
                     theme::font_title(),
                     None,
                     false,
+                    OverlayHeaderRule::Ruled,
                     cx,
                 )
             } else {
@@ -31046,11 +31082,18 @@ fn new_session_slogan_line(
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
+    let mark_size = theme::scaled_px(theme::NEW_SESSION_AGENT_LOGO_SIZE);
+    // The target is wider than the mark it holds, so the line takes that slack
+    // back out of its own gaps: the words keep the spacing the sentence was set
+    // with, and the thumb still gets a whole target.
+    let mark_slack = px((theme::TOUCH_TARGET - f32::from(mark_size)) / 2.0);
     let mark = div()
         .id("mobile-new-session-agent-mark")
         .debug_selector(|| "mobile-new-session-agent-mark".to_string())
         .size(px(theme::TOUCH_TARGET))
         .flex_shrink_0()
+        .ml(-mark_slack)
+        .mr(-mark_slack)
         .rounded_full()
         .flex()
         .items_center()
@@ -31064,7 +31107,7 @@ fn new_session_slogan_line(
         )
         .child(agent_brand_icon(
             &agent_brand_identity(agent_id.as_str(), agent_label),
-            theme::scaled_px(theme::NEW_SESSION_AGENT_LOGO_SIZE),
+            mark_size,
             theme::text_primary(),
         ));
     let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(4);
@@ -33214,10 +33257,23 @@ fn collaboration_status(status: vibex_core::ToolCallStatus) -> (&'static str, gp
 }
 
 /// The text-size step as the reader sees it.
+///
+/// Matched on the named steps rather than compared against 100, so the two
+/// sub-default rungs read differently instead of collapsing into one word: a
+/// reader who asked for the smaller of the two sees the name of the step they
+/// picked.
 fn text_size_label(percent: u32) -> String {
     match percent {
-        value if value < 100 => locale::text("Compact", "紧凑", "緊湊").to_string(),
-        100 => locale::common("Default").to_string(),
+        theme::FONT_SCALE_TINY => locale::text("Smallest", "最小", "最小").to_string(),
+        theme::FONT_SCALE_COMPACT => locale::text("Compact", "紧凑", "緊湊").to_string(),
+        theme::FONT_SCALE_DEFAULT => locale::common("Default").to_string(),
+        theme::FONT_SCALE_LARGE => locale::text("Large", "较大", "較大").to_string(),
+        // A value the ladder does not name cannot be reached from the row, so
+        // this only covers a stored step the loader let through. Name it by
+        // the half it falls in rather than drawing a number.
+        value if value < theme::FONT_SCALE_DEFAULT => {
+            locale::text("Compact", "紧凑", "緊湊").to_string()
+        }
         _ => locale::text("Large", "较大", "較大").to_string(),
     }
 }
@@ -40557,6 +40613,26 @@ fn session_opened(cx: &mut Context<Self>) {
             line.contains("theme::TOUCH_TARGET")
                 && line.contains("cx.listener(MobileApp::open_runtime_options)"),
             "the mark is a touch target that opens the Agent's settings"
+        );
+        // The target is wider than the mark, and the line takes that slack back
+        // out of its own gaps: a sentence that spaced its words around a target
+        // would read as three things instead of one.
+        assert!(
+            line.contains("let mark_slack = px(")
+                && line.contains(".ml(-mark_slack)")
+                && line.contains(".mr(-mark_slack)"),
+            "the mark's target must not become a gap in the sentence"
+        );
+
+        // The page is one open surface: the bar that names it carries no rule.
+        assert!(
+            page.contains("OverlayHeaderRule::Open"),
+            "the new-session page is not a band with a page under it"
+        );
+        let header = renderer_source(source, "render_overlay_header");
+        assert!(
+            header.contains("rule == OverlayHeaderRule::Ruled") && header.contains("border_b_1()"),
+            "the rule is the caller's choice, not the bar's own"
         );
 
         // One name for the mark and for the drawer it opens: the sentence's
