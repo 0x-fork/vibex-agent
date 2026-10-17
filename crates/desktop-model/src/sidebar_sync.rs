@@ -59,6 +59,131 @@ pub struct SidebarOrganizationView {
     /// session row, and a second channel would only be a second thing to keep
     /// in step.
     pub scheduled_sends: Vec<SidebarScheduledSend>,
+    /// The holder's whole pre-send queue, oldest first.
+    ///
+    /// A schedule is the subset of this that carries an hour; the rest waits for
+    /// its session to be ready. Both are the reader's own written-ahead work, so
+    /// a client that can see one and not the other shows a queue the holder does
+    /// not have. Publishing the whole list is what lets a compact client draw
+    /// that queue instead of keeping a second one of its own beside it.
+    pub queued_sends: Vec<SidebarQueuedSend>,
+    /// Sessions whose queue the reader has paused.
+    pub paused_queue_session_ids: BTreeSet<String>,
+    /// Sessions whose queue releases messages only when the reader says so.
+    pub manual_queue_session_ids: BTreeSet<String>,
+}
+
+/// Moves one entry inside its session's block of `queue`.
+///
+/// The queue is one ordered list across sessions, so a reorder is expressed
+/// within the block that session owns: a client dragging a row in one session's
+/// panel never resequences another session's messages, which it was not shown.
+/// `before` names the entry it lands before, or `None` for the end of the block.
+///
+/// Answers whether the order actually changed. A drop that rebuilds the block
+/// exactly as it was is a no-op the caller reports as already applied — a drag
+/// that never left its row must not ask the holder for a round trip.
+///
+/// An unknown message, or a `before` anchor outside the same block, is a
+/// rejection: the client acted on a queue the holder has since changed.
+fn move_send_within_block<T>(
+    queue: &mut Vec<T>,
+    session_id: &str,
+    message_id: u64,
+    before: Option<u64>,
+    id: impl Fn(&T) -> u64,
+    session: impl Fn(&T) -> &str,
+) -> Result<bool, SidebarMutationRejection> {
+    let positions: Vec<usize> = queue
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| session(entry) == session_id)
+        .map(|(index, _)| index)
+        .collect();
+    let Some(from) = positions
+        .iter()
+        .position(|index| id(&queue[*index]) == message_id)
+    else {
+        return Err(SidebarMutationRejection::Rejected);
+    };
+    let target = match before {
+        Some(anchor) => positions
+            .iter()
+            .position(|index| id(&queue[*index]) == anchor)
+            .ok_or(SidebarMutationRejection::Rejected)?,
+        None => positions.len(),
+    };
+    // Dropping an entry back where it already is changes nothing. `target`
+    // counts the other entries, so the position it came from is its own.
+    if target == from {
+        return Ok(false);
+    }
+    // The block's start, so a move inside a session that holds one message
+    // cannot drag it out of that session's place in the list.
+    let block_start = positions[0];
+    let entry = queue.remove(positions[from]);
+    let remaining: Vec<usize> = queue
+        .iter()
+        .enumerate()
+        .filter(|(_, queued)| session(queued) == session_id)
+        .map(|(index, _)| index)
+        .collect();
+    let insert_at = match remaining.get(target) {
+        Some(index) => *index,
+        // Past the end of the block, and never past the point where the next
+        // session's block begins: appending to the whole list would put this
+        // session's message behind another session's, which the reader never
+        // asked for.
+        None => remaining
+            .last()
+            .map_or(block_start.min(queue.len()), |last| last + 1),
+    };
+    if insert_at == positions[from].min(queue.len()) {
+        // The list would be rebuilt exactly as it was: an entry that was
+        // already last in its block dropped at the end of it again.
+        let same_index = positions[from].saturating_sub(usize::from(insert_at < positions[from]));
+        if insert_at == same_index {
+            queue.insert(insert_at, entry);
+            return Ok(false);
+        }
+    }
+    queue.insert(insert_at, entry);
+    Ok(true)
+}
+
+/// Moves one entry inside its session's block of the persisted queue.
+pub fn move_queued_send_relative(
+    queue: &mut Vec<crate::ComposerQueueEntry>,
+    session_id: &str,
+    message_id: u64,
+    before_message_id: Option<u64>,
+) -> bool {
+    move_send_within_block(
+        queue,
+        session_id,
+        message_id,
+        before_message_id,
+        |entry| entry.id,
+        |entry| entry.session_id.as_str(),
+    )
+    .unwrap_or(false)
+}
+
+/// One message in the holder's pre-send queue, as a client draws it.
+///
+/// The runtime selection and command invocation the holder keeps with its own
+/// entries are absent on purpose: a client did not build this queue, and a
+/// message it hands back is addressed by its id. What travels is what a row
+/// draws and what an edit carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarQueuedSend {
+    pub message_id: u64,
+    pub session_id: String,
+    pub text: String,
+    pub attachments: Vec<MessageAttachment>,
+    pub mentions: Vec<vibex_core::VibexUseMention>,
+    /// The deadline of a scheduled message; `None` waits only for the session.
+    pub scheduled_at_ms: Option<i64>,
 }
 
 /// One message waiting for its hour, as the holder publishes it.
@@ -315,6 +440,20 @@ impl SidebarOrganizationView {
                 .cloned()
                 .collect(),
             unread_session_ids: self.unread_session_ids.iter().cloned().collect(),
+            queued_sends: self
+                .queued_sends
+                .iter()
+                .map(|send| vibex_core::RemoteQueuedSend {
+                    message_id: send.message_id,
+                    session_id: send.session_id.clone(),
+                    text: send.text.clone(),
+                    attachments: send.attachments.clone(),
+                    mentions: send.mentions.clone(),
+                    scheduled_at_ms: send.scheduled_at_ms,
+                })
+                .collect(),
+            paused_queue_session_ids: self.paused_queue_session_ids.iter().cloned().collect(),
+            manual_queue_session_ids: self.manual_queue_session_ids.iter().cloned().collect(),
             scheduled_sends: self
                 .scheduled_sends
                 .iter()
@@ -442,6 +581,20 @@ impl SidebarOrganizationView {
                 .cloned()
                 .collect(),
             unread_session_ids: snapshot.unread_session_ids.iter().cloned().collect(),
+            queued_sends: snapshot
+                .queued_sends
+                .iter()
+                .map(|send| SidebarQueuedSend {
+                    message_id: send.message_id,
+                    session_id: send.session_id.clone(),
+                    text: send.text.clone(),
+                    attachments: send.attachments.clone(),
+                    mentions: send.mentions.clone(),
+                    scheduled_at_ms: send.scheduled_at_ms,
+                })
+                .collect(),
+            paused_queue_session_ids: snapshot.paused_queue_session_ids.iter().cloned().collect(),
+            manual_queue_session_ids: snapshot.manual_queue_session_ids.iter().cloned().collect(),
             scheduled_sends: snapshot
                 .scheduled_sends
                 .iter()
@@ -507,6 +660,37 @@ impl SidebarOrganizationView {
                 .auto_continue_paused_session_ids
                 .clone(),
             unread_session_ids: BTreeSet::new(),
+            queued_sends: state
+                .composer
+                .queue
+                .iter()
+                .map(|entry| SidebarQueuedSend {
+                    message_id: entry.id,
+                    session_id: entry.session_id.clone(),
+                    text: entry.text.clone(),
+                    attachments: entry.attachments.clone(),
+                    mentions: entry.mentions.clone(),
+                    scheduled_at_ms: entry.scheduled_at_ms,
+                })
+                .collect(),
+            // The send mode is a persisted preference, but it is stored for the
+            // whole shell rather than per session. A shell reading a parked
+            // arrangement therefore publishes it for every session it knows,
+            // which is what the Desktop does when it materializes its own set
+            // from the same field.
+            manual_queue_session_ids: match state.composer.queue_send_mode {
+                crate::ComposerQueueSendMode::Manual => state
+                    .composer
+                    .queue
+                    .iter()
+                    .map(|entry| entry.session_id.clone())
+                    .collect(),
+                crate::ComposerQueueSendMode::Automatic => BTreeSet::new(),
+            },
+            // A pause is live state: the Desktop sets it when the reader stops
+            // a turn and lifts it explicitly, so a shell that only reads the
+            // file has none of it.
+            paused_queue_session_ids: BTreeSet::new(),
             scheduled_sends: state
                 .composer
                 .queue
@@ -553,6 +737,41 @@ impl SidebarOrganizationView {
             self.auto_continue_session_overrides.clone();
         state.session.auto_continue_paused_session_ids =
             self.auto_continue_paused_session_ids.clone();
+        // The queue's content and the reader's send mode are written back for
+        // the same reason the arrangement is: a shell that took the home over
+        // from a Desktop that is no longer running owns this queue now, and the
+        // edits a client made through it have to survive the handback.
+        //
+        // Entries the view does not carry are left alone rather than dropped:
+        // the view publishes what a client may edit — words, files, mentions,
+        // and an hour — not the runtime selection and command a holder keeps
+        // with its own entry, so rewriting the whole list from here would lose
+        // them. Removals were already applied to the file by the mutation that
+        // asked for them.
+        for published in &self.queued_sends {
+            let Some(entry) = state
+                .composer
+                .queue
+                .iter_mut()
+                .find(|entry| entry.id == published.message_id)
+            else {
+                continue;
+            };
+            entry.text = published.text.clone();
+            entry.attachments = published.attachments.clone();
+            entry.mentions = published.mentions.clone();
+            entry.scheduled_at_ms = published.scheduled_at_ms;
+        }
+        // The send mode is one shell-wide preference, so it reads as manual
+        // when any session the view publishes is manual. A set holding some
+        // sessions and not others has no single persisted form, and the Desktop
+        // materializes it for every session the moment it loads — this is that
+        // same rule, applied on the way out.
+        state.composer.queue_send_mode = if self.manual_queue_session_ids.is_empty() {
+            crate::ComposerQueueSendMode::Automatic
+        } else {
+            crate::ComposerQueueSendMode::Manual
+        };
     }
 
     /// Whether this arrangement says anything at all about where rows go.
@@ -612,6 +831,190 @@ impl SidebarOrganizationView {
                 Ok(SidebarMutationEffect::SCHEDULED.into())
             }
         }
+    }
+
+    /// Rewrites one published queue entry in place.
+    ///
+    /// The words and the files change; the deadline and the position do not.
+    /// Editing what a message says is not an instruction about when it goes
+    /// out, and the queue's order is the reader's own arrangement — moving a
+    /// message because it was edited would reorder a list they set on purpose.
+    /// A message the view was never told about is one it cannot rewrite, so an
+    /// unknown id is a rejection rather than a silent insert: the holder would
+    /// otherwise receive an edit for a message it does not have.
+    fn set_queued_send(
+        &mut self,
+        session_id: &str,
+        message_id: u64,
+        text: &str,
+        attachments: &[MessageAttachment],
+        mentions: &[vibex_core::VibexUseMention],
+    ) -> Result<SidebarMutationOutcome, SidebarMutationRejection> {
+        let Some(send) = self
+            .queued_sends
+            .iter_mut()
+            .find(|send| send.session_id == session_id && send.message_id == message_id)
+        else {
+            return Err(SidebarMutationRejection::Rejected);
+        };
+        if send.text == text && send.attachments == attachments && send.mentions == mentions {
+            return Ok(SidebarMutationOutcome::AlreadyApplied);
+        }
+        send.text = text.to_string();
+        send.attachments = attachments.to_vec();
+        send.mentions = mentions.to_vec();
+        // A rewritten message that carries no schedule is still the same entry;
+        // its published deadline is untouched because this mutation never spoke
+        // about it.
+        Ok(SidebarMutationEffect::QUEUE.into())
+    }
+
+    /// Drops one published queue entry.
+    ///
+    /// The message never reached the authority, so this is a change to the
+    /// holder's own list. A message that is no longer in the queue has already
+    /// left it — the reader asked for it to be gone, and it is — so an unknown
+    /// id is a no-op rather than a rejection a client could do nothing about.
+    fn remove_queued_send(
+        &mut self,
+        session_id: &str,
+        message_id: u64,
+    ) -> Result<SidebarMutationOutcome, SidebarMutationRejection> {
+        let before = self.queued_sends.len();
+        self.queued_sends
+            .retain(|send| !(send.session_id == session_id && send.message_id == message_id));
+        // The schedule index is the same fact seen from the row's side; a
+        // cancelled entry must not keep counting down to an hour nothing
+        // happens at.
+        self.scheduled_sends
+            .retain(|send| !(send.session_id == session_id && send.message_id == message_id));
+        if self.queued_sends.len() == before {
+            return Ok(SidebarMutationOutcome::AlreadyApplied);
+        }
+        Ok(SidebarMutationEffect::QUEUE.into())
+    }
+
+    fn set_queue_paused(
+        &mut self,
+        session_id: &str,
+        paused: bool,
+    ) -> Result<SidebarMutationOutcome, SidebarMutationRejection> {
+        let changed = if paused {
+            self.paused_queue_session_ids.insert(session_id.to_string())
+        } else {
+            self.paused_queue_session_ids.remove(session_id)
+        };
+        if !changed {
+            return Ok(SidebarMutationOutcome::AlreadyApplied);
+        }
+        Ok(SidebarMutationEffect::QUEUE.into())
+    }
+
+    fn set_queue_manual(
+        &mut self,
+        session_id: &str,
+        manual: bool,
+    ) -> Result<SidebarMutationOutcome, SidebarMutationRejection> {
+        let changed = if manual {
+            self.manual_queue_session_ids.insert(session_id.to_string())
+        } else {
+            self.manual_queue_session_ids.remove(session_id)
+        };
+        if !changed {
+            return Ok(SidebarMutationOutcome::AlreadyApplied);
+        }
+        Ok(SidebarMutationEffect::QUEUE.into())
+    }
+
+    /// Notes one message a client asked the holder to hold.
+    ///
+    /// The view cannot accept the message itself — the queue, with the runtime
+    /// selection it will send with, is the holder's — so this publishes the
+    /// entry the client will see once the holder has taken it. The id is
+    /// zero-until-assigned: the holder renumbers it, and the client's next
+    /// snapshot carries the real one.
+    fn enqueue_queued_send(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        attachments: &[MessageAttachment],
+        mentions: &[vibex_core::VibexUseMention],
+    ) -> Result<SidebarMutationOutcome, SidebarMutationRejection> {
+        // Behind everything already waiting for that session, never behind
+        // another session's messages: the queue is one list across sessions, and
+        // a message written here belongs to its own session's block in it.
+        let insert_at = match self
+            .queued_sends
+            .iter()
+            .rposition(|send| send.session_id == session_id)
+        {
+            Some(last) => last + 1,
+            None => self
+                .queued_sends
+                .iter()
+                .position(|send| send.session_id.as_str() > session_id)
+                .unwrap_or(self.queued_sends.len()),
+        };
+        self.queued_sends.insert(
+            insert_at,
+            SidebarQueuedSend {
+                message_id: 0,
+                session_id: session_id.to_string(),
+                text: text.to_string(),
+                attachments: attachments.to_vec(),
+                mentions: mentions.to_vec(),
+                scheduled_at_ms: None,
+            },
+        );
+        Ok(SidebarMutationEffect::ENQUEUE.into())
+    }
+
+    /// Moves one published entry to a new place inside its session's block.
+    ///
+    /// The queue as a whole is the holder's order, so only the entries that
+    /// belong to the named session move: dropping a row in one session's panel
+    /// must not resequence another session's messages, which the reader was
+    /// never shown. An unknown message, or a "before" anchor that is not in the
+    /// same block, is a rejection — the client acted on a queue the holder has
+    /// since changed.
+    fn move_queued_send(
+        &mut self,
+        session_id: &str,
+        message_id: u64,
+        before_message_id: Option<u64>,
+    ) -> Result<SidebarMutationOutcome, SidebarMutationRejection> {
+        if move_send_within_block(
+            &mut self.queued_sends,
+            session_id,
+            message_id,
+            before_message_id,
+            |send| send.message_id,
+            |send| send.session_id.as_str(),
+        )? {
+            Ok(SidebarMutationEffect::QUEUE.into())
+        } else {
+            Ok(SidebarMutationOutcome::AlreadyApplied)
+        }
+    }
+
+    /// Whether one session's queue advances on its own.
+    pub fn queue_sends_automatically(&self, session_id: &str) -> bool {
+        !self.manual_queue_session_ids.contains(session_id)
+    }
+
+    /// Whether one session's queue is held where the reader left it.
+    pub fn queue_is_paused(&self, session_id: &str) -> bool {
+        self.paused_queue_session_ids.contains(session_id)
+    }
+
+    /// The queue entries one session is holding, oldest first.
+    pub fn queued_sends_for<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> impl Iterator<Item = &'a SidebarQueuedSend> {
+        self.queued_sends
+            .iter()
+            .filter(move |send| send.session_id == session_id)
     }
 
     /// The next send one session is waiting for, among those the holder
@@ -1093,6 +1496,52 @@ impl SidebarOrganizationView {
                 session_ids,
                 unread,
             } => self.set_sessions_unread(session_ids, *unread),
+            RemoteSidebarOrganizationMutation::SetQueuedSend {
+                session_id,
+                message_id,
+                text,
+                attachments,
+                mentions,
+            } => self.set_queued_send(session_id, *message_id, text, attachments, mentions)?,
+            RemoteSidebarOrganizationMutation::RemoveQueuedSend {
+                session_id,
+                message_id,
+            } => self.remove_queued_send(session_id, *message_id)?,
+            RemoteSidebarOrganizationMutation::SetQueuePaused { session_id, paused } => {
+                self.set_queue_paused(session_id, *paused)?
+            }
+            RemoteSidebarOrganizationMutation::SetQueueManual { session_id, manual } => {
+                self.set_queue_manual(session_id, *manual)?
+            }
+            RemoteSidebarOrganizationMutation::EnqueueQueuedSend {
+                session_id,
+                text,
+                attachments,
+                mentions,
+            } => self.enqueue_queued_send(session_id, text, attachments, mentions)?,
+            RemoteSidebarOrganizationMutation::MoveQueuedSend {
+                session_id,
+                message_id,
+                before_message_id,
+            } => self.move_queued_send(session_id, *message_id, *before_message_id)?,
+            // Sending one message now is a dispatch, not a change to the queue's
+            // shape: the holder promotes it and hands it over, and the entry
+            // leaves there. The view only says that the queue is about to
+            // change so a client repaints instead of acting on a stale list.
+            RemoteSidebarOrganizationMutation::SendQueuedSendNow {
+                session_id,
+                message_id,
+            } => {
+                if self
+                    .queued_sends
+                    .iter()
+                    .any(|send| send.session_id == *session_id && send.message_id == *message_id)
+                {
+                    SidebarMutationEffect::QUEUE.into()
+                } else {
+                    SidebarMutationOutcome::AlreadyApplied
+                }
+            }
         };
         self.revision = self.revision.wrapping_add(1);
         Ok(outcome)
@@ -1342,6 +1791,15 @@ pub struct SidebarMutationEffect {
     /// The unread marks changed: another client read sessions the authority was
     /// still badging, and its own readers must stop badging them too.
     pub unread: bool,
+    /// One entry of the holder's queue was rewritten or dropped, or a queue was
+    /// paused, resumed, or switched between automatic and manual.
+    ///
+    /// This is the queue's own content rather than its schedule, so it reaches
+    /// the holder's list instead of the deadline one entry waits on: only the
+    /// shell that owns the queue can edit a message it is holding. Resuming and
+    /// switching back to automatic also re-evaluate the head, which is why they
+    /// are filed here rather than with the read-only marks.
+    pub queue: bool,
 }
 
 impl SidebarMutationEffect {
@@ -1351,6 +1809,7 @@ impl SidebarMutationEffect {
         scheduled: false,
         enqueue: false,
         unread: false,
+        queue: false,
     };
     pub const NAVIGATION: Self = Self {
         organization: false,
@@ -1358,6 +1817,7 @@ impl SidebarMutationEffect {
         scheduled: false,
         enqueue: false,
         unread: false,
+        queue: false,
     };
     pub const SCHEDULED: Self = Self {
         organization: false,
@@ -1365,6 +1825,7 @@ impl SidebarMutationEffect {
         scheduled: true,
         enqueue: false,
         unread: false,
+        queue: false,
     };
     pub const UNREAD: Self = Self {
         organization: false,
@@ -1372,6 +1833,7 @@ impl SidebarMutationEffect {
         scheduled: false,
         enqueue: false,
         unread: true,
+        queue: false,
     };
     pub const ENQUEUE: Self = Self {
         organization: false,
@@ -1379,6 +1841,15 @@ impl SidebarMutationEffect {
         scheduled: false,
         enqueue: true,
         unread: false,
+        queue: false,
+    };
+    pub const QUEUE: Self = Self {
+        organization: false,
+        navigation: false,
+        scheduled: false,
+        enqueue: false,
+        unread: false,
+        queue: true,
     };
 }
 
@@ -1835,6 +2306,343 @@ mod tests {
 
     /// A client's scheduled send is accepted for a session the project knows,
     /// and only the shell that owns the queue can take it.
+    fn queued(
+        message_id: u64,
+        session_id: &str,
+        text: &str,
+        scheduled_at_ms: Option<i64>,
+    ) -> SidebarQueuedSend {
+        SidebarQueuedSend {
+            message_id,
+            session_id: session_id.to_string(),
+            text: text.to_string(),
+            attachments: Vec::new(),
+            mentions: Vec::new(),
+            scheduled_at_ms,
+        }
+    }
+
+    /// A client edits, removes, pauses, and switches a queue it does not own.
+    ///
+    /// The queue is the Desktop's — only it can release a message — but the
+    /// reader may be looking at a phone, so the view has to accept the same four
+    /// changes from either seat and report them as the queue's, never as the
+    /// tree's.
+    #[test]
+    fn a_client_edits_the_queue_the_holder_releases() {
+        let mut view = SidebarOrganizationView {
+            queued_sends: vec![
+                queued(1, "session-a", "first", None),
+                queued(2, "session-a", "second", Some(1_800_000_000_000)),
+                queued(3, "session-b", "other session", None),
+            ],
+            scheduled_sends: vec![SidebarScheduledSend {
+                session_id: "session-a".to_string(),
+                message_id: 2,
+                text: "second".to_string(),
+                attachments: Vec::new(),
+                scheduled_at_ms: 1_800_000_000_000,
+            }],
+            ..SidebarOrganizationView::default()
+        };
+
+        // An edit changes the words and nothing else: the deadline it never
+        // mentioned stays, because editing what a message says is not an
+        // instruction about when it goes.
+        let effect = view
+            .apply_remote(
+                &RemoteSidebarOrganizationMutation::SetQueuedSend {
+                    session_id: "session-a".to_string(),
+                    message_id: 2,
+                    text: "second, reworded".to_string(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .expect("an entry the view published is one it can rewrite");
+        let SidebarMutationOutcome::Applied(effect) = effect else {
+            panic!("an edit should report an applied effect");
+        };
+        assert!(
+            effect.queue && !effect.organization && !effect.navigation,
+            "the queue is not the tree"
+        );
+        assert_eq!(view.queued_sends[1].text, "second, reworded");
+        assert_eq!(
+            view.queued_sends[1].scheduled_at_ms,
+            Some(1_800_000_000_000),
+            "an edit never speaks about the hour"
+        );
+
+        // Rewriting it to the words it already has is a no-op rather than a
+        // round trip nobody asked for.
+        let outcome = view
+            .apply_remote(
+                &RemoteSidebarOrganizationMutation::SetQueuedSend {
+                    session_id: "session-a".to_string(),
+                    message_id: 2,
+                    text: "second, reworded".to_string(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .expect("an unchanged edit is legal");
+        assert_eq!(outcome, SidebarMutationOutcome::AlreadyApplied);
+
+        // A message the view never published is one it cannot rewrite.
+        assert!(
+            view.apply_remote(
+                &RemoteSidebarOrganizationMutation::SetQueuedSend {
+                    session_id: "session-a".to_string(),
+                    message_id: 99,
+                    text: "ghost".to_string(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .is_err(),
+            "an unknown message is a rejection, not an insert"
+        );
+
+        // Pausing and going manual are the queue's own two switches, and both
+        // are idempotent: a client setting what already holds has changed
+        // nothing.
+        let effect = view
+            .apply_remote(
+                &RemoteSidebarOrganizationMutation::SetQueuePaused {
+                    session_id: "session-a".to_string(),
+                    paused: true,
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .expect("pausing a known session is legal");
+        let SidebarMutationOutcome::Applied(effect) = effect else {
+            panic!("a first pause changes the state");
+        };
+        assert!(effect.queue);
+        assert!(view.queue_is_paused("session-a"));
+        assert!(
+            view.queue_sends_automatically("session-a"),
+            "a paused queue is still automatic: the pause is its own switch"
+        );
+        assert_eq!(
+            view.apply_remote(
+                &RemoteSidebarOrganizationMutation::SetQueuePaused {
+                    session_id: "session-a".to_string(),
+                    paused: true,
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .expect("setting what already holds is legal"),
+            SidebarMutationOutcome::AlreadyApplied
+        );
+
+        view.apply_remote(
+            &RemoteSidebarOrganizationMutation::SetQueueManual {
+                session_id: "session-a".to_string(),
+                manual: true,
+            },
+            &session_projects(),
+            &session_workspaces(),
+            "unused",
+            "unused",
+        )
+        .expect("manual mode is a queue preference");
+        assert!(!view.queue_sends_automatically("session-a"));
+
+        // A removal takes the entry out of the list and out of the schedule
+        // index: a cancelled message must not keep counting down to an hour
+        // nothing happens at.
+        let effect = view
+            .apply_remote(
+                &RemoteSidebarOrganizationMutation::RemoveQueuedSend {
+                    session_id: "session-a".to_string(),
+                    message_id: 2,
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .expect("removing a published message is legal");
+        let SidebarMutationOutcome::Applied(effect) = effect else {
+            panic!("a removal changes the queue");
+        };
+        assert!(effect.queue);
+        assert_eq!(
+            view.queued_sends_for("session-a").count(),
+            1,
+            "only the other session's message survives in this one's block"
+        );
+        assert!(
+            view.scheduled_sends.is_empty(),
+            "the schedule went with the message"
+        );
+        // Removing it again is what a retry after a reconnect does, and it is
+        // already true.
+        assert_eq!(
+            view.apply_remote(
+                &RemoteSidebarOrganizationMutation::RemoveQueuedSend {
+                    session_id: "session-a".to_string(),
+                    message_id: 2,
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .expect("removing what is gone is legal"),
+            SidebarMutationOutcome::AlreadyApplied
+        );
+    }
+
+    /// A queued message a client writes is taken, and stays inside its block.
+    #[test]
+    fn a_client_enqueues_and_reorders_inside_one_session() {
+        let mut view = SidebarOrganizationView {
+            queued_sends: vec![
+                queued(1, "session-a", "one", None),
+                queued(2, "session-a", "two", None),
+                queued(3, "session-b", "other", None),
+            ],
+            ..SidebarOrganizationView::default()
+        };
+
+        let effect = view
+            .apply_remote(
+                &RemoteSidebarOrganizationMutation::EnqueueQueuedSend {
+                    session_id: "session-a".to_string(),
+                    text: "three".to_string(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .expect("a session of the project is legal");
+        let SidebarMutationOutcome::Applied(effect) = effect else {
+            panic!("an enqueue asks the shell to take the message");
+        };
+        assert!(effect.enqueue, "the holder is what actually holds it");
+        assert_eq!(
+            view.queued_sends_for("session-a").count(),
+            3,
+            "the message is published at once so the row can draw it"
+        );
+
+        // A move reorders only the named session's block: another session's
+        // message keeps the place the reader never touched.
+        view.apply_remote(
+            &RemoteSidebarOrganizationMutation::MoveQueuedSend {
+                session_id: "session-a".to_string(),
+                message_id: 1,
+                before_message_id: Some(2),
+            },
+            &session_projects(),
+            &session_workspaces(),
+            "unused",
+            "unused",
+        )
+        .expect("a drag inside one session is legal");
+        let texts: Vec<&str> = view
+            .queued_sends
+            .iter()
+            .map(|send| send.text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["two", "one", "three", "other"],
+            "the moved message lands before its anchor and nothing else moves"
+        );
+
+        // A move to the end of the block, and a drop onto itself, which is the
+        // no-op a drag that never left its row reports.
+        view.apply_remote(
+            &RemoteSidebarOrganizationMutation::MoveQueuedSend {
+                session_id: "session-a".to_string(),
+                message_id: 2,
+                before_message_id: None,
+            },
+            &session_projects(),
+            &session_workspaces(),
+            "unused",
+            "unused",
+        )
+        .expect("dropping at the end is legal");
+        assert_eq!(
+            view.queued_sends_for("session-a")
+                .map(|send| send.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "three", "two"]
+        );
+        assert_eq!(
+            view.queued_sends
+                .iter()
+                .map(|send| send.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "three", "two", "other"],
+            "the block ends before the next session's messages, whichever way \
+             a row is dragged"
+        );
+        assert_eq!(
+            view.apply_remote(
+                &RemoteSidebarOrganizationMutation::MoveQueuedSend {
+                    session_id: "session-a".to_string(),
+                    message_id: 2,
+                    before_message_id: None,
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .expect("dropping it where it already is is legal"),
+            SidebarMutationOutcome::AlreadyApplied
+        );
+    }
+
+    /// The queue round-trips through the wire with its entries and switches.
+    #[test]
+    fn the_published_queue_round_trips_including_its_switches() {
+        let view = SidebarOrganizationView {
+            queued_sends: vec![
+                queued(4, "session-a", "held", None),
+                queued(5, "session-a", "later", Some(1_800_000_000_000)),
+            ],
+            paused_queue_session_ids: BTreeSet::from(["session-a".to_string()]),
+            manual_queue_session_ids: BTreeSet::from(["session-b".to_string()]),
+            ..SidebarOrganizationView::default()
+        };
+        let restored = SidebarOrganizationView::from_remote(&view.to_remote());
+        assert_eq!(restored.queued_sends, view.queued_sends);
+        assert!(restored.queue_is_paused("session-a"));
+        assert!(!restored.queue_sends_automatically("session-b"));
+        assert!(
+            restored.queue_sends_automatically("session-a"),
+            "manual mode is per session, not a switch for the whole shell"
+        );
+    }
+
     #[test]
     fn a_remote_scheduled_send_asks_the_shell_to_take_it() {
         let mut view = SidebarOrganizationView::default();

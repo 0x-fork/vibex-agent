@@ -4729,6 +4729,55 @@ pub struct RemoteSidebarOrganizationSnapshot {
     /// say what it is waiting to send.
     #[serde(default)]
     pub scheduled_sends: Vec<RemoteScheduledSend>,
+    /// The holder's whole pre-send queue, in the order it will be sent.
+    ///
+    /// A schedule is only the subset of this that carries an hour. The rest of
+    /// it — the messages waiting for a turn to end — is the same kind of fact:
+    /// the reader wrote them ahead, and a client that cannot see them shows an
+    /// empty queue for a session the holder has three messages for. Publishing
+    /// the whole list is what lets a client draw the queue the holder is
+    /// actually holding instead of keeping a second one beside it.
+    #[serde(default)]
+    pub queued_sends: Vec<RemoteQueuedSend>,
+    /// Sessions whose queue the reader has paused.
+    ///
+    /// A pause decides *when* the holder's own queue advances, so it belongs to
+    /// the holder and travels with the queue it governs: a client that could
+    /// only see the messages would draw a queue waiting for a reason it cannot
+    /// name, and a client that set a pause only for itself could not lift one.
+    #[serde(default)]
+    pub paused_queue_session_ids: Vec<String>,
+    /// Sessions whose queue releases messages only when the reader says so.
+    ///
+    /// The send mode is a preference about the whole queue, not about one
+    /// message, and the queue it governs is the holder's. A client renders and
+    /// sets it; the holder is what acts on it.
+    #[serde(default)]
+    pub manual_queue_session_ids: Vec<String>,
+}
+
+/// One message in the holder's pre-send queue, as the holder publishes it.
+///
+/// The fields the holder sends with it — the runtime selection, a command
+/// invocation — are deliberately absent: a client is describing a queue it did
+/// not build, and a message it hands back is addressed by its id. Only what a
+/// row has to draw, and what an edit has to carry, travels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteQueuedSend {
+    /// The holder's own queue entry, which is what an edit, a removal, or a
+    /// deadline addresses. Ids are unique within one queue.
+    pub message_id: u64,
+    pub session_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<MessageAttachment>,
+    #[serde(default)]
+    pub mentions: Vec<VibexUseMention>,
+    /// The local deadline of a scheduled message. `None` is an ordinary queued
+    /// message that only waits for its session to be ready.
+    #[serde(default)]
+    pub scheduled_at_ms: Option<i64>,
 }
 
 /// One message a client armed for a later hour.
@@ -4969,6 +5018,93 @@ pub enum RemoteSidebarOrganizationMutation {
     SetSessionsUnread {
         session_ids: Vec<String>,
         unread: bool,
+    },
+    /// Rewrites one message the holder is holding, in place.
+    ///
+    /// An edit is a change to what the message says, never to when it goes out:
+    /// a message that carried a deadline keeps it, because editing words is not
+    /// an instruction about the hour. A client that wants both sends
+    /// `SetQueuedSendSchedule` as well, which is the same pair the Desktop's own
+    /// editor writes.
+    SetQueuedSend {
+        session_id: String,
+        message_id: u64,
+        text: String,
+        #[serde(default)]
+        attachments: Vec<MessageAttachment>,
+        #[serde(default)]
+        mentions: Vec<VibexUseMention>,
+    },
+    /// Drops one message from the holder's queue.
+    ///
+    /// The entry never reaches the authority, so removing it is a change to the
+    /// holder's own list rather than a cancellation of anything in flight. A
+    /// message already dispatched is no longer in the queue, and removing it is
+    /// a no-op rather than an error: the reader asked for it to be gone, and it
+    /// is.
+    RemoveQueuedSend {
+        session_id: String,
+        message_id: u64,
+    },
+    /// Holds, or releases, one session's queue.
+    ///
+    /// A pause is the reader's own decision to stop the queue advancing, so it
+    /// is the holder's state that moves — the messages behind it stay exactly
+    /// where they are, and resuming re-evaluates the head immediately rather
+    /// than waiting for the next event that would have released it.
+    SetQueuePaused {
+        session_id: String,
+        paused: bool,
+    },
+    /// Switches one session's queue between automatic and manual sending.
+    ///
+    /// In manual mode the holder still holds every message, but it releases
+    /// only the one the reader sends now: switching back to automatic is itself
+    /// the instruction to release whatever is at the head.
+    SetQueueManual {
+        session_id: String,
+        manual: bool,
+    },
+    /// Hands one prompt to the holder's queue instead of sending it now.
+    ///
+    /// This is what a compact client writes when the reader sends during a live
+    /// turn: it has no queue of its own to hold the message in, and the holder
+    /// is the one that will release it. The holder decides where it goes —
+    /// behind everything already waiting for that session — because the queue's
+    /// order is the holder's to keep.
+    EnqueueQueuedSend {
+        session_id: String,
+        text: String,
+        #[serde(default)]
+        attachments: Vec<MessageAttachment>,
+        #[serde(default)]
+        mentions: Vec<VibexUseMention>,
+    },
+    /// Moves one session's queued message to a new position among that
+    /// session's messages.
+    ///
+    /// The holder's queue is one ordered list across sessions, so the position
+    /// is expressed inside the session's own block rather than across the whole
+    /// list: a client dragging a row in one session's panel must not resequence
+    /// another session's messages, which it was never shown.
+    MoveQueuedSend {
+        session_id: String,
+        message_id: u64,
+        /// The entry it lands before, or `None` for the end of that session's
+        /// block.
+        #[serde(default)]
+        before_message_id: Option<u64>,
+    },
+    /// Releases one queued message ahead of the turn holding it back.
+    ///
+    /// This is the reader's own instruction about a single message, so the
+    /// holder promotes it and dispatches it as an explicit send — the one
+    /// gesture allowed to overtake the queue. A turn that is still running is
+    /// stopped first, because a message cannot be submitted into a live turn
+    /// over this wire; the message then goes as that turn's resend.
+    SendQueuedSendNow {
+        session_id: String,
+        message_id: u64,
     },
 }
 

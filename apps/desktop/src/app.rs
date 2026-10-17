@@ -42,8 +42,7 @@ use gpui::{
     Subscription, SystemNotification, Task, TitlebarOptions, Unbind, WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
     WindowId, WindowKind, WindowOptions, div, img, linear_color_stop, linear_gradient, point,
-    prelude::*, px,
-    relative, rgb, size,
+    prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
     ActiveTheme as _, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
@@ -148,33 +147,33 @@ use vibex_desktop_model::{
     BACKGROUND_IMAGE_MIN_DIM_PERCENT, BackgroundImageFit, BrowserSearchEngine, BrowserStartPage,
     BrowserUiState, ComposerAttachment, ComposerQueueCommand, ComposerQueueEntry,
     ComposerQueueSendMode, ComposerSuggestionSelection, ComposerTrigger, ComputerPanelMode,
-    ComputerUiState,
-    DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, DEFAULT_NETWORK_PROXY_BYPASS, DesktopBehaviorUiState,
-    DesktopUiStateV1, DeveloperUiState, EditorAutosaveMode, GitSelectionKey, GitWorkbenchMode,
-    LocaleMode, MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS, MessageSendKey,
-    NavigationHistory, NetworkProxyMode, NetworkProxyUiState, NewSessionLocation,
-    NewSessionProjectTicket, NewSessionSubmissionStage, NewSessionWorkspaceState,
-    PreviewWindowMode, RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode,
-    ReasoningExpansionMode, RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
-    SESSION_GROUP_SPLIT_SCALE, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode,
-    SessionGroupLayout, SessionGroupPane, SessionGroupSplitPosition, SessionGroupUiState,
-    SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome, SidebarMutationRejection,
-    SidebarOrganizationItem, SidebarOrganizationScope, SidebarOrganizationState,
-    SidebarOrganizationView, SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
-    SidebarProjectProjection, SidebarScheduledSend, SidebarState, SidebarUiState,
-    SidebarWorkspaceProjection, StartupDestination, TerminalOpenMode, TerminalWorkingDirectory,
-    ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
-    TimelineDelegationProjection, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
-    TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind, WorkbenchRoute,
-    WorkspaceContextProjection, WorkspaceLayoutState, WorkspaceStateScope,
-    WorktreeLifecycleDisplayState, active_collaborations, clamp_editor_autosave_delay_ms,
-    complete_string_order, composer_trigger_at, current_active_goal, current_agent_plan,
-    custom_worktree_path_is_absolute, has_managed_child_agent_delegations, move_string_relative,
-    move_strings_relative, ordered_agent_ids, parse_unified_diff,
-    sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
-    sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
-    sidebar_root_items, split_share, timeline_agent_message_count_after_sequence,
-    timeline_conversation_turns, timeline_conversation_turns_with_leading_turn_start,
+    ComputerUiState, DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, DEFAULT_NETWORK_PROXY_BYPASS,
+    DesktopBehaviorUiState, DesktopUiStateV1, DeveloperUiState, EditorAutosaveMode,
+    GitSelectionKey, GitWorkbenchMode, LocaleMode, MAX_EDITOR_AUTOSAVE_DELAY_MS,
+    MIN_EDITOR_AUTOSAVE_DELAY_MS, MessageSendKey, NavigationHistory, NetworkProxyMode,
+    NetworkProxyUiState, NewSessionLocation, NewSessionProjectTicket, NewSessionSubmissionStage,
+    NewSessionWorkspaceState, PreviewWindowMode, RUNTIME_SELECTION_PREFERENCE_LIMIT,
+    ReasoningDisplayMode, ReasoningExpansionMode, RuntimeCascadeChoice, RuntimeCascadeProjection,
+    RuntimeModelFavorite, SESSION_GROUP_SPLIT_SCALE, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS,
+    SessionContentWidthMode, SessionGroupLayout, SessionGroupPane, SessionGroupSplitPosition,
+    SessionGroupUiState, SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome,
+    SidebarMutationRejection, SidebarOrganizationItem, SidebarOrganizationScope,
+    SidebarOrganizationState, SidebarOrganizationView, SidebarProjectAppearance,
+    SidebarProjectLogo, SidebarProjectLogoColor, SidebarProjectProjection, SidebarQueuedSend,
+    SidebarScheduledSend, SidebarState, SidebarUiState, SidebarWorkspaceProjection,
+    StartupDestination, TerminalOpenMode, TerminalWorkingDirectory, ThemeMode as ModelThemeMode,
+    ThrottledUiStateWriter, TimelineConversationTurn, TimelineDelegationProjection,
+    TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
+    UiStateStore, UnifiedDiffLineKind, WorkbenchRoute, WorkspaceContextProjection,
+    WorkspaceLayoutState, WorkspaceStateScope, WorktreeLifecycleDisplayState,
+    active_collaborations, clamp_editor_autosave_delay_ms, complete_string_order,
+    composer_trigger_at, current_active_goal, current_agent_plan, custom_worktree_path_is_absolute,
+    has_managed_child_agent_delegations, move_string_relative, move_strings_relative,
+    ordered_agent_ids, parse_unified_diff, sidebar_project_custom_logo_file_is_valid,
+    sidebar_project_items, sidebar_project_items_for_workspace,
+    sidebar_project_projections_with_workspace_order, sidebar_root_items, split_share,
+    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
+    timeline_conversation_turns_with_leading_turn_start,
     timeline_conversation_turns_with_reasoning_mode, timeline_row_delegation,
 };
 use vibex_desktop_runtime::DriverState;
@@ -10493,8 +10492,7 @@ impl VibexWorkbench {
         // The panel window can be closed from its own titlebar, so the
         // workbench has to forget the handle when that happens rather than
         // holding a stale one that would swallow the next open.
-        let computer_panel_closed_subscription =
-            observe_computer_panel_close(cx.weak_entity(), cx);
+        let computer_panel_closed_subscription = observe_computer_panel_close(cx.weak_entity(), cx);
         let window_handle = Some(window.window_handle());
         let mut this = Self {
             focus_handle,
@@ -11137,11 +11135,7 @@ impl VibexWorkbench {
 
     /// A panel window this workbench owns was closed by its titlebar button.
     fn handle_computer_panel_closed(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
-        if self
-            .computer_panel_window
-            .map(|handle| handle.window_id())
-            == Some(window_id)
-        {
+        if self.computer_panel_window.map(|handle| handle.window_id()) == Some(window_id) {
             self.computer_panel_window = None;
             cx.notify();
         }
@@ -12143,6 +12137,9 @@ impl VibexWorkbench {
             auto_continue_session_ids: self.auto_continue_session_ids.clone(),
             auto_continue_paused_session_ids: self.auto_continue_paused_session_ids.clone(),
             unread_session_ids: self.unread_agent_completion_session_ids.clone(),
+            queued_sends: self.published_queued_sends(),
+            paused_queue_session_ids: self.composer_queue_paused_session_ids.clone(),
+            manual_queue_session_ids: self.composer_queue_manual_session_ids.clone(),
             scheduled_sends: self.published_scheduled_sends(),
         };
         // Keep the remote order complete even when a newly-created Worktree has
@@ -12344,6 +12341,140 @@ impl VibexWorkbench {
                                 window_handle,
                                 cx,
                             );
+                        }
+                        if effect.queue {
+                            // The view publishes the queue a client edits; the
+                            // queue itself — with the runtime selection and
+                            // command a client never sees — is this shell's, so
+                            // every edit made through a client lands here.
+                            match &mutation {
+                                vibex_core::RemoteSidebarOrganizationMutation::SetQueuedSend {
+                                    session_id,
+                                    message_id,
+                                    text,
+                                    attachments,
+                                    mentions,
+                                } => {
+                                    self.set_queued_send(
+                                        session_id,
+                                        *message_id,
+                                        text,
+                                        attachments,
+                                        mentions,
+                                    );
+                                }
+                                vibex_core::RemoteSidebarOrganizationMutation::RemoveQueuedSend {
+                                    session_id,
+                                    message_id,
+                                } => {
+                                    self.remove_queued_send(session_id, *message_id);
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Pausing, resuming, and switching the send mode all
+                        // need a window: resuming and switching back to
+                        // automatic release the head right here, and the send
+                        // itself runs on the window that owns the queue.
+                        if let Some(handle) = self.window_handle {
+                            let mutation = mutation.clone();
+                            let entity = cx.weak_entity();
+                            let _ = cx.update_window(handle, move |_, window, cx| {
+                                let _ = entity.update(cx, |this, cx| {
+                                    match &mutation {
+                                        vibex_core::RemoteSidebarOrganizationMutation::SetQueuePaused {
+                                            session_id,
+                                            paused,
+                                        } => {
+                                            if let Ok(session_id) =
+                                                VibexSessionId::parse(session_id)
+                                            {
+                                                this.set_queue_paused(
+                                                    &session_id,
+                                                    *paused,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        }
+                                        vibex_core::RemoteSidebarOrganizationMutation::EnqueueQueuedSend {
+                                            session_id,
+                                            text,
+                                            attachments,
+                                            mentions,
+                                        } => {
+                                            if let Ok(session_id) =
+                                                VibexSessionId::parse(session_id)
+                                            {
+                                                this.enqueue_queued_send(
+                                                    &session_id,
+                                                    text,
+                                                    attachments,
+                                                    mentions,
+                                                );
+                                                this.start_message_schedule_timer(window, cx);
+                                            }
+                                        }
+                                        vibex_core::RemoteSidebarOrganizationMutation::MoveQueuedSend {
+                                            session_id,
+                                            message_id,
+                                            before_message_id,
+                                        } => {
+                                            if let Ok(session_id) =
+                                                VibexSessionId::parse(session_id)
+                                            {
+                                                this.move_queued_send(
+                                                    &session_id,
+                                                    *message_id,
+                                                    *before_message_id,
+                                                );
+                                            }
+                                        }
+                                        vibex_core::RemoteSidebarOrganizationMutation::SendQueuedSendNow {
+                                            session_id,
+                                            message_id,
+                                        } => {
+                                            if let Ok(parsed) =
+                                                VibexSessionId::parse(session_id)
+                                                && this
+                                                    .composer_queue
+                                                    .iter()
+                                                    .any(|queued| {
+                                                        queued.session_id == parsed
+                                                            && queued.id == *message_id
+                                                    })
+                                            {
+                                                // The same gesture the panel's own
+                                                // arrow makes: promote the message,
+                                                // lift any pause, and either stop the
+                                                // turn that is holding it or release
+                                                // it now.
+                                                this.steer_composer_queue_message(
+                                                    *message_id,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        }
+                                        vibex_core::RemoteSidebarOrganizationMutation::SetQueueManual {
+                                            session_id,
+                                            manual,
+                                        } => {
+                                            if let Ok(session_id) =
+                                                VibexSessionId::parse(session_id)
+                                            {
+                                                this.set_queue_manual(
+                                                    &session_id,
+                                                    *manual,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                });
+                            });
                         }
                         if let vibex_core::RemoteSidebarOrganizationMutation::SetSessionAutoContinuePaused {
                             session_ids,
@@ -34129,10 +34260,9 @@ impl VibexWorkbench {
             self.new_session_logo_swap = None;
             return;
         }
-        let (Some(previous), Some(chosen)) = (
-            self.agent_snapshot(previous),
-            self.agent_snapshot(chosen),
-        ) else {
+        let (Some(previous), Some(chosen)) =
+            (self.agent_snapshot(previous), self.agent_snapshot(chosen))
+        else {
             self.new_session_logo_swap = None;
             return;
         };
@@ -65890,10 +66020,7 @@ fn observe_preview_window_close<T: 'static>(
 /// The panel has no hand-back to perform, so unlike the detached preview window
 /// this needs no "the owner did it" marker: clearing a handle that is already
 /// `None` is a no-op.
-fn observe_computer_panel_close(
-    owner: WeakEntity<VibexWorkbench>,
-    cx: &mut App,
-) -> Subscription {
+fn observe_computer_panel_close(owner: WeakEntity<VibexWorkbench>, cx: &mut App) -> Subscription {
     cx.on_window_closed(move |cx, window_id| {
         let Some(owner) = owner.upgrade() else {
             return;
@@ -80181,9 +80308,9 @@ impl FoundationSettings {
                         .primary()
                         .label(locale::text("Open panel", "打开面板", "開啟面板"))
                         .on_click(cx.listener(|this, _, _, cx| {
-                            let _ = this.workbench.update(cx, |workbench, cx| {
-                                workbench.open_computer_panel(cx)
-                            });
+                            let _ = this
+                                .workbench
+                                .update(cx, |workbench, cx| workbench.open_computer_panel(cx));
                         })),
                 )
                 .child(settings_segmented_control(
@@ -80194,10 +80321,7 @@ impl FoundationSettings {
                             settings.panel_mode == ComputerPanelMode::Window,
                             cx.listener(|this, _, _, cx| {
                                 let _ = this.workbench.update(cx, |workbench, cx| {
-                                    workbench.set_computer_panel_mode(
-                                        ComputerPanelMode::Window,
-                                        cx,
-                                    )
+                                    workbench.set_computer_panel_mode(ComputerPanelMode::Window, cx)
                                 });
                             }),
                         ),
@@ -80206,10 +80330,8 @@ impl FoundationSettings {
                             settings.panel_mode == ComputerPanelMode::Floating,
                             cx.listener(|this, _, _, cx| {
                                 let _ = this.workbench.update(cx, |workbench, cx| {
-                                    workbench.set_computer_panel_mode(
-                                        ComputerPanelMode::Floating,
-                                        cx,
-                                    )
+                                    workbench
+                                        .set_computer_panel_mode(ComputerPanelMode::Floating, cx)
                                 });
                             }),
                         ),
@@ -97767,9 +97889,7 @@ mod tests {
     /// chip has to exist whenever the marker's box has any overlap with the
     /// textarea's own viewport.
     #[gpui::test]
-    fn composer_paste_keeps_the_chip_on_a_row_clipped_by_the_viewport(
-        cx: &mut TestAppContext,
-    ) {
+    fn composer_paste_keeps_the_chip_on_a_row_clipped_by_the_viewport(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let input_slot = Rc::new(RefCell::new(None));
         let input_slot_for_view = input_slot.clone();
@@ -100386,9 +100506,7 @@ mod tests {
         // Both lanes resolve their mark through the same gate.
         let gate = source
             .split_once("fn sidebar_session_state_mark(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n/// Projects the state a sidebar row shows.")
-            })
+            .and_then(|(_, tail)| tail.split_once("\n/// Projects the state a sidebar row shows."))
             .map(|(body, _)| body)
             .expect("the shared state gate should remain inspectable");
         assert!(gate.contains("display_state == AgentSessionState::NeedsInput"));
@@ -100409,7 +100527,9 @@ mod tests {
 
         let mark = source
             .split_once("fn session_status_mark_for(")
-            .and_then(|(_, tail)| tail.split_once("\n/// Whether a session's state earns a mark at all"))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n/// Whether a session's state earns a mark at all")
+            })
             .map(|(body, _)| body)
             .expect("the shared status mark should remain inspectable");
         assert!(mark.contains("ActivityIndicator::sidebar(id)"));

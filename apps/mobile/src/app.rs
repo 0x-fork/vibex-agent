@@ -86,8 +86,8 @@ use crate::sidebar::{
 };
 use crate::storage::{
     AppSettings, CredentialStorage, MAX_SESSION_TIMELINE_ITEMS,
-    MobileTimelineDisplaySettingsOverride, StoredComposerQueuedMessage, StoredComposerSession,
-    StoredHostEntry, StoredSessionTimeline,
+    MobileTimelineDisplaySettingsOverride, StoredComposerSession, StoredHostEntry,
+    StoredSessionTimeline,
 };
 use crate::toast::{Hint, Tone};
 use crate::touch_selection::TouchToolbar;
@@ -614,22 +614,6 @@ impl TimelineBooleanSetting {
             TimelineBooleanSetting::EnhancedFileOperationDisplay => "File edit cards",
         }
     }
-}
-
-/// One prompt the reader wrote while the Agent was still working.
-///
-/// The queue is the phone's answer to a keyboard that cannot send into a live
-/// turn: the text is held per session, drawn above the composer, and handed to
-/// the authority when the turn settles. `id` is what the row's buttons address.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MobileQueuedMessage {
-    id: u64,
-    session_id: VibexSessionId,
-    text: String,
-    attachments: Vec<MessageAttachment>,
-    /// The `@` references the text still names, resolved when it was written.
-    mentions: Vec<VibexUseMention>,
-    created_at_ms: i64,
 }
 
 /// One prompt the history sheet can send the reader back to.
@@ -1530,13 +1514,6 @@ pub struct MobileApp {
     /// Whether the goal bar is showing its objective in full. A phone has room
     /// for the phase and one line of objective, and no more.
     composer_goal_expanded: bool,
-    /// Prompts written while a turn was running, oldest first.
-    ///
-    /// The desktop keeps a full scheduler here; a phone needs the part that
-    /// matters on a small screen: write ahead, see what is waiting, send it
-    /// when the turn settles (or force it in now).
-    composer_queue: Vec<MobileQueuedMessage>,
-    composer_queue_next_id: u64,
     /// The queued prompt being dragged to a new place, and where it would land.
     /// A phone reorders by holding a row and sliding it, the way the sidebar
     /// already does; the drop target is derived from the finger's travel and
@@ -1727,15 +1704,12 @@ pub struct MobileApp {
     /// rather than a flag because stopping a turn can hand the queue the next
     /// prompt while the interrupted submission is still on the wire.
     turn_submissions_in_flight: usize,
-    /// A stop this phone has asked for, and the queued prompt waiting on it.
+    /// A stop this phone has asked for.
     ///
-    /// There is no native steering on the wire, so "send now" means what it
-    /// means on the desktop: stop the running turn, then submit this message as
-    /// a resend so the transcript keeps the history of what it interrupted. The
-    /// entry stays in the queue until the stop lands, so a refused interrupt
-    /// costs the reader nothing.
+    /// The Desktop owns the queue, so releasing one message ahead of a turn is
+    /// its gesture too: the phone asks for it instead of interrupting and
+    /// resending itself, and an interrupt here is only the reader's own Stop.
     turn_interrupt_in_flight: bool,
-    composer_queue_after_interrupt: Option<u64>,
     fork_session_busy: bool,
     new_session_busy: bool,
     new_session_open: bool,
@@ -3462,23 +3436,6 @@ fn settings_empty_note(text: &'static str) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// Where a reordered queue entry belongs, as an index into the whole queue.
-///
-/// `remaining` holds the indices of the session's messages after the moved one
-/// was taken out, and `target` is where it should sit among them. A target at
-/// or past the end means "after the last one", which is the only place that is
-/// not "before the message currently there".
-fn queue_insert_index(remaining: &[usize], target: usize, queue_len: usize) -> usize {
-    match remaining.get(target) {
-        Some(index) => *index,
-        None => remaining
-            .last()
-            .map(|last| last + 1)
-            .unwrap_or(queue_len)
-            .min(queue_len),
-    }
-}
-
 /// A round control on the image preview's footer bar.
 fn attachment_preview_button(
     id: &'static str,
@@ -3782,8 +3739,6 @@ impl MobileApp {
             }),
             goal_objective_open: false,
             composer_goal_expanded: false,
-            composer_queue: restored_composer.queue,
-            composer_queue_next_id: restored_composer.next_queue_id,
             composer_queue_drag: None,
             timeline_turns: Arc::new(Vec::new()),
             timeline_markdown_views: RefCell::new(BTreeMap::new()),
@@ -3890,7 +3845,6 @@ impl MobileApp {
             operation_busy: false,
             turn_submissions_in_flight: 0,
             turn_interrupt_in_flight: false,
-            composer_queue_after_interrupt: None,
             fork_session_busy: false,
             new_session_busy: false,
             new_session_open: false,
@@ -5399,9 +5353,6 @@ impl MobileApp {
             self.refresh_sidebar_organization(cx);
             needs_repaint = true;
         }
-        // A session snapshot that says the turn is over is what releases the
-        // next queued prompt; this is the batch that carries it.
-        self.maybe_dispatch_next_queued_message(cx);
         if needs_repaint {
             cx.notify();
         }
@@ -8129,7 +8080,6 @@ impl MobileApp {
                     if let Some(workspace_id) = workspace_id {
                         this.ensure_workbench(workspace_id, cx);
                     }
-                    this.maybe_dispatch_next_queued_message(cx);
                 }
                 cx.notify();
             });
@@ -8172,10 +8122,7 @@ impl MobileApp {
     fn restore_composer_state(
         restored: BackendResult<Vec<StoredComposerSession>>,
     ) -> RestoredComposerState {
-        let mut state = RestoredComposerState {
-            next_queue_id: 1,
-            ..RestoredComposerState::default()
-        };
+        let mut state = RestoredComposerState::default();
         // The file is a convenience: a phone that cannot read it still opens its
         // conversations, so a failure is not the reader's problem.
         let Ok(sessions) = restored else {
@@ -8184,9 +8131,9 @@ impl MobileApp {
         for session in sessions {
             let key = session.session_id.clone();
             // A draft and its files are worth keeping even for a key no
-            // conversation answers to, but a queue is only meaningful against a
-            // session that can be opened again.
-            let queued_session = VibexSessionId::parse(key.clone()).ok();
+            // conversation answers to. The queue is not read back: it belongs to
+            // the Desktop, and a copy kept here would be a second queue that
+            // sends messages the Desktop never took.
             if !session.draft.trim().is_empty() {
                 state.drafts.insert(key.clone(), session.draft);
             }
@@ -8198,32 +8145,11 @@ impl MobileApp {
             if !attachments.is_empty() {
                 state.attachments.insert(key, attachments);
             }
-            let Some(queued_session) = queued_session else {
-                continue;
-            };
-            for queued in session.queued {
-                let id = state.next_queue_id;
-                state.next_queue_id = state.next_queue_id.saturating_add(1);
-                state.queue.push(MobileQueuedMessage {
-                    id,
-                    session_id: queued_session.clone(),
-                    text: queued.text,
-                    attachments: queued
-                        .attachments
-                        .iter()
-                        .filter_map(restore_composer_attachment)
-                        .collect(),
-                    mentions: queued.mentions,
-                    created_at_ms: unix_timestamp_ms(),
-                });
-            }
         }
         state
     }
 
-    /// Parks whatever the open session's field holds, the way switching
-    /// sessions does, so the file describes the live composer too and not only
-    /// the conversations the reader has moved away from.
+    /// Parks the draft the field is holding with the session it belongs to.
     fn park_live_composer(&mut self, cx: &gpui::App) {
         let Some(session_id) = self
             .controller
@@ -8285,7 +8211,6 @@ impl MobileApp {
         let _ = self.storage.clear_composer_state();
         self.composer_drafts.clear();
         self.composer_attachment_drafts.clear();
-        self.composer_queue.clear();
         cx.notify();
     }
 
@@ -8303,19 +8228,6 @@ impl MobileApp {
                 .iter()
                 .filter_map(stored_composer_attachment)
                 .collect();
-        }
-        for message in &self.composer_queue {
-            composer_session_entry(&mut sessions, message.session_id.as_str(), now)
-                .queued
-                .push(StoredComposerQueuedMessage {
-                    text: message.text.clone(),
-                    attachments: message
-                        .attachments
-                        .iter()
-                        .filter_map(stored_composer_attachment)
-                        .collect(),
-                    mentions: message.mentions.clone(),
-                });
         }
         let sessions = sessions.into_values().collect::<Vec<_>>();
         // Best effort: the drafts are a courtesy, and a full or read-only data
@@ -11529,10 +11441,17 @@ impl MobileApp {
         let mentions = self.armed_mentions(cx);
         let attachments = std::mem::take(&mut self.composer_attachments);
         self.composer_armed_mentions.clear();
+        // The Desktop's queue is one ordered list, and its head is the only
+        // message it will release. A send that jumped an entry already waiting
+        // would reorder a list the reader set on purpose, so the same three
+        // cases the Desktop admits a message in are the three here: a live
+        // turn, a held queue, and a paused one.
+        let held = !self.composer_queue_for_open_session().is_empty();
+        let paused = self.composer_queue_paused();
         // A prompt written while the Agent is still working is neither lost nor
         // shouted over the running turn: it waits in the queue above the field
         // and goes out when the turn settles, unless the reader forces it in.
-        if running {
+        if running || held || paused {
             self.enqueue_composer_message(text, attachments, mentions, window, cx);
             return;
         }
@@ -11580,7 +11499,15 @@ impl MobileApp {
             })
     }
 
-    /// Holds a prompt until the open session's turn settles.
+    /// Hands a prompt to the Desktop's queue, which is the one that holds it.
+    ///
+    /// The phone used to keep a queue of its own here. Two queues meant two
+    /// truths: a message written on the phone was invisible on the Desktop and
+    /// the other way round, and whichever shell the reader was not looking at
+    /// could send a message they thought was still waiting. The queue belongs
+    /// to the shell that will release it, so this writes the message into that
+    /// queue and lets the snapshot bring it back — see
+    /// [`Self::composer_queue_for_open_session`].
     fn enqueue_composer_message(
         &mut self,
         text: String,
@@ -11596,44 +11523,51 @@ impl MobileApp {
         else {
             return;
         };
-        let id = self.composer_queue_next_id;
-        self.composer_queue_next_id = self.composer_queue_next_id.saturating_add(1);
-        self.composer_queue.push(MobileQueuedMessage {
-            id,
-            session_id,
-            text,
-            attachments,
-            mentions,
-            created_at_ms: unix_timestamp_ms(),
-        });
-        if let Some(draft_key) = self
-            .controller
-            .as_ref()
-            .and_then(|controller| controller.state.selected_session_id.as_ref())
-            .map(|session_id| session_id.as_str().to_string())
-        {
+        if let Some(draft_key) = Some(session_id.as_str().to_string()) {
             self.composer_drafts.remove(&draft_key);
         }
         self.composer_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         // The keyboard stays up: the next line is usually already in mind.
         crate::platform::show_keyboard();
+        self.send_sidebar_mutation(
+            RemoteSidebarOrganizationMutation::EnqueueQueuedSend {
+                session_id: session_id.as_str().to_string(),
+                text,
+                attachments,
+                mentions,
+            },
+            false,
+            cx,
+        );
         // Held is neither sent nor dropped, and the info toast stays silent, so
         // the tick is what says the line went to the queue rather than out.
         crate::platform::haptic(crate::platform::Haptic::Selection);
         self.hint(
             Tone::Info,
-            locale::text(
-                "Queued until the turn finishes",
-                "已排队，回合结束后发送",
-                "已排隊，回合結束後傳送",
-            ),
+            if self.composer_queue_paused() {
+                locale::text(
+                    "Queued; the queue is paused",
+                    "已排队，队列当前暂停",
+                    "已排隊，佇列目前暫停",
+                )
+            } else {
+                locale::text(
+                    "Queued behind the messages already waiting",
+                    "已排队，排在已有消息之后",
+                    "已排隊，排在已有訊息之後",
+                )
+            },
         );
         cx.notify();
     }
 
-    /// The queued prompts that belong to the session on screen.
-    fn composer_queue_for_open_session(&self) -> Vec<MobileQueuedMessage> {
+    /// The queued prompts the Desktop is holding for the session on screen.
+    ///
+    /// The Desktop's queue is the only one, so this is a projection of it rather
+    /// than a list this client keeps: what a message says, what it will send
+    /// with, and when it is due all come from the snapshot.
+    fn composer_queue_for_open_session(&self) -> Vec<vibex_desktop_model::SidebarQueuedSend> {
         let Some(session_id) = self
             .controller
             .as_ref()
@@ -11641,27 +11575,39 @@ impl MobileApp {
         else {
             return Vec::new();
         };
-        self.composer_queue
-            .iter()
-            .filter(|message| message.session_id == session_id)
+        self.sidebar_view
+            .queued_sends_for(session_id.as_str())
             .cloned()
             .collect()
     }
 
-    fn remove_queued_message(&mut self, id: u64, cx: &mut Context<Self>) {
-        self.composer_queue.retain(|message| message.id != id);
-        // The file holds the queue too, so a prompt the reader deleted must
-        // not be waiting for them after a restart.
-        self.mark_composer_state_dirty(cx);
-        cx.notify();
+    /// Whether the open session's queue is held where the reader left it.
+    fn composer_queue_paused(&self) -> bool {
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return false;
+        };
+        self.sidebar_view.queue_is_paused(session_id.as_str())
     }
 
-    /// Drops every prompt waiting for the open session.
-    ///
-    /// Scoped to the session on screen, the way the rows above it are: clearing
-    /// here must not reach into another session's queue, which the reader
-    /// cannot even see.
-    fn clear_composer_queue(&mut self, cx: &mut Context<Self>) {
+    /// Whether the open session's queue releases messages on its own.
+    fn composer_queue_sends_automatically(&self) -> bool {
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return true;
+        };
+        self.sidebar_view
+            .queue_sends_automatically(session_id.as_str())
+    }
+
+    /// Lifts, or re-installs, the hold on the open session's queue.
+    fn toggle_composer_queue_paused(&mut self, cx: &mut Context<Self>) {
         let Some(session_id) = self
             .controller
             .as_ref()
@@ -11669,130 +11615,125 @@ impl MobileApp {
         else {
             return;
         };
-        self.composer_queue
-            .retain(|message| message.session_id != session_id);
+        let paused = self.sidebar_view.queue_is_paused(session_id.as_str());
+        self.send_sidebar_mutation(
+            RemoteSidebarOrganizationMutation::SetQueuePaused {
+                session_id: session_id.as_str().to_string(),
+                paused: !paused,
+            },
+            false,
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Switches the open session's queue between automatic and manual sending.
+    fn toggle_composer_queue_send_mode(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        let automatic = self
+            .sidebar_view
+            .queue_sends_automatically(session_id.as_str());
+        self.send_sidebar_mutation(
+            RemoteSidebarOrganizationMutation::SetQueueManual {
+                session_id: session_id.as_str().to_string(),
+                manual: automatic,
+            },
+            false,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn remove_queued_message(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
+            return;
+        };
+        self.send_sidebar_mutation(
+            RemoteSidebarOrganizationMutation::RemoveQueuedSend {
+                session_id: session_id.as_str().to_string(),
+                message_id: id,
+            },
+            false,
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Drops every prompt the Desktop is holding for the open session.
+    ///
+    /// Scoped to the session on screen, the way the rows above it are: clearing
+    /// here must not reach into another session's queue, which the reader
+    /// cannot even see. Each entry is addressed by id because that is what the
+    /// wire offers, and one removal per message is what keeps a queue the reader
+    /// edits in another shell from being dropped wholesale.
+    fn clear_composer_queue(&mut self, cx: &mut Context<Self>) {
+        let ids = self
+            .composer_queue_for_open_session()
+            .into_iter()
+            .map(|message| message.message_id)
+            .collect::<Vec<_>>();
         self.composer_queue_drag = None;
-        self.mark_composer_state_dirty(cx);
+        for id in ids {
+            self.remove_queued_message(id, cx);
+        }
         cx.notify();
     }
 
     /// Takes a queued prompt back into the field so it can be rewritten.
+    ///
+    /// The message leaves the Desktop's queue and becomes this phone's draft.
+    /// That is the one direction a queue entry can move without coming back: a
+    /// message being rewritten is not waiting to be sent any more, and leaving it
+    /// in the queue would send the old words as soon as the turn settles.
     fn edit_queued_message(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self
-            .composer_queue
-            .iter()
-            .position(|message| message.id == id)
+        let Some(message) = self
+            .composer_queue_for_open_session()
+            .into_iter()
+            .find(|message| message.message_id == id)
         else {
             return;
         };
-        let message = self.composer_queue.remove(index);
+        self.remove_queued_message(id, cx);
         self.composer_input
             .update(cx, |input, cx| input.set_value(message.text, window, cx));
+        self.composer_armed_mentions = message.mentions;
         crate::platform::show_keyboard();
-        self.mark_composer_state_dirty(cx);
         cx.notify();
     }
 
-    /// Pushes one queued prompt out ahead of the turn that is holding it back.
+    /// Releases one queued prompt ahead of the turn holding it back.
     ///
-    /// The wire has no native steering: `send_message` on a session whose turn
-    /// is live is refused by the authority with `agent_turn_already_running`,
-    /// so a steered delivery is not something this client can ask for. "Now"
-    /// therefore means what the desktop's own resend action means — stop the
-    /// running turn, then submit this message as the turn's `Resend`, so the
-    /// transcript records that it interrupted one instead of reading as an
-    /// ordinary prompt. The entry only leaves the queue once that interrupt has
-    /// actually landed, so a refused stop costs the reader nothing.
+    /// The Desktop owns the interrupt-then-resend dance this needs — it is the
+    /// shell that can stop its own turn — so the phone asks for it rather than
+    /// repeating it: promote the message, lift any pause, and send it as the
+    /// resend of the turn it interrupts.
     fn send_queued_message_now(&mut self, id: u64, cx: &mut Context<Self>) {
-        if self.composer_queue.iter().all(|message| message.id != id) {
-            return;
-        }
-        if self.composer_busy() {
-            return;
-        }
-        // A settled session has nothing to interrupt: the message simply goes.
-        if !self.session_turn_live() {
-            self.dispatch_queued_message_now(id, UserMessageDelivery::Prompt, cx);
-            return;
-        }
-        if self.turn_interrupt_in_flight {
-            return;
-        }
-        let Some(controller) = self.controller.as_mut() else {
-            return;
-        };
-        let Some(session_id) = controller.state.selected_session_id.clone() else {
-            return;
-        };
-        let request = MutationRequest::new(session_id);
-        let ticket = match controller.begin_interrupt(&request) {
-            Ok(ticket) => ticket,
-            Err(error) => {
-                self.fail(error);
-                cx.notify();
-                return;
-            }
-        };
-        let future = controller.interrupt(request);
-        // The marker is what turns a successful stop into the submission. It is
-        // installed before the call is spawned so a fast answer cannot arrive
-        // before the queue knows what it stopped for.
-        self.composer_queue_after_interrupt = Some(id);
-        self.turn_interrupt_in_flight = true;
-        let runner = gpui_tokio::Tokio::spawn(cx, future);
-        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let outcome = flatten_join(runner.await);
-            let _ = entity.update(cx, |this, cx| {
-                this.turn_interrupt_in_flight = false;
-                let mutation_error = this.controller.as_mut().and_then(|controller| {
-                    controller.apply_simple_mutation(&ticket, outcome);
-                    controller.state.latest_mutation.error.clone()
-                });
-                let stopped = mutation_error.is_none();
-                if let Some(error) = mutation_error {
-                    // The turn is still running, so the entry stays where the
-                    // reader left it and the message is still theirs to place.
-                    this.composer_queue_after_interrupt = None;
-                    this.fail(error);
-                }
-                if stopped && let Some(id) = this.composer_queue_after_interrupt.take() {
-                    this.dispatch_queued_message_now(id, UserMessageDelivery::Resend, cx);
-                }
-                cx.notify();
-            });
-        });
-        self.tasks.push(task);
-        cx.notify();
-    }
-
-    /// Sends one queued prompt that the caller has already decided may go.
-    ///
-    /// This is the queue's own release: the entry is taken out first so the
-    /// dispatch cannot see it as still waiting, and put back if the submission
-    /// is refused before it left.
-    fn dispatch_queued_message_now(
-        &mut self,
-        id: u64,
-        delivery: UserMessageDelivery,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(index) = self
-            .composer_queue
-            .iter()
-            .position(|message| message.id == id)
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
         else {
             return;
         };
-        let message = self.composer_queue.remove(index);
-        self.mark_composer_state_dirty(cx);
-        self.submit_prompt(
-            message.text,
-            message.attachments,
-            delivery,
-            Some(message.mentions),
-            None,
+        self.send_sidebar_mutation(
+            RemoteSidebarOrganizationMutation::SendQueuedSendNow {
+                session_id: session_id.as_str().to_string(),
+                message_id: id,
+            },
+            false,
             cx,
         );
+        cx.notify();
     }
 
     /// Whether this row is the newest prompt in the open session.
@@ -12157,7 +12098,7 @@ impl MobileApp {
             return;
         };
         self.composer_queue_drag = Some(MobileQueueDrag {
-            id: message.id,
+            id: message.message_id,
             start_index: index,
             start_y: f32::from(position.y) as i32,
             target_index: index,
@@ -12235,96 +12176,47 @@ impl MobileApp {
         else {
             return;
         };
-        // The queue is global with a session stamp, so the move happens inside
-        // the block this session owns rather than across the whole vector.
-        let positions: Vec<usize> = self
-            .composer_queue
-            .iter()
-            .enumerate()
-            .filter(|(_, message)| message.session_id == session_id)
-            .map(|(index, _)| index)
-            .collect();
-        let Some(from) = positions
-            .iter()
-            .position(|index| self.composer_queue[*index].id == id)
-        else {
+        // The Desktop's queue is one ordered list across sessions, so the drop
+        // is expressed inside this session's own block: the anchor is the
+        // message the row lands before, and `None` means the end of the block.
+        let queued = self.composer_queue_for_open_session();
+        let Some(from) = queued.iter().position(|message| message.message_id == id) else {
             return;
         };
-        let target = target_index.min(positions.len().saturating_sub(1));
+        // The target is where the row lands among the *others*: the dragged
+        // message is taken out before the drop is resolved, which is the same
+        // reading the drag itself drew with. Resolving it against the list the
+        // message is still in would land every downward move one row short.
+        let mut remaining = queued.clone();
+        remaining.remove(from);
+        let target = target_index.min(remaining.len());
         if from == target {
             return;
         }
-        let message = self.composer_queue.remove(positions[from]);
-        // The positions are recomputed after the removal: every index behind
-        // the one that left has shifted down, and dropping against a stale
-        // index would land one row off.
-        let remaining: Vec<usize> = self
-            .composer_queue
-            .iter()
-            .enumerate()
-            .filter(|(_, message)| message.session_id == session_id)
-            .map(|(index, _)| index)
-            .collect();
-        let insert_at = queue_insert_index(&remaining, target, self.composer_queue.len());
-        self.composer_queue.insert(insert_at, message);
+        let before_message_id = remaining.get(target).map(|message| message.message_id);
+        self.send_sidebar_mutation(
+            RemoteSidebarOrganizationMutation::MoveQueuedSend {
+                session_id: session_id.as_str().to_string(),
+                message_id: id,
+                before_message_id,
+            },
+            false,
+            cx,
+        );
         // The drop is the commit the drag was for, so it lands with the
         // weight the pick-up and the stepping did not use.
         crate::platform::haptic(crate::platform::Haptic::Medium);
-        self.mark_composer_state_dirty(cx);
         cx.notify();
     }
 
-    /// Sends the oldest queued prompt once the open session's turn has settled.
+    /// Re-reads the queue the Desktop is holding after something moved it.
     ///
-    /// Called wherever the state can have settled: an event batch, a finished
-    /// mutation, or a fresh session snapshot.
-    fn maybe_dispatch_next_queued_message(&mut self, cx: &mut Context<Self>) {
-        if self.composer_busy() || self.runtime_switch_busy_generation.is_some() {
-            return;
-        }
-        // A turn still on the wire is a turn still running, even when the last
-        // snapshot the phone has says otherwise: releasing the head now would
-        // hand the authority a second prompt it can only refuse.
-        if self.turn_submissions_in_flight > 0 {
-            return;
-        }
-        let Some(controller) = self.controller.as_ref() else {
-            return;
-        };
-        let Some(session_id) = controller.state.selected_session_id.clone() else {
-            return;
-        };
-        let state = controller
-            .state
-            .active_session
-            .value
-            .as_ref()
-            .map(|session| session.state);
-        if matches!(
-            state,
-            None | Some(AgentSessionState::Running) | Some(AgentSessionState::Initializing)
-        ) {
-            return;
-        }
-        let Some(index) = self
-            .composer_queue
-            .iter()
-            .position(|message| message.session_id == session_id)
-        else {
-            return;
-        };
-        let message = self.composer_queue.remove(index);
-        // The prompt is on its way out, so the file must stop claiming it is
-        // still waiting here.
-        self.mark_composer_state_dirty(cx);
-        self.submit_prompt(
-            message.text,
-            message.attachments,
-            UserMessageDelivery::Prompt,
-            Some(message.mentions),
-            None,
-            cx,
-        );
+    /// The queue is the Desktop's, so this client cannot advance it: the shell
+    /// that owns it releases the head when its own turn settles. What is left
+    /// here is a re-read, because a mutation's snapshot is the only thing that
+    /// tells the phone a message it wrote has actually been taken.
+    fn refresh_composer_queue(&mut self, cx: &mut Context<Self>) {
+        self.refresh_sidebar_organization(cx);
     }
 
     /// The one place a prompt leaves the phone.
@@ -12494,13 +12386,13 @@ impl MobileApp {
                 if failed && let Some(text) = restore_composer {
                     this.pending_composer_restore = Some(text);
                 }
-                // The turn this submission was waiting on has settled, so the
-                // next queued prompt is exactly what may go now. A send the
-                // controller rejected cannot have settled anything, so it
-                // leaves the queue armed for the event that does.
-                if !mutation_failed {
-                    this.maybe_dispatch_next_queued_message(cx);
-                }
+                // The turn this submission was waiting on has settled, which is
+                // the Desktop's cue to release the next queued prompt. The
+                // queue is the Desktop's, so the list on screen is re-read
+                // rather than advanced here; a rejected send moved nothing, so
+                // it is only the successful one that asks.
+                let _ = mutation_failed;
+                this.refresh_composer_queue(cx);
                 cx.notify();
             });
         });
@@ -12547,12 +12439,12 @@ impl MobileApp {
                     // the toast's, which is already its own pattern.
                     crate::platform::haptic(crate::platform::Haptic::Medium);
                 }
-                // The turn is gone, so whatever the reader wrote ahead may go
-                // now. A stop that failed settled nothing and leaves the queue
-                // armed for the completion that does.
-                if stopped {
-                    this.maybe_dispatch_next_queued_message(cx);
-                }
+                // A stop lets the Desktop release whatever it was holding, so
+                // the queue it publishes is re-read instead of advanced here. A
+                // stop that failed settled nothing, but re-reading is still the
+                // honest thing: the queue may have moved for another reason.
+                let _ = stopped;
+                this.refresh_composer_queue(cx);
                 cx.notify();
             });
         });
@@ -23292,11 +23184,13 @@ impl MobileApp {
     /// hover, and a bare stack of cards used to read as part of the field.
     fn render_composer_queue(
         &self,
-        queued: &[MobileQueuedMessage],
+        queued: &[vibex_desktop_model::SidebarQueuedSend],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let drag = self.composer_queue_drag;
         let count = queued.len();
+        let paused = self.composer_queue_paused();
+        let automatic = self.composer_queue_sends_automatically();
         div()
             .id("mobile-composer-queue")
             .debug_selector(|| "mobile-composer-queue".to_string())
@@ -23314,19 +23208,29 @@ impl MobileApp {
                             .path("icons/clock.svg")
                             .size(px(theme::ICON_SM))
                             .flex_shrink_0()
-                            .text_color(theme::text_muted()),
+                            .text_color(if paused {
+                                theme::accent_yellow()
+                            } else {
+                                theme::text_muted()
+                            }),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .text_size(theme::font_micro())
-                            .text_color(theme::text_muted())
-                            .child(if count == 1 {
+                            .text_color(if paused {
+                                theme::accent_yellow()
+                            } else {
+                                theme::text_muted()
+                            })
+                            .child(if paused {
+                                locale::text("Queue paused", "队列已暂停", "佇列已暫停").to_string()
+                            } else if count == 1 {
                                 locale::text(
-                                    "1 message waiting for this turn",
-                                    "1 条消息等待当前回合结束",
-                                    "1 則訊息等待目前回合結束",
+                                    "1 message waiting",
+                                    "1 条消息等待发送",
+                                    "1 則訊息等待傳送",
                                 )
                                 .to_string()
                             } else {
@@ -23334,12 +23238,112 @@ impl MobileApp {
                                     "{} {}",
                                     count,
                                     locale::text(
-                                        "messages waiting for this turn",
-                                        "条消息等待当前回合结束",
-                                        "則訊息等待目前回合結束",
+                                        "messages waiting",
+                                        "条消息等待发送",
+                                        "則訊息等待傳送",
                                     )
                                 )
                             }),
+                    )
+                    // The mode and the pause are the Desktop's own two
+                    // controls over this queue, and the queue is the Desktop's,
+                    // so each is one tap that sets the shared state rather than
+                    // a local flag this phone would act on by itself.
+                    .child(
+                        div()
+                            .id("mobile-composer-queue-mode")
+                            .debug_selector(|| "mobile-composer-queue-mode".to_string())
+                            .flex_shrink_0()
+                            .h(px(28.0))
+                            .px(px(theme::SPACING_SM))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .aria_label(
+                                if automatic {
+                                    locale::text(
+                                        "Switch to manual sending",
+                                        "切换为手动发送",
+                                        "切換為手動傳送",
+                                    )
+                                } else {
+                                    locale::text(
+                                        "Switch to automatic sending",
+                                        "切换为自动发送",
+                                        "切換為自動傳送",
+                                    )
+                                }
+                                .to_string(),
+                            )
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.toggle_composer_queue_send_mode(cx);
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(theme::font_micro())
+                                    .text_color(if automatic {
+                                        theme::text_muted()
+                                    } else {
+                                        theme::accent_blue()
+                                    })
+                                    .child(if automatic {
+                                        locale::text("Auto", "自动", "自動")
+                                    } else {
+                                        locale::text("Manual", "手动", "手動")
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("mobile-composer-queue-pause")
+                            .debug_selector(|| "mobile-composer-queue-pause".to_string())
+                            .flex_shrink_0()
+                            .h(px(28.0))
+                            .px(px(theme::SPACING_SM))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .aria_label(
+                                if paused {
+                                    locale::text("Resume the queue", "恢复队列", "恢復佇列")
+                                } else {
+                                    locale::text("Pause the queue", "暂停队列", "暫停佇列")
+                                }
+                                .to_string(),
+                            )
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.toggle_composer_queue_paused(cx);
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(theme::font_micro())
+                                    .text_color(if paused {
+                                        theme::accent_yellow()
+                                    } else {
+                                        theme::text_muted()
+                                    })
+                                    .child(if paused {
+                                        locale::text("Resume", "恢复", "恢復")
+                                    } else {
+                                        locale::text("Pause", "暂停", "暫停")
+                                    }),
+                            ),
                     )
                     .child(
                         div()
@@ -23417,9 +23421,9 @@ impl MobileApp {
                         .size_full()
                     })
                     .children(queued.iter().enumerate().map(|(index, message)| {
-                        let edit_id = message.id;
-                        let send_id = message.id;
-                        let remove_id = message.id;
+                        let edit_id = message.message_id;
+                        let send_id = message.message_id;
+                        let remove_id = message.message_id;
                         let position = index + 1;
                         let summary = if message.text.trim().is_empty() {
                             format!(
@@ -23430,12 +23434,12 @@ impl MobileApp {
                         } else {
                             message.text.clone()
                         };
-                        let lifted = drag.is_some_and(|drag| drag.id == message.id);
+                        let lifted = drag.is_some_and(|drag| drag.id == message.message_id);
                         let drop_gap = drag.is_some_and(|drag| {
-                            drag.id != message.id && drag.target_index == index
+                            drag.id != message.message_id && drag.target_index == index
                         });
                         div()
-                            .id(format!("mobile-composer-queue-row-{}", message.id))
+                            .id(format!("mobile-composer-queue-row-{}", message.message_id))
                             .min_h(px(theme::TOUCH_TARGET))
                             .rounded(px(theme::RADIUS_CARD))
                             .border_1()
@@ -23488,7 +23492,10 @@ impl MobileApp {
                             )
                             .child(
                                 div()
-                                    .id(format!("mobile-composer-queue-send-{}", message.id))
+                                    .id(format!(
+                                        "mobile-composer-queue-send-{}",
+                                        message.message_id
+                                    ))
                                     .size(px(36.0))
                                     .flex_shrink_0()
                                     .rounded(px(theme::RADIUS_CONTROL))
@@ -23521,7 +23528,10 @@ impl MobileApp {
                             )
                             .child(
                                 div()
-                                    .id(format!("mobile-composer-queue-remove-{}", message.id))
+                                    .id(format!(
+                                        "mobile-composer-queue-remove-{}",
+                                        message.message_id
+                                    ))
                                     .size(px(36.0))
                                     .flex_shrink_0()
                                     .rounded(px(theme::RADIUS_CONTROL))
@@ -33215,8 +33225,6 @@ fn sidebar_item_ref(item: &SidebarOrganizationItem) -> RemoteSidebarItemRef {
 struct RestoredComposerState {
     drafts: BTreeMap<String, String>,
     attachments: BTreeMap<String, Vec<MessageAttachment>>,
-    queue: Vec<MobileQueuedMessage>,
-    next_queue_id: u64,
 }
 
 /// The phone's half of an attachment is the data URL the picker produced.
@@ -36472,22 +36480,6 @@ mod tests {
     }
 
     #[test]
-    fn a_reordered_queue_entry_lands_where_the_finger_dropped_it() {
-        // A queue that is only this session's: dropping the first entry last.
-        assert_eq!(queue_insert_index(&[0, 1], 2, 2), 2);
-        // Dropping the last entry first.
-        assert_eq!(queue_insert_index(&[0, 1], 0, 2), 0);
-        // Dropping the first entry into the middle.
-        assert_eq!(queue_insert_index(&[0, 2], 1, 3), 2);
-        // Other sessions' prompts sit in the same vector and must not be
-        // crossed: the drop stays among this session's own rows.
-        assert_eq!(queue_insert_index(&[1, 2], 2, 4), 3);
-        assert_eq!(queue_insert_index(&[2, 3], 0, 4), 2);
-        // An empty remainder can only mean the queue emptied around the move.
-        assert_eq!(queue_insert_index(&[], 0, 0), 0);
-    }
-
-    #[test]
     fn a_zoomed_preview_cannot_be_pulled_off_the_screen() {
         let size = gpui::size(px(400.0), px(800.0));
         // At fit there is no slack at all, so every offset collapses to zero.
@@ -37120,9 +37112,13 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// A draft, the files waiting on it, and a prompt queued behind a running
-    /// turn are all on disk before the process dies — and a later launch is
-    /// what reads them back, which is the point of writing them at all.
+    /// A draft and the files waiting on it are on disk before the process dies
+    /// — and a later launch is what reads them back, which is the point of
+    /// writing them at all.
+    ///
+    /// The queue is deliberately not here: it belongs to the Desktop, and a copy
+    /// this phone kept would be a second queue sending messages the Desktop
+    /// never took.
     #[gpui::test]
     fn unsent_composer_work_survives_a_restart(cx: &mut TestAppContext) {
         init_kit_globals(cx);
@@ -37143,14 +37139,6 @@ mod tests {
                     inline_text_offset: None,
                 }],
             );
-            app.composer_queue.push(MobileQueuedMessage {
-                id: 1,
-                session_id: session_id.clone(),
-                text: "and then one more".to_string(),
-                attachments: Vec::new(),
-                mentions: Vec::new(),
-                created_at_ms: unix_timestamp_ms(),
-            });
             app.flush_composer_state(cx);
             app
         });
@@ -37173,9 +37161,11 @@ mod tests {
                 .expect("the files waiting on the draft came back");
             assert_eq!(attachments.len(), 1);
             assert_eq!(attachments[0].label, "notes.txt");
-            assert_eq!(app.composer_queue.len(), 1);
-            assert_eq!(app.composer_queue[0].session_id, session_id);
-            assert_eq!(app.composer_queue[0].text, "and then one more");
+            assert_eq!(
+                app.composer_queue_for_open_session().len(),
+                0,
+                "the queue is the Desktop's, so a cold start reads none of it"
+            );
         });
     }
 
@@ -37249,16 +37239,34 @@ mod tests {
         });
         click_mobile_control(cx, "send-message");
 
-        app.read_with(cx, |app, _| {
-            assert_eq!(
-                app.composer_queue.len(),
-                1,
+        // The composer is emptied and the prompt is on its way to the Desktop's
+        // queue. This client holds no copy: the snapshot is what brings the
+        // entry back, and until it arrives the queue it can show is the Desktop's
+        // last answer.
+        app.update(cx, |app, cx| {
+            assert!(
+                app.composer_input.read(cx).value().is_empty(),
                 "the prompt was taken instead of dropped"
             );
-            assert_eq!(app.composer_queue[0].text, "and then one more");
-            assert_eq!(app.composer_queue[0].session_id, session_id);
+            assert_eq!(app.composer_queue_for_open_session().len(), 0);
         });
-        // The queue is on screen while the turn it waits for is still running.
+
+        // The queue as the Desktop publishes it is what the panel draws, so
+        // seeding the view is seeding the panel — the same projection, not a
+        // second list kept in parallel.
+        app.update(cx, |app, _| {
+            app.sidebar_view
+                .queued_sends
+                .push(vibex_desktop_model::SidebarQueuedSend {
+                    message_id: 7,
+                    session_id: session_id.as_str().to_string(),
+                    text: "and then one more".to_string(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                    scheduled_at_ms: None,
+                });
+        });
+        draw_rooted_window(cx);
         assert!(
             cx.debug_bounds("mobile-composer-queue").is_some(),
             "a held prompt is visible above the composer"
@@ -37266,6 +37274,160 @@ mod tests {
         assert!(
             cx.debug_bounds("mobile-composer-queue-clear").is_some(),
             "the queue names itself and offers to be cleared"
+        );
+        assert!(
+            cx.debug_bounds("mobile-composer-queue-pause").is_some(),
+            "and offers to pause itself"
+        );
+        assert!(
+            cx.debug_bounds("mobile-composer-queue-mode").is_some(),
+            "and to switch between automatic and manual sending"
+        );
+    }
+
+    /// A send never jumps the messages already waiting.
+    ///
+    /// The Desktop releases the head of its queue, so a message that went out
+    /// immediately while another was waiting would reorder a list the reader set
+    /// on purpose. An idle session with a held queue therefore queues too — the
+    /// same three admissions the Desktop makes.
+    #[gpui::test]
+    fn a_send_waits_behind_the_messages_already_held(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().unwrap();
+        let session_id = VibexSessionId::parse("session_mobile_queue_order").unwrap();
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            let backend = vibex_backend::DisconnectedBackend::facade();
+            let mut controller =
+                AgentWorkflowController::new(backend.agent().clone(), backend.capabilities().agent);
+            controller.state.selected_session_id = Some(session_id.clone());
+            // An idle session: nothing is running, so only the held queue can
+            // keep this send from going out immediately.
+            controller.state.active_session.resolve(AgentSession {
+                id: session_id.clone(),
+                title: "Queue order".to_string(),
+                project_id: vibex_core::ProjectId::parse("project_order").unwrap(),
+                workspace_id: vibex_core::WorkspaceId::parse("workspace_order").unwrap(),
+                workspace_root: "/tmp/order".to_string(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                agent_id: AgentId::parse("claude").unwrap(),
+                state: AgentSessionState::Idle,
+                safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                last_message_at_ms: 0,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            });
+            app.controller = Some(controller);
+            app.sidebar_view
+                .queued_sends
+                .push(vibex_desktop_model::SidebarQueuedSend {
+                    message_id: 1,
+                    session_id: session_id.as_str().to_string(),
+                    text: "already waiting".to_string(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                    scheduled_at_ms: None,
+                });
+            app
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.composer_input.update(cx, |input, cx| {
+                    input.set_value("second in line", window, cx);
+                });
+            });
+            let _ = window.draw(cx);
+        });
+        click_mobile_control(cx, "send-message");
+
+        app.update(cx, |app, cx| {
+            assert!(
+                app.composer_input.read(cx).value().is_empty(),
+                "the prompt was taken"
+            );
+            // The prompt did not leave as a prompt of its own: it is now the
+            // Desktop's to hold behind the entry that was already waiting.
+            assert!(
+                app.pending_user_message.is_none(),
+                "nothing was submitted ahead of the queue"
+            );
+        });
+    }
+
+    /// The pause and the send mode are the Desktop's state, not a local flag.
+    ///
+    /// Both controls read the published queue and write it back through the same
+    /// sidebar channel every other shared mark uses, so a pause set on the phone
+    /// is a pause the Desktop honours — which is the only way it can change when
+    /// the Desktop releases the next message.
+    #[gpui::test]
+    fn the_queue_controls_read_and_write_the_shared_state(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().unwrap();
+        let session_id = VibexSessionId::parse("session_mobile_queue_controls").unwrap();
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            let backend = vibex_backend::DisconnectedBackend::facade();
+            let mut controller =
+                AgentWorkflowController::new(backend.agent().clone(), backend.capabilities().agent);
+            controller.state.selected_session_id = Some(session_id.clone());
+            app.controller = Some(controller);
+            app.sidebar_view
+                .queued_sends
+                .push(vibex_desktop_model::SidebarQueuedSend {
+                    message_id: 1,
+                    session_id: session_id.as_str().to_string(),
+                    text: "waiting".to_string(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                    scheduled_at_ms: None,
+                });
+            app
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.composer_queue_sends_automatically(),
+                "a queue nobody has switched starts automatic"
+            );
+            assert!(!app.composer_queue_paused(), "and starts running");
+        });
+
+        app.update(cx, |app, _| {
+            app.sidebar_view
+                .manual_queue_session_ids
+                .insert(session_id.as_str().to_string());
+            app.sidebar_view
+                .paused_queue_session_ids
+                .insert(session_id.as_str().to_string());
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.composer_queue_sends_automatically(),
+                "manual mode is what the Desktop published"
+            );
+            assert!(
+                app.composer_queue_paused(),
+                "and so is the pause the Desktop reports"
+            );
+        });
+
+        draw_rooted_window(cx);
+        assert!(
+            cx.debug_bounds("mobile-composer-queue-pause").is_some(),
+            "a paused queue still offers the way out of the pause"
         );
     }
 
@@ -42262,10 +42424,21 @@ fn agent_icon_path(",
     /// The sheet opens on the hour the send already waits for.
     #[test]
     fn the_reschedule_sheet_starts_where_the_send_is() {
-        let at = chrono::Local::now() + chrono::Duration::days(1) + chrono::Duration::hours(2);
+        // A fixed hour tomorrow, not `now + 1 day + 2 hours`: adding hours to
+        // the clock crosses midnight in the late evening, which made this
+        // assertion pass or fail depending on when the suite ran.
+        let now = chrono::Local::now();
+        let tomorrow = now
+            .date_naive()
+            .checked_add_days(chrono::Days::new(1))
+            .unwrap();
+        let at = tomorrow
+            .and_hms_opt(9, 30, 0)
+            .and_then(|naive| naive.and_local_timezone(chrono::Local).single())
+            .unwrap();
         let (day, time) = mobile_reschedule_seed(at.timestamp_millis());
         assert_eq!(day, 1, "tomorrow is the day the chips should point at");
-        assert_eq!(time, at.format("%H:%M").to_string());
+        assert_eq!(time, "09:30");
 
         // A deadline further out than the chips reach clamps to the last one,
         // and one already past reads as today.

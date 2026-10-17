@@ -512,7 +512,7 @@ pub use remote::{
     RemoteProviderSkillValidateRequest, RemoteProviderSkillValidateResponse,
     RemoteProviderUpdateAcpProfileConfigRequest, RemoteProviderUpdateAcpProfileConfigResponse,
     RemoteProviderUsageSummaryListRequest, RemoteProviderUsageSummaryListResponse,
-    RemoteRenameDeviceRequest, RemoteRenameRuntimeRequest, RemoteRequestEnvelope,
+    RemoteQueuedSend, RemoteRenameDeviceRequest, RemoteRenameRuntimeRequest, RemoteRequestEnvelope,
     RemoteResponseEnvelope, RemoteRestoreDeviceRequest, RemoteRevokeDeviceRequest,
     RemoteScheduledAttentionListRequest, RemoteScheduledAttentionListResponse,
     RemoteScheduledAuditListRequest, RemoteScheduledAuditListResponse,

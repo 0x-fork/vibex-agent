@@ -839,14 +839,33 @@ impl VibexWorkbench {
 
     /// The sends this shell is holding for a later hour, as the shared view
     /// publishes them to the clients that are not the one waiting.
-    ///
-    /// Only the entries with a deadline travel: an ordinary held message is a
-    /// fact about this window's own turn, and another client rendering it would
-    /// only be showing a queue it cannot drain.
     pub(super) fn published_scheduled_sends(&self) -> Vec<SidebarScheduledSend> {
         self.composer_queue
             .iter()
             .filter_map(published_scheduled_send)
+            .collect()
+    }
+
+    /// The whole pre-send queue, as the shared view publishes it.
+    ///
+    /// A compact client can now draw the queue the Desktop is actually holding
+    /// instead of keeping a second one of its own, so the ordinary held messages
+    /// travel too: a queue that published only its scheduled entries would show
+    /// a reader two messages where the Desktop has five. What does not travel is
+    /// the fields a client has no use for — the runtime selection the message
+    /// will be sent with and any command it runs — because a client addresses a
+    /// message by its id and never builds one.
+    pub(super) fn published_queued_sends(&self) -> Vec<SidebarQueuedSend> {
+        self.composer_queue
+            .iter()
+            .map(|message| SidebarQueuedSend {
+                message_id: message.id,
+                session_id: message.session_id.as_str().to_string(),
+                text: message.text.clone(),
+                attachments: message.attachments.clone(),
+                mentions: message.mentions.clone(),
+                scheduled_at_ms: message.scheduled_at_ms,
+            })
             .collect()
     }
 
@@ -898,6 +917,240 @@ impl VibexWorkbench {
         }
         self.publish_sidebar_invalidation();
         self.composer_queue_changed();
+        true
+    }
+
+    /// Rewrites one message this shell is holding.
+    ///
+    /// A client edits a queue it did not build, so the message keeps everything
+    /// the client cannot see — its runtime selection, any command it runs — and
+    /// only the parts a client actually showed it change. A deadline is left
+    /// alone for the same reason: editing words is not an instruction about the
+    /// hour, and a client that wants both sends the schedule change too.
+    pub(super) fn set_queued_send(
+        &mut self,
+        session_id: &str,
+        message_id: u64,
+        text: &str,
+        attachments: &[MessageAttachment],
+        mentions: &[vibex_core::VibexUseMention],
+    ) -> bool {
+        let Some(message) = self
+            .composer_queue
+            .iter_mut()
+            .find(|message| message.session_id.as_str() == session_id && message.id == message_id)
+        else {
+            return false;
+        };
+        message.text = text.to_string();
+        message.attachments = attachments.to_vec();
+        message.mentions = mentions.to_vec();
+        // A command was resolved from the words this message no longer has, so
+        // it no longer applies: running it would send something the reader did
+        // not write.
+        message.command_invocation = None;
+        self.publish_sidebar_invalidation();
+        self.composer_queue_changed();
+        true
+    }
+
+    /// Takes one message a client asked this shell to hold.
+    ///
+    /// The client cannot build a queue entry — it does not know the session's
+    /// runtime selection, and it must not choose the id — so the shell builds
+    /// one here, behind everything already waiting for that session. Returns
+    /// whether the message was taken: a session the shell cannot resolve a
+    /// runtime for is one it cannot hold a message for.
+    pub(super) fn enqueue_queued_send(
+        &mut self,
+        session_id: &VibexSessionId,
+        text: &str,
+        attachments: &[MessageAttachment],
+        mentions: &[vibex_core::VibexUseMention],
+    ) -> bool {
+        let Some(desired_runtime) = self.runtime_selection_for_session(session_id) else {
+            return false;
+        };
+        self.composer_queue_serial = self.composer_queue_serial.saturating_add(1).max(1);
+        let insert_at = self
+            .composer_queue
+            .iter()
+            .position(|message| message.session_id == *session_id)
+            .map(|first| {
+                self.composer_queue[first..]
+                    .iter()
+                    .position(|message| message.session_id != *session_id)
+                    .map_or(self.composer_queue.len(), |offset| first + offset)
+            })
+            .unwrap_or(self.composer_queue.len());
+        self.composer_queue.insert(
+            insert_at,
+            ComposerQueueMessage {
+                id: self.composer_queue_serial,
+                session_id: session_id.clone(),
+                desired_runtime,
+                text: text.to_string(),
+                attachments: attachments.to_vec(),
+                command_invocation: None,
+                scheduled_at_ms: None,
+                mentions: mentions.to_vec(),
+            },
+        );
+        self.publish_sidebar_invalidation();
+        self.composer_queue_changed();
+        true
+    }
+
+    /// Moves one queued message inside its session's block.
+    pub(super) fn move_queued_send(
+        &mut self,
+        session_id: &VibexSessionId,
+        message_id: u64,
+        before_message_id: Option<u64>,
+    ) -> bool {
+        let positions: Vec<usize> = self
+            .composer_queue
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.session_id == *session_id)
+            .map(|(index, _)| index)
+            .collect();
+        let Some(from) = positions
+            .iter()
+            .position(|index| self.composer_queue[*index].id == message_id)
+        else {
+            return false;
+        };
+        let target = match before_message_id {
+            Some(anchor) => positions
+                .iter()
+                .position(|index| self.composer_queue[*index].id == anchor),
+            None => Some(positions.len()),
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        if from == target {
+            return false;
+        }
+        let block_start = positions[0];
+        let message = self.composer_queue.remove(positions[from]);
+        let remaining: Vec<usize> = self
+            .composer_queue
+            .iter()
+            .enumerate()
+            .filter(|(_, queued)| queued.session_id == *session_id)
+            .map(|(index, _)| index)
+            .collect();
+        let insert_at = match remaining.get(target) {
+            Some(index) => *index,
+            // Past the end of this session's block, never past the point where
+            // the next session's begins: a drop at the bottom of one session's
+            // panel must not put its message behind another session's.
+            None => remaining
+                .last()
+                .map_or(block_start.min(self.composer_queue.len()), |last| last + 1),
+        };
+        self.composer_queue.insert(insert_at, message);
+        self.publish_sidebar_invalidation();
+        self.composer_queue_changed();
+        true
+    }
+
+    /// Drops one message this shell is holding.
+    pub(super) fn remove_queued_send(&mut self, session_id: &str, message_id: u64) -> bool {
+        let before = self.composer_queue.len();
+        self.composer_queue.retain(|message| {
+            !(message.session_id.as_str() == session_id && message.id == message_id)
+        });
+        if self.composer_queue.len() == before {
+            return false;
+        }
+        if self.composer_queue_editing_id == Some(message_id) {
+            self.composer_queue_editing_id = None;
+            self.composer_queue_edit_attachments.clear();
+            self.composer_queue_edit_geometry.input_bounds = None;
+        }
+        if self
+            .composer_queue_edit_in_composer
+            .is_some_and(|edit| edit.message_id == message_id)
+        {
+            self.composer_queue_edit_in_composer = None;
+        }
+        self.publish_sidebar_invalidation();
+        self.composer_queue_changed();
+        true
+    }
+
+    /// Holds, or releases, one session's queue.
+    ///
+    /// Releasing re-evaluates the head immediately rather than waiting for the
+    /// next event that would have released it: a reader who lifts a pause has
+    /// said the queue may go now, and a message that waits for an unrelated
+    /// completion would look like the pause never lifted.
+    pub(super) fn set_queue_paused(
+        &mut self,
+        session_id: &VibexSessionId,
+        paused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let changed = if paused {
+            self.composer_queue_paused_session_ids
+                .insert(session_id.as_str().to_string())
+        } else {
+            self.composer_queue_paused_session_ids
+                .remove(session_id.as_str())
+        };
+        if !changed {
+            return false;
+        }
+        if !paused {
+            self.maybe_dispatch_next_composer_queue_message(
+                Some(session_id),
+                ComposerQueueDispatchBehavior::ForceNext,
+                window,
+                cx,
+            );
+        }
+        self.publish_sidebar_invalidation();
+        cx.notify();
+        true
+    }
+
+    /// Switches one session's queue between automatic and manual sending.
+    ///
+    /// Switching back to automatic is itself the instruction to release
+    /// whatever is at the head, which is why it dispatches here instead of
+    /// waiting for a later event: a reader who turned manual mode off has said
+    /// the queue may drain.
+    pub(super) fn set_queue_manual(
+        &mut self,
+        session_id: &VibexSessionId,
+        manual: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let changed = if manual {
+            self.composer_queue_manual_session_ids
+                .insert(session_id.as_str().to_string())
+        } else {
+            self.composer_queue_manual_session_ids
+                .remove(session_id.as_str())
+        };
+        if !changed {
+            return false;
+        }
+        if !manual {
+            self.maybe_dispatch_next_composer_queue_message(
+                Some(session_id),
+                ComposerQueueDispatchBehavior::Automatic,
+                window,
+                cx,
+            );
+        }
+        self.publish_sidebar_invalidation();
+        cx.notify();
         true
     }
 

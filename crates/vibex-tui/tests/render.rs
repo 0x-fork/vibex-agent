@@ -10184,6 +10184,9 @@ fn the_session_list_draws_the_arrangement_the_desktop_published() {
         auto_continue_session_ids: Vec::new(),
         auto_continue_paused_session_ids: Vec::new(),
         unread_session_ids: Vec::new(),
+        queued_sends: Vec::new(),
+        paused_queue_session_ids: Vec::new(),
+        manual_queue_session_ids: Vec::new(),
         scheduled_sends: Vec::new(),
     };
 
@@ -11189,6 +11192,9 @@ fn a_delegated_row_under_a_folder_nested_session_hangs_from_its_elbow() {
         auto_continue_session_ids: Vec::new(),
         auto_continue_paused_session_ids: Vec::new(),
         unread_session_ids: Vec::new(),
+        queued_sends: Vec::new(),
+        paused_queue_session_ids: Vec::new(),
+        manual_queue_session_ids: Vec::new(),
         scheduled_sends: Vec::new(),
     };
 
@@ -11651,6 +11657,9 @@ fn a_folder_rows_action_button_offers_what_a_folder_can_do() {
         auto_continue_session_ids: Vec::new(),
         auto_continue_paused_session_ids: Vec::new(),
         unread_session_ids: Vec::new(),
+        queued_sends: Vec::new(),
+        paused_queue_session_ids: Vec::new(),
+        manual_queue_session_ids: Vec::new(),
         scheduled_sends: Vec::new(),
     };
     assert!(app.apply_sidebar_organization(&snapshot));

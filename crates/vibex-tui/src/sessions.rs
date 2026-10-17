@@ -1103,6 +1103,9 @@ mod tests {
             auto_continue_session_ids: BTreeSet::new(),
             auto_continue_paused_session_ids: BTreeSet::new(),
             unread_session_ids: BTreeSet::from(["session_recent01".to_string()]),
+            queued_sends: Vec::new(),
+            paused_queue_session_ids: BTreeSet::new(),
+            manual_queue_session_ids: BTreeSet::new(),
             scheduled_sends: Vec::new(),
         }
     }

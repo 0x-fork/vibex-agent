@@ -640,3 +640,76 @@ fn the_schedule_timer_releases_its_handle_where_it_stops() {
         "a second update outside the loop describes a decision already made"
     );
 }
+
+/// The two queue switches a client can set are the two the dispatcher reads.
+///
+/// A phone cannot release a message — the queue is the Desktop's — so every
+/// control it draws has to land in the state `maybe_dispatch_next_composer_
+/// queue_message` actually consults. This pins that wiring at the source level,
+/// because the failure mode is silent: a mutation that updated a private copy
+/// would leave the panel looking right and the queue still draining.
+#[test]
+fn the_queue_switches_a_client_sets_are_the_ones_the_dispatcher_reads() {
+    let source = include_str!("app.rs");
+    let dispatcher = source
+        .split_once("    fn maybe_dispatch_next_composer_queue_message(")
+        .and_then(|(_, tail)| tail.split_once("\n    /// "))
+        .map(|(body, _)| body)
+        .expect("the dispatcher should remain inspectable");
+    assert!(
+        dispatcher.contains("composer_queue_paused_session_ids"),
+        "a paused queue is what holds the head back"
+    );
+    assert!(
+        dispatcher.contains("composer_queue_dispatch_enabled("),
+        "and manual mode is the other half of the same decision"
+    );
+
+    let schedule = include_str!("message_schedule.rs");
+    let pause = schedule
+        .split_once("    pub(super) fn set_queue_paused(")
+        .and_then(|(_, tail)| tail.split_once("\n    /// "))
+        .map(|(body, _)| body)
+        .expect("the pause handler should remain inspectable");
+    assert!(
+        pause.contains("composer_queue_paused_session_ids"),
+        "the pause a client sets is the set the dispatcher reads, not a copy"
+    );
+    assert!(
+        pause.contains("ComposerQueueDispatchBehavior::ForceNext"),
+        "lifting a pause releases the head now instead of waiting for an event"
+    );
+
+    let manual = schedule
+        .split_once("    pub(super) fn set_queue_manual(")
+        .and_then(|(_, tail)| tail.split_once("\n    /// "))
+        .map(|(body, _)| body)
+        .expect("the mode handler should remain inspectable");
+    assert!(
+        manual.contains("composer_queue_manual_session_ids"),
+        "the mode a client sets is the set the dispatcher reads"
+    );
+    assert!(
+        manual.contains("ComposerQueueDispatchBehavior::Automatic"),
+        "switching back to automatic drains the head"
+    );
+
+    // Publishing the switches is what lets a client draw them at all: a queue
+    // that travelled without them would show messages the reader cannot explain
+    // the state of.
+    assert!(
+        source.contains("paused_queue_session_ids: self.composer_queue_paused_session_ids.clone()"),
+        "the snapshot carries the pause"
+    );
+    assert!(
+        source.contains("manual_queue_session_ids: self.composer_queue_manual_session_ids.clone()"),
+        "and the send mode"
+    );
+    // The whole queue travels, not only its scheduled subset: a client drawing
+    // the schedules alone would show an empty queue beside the Desktop's three
+    // waiting messages.
+    assert!(
+        source.contains("queued_sends: self.published_queued_sends()"),
+        "every held message is published, not just the ones with an hour"
+    );
+}

@@ -1160,7 +1160,14 @@ impl SidebarBackend for NativeBackend {
                 | RemoteSidebarOrganizationMutation::SetProjectCollapsed { .. }
                 | RemoteSidebarOrganizationMutation::SetWorkspaceCollapsed { .. }
                 | RemoteSidebarOrganizationMutation::SetGroupCollapsed { .. }
-                | RemoteSidebarOrganizationMutation::SetScheduledSend { .. } => Vec::new(),
+                | RemoteSidebarOrganizationMutation::SetScheduledSend { .. }
+                | RemoteSidebarOrganizationMutation::SetQueuedSend { .. }
+                | RemoteSidebarOrganizationMutation::RemoveQueuedSend { .. }
+                | RemoteSidebarOrganizationMutation::SetQueuePaused { .. }
+                | RemoteSidebarOrganizationMutation::SetQueueManual { .. }
+                | RemoteSidebarOrganizationMutation::EnqueueQueuedSend { .. }
+                | RemoteSidebarOrganizationMutation::MoveQueuedSend { .. }
+                | RemoteSidebarOrganizationMutation::SendQueuedSendNow { .. } => Vec::new(),
                 _ => runtime.agent().list_sessions(false).await?,
             };
             let session_projects = sessions
@@ -1218,6 +1225,75 @@ impl SidebarBackend for NativeBackend {
                         rejection.message(),
                     ));
                 }
+            }
+            // A removal is the one queue change that cannot be expressed by
+            // rewriting the published entries: the entry is gone, so writing it
+            // back with edited fields would resurrect the message the reader
+            // deleted. Pauses are live state and have no persisted form; the
+            // send mode is written back by `apply_to_desktop_ui_state` from the
+            // published set, which is where a shell that took the home over can
+            // find it.
+            match &mutation {
+                RemoteSidebarOrganizationMutation::RemoveQueuedSend {
+                    session_id,
+                    message_id,
+                } => {
+                    state.composer.queue.retain(|entry| {
+                        !(entry.session_id == *session_id && entry.id == *message_id)
+                    });
+                }
+                // A message a client handed over has to be written where this
+                // shell's queue is read from, or the next launch would lose it
+                // and the reader would have written a message nothing sends.
+                RemoteSidebarOrganizationMutation::EnqueueQueuedSend {
+                    session_id,
+                    text,
+                    attachments,
+                    mentions,
+                } => {
+                    // The runtime selection is the one thing a client cannot
+                    // supply, so it comes from the shell's own default. Without
+                    // one there is nothing to send the message with, and a
+                    // half-written entry would fail at dispatch time instead of
+                    // here.
+                    if let Some(desired_runtime) = state.composer.default_runtime_selection.clone()
+                    {
+                        let id = state
+                            .composer
+                            .queue
+                            .iter()
+                            .map(|entry| entry.id)
+                            .max()
+                            .unwrap_or(0)
+                            .saturating_add(1);
+                        state
+                            .composer
+                            .queue
+                            .push(vibex_desktop_model::ComposerQueueEntry {
+                                id,
+                                session_id: session_id.clone(),
+                                desired_runtime,
+                                text: text.clone(),
+                                attachments: attachments.clone(),
+                                mentions: mentions.clone(),
+                                command: None,
+                                scheduled_at_ms: None,
+                            });
+                    }
+                }
+                RemoteSidebarOrganizationMutation::MoveQueuedSend {
+                    session_id,
+                    message_id,
+                    before_message_id,
+                } => {
+                    vibex_desktop_model::move_queued_send_relative(
+                        &mut state.composer.queue,
+                        session_id,
+                        *message_id,
+                        *before_message_id,
+                    );
+                }
+                _ => {}
             }
             view.apply_to_desktop_ui_state(&mut state);
             store.save(&state).map_err(sidebar_state_error)?;

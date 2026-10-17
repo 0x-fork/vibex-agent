@@ -10899,6 +10899,9 @@ mod tests {
             auto_continue_session_ids: Vec::new(),
             auto_continue_paused_session_ids: Vec::new(),
             unread_session_ids: vec!["session_org000001".to_string()],
+            queued_sends: Vec::new(),
+            paused_queue_session_ids: Vec::new(),
+            manual_queue_session_ids: Vec::new(),
             scheduled_sends: Vec::new(),
         }
     }
@@ -11110,6 +11113,9 @@ mod tests {
             pinned_session_ids: Vec::new(),
             session_order: Vec::new(),
             unread_session_ids: Vec::new(),
+            queued_sends: Vec::new(),
+            paused_queue_session_ids: Vec::new(),
+            manual_queue_session_ids: Vec::new(),
             scheduled_sends: Vec::new(),
             ..empty
         };
@@ -12301,6 +12307,9 @@ mod tests {
         app.perform(Intent::ScheduleMessage);
         app.apply_sidebar_organization(&vibex_core::RemoteSidebarOrganizationSnapshot {
             revision: 8,
+            queued_sends: Vec::new(),
+            paused_queue_session_ids: Vec::new(),
+            manual_queue_session_ids: Vec::new(),
             scheduled_sends: Vec::new(),
             ..Default::default()
         });
