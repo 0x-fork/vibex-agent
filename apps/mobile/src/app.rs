@@ -1359,6 +1359,9 @@ fn apply_app_settings(
     theme::set_system_dark(system_appearance_is_dark(cx));
     locale::set_preference(settings.language.unwrap_or_default());
     theme::set_reduce_motion(settings.reduce_motion);
+    // Haptics are their own switch rather than a consequence of Reduce Motion:
+    // a reader may want the transitions gone and the tick in their hand kept.
+    crate::platform::set_haptics_enabled(settings.haptics);
     theme::apply_font_scale(settings.font_scale_percent, window);
     theme::set_theme_selection(&settings.theme_selection);
     // A wallpaper fades the theme's containers so the image shows through, so
@@ -4181,6 +4184,10 @@ impl MobileApp {
                             if let Some(workbench) = this.workbench.as_ref() {
                                 workbench.update(cx, |workbench, cx| workbench.resume(cx));
                             }
+                            // Back from the pocket with a live session, which
+                            // is a different event from having just paired: it
+                            // gets the lighter pattern.
+                            crate::platform::haptic(crate::platform::Haptic::Light);
                             cx.notify();
                         });
                         return;
@@ -4776,6 +4783,7 @@ impl MobileApp {
     /// surface of its own: nothing is written into a page, so a notice cannot
     /// leave a line behind on a screen it no longer describes.
     fn hint(&mut self, tone: Tone, message: impl Into<String>) {
+        self.announce(tone);
         self.pending_hints.push(Hint::new(tone, message));
     }
 
@@ -4786,8 +4794,29 @@ impl MobileApp {
         message: impl Into<String>,
         action: toast::HintAction,
     ) {
+        self.announce(tone);
         self.pending_hints
             .push(Hint::with_action(tone, message, action));
+    }
+
+    /// Tells the hand what the toast about to be pushed is about to say.
+    ///
+    /// Both hint paths go through here, so an action that reports itself to the
+    /// eye reports itself to the hand in the same weight. `Info` stays silent:
+    /// it is the tone for anything worth reading but not necessarily the result
+    /// of something the reader just did, and a tick on every passing notice is
+    /// what makes people turn feedback off. The operations that deserve a tick
+    /// ask for one where they happen.
+    fn announce(&self, tone: Tone) {
+        let feedback = match tone {
+            Tone::Success => Some(crate::platform::Haptic::Success),
+            Tone::Error => Some(crate::platform::Haptic::Error),
+            Tone::Warning => Some(crate::platform::Haptic::Warning),
+            Tone::Info => None,
+        };
+        if let Some(feedback) = feedback {
+            crate::platform::haptic(feedback);
+        }
     }
 
     /// Announces a failure the user asked for and did not get.
@@ -5140,6 +5169,12 @@ impl MobileApp {
                         this.controller =
                             Some(AgentWorkflowController::new(backend.clone(), capabilities));
                         this.mode = RootMode::Workspace;
+                        // Arriving on the workspace is the one milestone that
+                        // has to wait for the transport: the reader who just
+                        // scanned a code has nothing else to tell them the
+                        // pairing worked, and everything after this line is
+                        // the session list they are about to read.
+                        crate::platform::haptic(crate::platform::Haptic::Success);
                         this.record_active_host_connected(&backend);
                         this.start_event_stream(cx);
                         this.refresh_sessions(cx);
@@ -5253,6 +5288,26 @@ impl MobileApp {
                     &preferences,
                 ) && preferences.allows(notification)
                 {
+                    // In the foreground the system banner may be suppressed,
+                    // so the tick is what tells the hand about a turn that
+                    // finished or an Agent that stopped on the reader. The
+                    // background case is the pocket, where the notification is
+                    // the signal and a buzz would be noise the user cannot see
+                    // the reason for — `platform::haptic` drops it as well.
+                    if !self.app_backgrounded {
+                        crate::platform::haptic(match notification.kind {
+                            vibex_core::AgentNotificationKind::TurnCompleted => {
+                                crate::platform::Haptic::Success
+                            }
+                            vibex_core::AgentNotificationKind::TurnFailed => {
+                                crate::platform::Haptic::Error
+                            }
+                            vibex_core::AgentNotificationKind::ApprovalRequired { .. }
+                            | vibex_core::AgentNotificationKind::InputRequired { .. } => {
+                                crate::platform::Haptic::Warning
+                            }
+                        });
+                    }
                     notifications::present(notification);
                 }
             }
@@ -7592,6 +7647,10 @@ impl MobileApp {
                         this.dismiss_overlay(None, cx);
                         this.refresh_sessions(cx);
                         this.file_new_session_in_folder(&session, cx);
+                        // The session exists now, which is the milestone: the
+                        // first prompt either went out with it or reports its
+                        // own failure below.
+                        crate::platform::haptic(crate::platform::Haptic::Success);
                         let session_id = session.id.clone();
                         this.open_session(session_id, cx);
                         if let Some(Err(error)) = prompt_result {
@@ -9296,6 +9355,9 @@ impl MobileApp {
             row,
             target: None,
         });
+        // Picking a row up is the other long-press outcome, and the one that
+        // keeps the finger on the screen: the tick says the row is held.
+        crate::platform::haptic(crate::platform::Haptic::Heavy);
         cx.notify();
     }
 
@@ -9335,6 +9397,10 @@ impl MobileApp {
             return false;
         }
         self.sidebar_row_menu = Some(SidebarRowMenu { row });
+        // A row's own actions opening is the lighter of the two long-press
+        // outcomes: it is a menu, not a pick-up, and the heavier pattern is
+        // already what a text selection gets.
+        crate::platform::haptic(crate::platform::Haptic::Medium);
         window.prevent_default();
         cx.stop_propagation();
         cx.notify();
@@ -11552,6 +11618,9 @@ impl MobileApp {
             .update(cx, |input, cx| input.set_value("", window, cx));
         // The keyboard stays up: the next line is usually already in mind.
         crate::platform::show_keyboard();
+        // Held is neither sent nor dropped, and the info toast stays silent, so
+        // the tick is what says the line went to the queue rather than out.
+        crate::platform::haptic(crate::platform::Haptic::Selection);
         self.hint(
             Tone::Info,
             locale::text(
@@ -12093,6 +12162,7 @@ impl MobileApp {
             start_y: f32::from(position.y) as i32,
             target_index: index,
         });
+        crate::platform::haptic(crate::platform::Haptic::Heavy);
         cx.notify();
     }
 
@@ -12137,6 +12207,10 @@ impl MobileApp {
                 target_index: target,
                 ..drag
             });
+            // The row has moved past a neighbour, which is the same crossing a
+            // picker ticks for: the queue will land here unless the finger
+            // changes its mind.
+            crate::platform::haptic(crate::platform::Haptic::Selection);
             cx.notify();
         }
     }
@@ -12193,6 +12267,9 @@ impl MobileApp {
             .collect();
         let insert_at = queue_insert_index(&remaining, target, self.composer_queue.len());
         self.composer_queue.insert(insert_at, message);
+        // The drop is the commit the drag was for, so it lands with the
+        // weight the pick-up and the stepping did not use.
+        crate::platform::haptic(crate::platform::Haptic::Medium);
         self.mark_composer_state_dirty(cx);
         cx.notify();
     }
@@ -12332,6 +12409,10 @@ impl MobileApp {
                 return;
             }
         };
+        // The request is accepted here, which is the moment the reader's line
+        // left the field: the future only answers when the whole turn is over,
+        // and a tick that late would read as the Agent finishing instead.
+        crate::platform::haptic(crate::platform::Haptic::Light);
         let future = controller.send_message(request);
         self.pending_user_message = Some(pending_user_message);
         self.timeline_metadata_tip = None;
@@ -12460,6 +12541,11 @@ impl MobileApp {
                 let stopped = mutation_error.is_none();
                 if let Some(error) = mutation_error {
                     this.fail(error);
+                } else {
+                    // A stop is a deliberate interruption, so it lands with
+                    // more weight than the send it undoes. The failure path is
+                    // the toast's, which is already its own pattern.
+                    crate::platform::haptic(crate::platform::Haptic::Medium);
                 }
                 // The turn is gone, so whatever the reader wrote ahead may go
                 // now. A stop that failed settled nothing and leaves the queue
@@ -12528,8 +12614,20 @@ impl MobileApp {
                     controller.apply_permission_mutation(&ticket, &request_id_string, outcome);
                     controller.state.latest_mutation.error.clone()
                 });
-                if let Some(error) = mutation_error {
-                    this.fail(error);
+                match mutation_error {
+                    // A failed answer is the toast's error pattern.
+                    Some(error) => this.fail(error),
+                    None => {
+                        // The decision is what the reader gave weight to:
+                        // approving is the ordinary case, while a refusal (or a
+                        // blanket allow) is the one worth feeling.
+                        let feedback = if response == PermissionResponseKind::Deny {
+                            crate::platform::Haptic::Medium
+                        } else {
+                            crate::platform::Haptic::Light
+                        };
+                        crate::platform::haptic(feedback);
+                    }
                 }
                 this.rebuild_timeline_turns();
                 cx.notify();
@@ -12644,7 +12742,10 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) {
         if let Some(draft) = self.elicitation_drafts.get_mut(request_id.as_str()) {
+            // Picking one option out of a list is a picker crossing a step, so
+            // it gets the tick a picker gets.
             draft.select_option(field_id, value);
+            crate::platform::haptic(crate::platform::Haptic::Selection);
             cx.notify();
         }
     }
@@ -12658,6 +12759,7 @@ impl MobileApp {
     ) {
         if let Some(draft) = self.elicitation_drafts.get_mut(request_id.as_str()) {
             draft.set_boolean(field_id, value);
+            crate::platform::haptic(crate::platform::Haptic::Selection);
             cx.notify();
         }
     }
@@ -12671,6 +12773,7 @@ impl MobileApp {
     ) {
         if let Some(draft) = self.elicitation_drafts.get_mut(request_id.as_str()) {
             draft.toggle_multi_option(field_id, value);
+            crate::platform::haptic(crate::platform::Haptic::Selection);
             cx.notify();
         }
     }
@@ -12738,8 +12841,20 @@ impl MobileApp {
                     controller.apply_elicitation_mutation(&ticket, &request_id_string, outcome);
                     controller.state.latest_mutation.error.clone()
                 });
-                if let Some(error) = mutation_error {
-                    this.fail(error);
+                match mutation_error {
+                    Some(error) => this.fail(error),
+                    // The answer is sent, so the form's work is done. A
+                    // decline is also a decision the reader made and is
+                    // worth the heavier pattern; an answer is the ordinary
+                    // case and lands as a success.
+                    None => crate::platform::haptic(match action {
+                        ElicitationResolutionAction::Accept => crate::platform::Haptic::Success,
+                        // Backing out of a form is a decision too, and the
+                        // lighter pattern says so without sounding like a
+                        // failure.
+                        ElicitationResolutionAction::Decline
+                        | ElicitationResolutionAction::Cancel => crate::platform::Haptic::Selection,
+                    }),
                 }
                 this.rebuild_timeline_turns();
                 cx.notify();
@@ -13477,6 +13592,10 @@ impl MobileApp {
                 };
                 if overlay_back_swipe_committed(swipe.dx, swipe.dy) {
                     cx.stop_propagation();
+                    // The gesture is accepted here, so it gets its answer here:
+                    // the page it leaves is the one it was made on, and the
+                    // page that arrives may not be the one the reader expects.
+                    crate::platform::haptic(crate::platform::Haptic::Light);
                     self.handle_navigate_back(&NavigateBack, window, cx);
                 }
             }
@@ -13513,6 +13632,15 @@ impl MobileApp {
         };
         if was_dragging || was_partial {
             cx.stop_propagation();
+        }
+        // Only a page that actually changes gets a tick: a drag that comes back
+        // to where it started is a gesture the reader abandoned, and a tick for
+        // it would read as a page having opened. The cancelled path is the
+        // platform taking the gesture away, which is the same abandonment.
+        let from = self.settled_drawer_target();
+        let settling_elsewhere = target != from && drawer_page_at_offset(target).is_some();
+        if !cancelled && settling_elsewhere {
+            crate::platform::haptic(crate::platform::Haptic::Selection);
         }
         // A claimed swipe keeps the fling that follows it: the drawer snaps on
         // its own animation, and the momentum would otherwise scroll the page
@@ -13569,6 +13697,9 @@ impl MobileApp {
         if self.sheet.pull_just_released(key) {
             return;
         }
+        // The tap is a dismissal the reader made, so it lands like the pull
+        // that dismisses: the same outcome, whichever gesture reached it.
+        crate::platform::haptic(crate::platform::Haptic::Medium);
         self.close_sheet(key, cx);
     }
 
@@ -13591,14 +13722,30 @@ impl MobileApp {
             .pull(key, pan, crate::bottom_sheet::sheet_size(window))
         {
             SheetPull::Ignored => {}
-            SheetPull::Pulling | SheetPull::Restored => {
+            SheetPull::Pulling => {
                 // The panel owns the gesture now: the list inside the sheet
                 // must not scroll along with the finger that is moving it.
                 cx.stop_propagation();
                 cx.notify();
             }
+            SheetPull::Restored => {
+                // "Came back" is two different outcomes: the panel returned to
+                // the height it was at, or the pull crossed a height and left
+                // the sheet taller or shorter. Only the second is a move the
+                // reader made, and only it gets the picker's tick.
+                if self.sheet.settled_at_a_new_height(key) {
+                    crate::platform::haptic(crate::platform::Haptic::Selection);
+                }
+                cx.stop_propagation();
+                cx.notify();
+            }
             SheetPull::Dismissed(key) => {
                 cx.stop_propagation();
+                // The panel is leaving, which is the same answer a tap on the
+                // scrim or a decided question gives. It goes out before the
+                // sheet's own request is put away, so the tick lands with the
+                // gesture rather than with the frame that clears the page.
+                crate::platform::haptic(crate::platform::Haptic::Medium);
                 // A panel thrown down the screen is dismissed exactly as a tap
                 // on the scrim dismisses it, so the question needs its request
                 // put away before the fall lands: the page's flag is that
@@ -20137,6 +20284,10 @@ impl MobileApp {
                             MouseButton::Left,
                             cx.listener(move |_, _, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                                // Copying has no other sign of having happened:
+                                // the clipboard is not on screen, so the tick
+                                // is the whole confirmation.
+                                crate::platform::haptic(crate::platform::Haptic::Selection);
                             }),
                         ),
                     )
@@ -20550,6 +20701,9 @@ impl MobileApp {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
                                                 copy_text.clone(),
                                             ));
+                                            crate::platform::haptic(
+                                                crate::platform::Haptic::Selection,
+                                            );
                                         }),
                                     ),
                                 )
@@ -30036,6 +30190,35 @@ impl MobileApp {
                         }),
                     ),
                     settings_switch_row(
+                        "mobile-settings-haptics",
+                        locale::text("Haptic feedback", "触感反馈", "觸感回饋").to_string(),
+                        locale::text(
+                            "Vibrate for gestures and finished actions",
+                            "手势与操作完成时振动",
+                            "手勢與操作完成時震動",
+                        )
+                        .to_string(),
+                        self.app_settings.haptics,
+                        true,
+                        cx.listener(|this, _, _, cx| {
+                            let enabled = !this.app_settings.haptics;
+                            this.app_settings.haptics = enabled;
+                            // Turning feedback on gives the switch's own tick,
+                            // which is the first one the reader will feel.
+                            // Turning it off gives the last, and the new value
+                            // has to land after it or the tick is dropped by
+                            // the very preference it is confirming.
+                            if enabled {
+                                crate::platform::set_haptics_enabled(true);
+                                crate::platform::haptic(crate::platform::Haptic::Selection);
+                            } else {
+                                crate::platform::haptic(crate::platform::Haptic::Selection);
+                                crate::platform::set_haptics_enabled(false);
+                            }
+                            this.persist_app_settings(cx);
+                        }),
+                    ),
+                    settings_switch_row(
                         "mobile-settings-keep-screen-on",
                         locale::text("Keep the screen on", "保持屏幕常亮", "保持螢幕常亮")
                             .to_string(),
@@ -35261,6 +35444,65 @@ mod tests {
             features: Vec::new(),
             availability,
         }
+    }
+
+    /// A hint is the phone's only way of saying something happened, so the
+    /// hand hears the same thing the eye does: a success and a failure cannot
+    /// be mistaken for one another without looking at the screen. `Info` stays
+    /// silent — it is the tone for anything worth reading, not for a result.
+    ///
+    /// The process-wide preference is left alone: every other test that counts
+    /// ticks runs beside this one, and muting it here would mute them too. The
+    /// gate itself is asserted directly in `platform`.
+    #[gpui::test]
+    fn a_hint_announces_its_tone_to_the_hand(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().unwrap();
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            crate::platform::haptics_enabled(),
+            "a fresh install starts with feedback on"
+        );
+
+        for tone in [Tone::Success, Tone::Error, Tone::Warning, Tone::Info] {
+            let before = crate::platform::feedbacks();
+            app.update(cx, |app, _| app.hint(tone, "test notice"));
+            let ticks = crate::platform::feedbacks() - before;
+            assert_eq!(
+                ticks,
+                usize::from(tone != Tone::Info),
+                "a {tone:?} hint announced itself to the hand the wrong number of times"
+            );
+        }
+
+        // The failure the eye needs is still announced on screen after a mute,
+        // which is the part the hand no longer hears.
+        app.update(cx, |app, cx| {
+            app.app_settings.haptics = false;
+            app.fail(BackendError::offline(
+                "remote_transport_unreachable",
+                "no route to host",
+            ));
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            hint_is_shown(cx, Tone::Error),
+            "a muted phone still shows the failure it stopped buzzing for"
+        );
+        // The switch's own value is what a restart reads, so turning it off is
+        // kept rather than re-enabling feedback behind the reader's back.
+        app.update(cx, |app, cx| app.persist_app_settings(cx));
+        app.read_with(cx, |app, _| {
+            assert!(!app.storage.load_app_settings().unwrap().haptics);
+        });
     }
 
     /// Every step the row can cycle to has to read as its own name.

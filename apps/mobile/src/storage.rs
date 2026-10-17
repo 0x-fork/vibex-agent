@@ -170,6 +170,11 @@ pub struct AppSettings {
     /// screen. A phone that sleeps mid-run stops showing the thing the reader
     /// opened it to watch.
     pub keep_screen_on: bool,
+    /// Plays the device's own feedback for gestures and finished actions. On by
+    /// default: the switch exists so a reader who does not want it can say so.
+    /// It is independent of `reduce_motion` — a reader may want the animations
+    /// gone and still want the confirmation in their hand.
+    pub haptics: bool,
     /// The text-size step, as a percentage of the type ladder. The platform's
     /// own text-scaling setting still applies on top of it.
     pub font_scale_percent: u32,
@@ -201,6 +206,7 @@ impl Default for AppSettings {
             theme_selection: ThemeSelection::default(),
             reduce_motion: false,
             keep_screen_on: false,
+            haptics: true,
             font_scale_percent: crate::theme::FONT_SCALE_DEFAULT,
             notifications: true,
             notify_completed: true,
@@ -244,6 +250,8 @@ struct StoredAppSettings {
     reduce_motion: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     keep_screen_on: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    haptics: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     font_scale_percent: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -840,6 +848,10 @@ impl CredentialStorage {
             theme_selection: stored.theme_selection.unwrap_or_default(),
             reduce_motion: stored.reduce_motion.unwrap_or(false),
             keep_screen_on: stored.keep_screen_on.unwrap_or(false),
+            // A file written before the switch existed has no opinion, and the
+            // default is on, so an upgrade never silences a phone that was
+            // never asked.
+            haptics: stored.haptics.unwrap_or(true),
             font_scale_percent: stored
                 .font_scale_percent
                 .filter(|percent| crate::theme::FONT_SCALE_STEPS.contains(percent))
@@ -873,6 +885,7 @@ impl CredentialStorage {
                 .filter(|selection| selection.light.is_some() || selection.dark.is_some()),
             reduce_motion: Some(settings.reduce_motion),
             keep_screen_on: Some(settings.keep_screen_on),
+            haptics: Some(settings.haptics),
             font_scale_percent: Some(settings.font_scale_percent),
             notifications: Some(settings.notifications),
             notify_completed: Some(settings.notify_completed),
@@ -1748,6 +1761,10 @@ mod tests {
         assert!(fresh.notify_completed);
         assert!(fresh.notify_needs_input);
         assert!(fresh.notify_failed);
+        assert!(
+            fresh.haptics,
+            "feedback is on for a phone that was never asked"
+        );
         // `AppSettings::default()` and the loader have to agree, or a corrupt
         // file and a missing one would launch on two different sizes.
         assert_eq!(fresh, AppSettings::default());
@@ -1823,6 +1840,10 @@ mod tests {
         );
         assert!(loaded.reduce_motion);
         assert_eq!(loaded.font_scale_percent, crate::theme::FONT_SCALE_COMPACT);
+        assert!(
+            loaded.haptics,
+            "a file from before the switch existed keeps the default on"
+        );
     }
 
     /// A v1 file whose switches are not the all-off shape was written by a

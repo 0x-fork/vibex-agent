@@ -487,6 +487,17 @@ impl Render for SelectionMenu {
                                     cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
                                         window.dispatch_action(command.action(), cx);
+                                        // Cut, Copy and Paste leave the
+                                        // selection behind in one move, and
+                                        // the tick is what says the press
+                                        // landed. Select All keeps the menu up
+                                        // over what it selected, and the
+                                        // growing selection is its own answer.
+                                        if command != Command::SelectAll {
+                                            crate::platform::haptic(
+                                                crate::platform::Haptic::Selection,
+                                            );
+                                        }
                                         if command == Command::SelectAll {
                                             // The selection grew under the
                                             // handles, which the input has

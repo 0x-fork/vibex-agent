@@ -166,6 +166,10 @@ struct Panel {
     /// When the last pull let go, so the lift that ended it is not read as a
     /// tap on the scrim it landed on.
     released_at: Option<Instant>,
+    /// The extra height the panel was resting at when the last pull let go, and
+    /// the height it settled on, so a release that lands where it started is
+    /// not read as a move.
+    released_height: Option<(f32, f32)>,
     /// The identity the next motion takes, so a new one restarts the animation.
     next_id: u64,
 }
@@ -182,6 +186,7 @@ impl Panel {
             body_scroll: None,
             pull: None,
             released_at: None,
+            released_height: None,
             next_id: 0,
         };
         panel.start(
@@ -405,6 +410,18 @@ impl BottomSheet {
     /// panel is still clearing the screen.
     pub fn is_leaving(&self, key: SheetKey) -> bool {
         self.panel(key).is_some_and(|panel| panel.closing)
+    }
+
+    /// Whether the pull that just ended changed the sheet's height.
+    ///
+    /// Asked right after [`BottomSheet::pull`] reported `Restored`. The height
+    /// settles at one of two ends, and only a release that lands on the end it
+    /// was not already at is a move: giving back a height, or taking one that
+    /// was already taken, is the sheet going where it already was.
+    pub fn settled_at_a_new_height(&self, key: SheetKey) -> bool {
+        self.panel(key)
+            .and_then(|panel| panel.released_height)
+            .is_some_and(|(from, to)| (from - to).abs() >= 0.5)
     }
 
     /// Whether any panel is on screen for this page.
@@ -701,6 +718,9 @@ impl Panel {
                 Easing::Rise,
                 false,
             );
+            // Where it came from and where it landed, recorded for the caller
+            // that only wants to announce a real move.
+            self.released_height = Some((pull.extent, if open { extra } else { 0.0 }));
             SheetPull::Restored
         }
     }
@@ -712,6 +732,7 @@ impl Panel {
     /// found it.
     fn cancelled(&mut self) -> SheetPull {
         self.released_at = Some(Instant::now());
+        self.released_height = None;
         let Some(pull) = self.pull.take() else {
             return SheetPull::Ignored;
         };
@@ -1424,6 +1445,74 @@ mod tests {
             ),
             SheetPull::Pulling
         );
+    }
+
+    /// A release that ends where the pull started is not a move, and only a
+    /// move is worth announcing: the sheet's tick belongs to a height the
+    /// reader actually changed, not to the drag on its way to nowhere.
+    #[test]
+    fn a_release_that_changes_no_height_is_not_a_move() {
+        let mut sheet = BottomSheet::default();
+        settled(&mut sheet, SheetKey::AgentQuestion);
+
+        // A pull that never claims the panel: the body under the finger keeps
+        // it, and the sheet has nothing to report.
+        let _ = sheet.pull(
+            SheetKey::AgentQuestion,
+            SheetPan::Started {
+                dy: theme::SHEET_PULL_THRESHOLD / 2.0,
+            },
+            SIZE,
+        );
+        let _ = sheet.pull(SheetKey::AgentQuestion, SheetPan::Ended, SIZE);
+        assert!(
+            !sheet.settled_at_a_new_height(SheetKey::AgentQuestion),
+            "a pan the body kept is not a height change"
+        );
+
+        // A downward pull that is let go short of a dismissal goes back to the
+        // resting height, which is where it already was.
+        let _ = sheet.pull(SheetKey::AgentQuestion, SheetPan::Started { dy: 60.0 }, SIZE);
+        let _ = sheet.pull(SheetKey::AgentQuestion, SheetPan::Ended, SIZE);
+        assert!(
+            !sheet.settled_at_a_new_height(SheetKey::AgentQuestion),
+            "giving back a height the sheet did not have is not a move"
+        );
+
+        // Pulling it open is: the finger took the panel past half of what it
+        // can hold, and the sheet stays there.
+        let _ = sheet.pull(
+            SheetKey::AgentQuestion,
+            SheetPan::Started {
+                dy: -(EXTRA / 2.0 + 20.0),
+            },
+            SIZE,
+        );
+        let _ = sheet.pull(SheetKey::AgentQuestion, SheetPan::Ended, SIZE);
+        assert!(
+            sheet.settled_at_a_new_height(SheetKey::AgentQuestion),
+            "the sheet crossed a height, so the move is worth its tick"
+        );
+        // The pull above is a stray an assertion helper reads as one more test
+        // gesture; settle the motion it started before asking again.
+        sheet.settle(SheetKey::AgentQuestion);
+    }
+
+    /// A gesture the platform takes away announces nothing: the reader did not
+    /// finish it, so there is no move to report.
+    #[test]
+    fn a_cancelled_pull_is_never_a_move() {
+        let mut sheet = BottomSheet::default();
+        settled(&mut sheet, SheetKey::AgentQuestion);
+        let _ = sheet.pull(
+            SheetKey::AgentQuestion,
+            SheetPan::Started {
+                dy: -(EXTRA / 2.0 + 20.0),
+            },
+            SIZE,
+        );
+        let _ = sheet.pull(SheetKey::AgentQuestion, SheetPan::Cancelled, SIZE);
+        assert!(!sheet.settled_at_a_new_height(SheetKey::AgentQuestion));
     }
 
     /// A panel that a finger owns is where the finger put it: the shell is

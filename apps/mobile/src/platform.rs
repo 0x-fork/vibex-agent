@@ -25,6 +25,7 @@
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use gpui::{Edges, Pixels, Window, px};
 
@@ -219,6 +220,47 @@ pub fn clear_editor_documents() {
     EDITOR_DOCUMENTS.with(|documents| documents.borrow_mut().clear());
 }
 
+/// One of the device's own feedback patterns.
+///
+/// The names are semantics, not durations: a phone decides how each one feels,
+/// and the system's touch-feedback setting decides whether any of them plays at
+/// all. `Selection` is the tick a picker makes as it crosses a step, which is
+/// the only one used for something that is not a finished action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Haptic {
+    /// A chip going on or off, a drawer settling on a page.
+    Selection,
+    /// A small tap whose work is done.
+    Light,
+    /// A deliberate action with weight to it: a stop, a dismissal.
+    Medium,
+    /// A long press — the gesture the system itself plays this way.
+    Heavy,
+    /// Something that succeeded.
+    Success,
+    /// Something the reader should look at.
+    Warning,
+    /// The app could not finish what was asked.
+    Error,
+}
+
+/// Whether the reader lets the app play feedback.
+///
+/// Process-wide because the setting is, and because most call sites have no
+/// window to thread it through. On by default: the switch exists so a reader
+/// who does not want it can say so, not so the app has to ask first.
+static HAPTICS_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Records the reader's feedback preference.
+pub fn set_haptics_enabled(enabled: bool) {
+    HAPTICS_ENABLED.store(enabled, Ordering::Release);
+}
+
+/// Whether the app is allowed to play feedback.
+pub fn haptics_enabled() -> bool {
+    HAPTICS_ENABLED.load(Ordering::Acquire)
+}
+
 /// The tick a long press gets when it has something to show for itself.
 ///
 /// The platform's own long-press feedback, not a raw vibration: it is the
@@ -226,13 +268,91 @@ pub fn clear_editor_documents() {
 /// phone whose owner turned touch feedback off stays quiet, which a
 /// `Vibrator.vibrate` call would not honor.
 pub fn long_press_feedback() {
+    haptic(Haptic::Heavy);
+}
+
+/// Asks the device for one feedback pattern.
+///
+/// Every call site goes through here, so the preference, the lifecycle and the
+/// one-tick-per-event rule live in one place. Feedback while the app is in the
+/// background is dropped: a phone buzzing in a pocket for a page its owner
+/// cannot see is noise, and the system's own notification is the signal that
+/// belongs there.
+pub fn haptic(kind: Haptic) {
+    if !plays(haptics_enabled(), crate::lifecycle::is_backgrounded()) {
+        return;
+    }
+    // A burst of the same pattern is one event seen several times — a hint
+    // pushed from a batch of events, a state that settles over two frames.
+    // Distinct patterns still play back to back, which is what lets one action
+    // be followed by its notice.
+    if repeats_within_window(kind) {
+        return;
+    }
     #[cfg(test)]
     FEEDBACKS.with(|count| count.set(count.get() + 1));
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
-        let _ = gpui_mobile::packages::vibration::haptic_feedback(
-            gpui_mobile::packages::vibration::HapticFeedback::Heavy,
-        );
+        let _ = gpui_mobile::packages::vibration::haptic_feedback(platform_pattern(kind));
+    }
+}
+
+/// Whether a tick is wanted at all, before any pattern is chosen.
+///
+/// Kept as a free function so the two reasons it can be refused — the reader
+/// turned feedback off, and the app is not on screen — are asserted rather than
+/// inferred from a device that no test can observe.
+fn plays(enabled: bool, backgrounded: bool) -> bool {
+    enabled && !backgrounded
+}
+
+/// How soon the same outcome counts as the same outcome.
+const HAPTIC_REPEAT_WINDOW: Duration = Duration::from_millis(80);
+
+// The last outcome this thread announced, so a repeat can be recognized. The
+// interface runs on one thread, and a test harness gives every test its own,
+// which is also what keeps one test's ticks out of another's count.
+thread_local! {
+    static LAST_HAPTIC: std::cell::Cell<Option<(Haptic, Instant)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether `kind` repeats the outcome this thread just announced.
+///
+/// Only the patterns that report an outcome are folded. A gesture's tick is
+/// issued once per gesture by the code that recognizes it, and two of those are
+/// never closer together than the gesture itself, so folding them could only
+/// swallow one; a hint or a notification, by contrast, can be pushed several
+/// times for one event — once per event in a coalesced batch, or once per
+/// surface that noticed.
+fn repeats_within_window(kind: Haptic) -> bool {
+    if !matches!(kind, Haptic::Success | Haptic::Warning | Haptic::Error) {
+        return false;
+    }
+    LAST_HAPTIC.with(|last| {
+        let now = Instant::now();
+        let repeat = last.get().is_some_and(|(previous, at)| {
+            previous == kind && now.saturating_duration_since(at) < HAPTIC_REPEAT_WINDOW
+        });
+        if !repeat {
+            last.set(Some((kind, now)));
+        }
+        repeat
+    })
+}
+
+/// The platform crate's own name for a pattern.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn platform_pattern(kind: Haptic) -> gpui_mobile::packages::vibration::HapticFeedback {
+    use gpui_mobile::packages::vibration::HapticFeedback;
+    match kind {
+        Haptic::Selection => HapticFeedback::Selection,
+        Haptic::Light => HapticFeedback::Light,
+        Haptic::Medium => HapticFeedback::Medium,
+        Haptic::Heavy => HapticFeedback::Heavy,
+        Haptic::Success => HapticFeedback::Success,
+        Haptic::Warning => HapticFeedback::Warning,
+        Haptic::Error => HapticFeedback::Error,
     }
 }
 
@@ -245,7 +365,7 @@ thread_local! {
     static FEEDBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The ticks [`long_press_feedback`] has been asked for on this thread.
+/// The ticks [`haptic`] has been asked for on this thread.
 #[cfg(test)]
 pub fn feedbacks() -> usize {
     FEEDBACKS.with(std::cell::Cell::get)
@@ -431,7 +551,69 @@ mod android {
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_editor_documents, editor_documents, sync_editor_document, utf16_range};
+    use super::{
+        HAPTIC_REPEAT_WINDOW, Haptic, clear_editor_documents, editor_documents, feedbacks, haptic,
+        set_haptics_enabled, sync_editor_document, utf16_range,
+    };
+
+    /// The preference is process-wide and the tests share it, so each test that
+    /// changes it puts it back rather than leaving the next one muted.
+    #[test]
+    fn the_preference_gates_every_pattern() {
+        let before = feedbacks();
+        set_haptics_enabled(false);
+        haptic(Haptic::Selection);
+        haptic(Haptic::Warning);
+        assert_eq!(
+            feedbacks(),
+            before,
+            "a reader who turned feedback off must not feel any of it"
+        );
+
+        set_haptics_enabled(true);
+        haptic(Haptic::Selection);
+        assert_eq!(feedbacks(), before + 1);
+    }
+
+    /// One outcome seen several times is one tick: a hint pushed from a batch,
+    /// or a state that settles over two frames, must not play twice.
+    #[test]
+    fn the_same_outcome_within_the_window_plays_once() {
+        let before = feedbacks();
+        haptic(Haptic::Success);
+        haptic(Haptic::Success);
+        assert_eq!(
+            feedbacks(),
+            before + 1,
+            "the second tick is the same event as the first"
+        );
+    }
+
+    /// A gesture is its own event, so two of them are always two ticks — even
+    /// back to back, which is exactly how a test can produce them.
+    #[test]
+    fn a_gesture_is_never_folded_into_the_one_before_it() {
+        let before = feedbacks();
+        haptic(Haptic::Heavy);
+        haptic(Haptic::Heavy);
+        haptic(Haptic::Selection);
+        haptic(Haptic::Selection);
+        assert_eq!(feedbacks(), before + 4);
+    }
+
+    /// Distinct outcomes are distinct events, and the window is short enough
+    /// that a genuinely new one is never swallowed by the one before it.
+    #[test]
+    fn a_different_outcome_plays_again() {
+        assert!(
+            HAPTIC_REPEAT_WINDOW <= std::time::Duration::from_millis(100),
+            "an 80ms fold is what makes a repeat invisible to the finger"
+        );
+        let before = feedbacks();
+        haptic(Haptic::Success);
+        haptic(Haptic::Error);
+        assert_eq!(feedbacks(), before + 2);
+    }
 
     #[test]
     fn utf16_offsets_count_the_units_android_addresses_text_by() {
