@@ -347,7 +347,7 @@ environment key and the final ACP authentication decision.
 - Accept only the Agent's thinking-level vocabulary — `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — with a non-empty wire spelling for every level except `off`, and at least one level beyond `off`. The Harness rejects the whole settings file for anything else (unknown key, valueless level other than `off`, an offer of nothing to think with), so the Provider editor and the projection both refuse it while the Model is still nameable instead of leaving a session that cannot start.
 - Saving a Model whose declared capabilities or wire protocol changed drops that Model's cached `provider_model_runtime_option_snapshots` row. A successful per-Model probe is reused by model id, and the cache key carries no part of the declaration, so without the drop the run options keep advertising the previous vocabulary and an edited declaration looks ignored. An edit that cannot change a probe answer (display name, notes, unrelated fields) keeps the evidence.
 - Pin the route-level `compat: { supportsDeveloperRole: false }` on every route whose `api` is `openai-completions` or `openai-responses`. pi-ai sends a reasoning Model's system prompt in the `developer` role unless the endpoint's compatibility report says the endpoint takes it, and it resolves that report by detecting the provider id and the endpoint — neither of which recognizes a Vibex route, so the OpenAI default `true` stays in force. A gateway that only speaks OpenAI's older vocabulary then rejects the whole turn (`400`, unknown variant `developer`) while the same Model on an Agent account keeps working, and the rejection reaches the run options as a bare JSON-RPC failure. The pin and `reasoningEfforts` travel together: the role only changes once the Model reasons. Never write the pin for an `anthropic-messages` route — Anthropic Messages offers no such switch, and the Harness refuses a route-level switch no Model on the route can apply rather than ignoring it, which fails the entire settings file.
-- Keep the projected ACP model id bare, and accept the Harness's `route::model` spelling only as a read-back alias. `deepseek-harness-acp` 0.4.33 qualifies every model option id once more than one provider route is registered, and the Harness always mounts its own `deepseek-official` route beside the projected `llm-pi-ai` one, so the qualifier is always present on a Vibex session; 0.4.32 answers that same spelling with `-32602 unknown model`. The bare id is therefore the only form both Adapter versions accept on the wire, while the qualified spelling exists so a model id the Harness reports resolves back to its product Model. Without the alias the reported id no longer equals the requested one and the switch fails as `acp_session_config_response_mismatch` before the session converges. Derive the route id exactly as both overlays write it — `vendor_hint`, else the Profile id — never by re-spelling the Profile display name, which is not the route. The bare id is the only form both Adapter versions accept, so the catalog pin moved to `0.4.33`, then `0.4.35`, and now `0.4.37`, while the compatibility floor stays `0.4.32`: raising the floor with the pin would make an installed `0.4.32` runtime conservative and hide the provider editor for a release the projection still supports. The `0.4.36` and `0.4.37` pins need no new read-back shim — the qualification is byte-identical — so the floor does not move with them either.
+- Keep the projected ACP model id bare, and accept the Harness's `route::model` spelling only as a read-back alias. `deepseek-harness-acp` 0.4.33 qualifies every model option id once more than one provider route is registered, and the Harness always mounts its own `deepseek-official` route beside the projected `llm-pi-ai` one, so the qualifier is always present on a Vibex session; 0.4.32 answers that same spelling with `-32602 unknown model`. The bare id is therefore the only form both Adapter versions accept on the wire, while the qualified spelling exists so a model id the Harness reports resolves back to its product Model. Without the alias the reported id no longer equals the requested one and the switch fails as `acp_session_config_response_mismatch` before the session converges. Derive the route id exactly as both overlays write it — `vendor_hint`, else the Profile id — never by re-spelling the Profile display name, which is not the route. The bare id is the only form both Adapter versions accept, so the catalog pin moved to `0.4.33`, then `0.4.35`, and now `0.4.38`, while the compatibility floor stays `0.4.32`: raising the floor with the pin would make an installed `0.4.32` runtime conservative and hide the provider editor for a release the projection still supports. The `0.4.36` through `0.4.38` pins need no new read-back shim — the qualification is byte-identical — so the floor does not move with them either.
 - Roll back installs the Adapter version Vibex pins in its own catalog for that
   Agent, and is the only install target allowed to move an installation
   backwards. The pin is Vibex's compatibility statement, so a user asking for
@@ -386,9 +386,9 @@ environment key and the final ACP authentication decision.
 - Provider editor tests assert a declaration survives profile save normalization, catalogue merge, and an authoritative catalogue refresh for a Model the catalogue still advertises.
 - Projection tests assert the developer-role pin is present with value `false` exactly on the Chat Completions and Responses routes and absent — with no `compat` key at all — on the Anthropic Messages route, and that a reasoning route Model keeps its projected `reasoningEfforts` alongside the pin.
 - Projection tests assert the DeepSeek Harness read-back alias is `{projected route id}::{model id}` — the same route id the settings overlay writes — and that no other Agent projection declares one. Runtime tests assert the alias resolves to its product Model while the projected wire form stays bare, and that an alias another Model already owns is rejected as `acp_model_id_projection_ambiguous`.
-- Runtime tests assert the DeepSeek Harness descriptor pins `0.4.37` while accepting `>=0.4.32`: a `0.4.32` identity resolves to the typed projection with its credential and model controls, a `0.4.33` identity resolves the same way as a semver-range match, and `0.4.31` is conservative with `agent_projection_version_mismatch`. A `0.4.35` identity keeps the three chat protocols, `0.4.36` and `0.4.37` also offer Mistral Conversations, and a binding holding that protocol fails `agent_model_interface_unsupported` against the `0.4.35` descriptor.
+- Runtime tests assert the DeepSeek Harness descriptor pins `0.4.38` while accepting `>=0.4.32`: a `0.4.32` identity resolves to the typed projection with its credential and model controls, a `0.4.33` identity resolves the same way as a semver-range match, and `0.4.31` is conservative with `agent_projection_version_mismatch`. A `0.4.35` identity keeps the three chat protocols, `0.4.36` through `0.4.38` also offer Mistral Conversations, and a binding holding that protocol fails `agent_model_interface_unsupported` against the `0.4.35` descriptor.
 - Core tests assert each DeepSeek Harness release gate against its own release: `0.4.35` substitutes nothing, accepts no Mistral route, and advertises no inclusive fork; `0.4.36` substitutes and accepts Mistral; `0.4.37` satisfies the fork gate; `None`, blank, and malformed versions satisfy none of them; an explicit Adapter version wins over the Agent version.
-- ACP tests assert the frozen `initialize` shape carries `_meta["subagent-transcript"] = true`, the inclusive `session/fork` params carry `_meta.jetbrains.air.fork` version `1` with the message id while the plain fork shape stays `{ sessionId, cwd, mcpServers }`, an unknown extension version is not read as supported, child-session ids are scoped, a `title` on a subagent-attributed `session_info_update` is ignored while the root session's own still lands, and the completed-message marker reports its Model. A switch test drives a mid-timeline cut against a mock that advertises the extension and asserts the request; the same cut against a mock without it asserts no `session/fork` at all plus the `session/new` fallback. A process test asserts a differing Model answer is a substitution on `0.4.37` and `None` (a conflict) on `0.4.35` and on an unmanaged `unknown` install.
+- ACP tests assert the frozen `initialize` shape carries `_meta["subagent-transcript"] = true`, the inclusive `session/fork` params carry `_meta.jetbrains.air.fork` version `1` with the message id while the plain fork shape stays `{ sessionId, cwd, mcpServers }`, an unknown extension version is not read as supported, child-session ids are scoped, a `title` on a subagent-attributed `session_info_update` is ignored while the root session's own still lands, and the completed-message marker reports its Model. A switch test drives a mid-timeline cut against a mock that advertises the extension and asserts the request; the same cut against a mock without it asserts no `session/fork` at all plus the `session/new` fallback. A process test asserts a differing Model answer is a substitution on `0.4.37`+ and `None` (a conflict) on `0.4.35` and on an unmanaged `unknown` install.
 - Manager tests assert the fork cut anchors to the last identified assistant segment at or before the requested sequence, that an anonymous segment yields no cut, and that the fork projection still drops provider correlation ids.
 - The typed projector matrix asserts the private `settings.yaml` and `cordis.patch.yml`, `DSH_HOME`, and Vibex-scoped credential environment boundary.
 
@@ -4063,7 +4063,7 @@ ResolvedAgentProviderProjection {
   - Agents whose newer release changed a wire detail, where Vibex answers the
     older spelling with a read-back shim, or whose newer release added a
     capability that only the newer runtime can serve. DeepSeek Harness is the
-    reference: the pin is `0.4.37` while the floor stays `0.4.32`. `0.4.33`
+    reference: the pin is `0.4.38` while the floor stays `0.4.32`. `0.4.33`
     introduced the `route::model` qualification, which Vibex answers with a
     read-back alias; `0.4.35` moved the bundled Harness runtime to `0.1.7`,
     whose route registration Vibex answers by projecting the cordis home patch
@@ -4075,41 +4075,76 @@ ResolvedAgentProviderProjection {
     An installed `0.4.32` keeps the typed projection: the newer capability is
     withheld, the release is not.
   - Agents whose pin moved forward on a review that found no change to the
-    projection contract: CodeBuddy `2.160.0` over `>=2.109.0`, Copilot `1.0.89`
-    over `>=1.0.78`, Gemini `0.62.0` over `>=0.47.0`, Grok `1.0.44` over
-    `>=1.0.8`, Pi `0.0.34` over `>=0.0.33`, and Claude Code, whose adapter pin
-    is `0.84.0` while `CLAUDE_CONFIG_ALIAS_VERSION_REQUIREMENT` stays
-    `>=0.71.0` because the alias contract resolves the same `model` values in
-    both releases. The older release is still projected, so the floor stays
-    where the contract was last verified.
-  - Codex, whose identity is composite. `codex-acp` moves to `2.0.1` and its
-    managed runtime to `@openai/codex` `0.159.2`, which is what 2.0.1 declares
-    (`^0.159.1`) rather than the `^0.152.0` its predecessor declared. The quirk,
-    the config-option aliases and the event enricher are keyed on the exact
-    identity `adapter=codex-acp@2.0.1;runtime=@openai/codex@0.159.2`, while
+    projection contract: CodeBuddy `2.168.2` over `>=2.109.0`, Copilot `1.0.98`
+    over `>=1.0.78`, Gemini `0.64.0` over `>=0.47.0`, Grok `1.0.62` over
+    `>=1.0.8`, Pi `0.0.34` over `>=0.0.33`, Cline `3.0.73` over `3.0.29`,
+    OpenCode `1.19.3` over `>=1.17.9`, Antigravity `1.4.0` over `1.0.0`, and
+    Claude Code, whose adapter pin is `0.93.0` while
+    `CLAUDE_CONFIG_ALIAS_VERSION_REQUIREMENT` stays `>=0.71.0` because the alias
+    contract resolves the same `model` values in both releases. The older
+    release is still projected, so the floor stays where the contract was last
+    verified.
+  - Cline's floor is the one entry that must be declared explicitly. Its
+    `ReplaceableProvider` shape would otherwise derive `>=3.0.73` from the pin,
+    turning every not-yet-upgraded runtime into the conservative surface with
+    `agent_projection_version_mismatch`. The 3.0.49+ model-catalogue rule is
+    answered at runtime instead: `CLINE_MODEL` stays only the process-start
+    hint, the ACP `model` config option remains the authority, and the
+    attachment now reports a substituted `currentModelId` as a warning once.
+  - Codex, whose identity is composite. `codex-acp` moves to `2.2.2` and its
+    managed runtime to `@openai/codex` `0.160.1`, which is what 2.2.2 declares
+    (`^0.160.1`) rather than the `^0.159.1` its predecessor declared. `^0.160.1`
+    is a 0.x caret range, so it stops below `0.161.0`; the newest Codex release
+    (`0.163.0`) is outside the Adapter's own declaration and npm would install
+    a `0.160.x` build anyway. The quirk, the config-option aliases and the
+    event enricher are keyed on the exact identity
+    `adapter=codex-acp@2.2.2;runtime=@openai/codex@0.160.1`, while
     `CODEX_COMPATIBLE_ADAPTER_VERSION_REQUIREMENT` stays `>=1.8.0`: a runtime
     that has not upgraded keeps the typed projection but stops inheriting the
     alias table, because that table is deliberately exact-identity only. Both
     versions live in `crates/agent-acp/src/registry.rs` and the identity string
     is derived from them rather than spelled out at a call site.
+  - ZCode moves to `0.72.0` and its exact alias gate moves with it
+    (`=0.72.0`). The mode catalogue gained `guarded` and stopped advertising
+    `auto`, the bridge dual-emits turn state under `$/zcode/` and `_zcode/`,
+    and `embeddedContext` turned on; the config option ids
+    (`model`/`mode`/`thought`) did not move. `ZCODE_CREDENTIAL_SECRET` joins the
+    scrub list because 0.68.1 added an encrypted credential store keyed by it.
+  - DeepSeek Harness moves to `0.4.38` on the same bundled runtime
+    (`0.2.0-rc.2`). The release makes the packaged runtime the only default and
+    turns an explicit `DSH_PATH` into a semver-gated override that is *refused*
+    rather than falling back, so the managed launch must leave `DSH_PATH`
+    unset; its auth-method list is also now derived from the client's declared
+    capabilities and has to be re-read per `initialize`.
+  - Hermes stays at `0.19.0` because that is the last release on PyPI. Upstream
+    ships 0.22.x only as GitHub source tags with no wheel or sdist, so the uvx
+    channel cannot reach it; the pin is explicit instead of a "latest" lookup
+    that would silently keep returning 0.19.0. Moving to 0.22 needs a VCS or
+    installer distribution and is a separate change.
+  - Pi's *runtime* is pinned rather than floated. `pi-acp@0.0.34` requires pi
+    `>=0.81.0`, and the 1.x line has already changed provider wire defaults, so
+    the managed companion installs `@earendil-works/pi-coding-agent@1.3.0`
+    instead of resolving npm `latest` on every check.
+  - Cursor's version string is compared by its release triple. The Registry
+    names `2026.10.14` while the artifact is `2026.10.14-941492e`, and `semver`
+    parses that suffix as a pre-release that sorts *below* the base — so a real
+    build would look older than itself and either be rejected as a downgrade or
+    never seen as an update. A trailing hex build id is read as metadata.
 - A pin stays behind its Agent's newest release when the release changes a
   contract Vibex has to implement, not when it only changes a version string.
   The held pins and their reasons:
-  - Cline — 3.0.65 resolves an initial model through
-    `resolveDefaultModelId(provider, CLINE_MODEL, catalogue)`: an id outside the
-    selected provider's catalogue is no longer used verbatim but silently
-    replaced by that provider's default. This does not need a code change,
-    because `CLINE_MODEL` is only the process-start hint: the Agent's
-    descriptor projects the Model through the ACP `model` config option
-    (`AgentModelControl::AcpConfigOption`), and that write path is unchanged and
-    still unvalidated in 3.0.65. Read the environment variable as a starting
-    suggestion and the config option as the authority — do not "fix" this by
-    pre-validating the id against the catalogue at projection time, because the
-    catalogue only exists inside a running Agent. The visible difference is
-    limited to the initial Model on a provider whose catalogue lacks the
-    configured id. 3.0.56 also narrowed the advertised ACP model listing to chat
-    models; Vibex reads that list rather than assuming it, so it only gets
-    cleaner.
+  - Cline — from 3.0.49 `resolveDefaultModelId(provider, CLINE_MODEL,
+    catalogue)` replaces an id outside the selected provider's catalogue with
+    that provider's default instead of using it verbatim. This still needs no
+    pre-validation, because the catalogue only exists inside a running Agent.
+    `CLINE_MODEL` is the process-start hint; the ACP `model` config option is
+    the authority, and a substitution is now surfaced as one warning rather
+    than silently running a different Model.
+  - Cursor — the 2026.10.14 build has a resolvable artifact and a documented
+    ACP extension surface (`cursor/ask_question`, `cursor/create_plan`,
+    `subagents`), even though Cursor publishes no note for that exact build.
+    Both blocking methods are bridged onto the elicitation surface: replying
+    `method-not-found` fails Cursor's tool call instead of degrading.
   - Kimi, which is not a pin bump but a move to a different product. Moonshot
     archived the Python `kimi-cli` line — 1.51.0 marked it end-of-life and
     1.52.0 turned its entry point into a deprecation gate that prints a
@@ -4148,16 +4183,13 @@ ResolvedAgentProviderProjection {
     pi-ai compat gate. `0.4.37` added `session/fork` with the inclusive
     `jetbrains.air.fork` cut. Each of those is answered per release rather than
     by the projection floor, which stays on `0.4.32` because the `route::model`
-    read-back qualification it covers is byte-identical through `0.4.37`.
-  - Cursor — Cursor publishes no CLI release notes for September, and its own
-    installer and Homebrew cask resolve to `2026.09.28-64d2043`, a version
-    string whose real shape carries a commit suffix this catalog does not
-    model. The pin stays on the last release with published notes and a
-    resolvable artifact rather than claiming the Registry's version, which no
-    source confirms. Antigravity is the opposite case and did move: Google
-    publishes no changelog for its ACP server either, but the ACP Registry's
-    daily protocol probes cover 1.0.0, 1.1.1 and 1.2.1 and report an identical
-    ACP surface at all three.
+    read-back qualification it covers is byte-identical through `0.4.38`.
+  - Antigravity moved to `1.4.0` on Registry metadata alone: Google publishes
+    no changelog for the ACP server, but the Registry's daily protocol probes
+    report an identical ACP surface at 1.0.0, 1.1.1 and 1.2.1, and 1.4.0 keeps
+    the same entry point, the same Linux `--uid=` argument and the same two
+    archive members. The compatibility floor stays on 1.0.0 because the
+    handshake, not the archive, is what the floor describes.
 - Do not build a client for Gemini CLI's failure taxonomy. `MAX_TOKENS_EXCEEDED`,
   `SAFETY_BLOCKED`, `RECITATION_BLOCKED`, `OTHER_BLOCKED` and
   `THINKING_ONLY_RESPONSE` are internal stream-error classifications inside the
@@ -4413,7 +4445,7 @@ effective runtime configuration.
 
 - Trigger: adding or upgrading a catalog Agent descriptor, running an ACP
   provider probe, or deciding whether an existing binding may switch provider.
-- The rollout manifest contains exactly three builtin and 36 catalog Agent ids.
+- The rollout manifest contains exactly four builtin and 33 catalog Agent ids.
   Catalog installability and provider verification remain separate claims.
 
 ### 2. Signatures

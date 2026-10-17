@@ -126,6 +126,12 @@ pub enum AgentHostRequestDialect {
     /// answers with `{outcome, feedback}`; the agent stays in plan mode until
     /// then.
     GrokExitPlanMode,
+    /// `cursor/ask_question` — Cursor's multiple-choice question. Blocking;
+    /// the turn waits for the host's answered/skipped/cancelled outcome.
+    CursorAskQuestion,
+    /// `cursor/create_plan` — Cursor's plan approval. Blocking; Cursor waits
+    /// for accepted/rejected/cancelled before continuing.
+    CursorCreatePlan,
 }
 
 impl AgentHostRequestDialect {
@@ -133,6 +139,8 @@ impl AgentHostRequestDialect {
         match self {
             Self::GrokAskUserQuestion => "_x.ai/ask_user_question",
             Self::GrokExitPlanMode => "_x.ai/exit_plan_mode",
+            Self::CursorAskQuestion => crate::grok::CURSOR_ASK_QUESTION_METHOD,
+            Self::CursorCreatePlan => crate::grok::CURSOR_CREATE_PLAN_METHOD,
         }
     }
 }
@@ -308,7 +316,14 @@ const AGENT_DIALECT_PROFILES: &[AgentDialectProfile] = &[
         )
         .with_credential_scrub(&["CURSOR_API_KEY", "CURSOR_API_BASE_URL"])
         .with_mcp_delivery(McpWireDelivery::NativeConfig)
-        .with_parameterized_model_picker(),
+        .with_parameterized_model_picker()
+        // Both requests block the turn until the host answers. Replying
+        // `method-not-found` fails Cursor's tool call instead of degrading, so
+        // they are bridged onto the elicitation surface like Grok's.
+        .with_host_request_dialects(&[
+            AgentHostRequestDialect::CursorAskQuestion,
+            AgentHostRequestDialect::CursorCreatePlan,
+        ]),
     // pi-acp accepts `mcpServers` and drops it: it never forwards MCP to the
     // inner `pi --mode rpc` process, and pi has no native MCP either.
     // Workspace trust gates config/skill loading only, never execution.
@@ -328,8 +343,14 @@ const AGENT_DIALECT_PROFILES: &[AgentDialectProfile] = &[
     // root's config.toml before session/new. Both names stay in the scrub list
     // because either can name real credential state on a machine that has run
     // both CLIs.
+    //
+    // 2.2.0 added an interactive "trust this folder?" gate that skips
+    // project-level MCP servers and skills while the workspace is untrusted.
+    // Vibex always owns the workspace it launches into, so the launch declares
+    // it trusted instead of letting the Agent drop repository configuration.
     AgentDialectProfile::generic("kimi")
         .profiled("forwards ACP MCP descriptors and loads provider state from KIMI_CODE_HOME")
+        .with_required_env(&[("KIMI_CODE_TRUST_WORKSPACE", "1")])
         .with_credential_scrub(&[
             "KIMI_SHARE_DIR",
             "KIMI_CODE_HOME",
@@ -597,6 +618,11 @@ mod tests {
             );
         }
         assert!(kimi.mcp_wire_delivery.forwards_servers());
+        assert!(
+            kimi.required_launch_env
+                .contains(&("KIMI_CODE_TRUST_WORKSPACE", "1")),
+            "a managed Kimi launch must declare its own workspace trusted"
+        );
     }
 
     #[test]
@@ -611,6 +637,17 @@ mod tests {
             Some(AgentHostRequestDialect::GrokExitPlanMode)
         );
         assert_eq!(grok.handles_host_request("session/update"), None);
+        let cursor = agent_dialect_profile("cursor");
+        assert_eq!(
+            cursor.handles_host_request("cursor/ask_question"),
+            Some(AgentHostRequestDialect::CursorAskQuestion)
+        );
+        assert_eq!(
+            cursor.handles_host_request("cursor/create_plan"),
+            Some(AgentHostRequestDialect::CursorCreatePlan)
+        );
+        let claude = agent_dialect_profile("claude");
+        assert_eq!(claude.handles_host_request("cursor/ask_question"), None);
         // `agent stdio` rejects the flag, so it must precede the configured
         // subcommand arguments.
         assert_eq!(

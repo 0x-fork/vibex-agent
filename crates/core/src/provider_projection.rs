@@ -45,20 +45,24 @@ pub const ZCODE_PROJECTION_DESCRIPTOR_ID: &str = "projection_zcode_private_confi
 
 const CLAUDE_AGENT_ID: &str = "claude";
 const CLAUDE_ADAPTER_ID: &str = "claude-agent-acp";
-const CLAUDE_ADAPTER_VERSION: &str = "0.84.0";
+const CLAUDE_ADAPTER_VERSION: &str = "0.93.0";
 pub const CLAUDE_COMPATIBLE_ADAPTER_VERSION_REQUIREMENT: &str = ">=0.71.0";
 const CODEX_AGENT_ID: &str = "codex";
 const CODEX_ADAPTER_ID: &str = "codex-acp";
-const CODEX_ADAPTER_VERSION: &str = "1.8.0";
+const CODEX_ADAPTER_VERSION: &str = "2.2.2";
+/// The pin moved to 2.2.2 and its runtime to 0.160.1, but the typed
+/// projection is still the same contract 1.8.0 introduced: an installed older
+/// adapter keeps the provider editor and only misses the exact-identity alias
+/// table, which the registry gates separately.
 pub const CODEX_COMPATIBLE_ADAPTER_VERSION_REQUIREMENT: &str = ">=1.8.0";
 #[cfg(test)]
 const CODEX_RUNTIME_PACKAGE: &str = "@openai/codex";
-const CODEX_RUNTIME_VERSION: &str = "0.159.2";
+const CODEX_RUNTIME_VERSION: &str = "0.160.1";
 const OPENCODE_AGENT_ID: &str = "opencode";
 const OPENCODE_ADAPTER_ID: &str = "opencode-acp";
 const ZCODE_AGENT_ID: &str = "zcode";
 const ZCODE_ADAPTER_ID: &str = "zcode-acp-server";
-pub const ZCODE_ADAPTER_VERSION: &str = "0.54.0";
+pub const ZCODE_ADAPTER_VERSION: &str = "0.72.0";
 /// Automatic provider projection remains available after an Agent upgrade
 /// once the runtime is at least the first verified version for its descriptor.
 ///
@@ -66,7 +70,12 @@ pub const ZCODE_ADAPTER_VERSION: &str = "0.54.0";
 /// Vibex verifies, installs, and rolls back to, while the floor stays on the
 /// oldest runtime the inline-provider projection still supports.
 pub const OPENCODE_COMPATIBLE_VERSION_REQUIREMENT: &str = ">=1.17.9";
-pub const OPENCODE_LAST_VERIFIED_VERSION: &str = "1.18.33";
+/// `opencode acp` is byte-identical from `1.18.33` through `1.19.3`: the same
+/// entry point, session modes, config option ids (`model`/`effort`/`mode`) and
+/// inline-provider schema. The releases between them only add provider headers
+/// and a config-driven `reasoning_options` field, neither of which the
+/// projection writes today, so the floor and the pin can move independently.
+pub const OPENCODE_LAST_VERIFIED_VERSION: &str = "1.19.3";
 
 const MAX_DISPLAY_NAME_LEN: usize = 160;
 const MAX_MODEL_COUNT: usize = 512;
@@ -1835,7 +1844,7 @@ fn zcode_projection_descriptor() -> VibexResult<AgentProviderProjectionDescripto
         evidence: ProjectionEvidenceReference {
             state: ProjectionEvidenceState::Documented,
             source_reference: Some(
-                "zcode-acp-server@0.54.0/provider-registry-and-runtime-model".to_string(),
+                "zcode-acp-server@0.72.0/provider-registry-and-runtime-model".to_string(),
             ),
             runtime_reference: None,
             diagnostic_code: Some("agent_projection_runtime_verification_required".to_string()),

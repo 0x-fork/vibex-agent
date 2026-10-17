@@ -35,13 +35,12 @@ use vibex_db::{
 };
 
 const ZCODE_ACP_PACKAGE: &str = "zcode-acp-server";
-const ZCODE_ACP_VERSION: &str = "0.54.0";
+const ZCODE_ACP_VERSION: &str = "0.72.0";
 const ZCODE_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 0, 0);
 
 const ACP_REGISTRY_URL: &str =
     "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
 const NPM_REGISTRY_BASE_URL: &str = "https://registry.npmjs.org";
-const PYPI_JSON_BASE_URL: &str = "https://pypi.org/pypi";
 const KIRO_MANIFEST_URL: &str = "https://prod.download.cli.kiro.dev/stable/latest/manifest.json";
 const KIRO_DOWNLOAD_BASE_URL: &str = "https://prod.download.cli.kiro.dev/stable/latest";
 const REGISTRY_CACHE_MAX_AGE_MS: i64 = 60 * 60 * 1_000;
@@ -58,6 +57,11 @@ const MINIMUM_UV_VERSION: semver::Version = semver::Version::new(0, 5, 0);
 const DEEPSEEK_HARNESS_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 15, 0);
 const PI_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 19, 0);
 const PI_CODING_AGENT_PACKAGE: &str = "@earendil-works/pi-coding-agent";
+/// The managed pi runtime is a verified version, not "whatever npm calls
+/// latest". pi-acp 0.0.34 needs pi `>= 0.81.0`, and the 1.x line has already
+/// changed provider wire defaults (`kimi-coding` moved to Chat Completions with
+/// a `/v1` base URL), so a floating install silently crosses major versions.
+const PI_CODING_AGENT_VERSION: &str = "1.3.0";
 const PI_COMMAND_NAME: &str = "pi";
 const NPM_COMPANION_LAUNCHER_NAME: &str = "vibex-acp-companion-launcher.cjs";
 const NPM_WINDOWS_CHILD_PROCESS_HOOK_NAME: &str = "vibex-windows-child-process.cjs";
@@ -179,6 +183,15 @@ const AMP_CLI_PACKAGE: &str = "@ampcode/cli";
 const CODEWHALE_CLI_PACKAGE: &str = "codewhale";
 const DEEPSEEK_HARNESS_ACP_PACKAGE: &str = "@openma/deepseek-harness-acp";
 const HERMES_CLI_PACKAGE: &str = "hermes-agent";
+/// The newest `hermes-agent` release published on PyPI.
+///
+/// Upstream moved to a GitHub-release/installer channel: 0.22.x exists only as
+/// a source tag (`v0.22.0` … `v0.22.2`) and ships no wheel or sdist, while PyPI
+/// stops at 0.19.0. Vibex's uvx path installs from PyPI, so asking PyPI for
+/// "latest" every launch would silently keep the frozen release while looking
+/// like it tracks upstream. The pin is therefore explicit and the upgrade path
+/// is a separate, larger change to a VCS/installer distribution.
+const HERMES_AGENT_VERSION: &str = "0.19.0";
 /// The successor to the archived Python `kimi-cli`. Its own release channel is
 /// npm, and the ACP Registry entry called `kimi` still points at the PyPI line
 /// whose final release cannot start ACP at all, so this Agent must not resolve
@@ -953,22 +966,19 @@ impl AgentInstallService {
                     kiro: None,
                 },
             },
-            ManagedCliAgent::Hermes => {
-                let version = self.fetch_latest_pypi_version(HERMES_CLI_PACKAGE).await?;
-                RegistryEntry {
-                    id: agent.registry_id().to_string(),
-                    version: version.clone(),
-                    distribution: RegistryDistribution {
-                        binary: None,
-                        npx: None,
-                        uvx: Some(RegistryUvxDistribution {
-                            package: format!("{HERMES_CLI_PACKAGE}[acp]=={version}"),
-                            args: vec!["acp".to_string()],
-                        }),
-                        kiro: None,
-                    },
-                }
-            }
+            ManagedCliAgent::Hermes => RegistryEntry {
+                id: agent.registry_id().to_string(),
+                version: HERMES_AGENT_VERSION.to_string(),
+                distribution: RegistryDistribution {
+                    binary: None,
+                    npx: None,
+                    uvx: Some(RegistryUvxDistribution {
+                        package: format!("{HERMES_CLI_PACKAGE}[acp]=={HERMES_AGENT_VERSION}"),
+                        args: vec!["acp".to_string()],
+                    }),
+                    kiro: None,
+                },
+            },
             // The ACP Registry's `kimi` entry is the archived Python CLI, whose
             // final release turns its entry point into a deprecation gate that
             // prints a notice and exits 0 without ever speaking ACP. Resolve the
@@ -1044,9 +1054,12 @@ impl AgentInstallService {
 
     async fn npm_companion_version(
         &self,
-        _agent_id: &AgentId,
+        agent_id: &AgentId,
         package: &str,
     ) -> VibexResult<String> {
+        if agent_id.as_str() == "pi" && package == PI_CODING_AGENT_PACKAGE {
+            return Ok(PI_CODING_AGENT_VERSION.to_string());
+        }
         Ok(self.fetch_latest_npm_metadata(package).await?.version)
     }
 
@@ -1828,26 +1841,6 @@ impl AgentInstallService {
             &metadata.version,
         )?;
         Ok(metadata)
-    }
-
-    async fn fetch_latest_pypi_version(&self, package: &str) -> VibexResult<String> {
-        let url = format!("{PYPI_JSON_BASE_URL}/{package}/json");
-        let bytes = self.fetch_limited(&url, REGISTRY_MAX_BYTES).await?;
-        let metadata: PypiPackageMetadata = serde_json::from_slice(&bytes).map_err(|error| {
-            VibexError::validation(
-                "agent_pypi_metadata_invalid",
-                "latest PyPI package metadata was invalid",
-            )
-            .with_diagnostic("error", error.to_string())
-        })?;
-        if metadata.info.name != package {
-            return Err(VibexError::validation(
-                "agent_pypi_metadata_identity_mismatch",
-                "latest PyPI package metadata did not match the requested package",
-            ));
-        }
-        validate_npm_version(&metadata.info.version, "latest PyPI package version")?;
-        Ok(metadata.info.version)
     }
 
     async fn fetch_latest_kiro_distribution(&self) -> VibexResult<RegistryKiroDistribution> {
@@ -2741,17 +2734,6 @@ struct NpmPackageMetadata {
 }
 
 #[derive(Debug, Deserialize)]
-struct PypiPackageMetadata {
-    info: PypiPackageInfo,
-}
-
-#[derive(Debug, Deserialize)]
-struct PypiPackageInfo {
-    name: String,
-    version: String,
-}
-
-#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KiroReleaseManifest {
     version: String,
@@ -3086,8 +3068,11 @@ fn npm_companion_command(agent_id: &AgentId) -> Option<&'static str> {
 fn npm_companion_environment(agent_id: &AgentId) -> Option<&'static str> {
     match agent_id.as_str() {
         "amp-acp" => Some("AMP_CLI_PATH"),
-        "deepseek-harness" => Some("DSH_PATH"),
         "pi" => Some("PI_ACP_PI_COMMAND"),
+        // DeepSeek Harness deliberately has no companion environment entry:
+        // 0.4.38 makes an explicit `DSH_PATH` a semver-gated override that is
+        // refused instead of falling back to the Adapter's bundled runtime, so
+        // a managed launch must leave it unset.
         _ => None,
     }
 }
@@ -4793,10 +4778,8 @@ fn record_matches_distribution(
 }
 
 fn reject_semver_downgrade(installed: &str, available: &str) -> VibexResult<()> {
-    let (Ok(installed_version), Ok(available_version)) = (
-        semver::Version::parse(installed),
-        semver::Version::parse(available),
-    ) else {
+    let Some((installed_version, available_version)) = release_versions(installed, available)
+    else {
         return Ok(());
     };
     if available_version < installed_version {
@@ -4811,13 +4794,40 @@ fn reject_semver_downgrade(installed: &str, available: &str) -> VibexResult<()> 
 }
 
 fn version_is_newer(installed: &str, available: &str) -> bool {
-    match (
-        semver::Version::parse(installed),
-        semver::Version::parse(available),
-    ) {
-        (Ok(installed), Ok(available)) => available > installed,
-        _ => installed != available,
+    match release_versions(installed, available) {
+        Some((installed, available)) => available > installed,
+        None => installed != available,
     }
+}
+
+/// The comparable release pair for two version strings.
+///
+/// Cursor publishes `2026.10.14` in the Registry while the artifact it points
+/// at is `2026.10.14-941492e`. `semver` parses the build suffix as a
+/// **prerelease**, which sorts below the bare release, so comparing the raw
+/// strings makes a real build look older than its own base — a spurious
+/// downgrade rejection, or a missed update. A trailing short hex commit id is
+/// therefore read as build metadata rather than as a pre-release stage.
+fn release_versions(
+    installed: &str,
+    available: &str,
+) -> Option<(semver::Version, semver::Version)> {
+    Some((release_version(installed)?, release_version(available)?))
+}
+
+fn release_version(value: &str) -> Option<semver::Version> {
+    let mut version = semver::Version::parse(value.trim()).ok()?;
+    if !version.pre.is_empty()
+        && version.pre.as_str().len() >= 7
+        && version
+            .pre
+            .as_str()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        version.pre = semver::Prerelease::EMPTY;
+    }
+    Some(version)
 }
 
 fn read_manifest_runtime_version(root: &Path) -> Option<String> {
@@ -6058,7 +6068,7 @@ mod tests {
 
         assert!(latest_npm_companion(&agent_id).is_none());
         assert_eq!(npm_companion_command(&agent_id), Some("dsh"));
-        assert_eq!(npm_companion_environment(&agent_id), Some("DSH_PATH"));
+        assert_eq!(npm_companion_environment(&agent_id), None);
         assert!(managed_npm_companion_for_registry_id("deepseek-harness-acp").is_none());
     }
 
@@ -6298,7 +6308,7 @@ mod tests {
 
         let pinned = pin_entry_to_target(&agent, entry.clone(), ManagedInstallTarget::Verified)
             .expect("the catalog pins this Agent");
-        assert_eq!(pinned.version, "0.4.37");
+        assert_eq!(pinned.version, "0.4.38");
         assert_eq!(
             pinned
                 .distribution
@@ -6306,7 +6316,7 @@ mod tests {
                 .as_ref()
                 .expect("npm distribution survives")
                 .package,
-            "@openma/deepseek-harness-acp@0.4.37"
+            "@openma/deepseek-harness-acp@0.4.38"
         );
         assert_eq!(
             parse_exact_npm_spec(
@@ -6314,7 +6324,7 @@ mod tests {
                 &pinned.version
             )
             .unwrap(),
-            ("@openma/deepseek-harness-acp", "0.4.37")
+            ("@openma/deepseek-harness-acp", "0.4.38")
         );
 
         let unchanged = pin_entry_to_target(&agent, entry, ManagedInstallTarget::Latest).unwrap();
@@ -6556,6 +6566,15 @@ mod tests {
         assert!(!version_is_newer("1.2.4", "1.2.3"));
         assert!(!version_is_newer("1.2.3", "1.2.3"));
         assert!(version_is_newer("release-a", "release-b"));
+        // A build suffix is metadata, not a pre-release stage: a Cursor build
+        // must not sort below the base release the Registry names.
+        assert!(!version_is_newer("2026.10.14-941492e", "2026.10.14"));
+        assert!(version_is_newer("2026.10.08", "2026.10.14-941492e"));
+        assert!(reject_semver_downgrade("2026.10.14-941492e", "2026.10.14").is_ok());
+        // A real pre-release keeps its prerelease ordering: `1.0.0-beta.1`
+        // is older than `1.0.0`, and not a hex build suffix.
+        assert!(version_is_newer("1.0.0-beta.1", "1.0.0"));
+        assert!(!version_is_newer("1.0.0", "1.0.0-beta.1"));
     }
 
     #[test]

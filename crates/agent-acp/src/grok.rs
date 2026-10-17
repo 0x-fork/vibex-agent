@@ -288,6 +288,248 @@ fn bounded(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
+/// Cursor's blocking `cursor/ask_question` / `cursor/create_plan` requests.
+///
+/// Cursor documents both as **blocking** JSON-RPC requests: the agent waits for
+/// a response before continuing, so answering `method-not-found` fails the
+/// tool call and a turn can stall. Both map onto Vibex's elicitation surface,
+/// the same way Grok's private requests do.
+pub(crate) const CURSOR_ASK_QUESTION_METHOD: &str = "cursor/ask_question";
+pub(crate) const CURSOR_CREATE_PLAN_METHOD: &str = "cursor/create_plan";
+
+const CURSOR_MAX_QUESTIONS: usize = 8;
+const CURSOR_MAX_OPTIONS: usize = 24;
+const CURSOR_MAX_TEXT_CHARS: usize = 4000;
+
+/// Convert `cursor/ask_question` params into a form with one select per
+/// question. Returns `None` when nothing usable is present, so the caller can
+/// answer with Cursor's "skipped" outcome instead of parking a dead card.
+pub(crate) fn parse_cursor_ask_question(
+    params: &Value,
+    request_id: RequestId,
+    session_id: VibexSessionId,
+) -> Option<ElicitationRequest> {
+    let questions = params.get("questions").and_then(Value::as_array)?;
+    let mut fields = Vec::new();
+    for question in questions.iter().take(CURSOR_MAX_QUESTIONS) {
+        let prompt = question
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        let options = cursor_question_options(question.get("options"))?;
+        let multi_select = question
+            .get("allowMultiple")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let id = question
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| bounded(value, CURSOR_MAX_TEXT_CHARS))
+            .unwrap_or_else(|| prompt.to_string());
+        fields.push(ElicitationField {
+            id,
+            title: bounded(prompt, CURSOR_MAX_TEXT_CHARS),
+            description: None,
+            required: true,
+            kind: if multi_select {
+                ElicitationFieldKind::MultiSelect {
+                    options,
+                    min_items: Some(0),
+                    max_items: None,
+                    default: Vec::new(),
+                }
+            } else {
+                ElicitationFieldKind::Text {
+                    min_length: None,
+                    max_length: None,
+                    pattern: None,
+                    format: None,
+                    default: None,
+                    options,
+                }
+            },
+        });
+    }
+    if fields.is_empty() {
+        return None;
+    }
+    Some(ElicitationRequest {
+        id: request_id.clone(),
+        session_id,
+        provider_request_id: Some(request_id.as_str().to_string()),
+        tool_call_id: params
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        message: fields
+            .first()
+            .map(|field| field.title.clone())
+            .unwrap_or_default(),
+        title: params
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| bounded(value, CURSOR_MAX_TEXT_CHARS)),
+        description: None,
+        fields,
+        status: ElicitationRequestStatus::Pending,
+        requested_at_ms: unix_timestamp_ms(),
+    })
+}
+
+fn cursor_question_options(value: Option<&Value>) -> Option<Vec<ElicitationOption>> {
+    let raw = value.and_then(Value::as_array)?;
+    let mut options: Vec<ElicitationOption> = Vec::new();
+    for option in raw {
+        if options.len() == CURSOR_MAX_OPTIONS {
+            break;
+        }
+        let id = option
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        let label = option
+            .get("label")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(id);
+        let id = bounded(id, CURSOR_MAX_TEXT_CHARS);
+        if options.iter().any(|existing| existing.value == id) {
+            continue;
+        }
+        options.push(ElicitationOption {
+            value: id,
+            title: bounded(label, CURSOR_MAX_TEXT_CHARS),
+            description: None,
+        });
+    }
+    (!options.is_empty()).then_some(options)
+}
+
+/// Encode a resolved question into Cursor's response shape.
+pub(crate) fn build_cursor_ask_question_response(resolution: &ElicitationResolution) -> Value {
+    if resolution.action != ElicitationResolutionAction::Accept {
+        return cursor_ask_skipped_response();
+    }
+    let mut answers = Vec::new();
+    for (question_id, answer) in &resolution.answers {
+        let selected = match answer {
+            ElicitationAnswerValue::String(value) => vec![value.clone()],
+            ElicitationAnswerValue::StringArray(values) => values.clone(),
+            ElicitationAnswerValue::Integer(value) => vec![value.to_string()],
+            ElicitationAnswerValue::Number(value) => vec![value.clone()],
+            ElicitationAnswerValue::Boolean(value) => vec![value.to_string()],
+        };
+        answers.push(json!({
+            "questionId": question_id,
+            "selectedOptionIds": selected,
+        }));
+    }
+    if answers.is_empty() {
+        return cursor_ask_skipped_response();
+    }
+    json!({ "outcome": { "outcome": "answered", "answers": answers } })
+}
+
+/// Reply for a declined or torn-down question: Cursor cancels the tool call.
+pub(crate) fn cursor_ask_skipped_response() -> Value {
+    json!({ "outcome": { "outcome": "cancelled" } })
+}
+
+/// Convert `cursor/create_plan` params into a single-choice approval form.
+pub(crate) fn parse_cursor_create_plan(
+    params: &Value,
+    request_id: RequestId,
+    session_id: VibexSessionId,
+) -> Option<ElicitationRequest> {
+    let plan = params
+        .get("plan")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| bounded(value, CURSOR_MAX_TEXT_CHARS))
+        .unwrap_or_else(|| "Cursor is ready to start this plan.".to_string());
+    let title = params
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| bounded(value, CURSOR_MAX_TEXT_CHARS))
+        .unwrap_or_else(|| "Approve Cursor's plan".to_string());
+    Some(ElicitationRequest {
+        id: request_id.clone(),
+        session_id,
+        provider_request_id: Some(request_id.as_str().to_string()),
+        tool_call_id: params
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        message: plan,
+        title: Some(title),
+        description: params
+            .get("overview")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| bounded(value, CURSOR_MAX_TEXT_CHARS)),
+        fields: vec![ElicitationField {
+            id: CURSOR_PLAN_DECISION_FIELD.to_string(),
+            title: "Plan decision".to_string(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::Text {
+                min_length: None,
+                max_length: None,
+                pattern: None,
+                format: None,
+                default: Some(CURSOR_PLAN_ACCEPTED.to_string()),
+                options: vec![
+                    ElicitationOption {
+                        value: CURSOR_PLAN_ACCEPTED.to_string(),
+                        title: "Accept and start".to_string(),
+                        description: None,
+                    },
+                    ElicitationOption {
+                        value: CURSOR_PLAN_REJECTED.to_string(),
+                        title: "Reject the plan".to_string(),
+                        description: None,
+                    },
+                ],
+            },
+        }],
+        status: ElicitationRequestStatus::Pending,
+        requested_at_ms: unix_timestamp_ms(),
+    })
+}
+
+/// Field id of the single decision a `create_plan` approval carries.
+pub(crate) const CURSOR_PLAN_DECISION_FIELD: &str = "outcome";
+const CURSOR_PLAN_ACCEPTED: &str = "accepted";
+const CURSOR_PLAN_REJECTED: &str = "rejected";
+
+/// Encode a plan decision. A torn-down approval is `cancelled`, which leaves
+/// the plan unapproved and lets Cursor re-surface it.
+pub(crate) fn build_cursor_create_plan_response(resolution: &ElicitationResolution) -> Value {
+    if resolution.action != ElicitationResolutionAction::Accept {
+        return json!({ "outcome": { "outcome": "cancelled" } });
+    }
+    let decision = match resolution.answers.get(CURSOR_PLAN_DECISION_FIELD) {
+        Some(ElicitationAnswerValue::String(value)) => value.as_str(),
+        _ => CURSOR_PLAN_REJECTED,
+    };
+    if decision == CURSOR_PLAN_ACCEPTED {
+        json!({ "outcome": { "outcome": "accepted" } })
+    } else {
+        json!({ "outcome": { "outcome": "rejected" } })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,5 +706,92 @@ mod tests {
             grok_exit_plan_keep_planning_response()["outcome"],
             json!("keep_planning")
         );
+    }
+
+    #[test]
+    fn cursor_questions_answer_by_option_id_and_cancel_cleanly() {
+        let params = json!({
+            "toolCallId": "call-1",
+            "title": "Need input",
+            "questions": [{
+                "id": "q1",
+                "prompt": "Which mode?",
+                "options": [
+                    {"id": "agent", "label": "Agent"},
+                    {"id": "plan", "label": "Plan"},
+                ],
+            }],
+        });
+        let request = parse_cursor_ask_question(&params, RequestId::new(), VibexSessionId::new())
+            .expect("a question with options is actionable");
+        assert_eq!(request.fields.len(), 1);
+        assert_eq!(request.fields[0].id, "q1");
+        assert_eq!(request.fields[0].title, "Which mode?");
+        assert_eq!(request.title.as_deref(), Some("Need input"));
+
+        let answered = build_cursor_ask_question_response(&resolution(
+            ElicitationResolutionAction::Accept,
+            vec![("q1", ElicitationAnswerValue::String("agent".to_string()))],
+        ));
+        assert_eq!(answered["outcome"]["outcome"], json!("answered"));
+        assert_eq!(
+            answered["outcome"]["answers"][0]["selectedOptionIds"],
+            json!(["agent"])
+        );
+        assert_eq!(
+            build_cursor_ask_question_response(&resolution(
+                ElicitationResolutionAction::Decline,
+                Vec::new()
+            )),
+            cursor_ask_skipped_response()
+        );
+        // No usable question means no card; the caller answers "cancelled".
+        assert!(
+            parse_cursor_ask_question(
+                &json!({"questions": [{"prompt": "Which mode?", "options": []}]}),
+                RequestId::new(),
+                VibexSessionId::new()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cursor_create_plan_accepts_or_rejects_and_cancels_on_teardown() {
+        let request = parse_cursor_create_plan(
+            &json!({"toolCallId": "call-2", "name": "Fix login", "plan": "1. patch it"}),
+            RequestId::new(),
+            VibexSessionId::new(),
+        )
+        .expect("a plan is always actionable");
+        assert_eq!(request.message, "1. patch it");
+        assert_eq!(request.title.as_deref(), Some("Fix login"));
+        assert_eq!(request.fields[0].id, CURSOR_PLAN_DECISION_FIELD);
+
+        for (decision, expected) in [
+            ("accepted", "accepted"),
+            ("rejected", "rejected"),
+            ("something-else", "rejected"),
+        ] {
+            assert_eq!(
+                build_cursor_create_plan_response(&resolution(
+                    ElicitationResolutionAction::Accept,
+                    vec![(
+                        CURSOR_PLAN_DECISION_FIELD,
+                        ElicitationAnswerValue::String(decision.to_string()),
+                    )],
+                ))["outcome"]["outcome"],
+                json!(expected)
+            );
+        }
+        for action in [
+            ElicitationResolutionAction::Decline,
+            ElicitationResolutionAction::Cancel,
+        ] {
+            assert_eq!(
+                build_cursor_create_plan_response(&resolution(action, Vec::new()))["outcome"]["outcome"],
+                json!("cancelled")
+            );
+        }
     }
 }

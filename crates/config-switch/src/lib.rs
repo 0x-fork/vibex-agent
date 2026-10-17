@@ -4151,10 +4151,13 @@ fn probe_explicit_agent_version(
     }
 }
 
+/// Copilot is deliberately absent: the npm package is a SEA bootstrapper that
+/// resolves its payload from `~/.cache/copilot/pkg/<version>`, so a `--version`
+/// probe reports the cached payload's version rather than the installed
+/// package's. A managed install records the authoritative npm version instead.
 fn trusted_version_probe_binary_names(agent_id: &str) -> Option<&'static [&'static str]> {
     match agent_id {
         "opencode" => Some(&["opencode"]),
-        "copilot" => Some(&["copilot"]),
         "codewhale" => Some(&["codewhale"]),
         "crow-cli" => Some(&["crow-cli"]),
         "goose" => Some(&["goose"]),
@@ -4860,7 +4863,7 @@ fn claude_acp_preset() -> AcpProviderCatalogPreset {
     let mut preset = acp_catalog_preset(
         "claude-agent-acp",
         "Claude Code (ACP)",
-        "Claude Code through the fixed @agentclientprotocol/claude-agent-acp@0.84.0 Adapter managed by the Compatibility Registry.",
+        "Claude Code through the fixed @agentclientprotocol/claude-agent-acp@0.93.0 Adapter managed by the Compatibility Registry.",
         "claude-agent-acp",
         &[],
         &["local", "acp", "claude"],
@@ -4868,7 +4871,7 @@ fn claude_acp_preset() -> AcpProviderCatalogPreset {
     // Session modes the pinned adapter advertises unconditionally; gated
     // modes (bypassPermissions) are discovered live by the runtime
     // option catalog probe instead of being promised here. `auto` is part of
-    // the 0.84.0 catalog, which advertises the same ids as 0.71.0 did; the
+    // the 0.93.0 catalog, which advertises the same ids as 0.71.0 did; the
     // bridge clamps it per-model.
     preset.default_config.modes = ["default", "acceptEdits", "plan", "auto"]
         .into_iter()
@@ -4897,7 +4900,7 @@ fn zcode_acp_preset() -> AcpProviderCatalogPreset {
     acp_catalog_preset(
         "zcode-acp-server",
         "ZCode (ACP)",
-        "ZCode through the fixed zcode-acp-server@0.54.0 Adapter managed by the Compatibility Registry.",
+        "ZCode through the fixed zcode-acp-server@0.72.0 Adapter managed by the Compatibility Registry.",
         "zcode-acp-server",
         &[],
         &["local", "acp", "zcode"],
@@ -8541,7 +8544,7 @@ mod tests {
             (
                 "gemini",
                 "npx",
-                &["-y", "@google/gemini-cli@0.62.0", "--acp"][..],
+                &["-y", "@google/gemini-cli@0.64.0", "--acp"][..],
             ),
             (
                 "qwen-code",
@@ -10746,7 +10749,6 @@ mod tests {
     #[test]
     fn typed_catalog_system_agents_have_trusted_version_probe_binaries() {
         let expected = [
-            ("copilot", "copilot"),
             ("codewhale", "codewhale"),
             ("crow-cli", "crow-cli"),
             ("goose", "goose"),
@@ -10767,7 +10769,7 @@ mod tests {
                 "{agent_id} must only probe its code-owned executable name"
             );
         }
-        for pinned_agent in ["dirac", "factory-droid", "pi", "qwen-code"] {
+        for pinned_agent in ["copilot", "dirac", "factory-droid", "pi", "qwen-code"] {
             assert_eq!(trusted_version_probe_binary_names(pinned_agent), None);
         }
     }

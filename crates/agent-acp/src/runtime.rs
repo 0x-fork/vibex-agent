@@ -118,8 +118,10 @@ use crate::dialect::{
     AgentHostRequestDialect, LaunchArgPlacement, McpWireDelivery, agent_dialect_profile,
 };
 use crate::grok::{
-    build_grok_ask_response, build_grok_exit_plan_response, grok_ask_skip_response,
-    grok_exit_plan_keep_planning_response, parse_grok_ask_user_question, parse_grok_exit_plan_mode,
+    build_cursor_ask_question_response, build_cursor_create_plan_response, build_grok_ask_response,
+    build_grok_exit_plan_response, cursor_ask_skipped_response, grok_ask_skip_response,
+    grok_exit_plan_keep_planning_response, parse_cursor_ask_question, parse_cursor_create_plan,
+    parse_grok_ask_user_question, parse_grok_exit_plan_mode,
 };
 use crate::host_fs::{resolve_contained_write_path, write_host_file_atomic};
 use crate::process_environment::{
@@ -221,6 +223,10 @@ const ACP_TRANSCRIPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const ACP_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const ACP_PERMISSION_CANCELLED_RESPONSE: &str = "cancelled";
 const OPENCODE_AGENT_ID: &str = "opencode";
+/// Cline's ACP bridge resolves `CLINE_MODEL` only inside the selected
+/// provider's catalogue and silently falls back to the provider default when
+/// the id is absent from it. Its reported `currentModelId` is the authority.
+const CLINE_AGENT_ID: &str = "cline";
 const GROK_AGENT_ID: &str = "grok";
 const PI_AGENT_ID: &str = "pi";
 /// The bare `session/steer` method. It is not ACP core and it is not namespaced
@@ -2083,6 +2089,10 @@ impl PendingElicitation {
             Some(AgentHostRequestDialect::GrokExitPlanMode) => {
                 grok_exit_plan_keep_planning_response()
             }
+            Some(AgentHostRequestDialect::CursorAskQuestion) => cursor_ask_skipped_response(),
+            Some(AgentHostRequestDialect::CursorCreatePlan) => json!({
+                "outcome": { "outcome": "cancelled" }
+            }),
             None => elicitation_cancelled_response(),
         }
     }
@@ -2094,6 +2104,12 @@ impl PendingElicitation {
             }
             Some(AgentHostRequestDialect::GrokExitPlanMode) => {
                 Ok(build_grok_exit_plan_response(resolution))
+            }
+            Some(AgentHostRequestDialect::CursorAskQuestion) => {
+                Ok(build_cursor_ask_question_response(resolution))
+            }
+            Some(AgentHostRequestDialect::CursorCreatePlan) => {
+                Ok(build_cursor_create_plan_response(resolution))
             }
             None => elicitation_response_value(resolution),
         }
@@ -3240,6 +3256,34 @@ impl AcpSessionAttachment {
         }
         state.model_substitution_notice = Some(pair);
         true
+    }
+
+    /// Reports one Model substitution for an Agent that resolves the requested
+    /// id against its own catalogue.
+    ///
+    /// Only an attachment that has already recorded both values can answer, so
+    /// a missing effective Model stays unreported instead of being guessed.
+    fn note_reporting_agent_model_substitution(&self, requested: &str) {
+        let effective = {
+            let Ok(state) = self.state.lock() else {
+                return;
+            };
+            let Some(effective) = state.session_runtime_config_state.effective_model.clone() else {
+                return;
+            };
+            effective
+        };
+        if effective == requested {
+            return;
+        }
+        if self.note_model_substitution(requested, &effective) {
+            self.emit_session_state_event(AcpEvent::SystemNotice {
+                level: SystemNoticeLevel::Warning,
+                message: format!(
+                    "The Agent runs Model \"{effective}\" instead of the requested \"{requested}\": the selected provider catalogue does not list the requested Model"
+                ),
+            });
+        }
     }
 
     /// Records the Model a completed-message marker reports.
@@ -6549,6 +6593,10 @@ impl AcpProcess {
         let fallback = || match dialect {
             AgentHostRequestDialect::GrokAskUserQuestion => grok_ask_skip_response(),
             AgentHostRequestDialect::GrokExitPlanMode => grok_exit_plan_keep_planning_response(),
+            AgentHostRequestDialect::CursorAskQuestion => cursor_ask_skipped_response(),
+            AgentHostRequestDialect::CursorCreatePlan => json!({
+                "outcome": { "outcome": "cancelled" }
+            }),
         };
         let admission = self.with_routed_params(params, dialect.method(), |attachment| {
             let request_id = RequestId::new();
@@ -6559,6 +6607,16 @@ impl AcpProcess {
                     attachment.logical_session_id().clone(),
                 ),
                 AgentHostRequestDialect::GrokExitPlanMode => parse_grok_exit_plan_mode(
+                    params,
+                    request_id.clone(),
+                    attachment.logical_session_id().clone(),
+                ),
+                AgentHostRequestDialect::CursorAskQuestion => parse_cursor_ask_question(
+                    params,
+                    request_id.clone(),
+                    attachment.logical_session_id().clone(),
+                ),
+                AgentHostRequestDialect::CursorCreatePlan => parse_cursor_create_plan(
                     params,
                     request_id.clone(),
                     attachment.logical_session_id().clone(),
@@ -14144,6 +14202,15 @@ impl AcpRuntimeClient {
                 AttachmentMutationMode::Current,
             )
             .await?;
+        if attachment.payload().process().agent_id.as_str() == CLINE_AGENT_ID {
+            // Cline substitutes a Model its provider catalogue does not list
+            // instead of rejecting it, so the requested id can differ from the
+            // one that actually runs. Report the substitution once rather than
+            // letting the turn silently bill a different Model.
+            attachment
+                .payload()
+                .note_reporting_agent_model_substitution(&model);
+        }
         if result.outcomes.iter().any(|outcome| {
             matches!(
                 outcome.status,
@@ -16366,7 +16433,15 @@ fn render_codex_runtime_config(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     if fragment.is_some_and(codex_config_is_complete) {
-        let mut config = fragment.unwrap().to_string();
+        // A complete caller-supplied fragment is emitted verbatim, but the
+        // Codex runtime pin is authoritative: `wire_api` now has exactly one
+        // supported spelling (`responses`) and `approval_policy` no longer
+        // accepts `untrusted`. Rewriting an unsupported wire spelling here is
+        // what keeps a fragment written for an older runtime from failing the
+        // whole session, and the validation in `vibex-config-switch` refuses
+        // the same values before they are stored.
+        let config = codex_rewrite_unsupported_wire_api(fragment.unwrap());
+        let mut config = config;
         if !config.ends_with('\n') {
             config.push('\n');
         }
@@ -16406,7 +16481,8 @@ fn render_codex_runtime_config(
         toml_quoted_string(provider_id)
     ));
     if let Some(fragment) = fragment {
-        lines.extend(fragment.lines().map(ToString::to_string));
+        let rewritten = codex_rewrite_unsupported_wire_api(fragment);
+        lines.extend(rewritten.lines().map(ToString::to_string));
     } else {
         lines.push(format!(
             "name = {}",
@@ -16420,10 +16496,12 @@ fn render_codex_runtime_config(
         {
             lines.push(format!("base_url = {}", toml_quoted_string(base_url)));
         }
-        lines.push(format!(
-            "wire_api = {}",
-            toml_quoted_string(runtime.wire_api.as_deref().unwrap_or("responses"))
-        ));
+        // `@openai/codex` 0.160+ documents Responses as the only `wire_api`.
+        // Writing a retired spelling makes the runtime refuse the whole
+        // provider route, so the projection emits the supported one rather
+        // than echoing a stale profile value (`vibex-config-switch` refuses
+        // the same values before they are stored).
+        lines.push("wire_api = \"responses\"".to_string());
         lines.push("requires_openai_auth = true".to_string());
     }
     if !runtime
@@ -16437,6 +16515,35 @@ fn render_codex_runtime_config(
         ));
     }
     Some(format!("{}\n", lines.join("\n")))
+}
+
+#[cfg(test)]
+/// Rewrite a fragment's `wire_api` to `responses`.
+///
+/// `@openai/codex` 0.160+ documents Responses as the only `wire_api`, while the
+/// adapter still accepts a fragment written for older releases. The fragment is
+/// otherwise user-authored, so only that one key is rewritten and every other
+/// line (including comments) is preserved verbatim.
+fn codex_rewrite_unsupported_wire_api(fragment: &str) -> String {
+    let mut out = String::with_capacity(fragment.len());
+    let mut first = true;
+    for line in fragment.lines() {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("wire_api")
+            && rest.trim_start().starts_with('=')
+        {
+            let indent = &line[..line.len() - trimmed.len()];
+            out.push_str(indent);
+            out.push_str("wire_api = \"responses\"");
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -21257,14 +21364,14 @@ mod tests {
         assert_eq!(identity.event_enricher, AgentEventEnricherKind::Claude);
 
         let codex = test_acp_config("/managed/node", vec!["/managed/codex-acp.js".to_string()]);
-        persist_managed_runtime(&conn, "codex", "codex-acp", "2.0.1", &codex);
+        persist_managed_runtime(&conn, "codex", "codex-acp", "2.2.2", &codex);
         let identity = client
             .effective_adapter_identity(&AgentId::parse("codex").unwrap(), &codex)
             .unwrap();
-        assert_eq!(identity.adapter_version, "2.0.1");
+        assert_eq!(identity.adapter_version, "2.2.2");
         assert_eq!(
             identity.compatibility_identity,
-            "adapter=codex-acp@2.0.1;runtime=@openai/codex@0.159.2"
+            "adapter=codex-acp@2.2.2;runtime=@openai/codex@0.160.1"
         );
         assert!(identity.exact_descriptor);
         assert_eq!(identity.event_enricher, AgentEventEnricherKind::Codex);
@@ -24582,6 +24689,34 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         assert!(config.contains("[model_providers.\"relay\"]"));
         assert!(config.contains("env_key = \"OPENAI_API_KEY\""));
         assert!(!config.contains("must-not-be-rendered"));
+    }
+
+    #[test]
+    fn codex_provider_projection_rewrites_a_retired_wire_api() {
+        let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
+        profile.agent_id = AgentId::parse("codex").unwrap();
+        profile.display_name = "Relay".to_string();
+        let runtime = CodexProviderRuntimeConfig {
+            model: Some("gpt-test".to_string()),
+            model_provider_id: "relay".to_string(),
+            provider_config_toml: Some(
+                "# imported from an older profile\nbase_url = \"https://relay.example.invalid/v1\"\nwire_api = \"chat_completions\""
+                    .to_string(),
+            ),
+            provider_config_toml_keys: vec!["base_url".to_string(), "wire_api".to_string()],
+            base_url: Some("https://relay.example.invalid/v1".to_string()),
+            wire_api: Some("chat_completions".to_string()),
+            api_key_env_key: "OPENAI_API_KEY".to_string(),
+            api_key: None,
+        };
+
+        let config = render_codex_runtime_config(&profile, &runtime).unwrap();
+
+        assert!(config.contains("wire_api = \"responses\""));
+        assert!(!config.contains("chat_completions"));
+        // Every other line survives, including the caller's comment.
+        assert!(config.contains("# imported from an older profile"));
+        assert!(config.contains("base_url = \"https://relay.example.invalid/v1\""));
     }
 
     #[test]

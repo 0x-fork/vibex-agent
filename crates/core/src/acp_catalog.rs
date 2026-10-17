@@ -81,7 +81,7 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         // results, and launch the same `agy_acp_server.par --uid=`. Only the
         // release archive changed its name at 1.2.0, which does not reach Vibex
         // because the archive URL comes from the Registry rather than a template.
-        "1.2.1",
+        "1.4.0",
         "https://antigravity.google/docs/ide/extensions",
         &["agy_acp_server"],
     )
@@ -107,15 +107,27 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "cline",
         "Cline",
         "Autonomous coding agent CLI - capable of creating/editing files, running commands, using the browser, and more",
-        "3.0.29",
+        // 3.0.73 changed the config-option surface (`auto_approve`, a third
+        // auth method) but not the `CLINE_PROVIDER`/`CLINE_MODEL`/
+        // `CLINE_API_KEY` contract the projection writes, so the old pin stays
+        // the floor. The pin moves because the CLI's model catalogue is only
+        // available inside a running Agent: an id outside the selected
+        // provider's catalogue is silently replaced by the provider default
+        // from 3.0.49 onward, and the runtime now reads the reported
+        // `currentModelId` back instead of trusting `CLINE_MODEL`.
+        "3.0.73",
         "https://cline.bot/cli",
-        &["npx", "-y", "cline@3.0.29", "--acp"],
-    ),
+        &["npx", "-y", "cline@3.0.73", "--acp"],
+    )
+    .with_compatible_version("3.0.29"),
     AcpAgentCatalogEntry::new(
         "copilot",
         "GitHub Copilot",
         "GitHub Copilot CLI agent connected through ACP",
-        "1.0.89",
+        // 1.0.93 made `~/.copilot/settings.json` the only user-settings file;
+        // keys in `config.json` are ignored. The ACP handshake and the
+        // `mode`/`allow_all` options did not move.
+        "1.0.98",
         "https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli",
         &["copilot", "--acp"],
     )
@@ -124,12 +136,18 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "codebuddy-code",
         "Codebuddy",
         "Tencent Cloud's official intelligent coding tool",
-        "2.160.0",
+        // 2.165.0 moved the ACP SDK to 1.7.0 (stable elicitation, ESM dynamic
+        // import), 2.166.0 added background-task methods, and 2.163.0 renamed
+        // `CODEBUDDY_DISABLE_SESSION_HISTORY_CLEANUP` to
+        // `CODEBUDDY_SESSION_HISTORY_CLEANUP` (the old name is no longer read).
+        // `CODEBUDDY_BASE_URL`/`_API_KEY`/`_MODEL` are unchanged, so the
+        // projection floor stays at 2.109.0.
+        "2.168.2",
         "https://www.codebuddy.cn/cli/",
         &[
             "npx",
             "-y",
-            "@tencent-ai/codebuddy-code@2.160.0",
+            "@tencent-ai/codebuddy-code@2.168.2",
             "--acp",
         ],
     )
@@ -154,13 +172,14 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "cursor",
         "Cursor",
         "Cursor's coding agent",
-        // The ACP Registry advertises `2026.09.26`, but Cursor publishes no
-        // CLI release notes for September and its own installer and Homebrew
-        // cask both resolve to `2026.09.28-64d2043` — a version string whose
-        // real shape carries a commit suffix this catalog does not model. The
-        // pin stays on the last release with published notes and a resolvable
-        // artifact rather than claiming a version nobody can point at.
-        "2026.03.30",
+        // The Registry's `2026.10.14` build resolves to a real artifact under
+        // `2026.10.14-941492e`; Cursor publishes no release note for that
+        // specific build, but the ACP extension surface it added
+        // (`subagents`, watched-shell wakeups) is documented. The catalog
+        // records the Registry's base version, and the installer compares
+        // release builds by their core triple so the `-<commit>` suffix can
+        // neither sort a build below its own base nor hide an update.
+        "2026.10.14",
         "https://docs.cursor.com/en/cli/overview",
         &["cursor-agent", "acp"],
     ),
@@ -176,7 +195,15 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "deepseek-harness",
         "DeepSeek Harness",
         "DeepSeek Harness coding agent connected through the deepseek-harness-acp bridge.",
-        // 0.4.37 bundles Harness runtime `0.2.0-rc.2` (0.4.35 bundled
+        // 0.4.38 still bundles Harness runtime `0.2.0-rc.2`, so no runtime
+        // behavior moves with this pin. The release makes the packaged runtime
+        // the only default and gates every explicit `--dsh-path`/`DSH_PATH`/
+        // `DSH_ACP_HOST` against `0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2`
+        // instead of falling back to it, and it advertises only the auth
+        // methods the client declared. Vibex therefore leaves `DSH_PATH` unset
+        // for a managed launch and re-reads the method list per initialize.
+        //
+        // 0.4.37 had bundled Harness runtime `0.2.0-rc.2` (0.4.35 bundled
         // `0.1.7-rc.2`). The runtime move changed three behaviors Vibex reads:
         // token deltas now arrive as live `agent/assistant-stream` frames
         // (0.4.36 taught the bridge to project them; 0.4.35 stayed silent and
@@ -193,19 +220,19 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         // accepts `mistral-conversations`. The release's moves to the Messages
         // API and its shrunken default catalogue apply to the official
         // `deepseek-official` route, which the projected route does not use.
-        "0.4.37",
+        "0.4.38",
         "https://github.com/openma-ai/deepseek-harness-acp",
         &[
             "npx",
             "-y",
-            "@openma/deepseek-harness-acp@0.4.37",
+            "@openma/deepseek-harness-acp@0.4.38",
         ],
     )
     // 0.4.33 qualifies every ACP model option id as `route::model`; Vibex keeps
     // the bare id on the wire and reads the qualified spelling back as an alias
     // so 0.4.32 keeps working. The projection floor therefore stays on 0.4.32
     // even though the pin moved past it; that qualification is byte-identical
-    // through 0.4.37, so the floor still describes a release the alias covers.
+    // through 0.4.38, so the floor still describes a release the alias covers.
     .with_compatible_version("0.4.32"),
     AcpAgentCatalogEntry::new(
         "devin",
@@ -255,9 +282,14 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "gemini",
         "Gemini CLI",
         "Google's official CLI for Gemini",
-        "0.62.0",
+        // 0.63 and 0.64 are additive on the ACP surface: `initialize` and
+        // `session/new` keep the same auth methods, modes and model list, while
+        // `session/prompt` gains a `usage` block plus `usage_update`
+        // notifications. A client that ignores them is not refused, so the
+        // floor stays on the release the projection was first verified at.
+        "0.64.0",
         "https://geminicli.com",
-        &["npx", "-y", "@google/gemini-cli@0.62.0", "--acp"],
+        &["npx", "-y", "@google/gemini-cli@0.64.0", "--acp"],
     )
     .with_compatible_version("0.47.0"),
     AcpAgentCatalogEntry::new(
@@ -280,11 +312,12 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "grok",
         "Grok Build",
         "xAI's Grok Build agentic coding CLI with plan mode and parallel subagents. Requires a SuperGrok or X Premium+ subscription.",
-        // The registry's newest grok build is 1.0.45, which xAI publishes only
-        // on its alpha and enterprise channels; `https://x.ai/cli/stable` and
-        // the public changelog both stop at 1.0.44. Pin the release with a
-        // published channel and release notes instead of the unreviewed build.
-        "1.0.44",
+        // 1.0.62 is the newest `latest` build; 1.0.63 is published only on the
+        // alpha channel, so it is not eligible for a verified pin. The ACP
+        // surface is unchanged from 1.0.44 through 1.0.62: same protocol
+        // version, auth methods, session capabilities, model state and
+        // `reasoningEfforts`, with only a CLI `--allowed-tools` alias added.
+        "1.0.62",
         "https://docs.x.ai/build/overview",
         // xAI's guidance for ACP and headless use is to skip background update
         // checks, because a self-update can swap the binary a live session is
@@ -299,6 +332,12 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "hermes",
         "Hermes",
         "Nous Research self-improving AI agent",
+        // PyPI stops at 0.19.0; upstream ships 0.22.x only as GitHub source
+        // tags with no wheel or sdist, so the uvx channel cannot reach it. The
+        // pin is explicit rather than a "latest" lookup that would keep
+        // returning 0.19.0, and the managed install uses the same constant.
+        // Moving to 0.22 needs a VCS/installer distribution (and a re-check of
+        // its canonical session-MCP reattachment rule).
         "0.19.0",
         "https://hermes-agent.nousresearch.com/docs/user-guide/features/acp",
         &["hermes", "acp"],
@@ -345,7 +384,11 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         // advertise a credential and model surface that does not work. A runtime
         // still on the old CLI collapses to the conservative surface instead,
         // which is the honest answer, and the managed install moves it forward.
-        "2.1.1",
+        // 2.2.0 is additive over 2.1.1: the ACP handshake, config option ids
+        // and the `config.toml` provider/model tables are unchanged, and the
+        // release's only new launch surface is `KIMI_CODE_TRUST_WORKSPACE`,
+        // which Vibex sets itself because it already owns the workspace.
+        "2.2.0",
         "https://github.com/MoonshotAI/kimi-code",
         &["kimi", "acp"],
     )
@@ -579,7 +622,7 @@ mod tests {
             .iter()
             .find(|entry| entry.id == "antigravity")
             .unwrap();
-        assert_eq!(antigravity.version, "1.2.1");
+        assert_eq!(antigravity.version, "1.4.0");
         assert_eq!(antigravity.command, &["agy_acp_server"]);
         assert_eq!(antigravity.compatible_version, Some("1.0.0"));
         assert_eq!(
@@ -598,11 +641,11 @@ mod tests {
             .iter()
             .find(|entry| entry.id == "deepseek-harness")
             .unwrap();
-        assert_eq!(deepseek.version, "0.4.37");
+        assert_eq!(deepseek.version, "0.4.38");
         assert_eq!(deepseek.compatible_version, Some("0.4.32"));
         assert_eq!(
             deepseek.command,
-            &["npx", "-y", "@openma/deepseek-harness-acp@0.4.37"]
+            &["npx", "-y", "@openma/deepseek-harness-acp@0.4.38"]
         );
         assert!(!entries.iter().any(|entry| entry.id == "corust-agent"));
     }
@@ -611,9 +654,9 @@ mod tests {
     fn verified_versions_skip_agents_vibex_does_not_pin() {
         assert_eq!(
             acp_agent_verified_version("deepseek-harness"),
-            Some("0.4.37")
+            Some("0.4.38")
         );
-        assert_eq!(acp_agent_verified_version("gemini"), Some("0.62.0"));
+        assert_eq!(acp_agent_verified_version("gemini"), Some("0.64.0"));
         assert_eq!(acp_agent_verified_version("devin"), None);
         assert_eq!(acp_agent_verified_version("kiro"), None);
         assert_eq!(acp_agent_verified_version("not-a-catalog-agent"), None);
@@ -630,11 +673,12 @@ mod tests {
     #[test]
     fn moved_pins_keep_their_compatibility_floor() {
         for (agent_id, pin, floor) in [
-            ("antigravity", "1.2.1", "1.0.0"),
-            ("codebuddy-code", "2.160.0", "2.109.0"),
-            ("copilot", "1.0.89", "1.0.78"),
-            ("gemini", "0.62.0", "0.47.0"),
-            ("grok", "1.0.44", "1.0.8"),
+            ("antigravity", "1.4.0", "1.0.0"),
+            ("cline", "3.0.73", "3.0.29"),
+            ("codebuddy-code", "2.168.2", "2.109.0"),
+            ("copilot", "1.0.98", "1.0.78"),
+            ("gemini", "0.64.0", "0.47.0"),
+            ("grok", "1.0.62", "1.0.8"),
             ("pi", "0.0.34", "0.0.33"),
         ] {
             let entry = acp_agent_catalog_entries()
