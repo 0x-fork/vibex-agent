@@ -52,8 +52,7 @@ use vibex_core::{
     WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
-    ActiveGoal, BACKGROUND_IMAGE_MAX_DIM_PERCENT, BACKGROUND_IMAGE_MIN_DIM_PERCENT,
-    BackgroundImageFit, NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice,
+    ActiveGoal, NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice,
     RuntimeCascadeProjection, SidebarHierarchyMode, SidebarOrganizationItem,
     SidebarOrganizationView, SidebarProjectLogo, SidebarProjectLogoColor, SidebarState,
     ThemeSelection, TimelineConversationTurn, TimelineModel, TimelineProcessActivityGroup,
@@ -1333,12 +1332,7 @@ fn system_appearance_is_dark(cx: &App) -> bool {
 /// process-wide resolvers. Called at startup and whenever a setting changes.
 /// Mobile settings take precedence when they exist; absent values follow the
 /// platform.
-fn apply_app_settings(
-    settings: &AppSettings,
-    data_dir: &std::path::Path,
-    window: &mut Window,
-    cx: &mut App,
-) {
+fn apply_app_settings(settings: &AppSettings, window: &mut Window, cx: &mut App) {
     theme::set_appearance_mode(settings.theme.unwrap_or_default());
     theme::set_system_dark(system_appearance_is_dark(cx));
     locale::set_preference(settings.language.unwrap_or_default());
@@ -1348,13 +1342,6 @@ fn apply_app_settings(
     crate::platform::set_haptics_enabled(settings.haptics);
     theme::apply_font_scale(settings.font_scale_percent, window);
     theme::set_theme_selection(&settings.theme_selection);
-    // A wallpaper fades the theme's containers so the image shows through, so
-    // the palette has to know whether one is behind it before the kit theme is
-    // built. Resolution is a stat against the managed file: a deleted wallpaper
-    // degrades to the theme's color instead of leaving the page translucent.
-    theme::set_wallpaper_backdrop(
-        crate::background::resolve(data_dir, &settings.background_image).is_some(),
-    );
     // The kit's own components (inputs, sheets, notification layer) read the
     // theme global, and it was only ever applied at startup: changing the
     // appearance repainted the hand-built rows and left every kit control on
@@ -1387,7 +1374,6 @@ type TimelineMarkdownViews =
 struct PlatformEventStreams {
     scanner_results: UnboundedReceiver<String>,
     attachment_picks: UnboundedReceiver<crate::attachment::AttachmentPickEvent>,
-    background_picks: UnboundedReceiver<crate::attachment::BackgroundPickEvent>,
     notification_actions: UnboundedReceiver<notifications::NotificationAction>,
     update_actions: UnboundedReceiver<update::UpdateAction>,
     lan_discovery_events: UnboundedReceiver<LanDiscoveryEvent>,
@@ -1400,7 +1386,6 @@ impl PlatformEventStreams {
         Self {
             scanner_results: scanner::subscribe(),
             attachment_picks: crate::attachment::subscribe(),
-            background_picks: crate::attachment::subscribe_background_picker(),
             notification_actions: notifications::subscribe_actions(),
             update_actions: update::subscribe_actions(),
             lan_discovery_events: crate::discovery::subscribe(),
@@ -1414,7 +1399,6 @@ impl PlatformEventStreams {
         Self {
             scanner_results: futures_channel::mpsc::unbounded().1,
             attachment_picks: futures_channel::mpsc::unbounded().1,
-            background_picks: futures_channel::mpsc::unbounded().1,
             notification_actions: futures_channel::mpsc::unbounded().1,
             update_actions: futures_channel::mpsc::unbounded().1,
             lan_discovery_events: futures_channel::mpsc::unbounded().1,
@@ -1589,10 +1573,6 @@ pub struct MobileApp {
     settings_page: SettingsPage,
     /// Whether the palette picker is over the Appearance page.
     settings_palette_open: bool,
-    /// Whether the wallpaper picker is out. A second launch would replace the
-    /// result callback the first one is waiting on, so the row ignores a repeat
-    /// tap until the host answers.
-    background_pick_busy: bool,
     sidebar_search_input: Entity<InputState>,
     sidebar_search_open: bool,
     sidebar_projects_initialized: bool,
@@ -2752,154 +2732,6 @@ fn settings_index_row(
         .into_any_element()
 }
 
-/// The wallpaper chooser: a preview where the image would be, the title, and
-/// the word for what a tap does.
-///
-/// It is not a [`settings_nav_row`] because the value column is a picture. A
-/// thumbnail is the one piece of state the reader can check at a glance — the
-/// same image is behind the page they just left — and a file name would tell
-/// them nothing they can see.
-fn settings_background_image_row(
-    preview: Option<gpui::AnyElement>,
-    title: String,
-    detail: String,
-    action: String,
-    handler: impl Fn(&gpui::MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
-) -> gpui::AnyElement {
-    let tile = match preview {
-        Some(image) => image,
-        // An empty tile of the same size keeps the labels aligned before and
-        // after a choice, so the row does not jump when an image is set.
-        None => div()
-            .w(px(crate::background::BACKGROUND_IMAGE_THUMBNAIL_SIZE))
-            .h(px(crate::background::BACKGROUND_IMAGE_THUMBNAIL_SIZE))
-            .flex_none()
-            .rounded(px(6.0))
-            .bg(theme::bg_card_dim())
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                svg()
-                    .path("icons/image.svg")
-                    .size(px(theme::ICON_SM))
-                    .text_color(theme::text_muted()),
-            )
-            .into_any_element(),
-    };
-    settings_row_frame("mobile-settings-background-image", !detail.is_empty())
-        .cursor_pointer()
-        .active(|style| style.bg(theme::row_pressed_bg()))
-        .on_mouse_up(MouseButton::Left, handler)
-        .child(tile)
-        .child(settings_row_labels(title, detail))
-        .child(settings_value_chip(action))
-        .into_any_element()
-}
-
-/// A row of explanation under a control, with no value and nothing to press.
-///
-/// A settings page that only names a control leaves the reader guessing what it
-/// will do to their page; this is where the consequence is said once, in the
-/// same muted type the row details use.
-fn settings_row_note(id: &'static str, text: String) -> gpui::AnyElement {
-    div()
-        .id(id)
-        .debug_selector(move || id.to_string())
-        .w_full()
-        .px(px(theme::SPACING_SM))
-        .pb(px(theme::SPACING_SM))
-        .text_size(theme::font_micro())
-        .line_height(theme::line_height_for(theme::FONT_MICRO))
-        .text_color(theme::text_muted())
-        .child(text)
-        .into_any_element()
-}
-
-/// The veil row: the percentage it sits at, and the two steps either side of it.
-fn settings_background_veil_row(dim_percent: u16, cx: &mut Context<MobileApp>) -> gpui::AnyElement {
-    let step = |id: &'static str,
-                path: &'static str,
-                label: &'static str,
-                delta: i16,
-                cx: &mut Context<MobileApp>| {
-        div()
-            .id(id)
-            .debug_selector(move || id.to_string())
-            .size(px(theme::TOUCH_TARGET))
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(theme::RADIUS_CONTROL))
-            .cursor_pointer()
-            .aria_label(locale::common(label))
-            .active(|style| style.bg(theme::row_pressed_bg()))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _, window, cx| {
-                    this.adjust_background_image_veil(delta, window, cx)
-                }),
-            )
-            .child(
-                svg()
-                    .path(path)
-                    .size(px(theme::ICON_SM))
-                    .text_color(theme::text_secondary()),
-            )
-            .into_any_element()
-    };
-    settings_row_frame("mobile-settings-background-veil", true)
-        .child(settings_row_labels(
-            locale::text("Image veil", "图片暗化", "圖片暗化").to_string(),
-            locale::text(
-                "How much the page color dims the image",
-                "页面颜色对图片的遮盖程度",
-                "頁面顏色對圖片的遮蓋程度",
-            )
-            .to_string(),
-        ))
-        .child(step(
-            "mobile-settings-background-veil-less",
-            "icons/minus.svg",
-            "Less",
-            -5,
-            cx,
-        ))
-        .child(
-            div()
-                .flex_shrink_0()
-                .w(px(44.0))
-                .text_center()
-                .text_size(theme::font_detail())
-                .text_color(theme::text_primary())
-                .child(format!("{dim_percent}%")),
-        )
-        .child(step(
-            "mobile-settings-background-veil-more",
-            "icons/plus.svg",
-            "More",
-            5,
-            cx,
-        ))
-        .into_any_element()
-}
-
-/// The localized name of a fit, matching the desktop's own labels.
-fn background_fit_label(fit: BackgroundImageFit) -> String {
-    match fit {
-        BackgroundImageFit::Cover => {
-            locale::text("Fill the page", "铺满页面", "鋪滿頁面").to_string()
-        }
-        BackgroundImageFit::Contain => {
-            locale::text("Show it all", "完整显示", "完整顯示").to_string()
-        }
-        BackgroundImageFit::Fill => {
-            locale::text("Stretch to fit", "拉伸填充", "拉伸填充").to_string()
-        }
-    }
-}
-
 /// A row of a topic's own page: a title, the value it is set to on the right,
 /// and — where the row needs saying more about than its title — one line of
 /// explanation under it.
@@ -3608,7 +3440,7 @@ impl MobileApp {
         let app_settings = storage
             .load_app_settings()
             .unwrap_or_else(|_| AppSettings::default());
-        apply_app_settings(&app_settings, storage.data_dir(), window, cx);
+        apply_app_settings(&app_settings, window, cx);
         let appearance_subscription = if theme::follows_system() {
             Some(cx.observe_window_appearance(window, |_this, _window, cx| {
                 theme::set_system_dark(system_appearance_is_dark(cx));
@@ -3659,12 +3491,6 @@ impl MobileApp {
         let battery_allowlist_subscription =
             cx.observe_window_activation(window, move |this, _, cx| {
                 this.refresh_battery_allowlist(cx);
-                // A picker is another Activity, so opening one deactivates this
-                // window and closing it reactivates. A cancelled pick reports
-                // nothing at all, so this is the only signal that says the trip
-                // is over: without it one cancellation would leave the row
-                // refusing every later tap for the life of the process.
-                this.background_pick_busy = false;
             });
         let composer_input = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -3774,7 +3600,6 @@ impl MobileApp {
             settings_scroll: ScrollHandle::new(),
             settings_page: SettingsPage::Root,
             settings_palette_open: false,
-            background_pick_busy: false,
             sidebar_search_input,
             sidebar_search_open: false,
             sidebar_projects_initialized: false,
@@ -4013,7 +3838,6 @@ impl MobileApp {
         }
         app.start_scanner_result_stream(events.scanner_results, cx);
         app.start_attachment_pick_stream(events.attachment_picks, cx);
-        app.start_background_pick_stream(events.background_picks, cx);
         app.start_notification_action_stream(events.notification_actions, cx);
         app.start_lan_discovery_event_stream(events.lan_discovery_events, cx);
         app.start_lifecycle_stream(events.lifecycle_events, cx);
@@ -4213,143 +4037,6 @@ impl MobileApp {
             }
         });
         self.tasks.push(task);
-    }
-
-    /// Watches the wallpaper picker for the image it hands back.
-    ///
-    /// The import — decode, name, write — runs on the background executor
-    /// because a wallpaper can be tens of megabytes: doing that on the frame
-    /// thread would freeze the settings page the reader just tapped.
-    fn start_background_pick_stream(
-        &mut self,
-        mut picks: UnboundedReceiver<crate::attachment::BackgroundPickEvent>,
-        cx: &mut Context<Self>,
-    ) {
-        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            while let Some(event) = picks.next().await {
-                if entity
-                    .update(cx, |this, cx| this.handle_background_pick(event, cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-        self.tasks.push(task);
-    }
-
-    /// Opens the platform image picker for the page's background.
-    fn choose_background_image(
-        &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.background_pick_busy {
-            // The picker is already out; a second launch would replace the
-            // result callback the first one is waiting on.
-            return;
-        }
-        if let Err(error) = crate::attachment::launch_background_picker() {
-            self.fail(error);
-            cx.notify();
-            return;
-        }
-        self.background_pick_busy = true;
-        cx.notify();
-    }
-
-    /// Applies one trip to the wallpaper picker.
-    fn handle_background_pick(
-        &mut self,
-        event: crate::attachment::BackgroundPickEvent,
-        cx: &mut Context<Self>,
-    ) {
-        self.background_pick_busy = false;
-        let data_url = match event {
-            crate::attachment::BackgroundPickEvent::Picked(data_url) => data_url,
-            crate::attachment::BackgroundPickEvent::Failed(message) => {
-                self.hint(Tone::Error, message);
-                cx.notify();
-                return;
-            }
-        };
-        let data_dir = self.storage.data_dir().to_path_buf();
-        let background = cx.background_executor().clone();
-        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let outcome = background
-                .spawn(async move { crate::background::import_picked(&data_url, &data_dir) });
-            let outcome = outcome.await;
-            let _ = entity.update(cx, |this, cx| {
-                match outcome {
-                    Ok(file_name) => {
-                        this.app_settings.background_image.file = Some(file_name);
-                        this.apply_background_image(cx);
-                        this.hint(
-                            Tone::Info,
-                            locale::text(
-                                "Background image set",
-                                "已设置背景图片",
-                                "已設定背景圖片",
-                            ),
-                        );
-                    }
-                    Err(message) => this.hint(Tone::Error, message),
-                }
-                cx.notify();
-            });
-        });
-        self.tasks.push(task);
-    }
-
-    /// Re-applies the appearance and persists it after the wallpaper changed.
-    fn apply_background_image(&mut self, cx: &mut Context<Self>) {
-        theme::set_wallpaper_backdrop(
-            crate::background::resolve(
-                self.storage.data_dir(),
-                &self.app_settings.background_image,
-            )
-            .is_some(),
-        );
-        self.persist_app_settings(cx);
-    }
-
-    /// Removes the wallpaper, leaving the stored file in place.
-    ///
-    /// The file is content-addressed, so a stale write that still names it has
-    /// to keep resolving; only the preference is cleared.
-    fn clear_background_image(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.app_settings.background_image.file = None;
-        self.apply_background_image(cx);
-        cx.notify();
-    }
-
-    /// Cycles the fit between the three the desktop offers.
-    fn cycle_background_image_fit(
-        &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let fit = &mut self.app_settings.background_image.fit;
-        *fit = match fit {
-            BackgroundImageFit::Cover => BackgroundImageFit::Contain,
-            BackgroundImageFit::Contain => BackgroundImageFit::Fill,
-            BackgroundImageFit::Fill => BackgroundImageFit::Cover,
-        };
-        self.apply_background_image(cx);
-        cx.notify();
-    }
-
-    /// Moves the veil one step, clamped to the range the desktop allows.
-    fn adjust_background_image_veil(&mut self, delta: i16, _: &mut Window, cx: &mut Context<Self>) {
-        let dim = i32::from(self.app_settings.background_image.dim_percent) + i32::from(delta);
-        self.app_settings.background_image.dim_percent = dim.clamp(
-            i32::from(BACKGROUND_IMAGE_MIN_DIM_PERCENT),
-            i32::from(BACKGROUND_IMAGE_MAX_DIM_PERCENT),
-        ) as u16;
-        self.apply_background_image(cx);
-        cx.notify();
     }
 
     /// Applies a launcher shortcut the host reported.
@@ -26898,31 +26585,6 @@ impl Render for MobileApp {
         // itself (`drawer_inset_band`), so this colour never follows a drawer —
         // following it is what used to wash the drawer's tone over the middle
         // of the phone and flip the strip at the top of the screen.
-        //
-        // A user wallpaper is the bottom layer of that page: an opaque plate of
-        // the theme's own color, the image, then the veil the `dim_percent`
-        // preference mixes from the same plate. The plate is what a `Contain`
-        // fit's letterbox lands on, and what keeps the window from being
-        // translucent to whatever sits behind it.
-        let wallpaper = crate::background::resolve(
-            self.storage.data_dir(),
-            &self.app_settings.background_image,
-        )
-        .map(|path| {
-            crate::background::wallpaper_layer(
-                &self.app_settings.background_image,
-                &path,
-                theme::is_dark(),
-            )
-        });
-        // With an image behind them the surfaces are translucent, so the page's
-        // own fill cannot be what the letterbox lands on. The plate is the
-        // authored color at full opacity, painted under the image.
-        let page_background = if wallpaper.is_some() {
-            theme::page_plate(theme::is_dark())
-        } else {
-            theme::bg_primary()
-        };
 
         // The page under the phone's finger sees a touch pan before the lists
         // inside it consume the gesture, so a rightward swipe can leave a page
@@ -26932,19 +26594,13 @@ impl Render for MobileApp {
             "mobile-app-swipe-back",
             div()
                 .size_full()
-                .relative()
-                .bg(page_background)
+                .bg(theme::bg_primary())
                 .font_family(theme::UI_FONT_FAMILY)
                 .text_color(theme::text_secondary())
                 .pt(insets.top)
                 .pr(insets.right)
                 .pb(insets.bottom)
                 .pl(insets.left)
-                // The image is the page's bottom layer, over the plate this
-                // element already paints. An absolutely positioned child is
-                // placed against the padding box, so it reaches under the
-                // status and gesture bands the insets reserve as well.
-                .children(wallpaper)
                 // Reads the release a touch menu leaves behind; it draws
                 // nothing and works from anywhere in the window.
                 .child(crate::touch_selection::watch(self.composer_input.clone()))
@@ -30164,7 +29820,6 @@ impl MobileApp {
                     ),
                 ],
             ),
-            self.render_settings_background_image(cx),
             settings_group(
                 locale::text("Behaviour", "行为", "行為"),
                 vec![
@@ -30235,80 +29890,6 @@ impl MobileApp {
                 ],
             ),
         ]
-    }
-
-    /// The wallpaper card: choose, fit, veil, remove.
-    ///
-    /// One group rather than one row apiece because the three rows below the
-    /// chooser describe the one image above them — a fit and a veil with no
-    /// image would be settings with nothing to act on, so they appear only once
-    /// an image is configured. That is also what keeps the page short on the
-    /// common case: most readers never set one.
-    fn render_settings_background_image(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let background = &self.app_settings.background_image;
-        let stored = crate::background::resolve(self.storage.data_dir(), background);
-        let configured = stored.is_some();
-        let mut rows = vec![
-            settings_background_image_row(
-                stored.as_deref().map(crate::background::thumbnail),
-                locale::text("Background image", "背景图片", "背景圖片").to_string(),
-                locale::text(
-                    "Paint your own image behind the page",
-                    "在页面后方铺一张自己的图片",
-                    "在頁面後方鋪一張自己的圖片",
-                )
-                .to_string(),
-                if configured {
-                    locale::common("Change").to_string()
-                } else {
-                    locale::common("Choose").to_string()
-                },
-                cx.listener(|this, event, window, cx| this.choose_background_image(event, window, cx)),
-            ),
-            settings_row_note(
-                "mobile-settings-background-image-note",
-                locale::text(
-                    "The panels turn translucent so the image shows through, and the veil below keeps the text on them readable. A GIF loops while the window is active, and holds still under Reduce motion.",
-                    "面板会变为半透明以透出图片，下方暗化用于保证文字可读。GIF 会在窗口激活时循环播放，开启减少动效时保持静止。",
-                    "面板會變為半透明以透出圖片，下方暗化用於保證文字可讀。GIF 會在視窗啟用時循環播放，開啟減少動效時保持靜止。",
-                )
-                .to_string(),
-            ),
-        ];
-        if configured {
-            rows.push(settings_nav_row(
-                "mobile-settings-background-fit",
-                locale::text("Fit", "填充方式", "填充方式").to_string(),
-                locale::text(
-                    "Fill the page and crop, show it all, or stretch it",
-                    "铺满页面并裁切、完整显示，或拉伸填充",
-                    "鋪滿頁面並裁切、完整顯示，或拉伸填充",
-                )
-                .to_string(),
-                background_fit_label(background.fit),
-                cx.listener(|this, event, window, cx| {
-                    this.cycle_background_image_fit(event, window, cx)
-                }),
-            ));
-            rows.push(settings_background_veil_row(background.dim_percent, cx));
-            rows.push(settings_danger_note(
-                "mobile-settings-background-remove",
-                locale::text(
-                    "Remove the background image",
-                    "移除背景图片",
-                    "移除背景圖片",
-                ),
-                locale::text(
-                    "The page goes back to the theme's own color",
-                    "页面恢复为主题自身的颜色",
-                    "頁面恢復為主題自身的顏色",
-                ),
-                cx.listener(|this, event, window, cx| {
-                    this.clear_background_image(event, window, cx)
-                }),
-            ));
-        }
-        settings_group(locale::text("Background", "背景", "背景"), rows)
     }
 
     /// Conversation: only the timeline settings the phone can act on, plus the

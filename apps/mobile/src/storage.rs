@@ -8,7 +8,7 @@ use vibex_backend::{BackendError, BackendResult};
 use vibex_core::{
     AgentTimelineReasoningDisplayMode, RemoteServerKind, TimelineItem, VibexSessionId,
 };
-use vibex_desktop_model::{BackgroundImageUiState, ThemeSelection};
+use vibex_desktop_model::ThemeSelection;
 use vibex_remote_client::ClientDeviceIdentity;
 
 use crate::pairing::MobileCredentialBundle;
@@ -184,11 +184,6 @@ pub struct AppSettings {
     pub notify_completed: bool,
     pub notify_needs_input: bool,
     pub notify_failed: bool,
-    /// The user's own image painted behind the page, in place of the theme's
-    /// color. The shape is the desktop's own record — a managed file name, a
-    /// fit, and a veil — so an image and its settings mean the same thing on
-    /// either shell. Absent keeps the theme in charge of the whole window.
-    pub background_image: BackgroundImageUiState,
 }
 
 /// What a phone with no stored settings file starts on.
@@ -212,28 +207,8 @@ impl Default for AppSettings {
             notify_completed: true,
             notify_needs_input: true,
             notify_failed: true,
-            background_image: BackgroundImageUiState::default(),
         }
     }
-}
-
-/// A stored wallpaper reduced to what the renderer may act on.
-///
-/// The desktop normalizes the same two fields inside its whole appearance
-/// state. The phone has its own settings record, so it applies the same two
-/// rules here: a file name that is not `<64 lowercase hex>.<supported
-/// extension>` is dropped, and the veil is clamped to the range its own
-/// controls can produce.
-fn normalize_background_image(mut background: BackgroundImageUiState) -> BackgroundImageUiState {
-    background.file = background
-        .file
-        .take()
-        .filter(|file_name| vibex_desktop_model::background_image_file_name_is_valid(file_name));
-    background.dim_percent = background.dim_percent.clamp(
-        vibex_desktop_model::BACKGROUND_IMAGE_MIN_DIM_PERCENT,
-        vibex_desktop_model::BACKGROUND_IMAGE_MAX_DIM_PERCENT,
-    );
-    background
 }
 
 #[derive(Deserialize, Serialize)]
@@ -262,8 +237,6 @@ struct StoredAppSettings {
     notify_needs_input: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     notify_failed: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    background_image: Option<BackgroundImageUiState>,
 }
 
 /// One paired runtime: the credential plus the mobile-owned metadata the
@@ -388,14 +361,6 @@ pub struct CredentialStorage {
 impl CredentialStorage {
     pub fn new(data_dir: PathBuf) -> Self {
         Self { data_dir }
-    }
-
-    /// The app's own data directory, where the managed payloads live.
-    ///
-    /// The wallpaper store is one of them, so the appearance code needs the
-    /// directory itself rather than one of the file paths derived from it.
-    pub fn data_dir(&self) -> &Path {
-        &self.data_dir
     }
 
     pub fn path(&self) -> PathBuf {
@@ -860,15 +825,6 @@ impl CredentialStorage {
             notify_completed: notification_switch(stored.notify_completed),
             notify_needs_input: notification_switch(stored.notify_needs_input),
             notify_failed: notification_switch(stored.notify_failed),
-            // A stored name that is not content-addressed is dropped rather
-            // than trusted, and the veil is clamped to the bounds the desktop
-            // accepts, so a hand-edited file cannot point the renderer at an
-            // arbitrary path or at a veil the controls cannot produce.
-            background_image: stored
-                .background_image
-                .filter(|background| background.is_configured())
-                .map(normalize_background_image)
-                .unwrap_or_default(),
         })
     }
 
@@ -891,8 +847,6 @@ impl CredentialStorage {
             notify_completed: Some(settings.notify_completed),
             notify_needs_input: Some(settings.notify_needs_input),
             notify_failed: Some(settings.notify_failed),
-            background_image: Some(settings.background_image.clone())
-                .filter(|background| background.is_configured()),
         };
         let encoded = serde_json::to_vec(&stored)
             .map_err(|_| storage_error("mobile_app_settings_encode_failed"))?;
@@ -1663,64 +1617,6 @@ mod tests {
 
         storage.clear_app_settings().unwrap();
         assert_eq!(storage.load_app_settings().unwrap(), AppSettings::default());
-    }
-
-    /// A wallpaper survives a restart, and a hand-edited record cannot smuggle
-    /// an external path or an out-of-range veil into the renderer.
-    #[test]
-    fn a_background_image_round_trips_and_normalizes_its_bounds() {
-        let temp = tempfile::tempdir().unwrap();
-        let storage = CredentialStorage::new(temp.path().to_path_buf());
-        let file_name = format!("{}.png", "a".repeat(64));
-        let settings = AppSettings {
-            background_image: BackgroundImageUiState {
-                file: Some(file_name.clone()),
-                fit: vibex_desktop_model::BackgroundImageFit::Contain,
-                dim_percent: 55,
-            },
-            ..AppSettings::default()
-        };
-        storage.save_app_settings(&settings).unwrap();
-        assert_eq!(storage.load_app_settings().unwrap(), settings);
-
-        // A traversal-like name is dropped rather than trusted, and a veil past
-        // the ceiling is clamped to what the page can produce.
-        fs::create_dir_all(temp.path()).unwrap();
-        fs::write(
-            storage.app_settings_path(),
-            format!(
-                r#"{{"schemaVersion":"{APP_SETTINGS_SCHEMA_VERSION}","backgroundImage":{{"file":"../../../etc/passwd.png","fit":"fill","dimPercent":400}}}}"#
-            ),
-        )
-        .unwrap();
-        let loaded = storage.load_app_settings().unwrap();
-        assert_eq!(loaded.background_image.file, None);
-        assert!(!loaded.background_image.is_configured());
-        assert_eq!(
-            loaded.background_image.dim_percent,
-            vibex_desktop_model::BACKGROUND_IMAGE_MAX_DIM_PERCENT
-        );
-    }
-
-    /// A settings file written before the feature decodes with no image, which
-    /// is what keeps an upgrade painting the theme's own color.
-    #[test]
-    fn a_settings_file_without_a_background_image_loads_with_none() {
-        let temp = tempfile::tempdir().unwrap();
-        let storage = CredentialStorage::new(temp.path().to_path_buf());
-        fs::create_dir_all(temp.path()).unwrap();
-        fs::write(
-            storage.app_settings_path(),
-            format!(r#"{{"schemaVersion":"{APP_SETTINGS_SCHEMA_VERSION}","theme":"dark"}}"#),
-        )
-        .unwrap();
-        let loaded = storage.load_app_settings().unwrap();
-        assert_eq!(loaded.theme, Some(crate::theme::AppearanceMode::Dark));
-        assert!(!loaded.background_image.is_configured());
-        assert_eq!(
-            loaded.background_image.fit,
-            vibex_desktop_model::BackgroundImageFit::Cover
-        );
     }
 
     #[test]
