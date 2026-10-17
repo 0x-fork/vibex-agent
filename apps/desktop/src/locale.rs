@@ -94,7 +94,15 @@ pub struct Strings {
     pub new_session_no_projects: &'static str,
     pub new_session_choose_project: &'static str,
     pub new_session_create: &'static str,
+    /// Names the answer a session without a project has. The project menu
+    /// offers it as its own fixed row and the trigger shows it once chosen, so
+    /// both read the same term.
     pub new_session_working_in: &'static str,
+    /// Explains that fixed row before it is chosen.
+    pub new_session_temporary_hint: &'static str,
+    /// Explains the same row on a runtime that cannot resolve a root for a
+    /// session with no project.
+    pub new_session_temporary_unavailable: &'static str,
     pub new_session_no_agents: &'static str,
     pub new_session_add_agent: &'static str,
     pub model_provider_label: &'static str,
@@ -326,6 +334,8 @@ static STRINGS_EN: Strings = Strings {
     new_session_choose_project: "Choose another directory",
     new_session_create: "Create session",
     new_session_working_in: "Temporary session",
+    new_session_temporary_hint: "Starts in a temporary directory, with no project",
+    new_session_temporary_unavailable: "This runtime cannot start a session without a project",
     new_session_no_agents: "No Agent has been added. Open Config Center to add one.",
     new_session_add_agent: "Add Agent",
     model_provider_label: "Model provider",
@@ -528,6 +538,8 @@ static STRINGS_ZH_CN: Strings = Strings {
     new_session_choose_project: "选择其他目录",
     new_session_create: "创建会话",
     new_session_working_in: "临时会话",
+    new_session_temporary_hint: "在临时目录中启动，不加入任何项目",
+    new_session_temporary_unavailable: "该运行时不支持无项目的临时会话",
     new_session_no_agents: "尚未添加 Agent，请进入配置中心添加。",
     new_session_add_agent: "添加 Agent",
     model_provider_label: "模型供应商",
@@ -730,6 +742,8 @@ static STRINGS_ZH_TW: Strings = Strings {
     new_session_choose_project: "選擇其他目錄",
     new_session_create: "建立會話",
     new_session_working_in: "臨時會話",
+    new_session_temporary_hint: "在臨時目錄中啟動，不加入任何專案",
+    new_session_temporary_unavailable: "此執行環境不支援無專案的臨時工作階段",
     new_session_no_agents: "尚未新增 Agent，請進入配置中心新增。",
     new_session_add_agent: "新增 Agent",
     model_provider_label: "模型供應商",

@@ -575,7 +575,10 @@ const SIDEBAR_HOVER_PREVIEW_CLOSE_DELAY: Duration = Duration::from_millis(120);
 const SIDEBAR_HOVER_PREVIEW_SUPPRESS_DELAY: Duration = Duration::from_millis(450);
 const NEW_SESSION_PROJECT_MENU_TRANSITION_DURATION: Duration = Duration::from_millis(100);
 const NEW_SESSION_PROJECT_MENU_MAX_HEIGHT: f32 = 360.0;
-const NEW_SESSION_PROJECT_MENU_CHROME_HEIGHT: f32 = 116.0;
+/// Everything in the project menu that is not a project row: padding, the
+/// section label, the search field, the divider, and the two fixed rows under
+/// the list — the temporary session and the directory picker.
+const NEW_SESSION_PROJECT_MENU_CHROME_HEIGHT: f32 = 144.0;
 const NEW_SESSION_PROJECT_MENU_ROW_HEIGHT: f32 = 28.0;
 const NEW_SESSION_AGENT_DRAG_HORIZONTAL_SLOP: f32 = 2.0;
 const NEW_SESSION_AGENT_DRAG_VERTICAL_SLOP: f32 = 8.0;
@@ -33542,6 +33545,32 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Aims the new-session page at no project at all.
+    ///
+    /// The temporary root belongs to the authority that runs the Agent, so the
+    /// draft only has to forget the project it was pointed at: the trigger
+    /// falls back to the temporary name, the location control disappears with
+    /// the Worktree form it carries, and the submission creates the session
+    /// against the authority's own root.
+    fn choose_temporary_new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_session_workspace.clear(
+            RequestId::new().to_string(),
+            self.new_session_managed_root(),
+        );
+        self.new_session_workspace.preference =
+            self.ui_state.workbench.default_new_session_location;
+        // A probe for the project this replaces can still be in flight. Its
+        // ticket no longer matches the cleared state, so dropping the task is
+        // the whole cleanup.
+        self.new_session_eligibility_task = None;
+        self.new_session_folder_id = None;
+        self.new_session_error = None;
+        self.new_session_eligibility_error = None;
+        self.sync_new_session_worktree_inputs(window, cx);
+        self.refresh_active_suggestions(ComposerTarget::NewSession, cx);
+        cx.notify();
+    }
+
     /// Opens the new-session page on the project or Worktree `folder_id`
     /// belongs to, and remembers the folder so the session the page creates is
     /// filed under it.
@@ -51120,6 +51149,20 @@ impl VibexWorkbench {
             .anchor(Anchor::TopRight);
 
         let active_project_id = self.new_session_workspace.project_id.clone();
+        // The authority that runs the Agent hands out the root a project-less
+        // session runs in, so a backend that cannot resolve one leaves the
+        // temporary row disabled and says why.
+        let temporary_session_supported = self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .capabilities()
+                .workspace
+                .supports(BackendOperation::WorkspaceTemporarySessionRoot)
+        });
+        let temporary_session_hint = if temporary_session_supported {
+            strings.new_session_temporary_hint
+        } else {
+            strings.new_session_temporary_unavailable
+        };
         let workspace_label = active_project_id
             .as_ref()
             .and_then(|project_id| {
@@ -51255,6 +51298,50 @@ impl VibexWorkbench {
                     ),
             )
             .child(project_results)
+            // The answer for a session that belongs to no checkout. It is
+            // fixed under the list rather than inside it — a search that
+            // matches no project still has to leave the way out visible — and
+            // it borrows the project row's geometry so the two read as one
+            // set of answers.
+            .child(button_with_aria_label(
+                Button::new("new-session-temporary-session")
+                    .small()
+                    .ghost()
+                    .w_full()
+                    .h(px(28.0))
+                    .px_2()
+                    .selected(active_project_id.is_none())
+                    .rounded(gpui_component::button::ButtonRounded::Size(px(8.0)))
+                    .text_color(popover_foreground)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .justify_start()
+                            .gap_2()
+                            .text_xs()
+                            .font_normal()
+                            .child(sidebar_icon("icons/vibex/box.svg").size(px(14.0)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(strings.new_session_working_in),
+                            ),
+                    )
+                    .tooltip(temporary_session_hint)
+                    .disabled(self.agent_action_pending || !temporary_session_supported)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.choose_temporary_new_session(window, cx);
+                        this.new_session_project_search
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        this.set_new_session_project_menu_open(false, window, cx);
+                        this.new_session_input
+                            .update(cx, |input, cx| input.focus(window, cx));
+                    })),
+                strings.new_session_working_in,
+            ))
             .child(
                 div()
                     .mx(px(-4.0))
@@ -98623,9 +98710,81 @@ mod tests {
 
     #[test]
     fn new_session_project_menu_uses_content_height_until_its_cap() {
-        assert_eq!(new_session_project_menu_height(0), 144.0);
-        assert_eq!(new_session_project_menu_height(3), 200.0);
+        // The chrome carries both fixed rows a project list cannot express:
+        // the temporary session and the directory picker.
+        assert_eq!(new_session_project_menu_height(0), 172.0);
+        assert_eq!(new_session_project_menu_height(3), 228.0);
         assert_eq!(new_session_project_menu_height(20), 360.0);
+    }
+
+    #[test]
+    fn new_session_project_menu_keeps_the_temporary_session_row_fixed() {
+        let source = include_str!("app.rs");
+        let panel = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
+            .map(|(body, _)| body)
+            .expect("new-session panel should remain inspectable");
+        // The row is fixed because it is rendered outside the scrolling
+        // results: a search that matches no project must not hide the answer
+        // that needs no project.
+        let results = panel
+            .split_once("        let project_results =")
+            .and_then(|(_, tail)| tail.split_once("        let project_menu_open ="))
+            .map(|(body, _)| body)
+            .expect("the project results region should remain inspectable");
+        assert!(
+            !results.contains("new-session-temporary-session"),
+            "the temporary row must sit outside the scrolling project results"
+        );
+        let temporary_row = panel
+            .find("Button::new(\"new-session-temporary-session\")")
+            .expect("the project menu should offer a session without a project");
+        let directory_picker = panel
+            .find("Button::new(\"new-session-choose-project-directory\")")
+            .expect("the directory picker should keep its row");
+        let divider = panel
+            .find(".child(\n                div()\n                    .mx(px(-4.0))")
+            .expect("the divider should separate the answers from the picker");
+        assert!(
+            temporary_row < divider && divider < directory_picker,
+            "the temporary row is an answer, so it stays above the divider"
+        );
+        assert!(
+            panel.contains(".selected(active_project_id.is_none())"),
+            "the row must show that it is the current answer"
+        );
+        assert!(
+            panel.contains("WorkspaceTemporarySessionRoot"),
+            "the row reads the authority's own capability before offering itself"
+        );
+
+        // Choosing it forgets the project rather than inventing a path: the
+        // authority resolves the temporary root at submission time.
+        let handler = source
+            .split_once("    fn choose_temporary_new_session(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Opens the new-session page on the project or Worktree")
+            })
+            .map(|(body, _)| body)
+            .expect("the temporary-session choice should remain inspectable");
+        assert!(handler.contains("self.new_session_workspace.clear("));
+        assert!(handler.contains("self.new_session_eligibility_task = None;"));
+        assert!(handler.contains("self.new_session_eligibility_error = None;"));
+        assert!(!handler.contains("workspace_root"));
+
+        // A glyph that is not in the bundle resolves to nothing, so the box the
+        // row borrows from the phone's own temporary row has to be loadable.
+        assert!(panel.contains("sidebar_icon(\"icons/vibex/box.svg\")"));
+        use gpui::AssetSource as _;
+        let path = "icons/vibex/box.svg";
+        assert!(
+            crate::assets::VibexAssets
+                .load(path)
+                .expect("asset lookup should not fail")
+                .is_some(),
+            "the temporary row asks for {path}, which is not in the asset bundle"
+        );
     }
 
     #[test]

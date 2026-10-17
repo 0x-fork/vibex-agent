@@ -2780,6 +2780,13 @@ SidebarUiState.organization = empty tree
   switch may persist `NewWorktree`, but the one-shot location control never
   writes that preference. A detailed Workspace-row `+` fixes that exact
   Workspace and ignores the Project preference.
+- The Project picker answers with a Project or with no Project at all. The
+  temporary-session row is fixed outside the filtered, scrolling Project rows,
+  so a query that matches nothing still offers it, and choosing it clears the
+  draft's Project, origin Workspace, Worktree form, and pending eligibility
+  ticket instead of inventing a root. The authority resolves that root at
+  submission, so the row is offered only while the Backend advertises
+  `WorkspaceTemporarySessionRoot`.
 - Eligibility results apply only when the full
   `{generation, projectId, originWorkspaceId, projectRoot}` ticket still
   matches. Programmatic input synchronization also compares the incoming value
@@ -2824,12 +2831,17 @@ expected-revision/idempotent Worktree create
 | Name/path is empty, unbounded, controlled, or custom path is relative | Disable submit and retain the draft; Backend validation remains authoritative. |
 | Worktree succeeds and Session create fails | Keep `created_workspace`, prompt, attachments, runtime, settings, and key; retry starts at Session create. |
 | Backend lacks `GitWorktreeCreate` | Hide mutation controls; keep read-only Workspace identity. |
+| Backend lacks `WorkspaceTemporarySessionRoot` | Disable the temporary row and explain the reason; Projects stay selectable. |
+| Temporary row chosen, including after a Project was picked | Clear Project, origin Workspace, Worktree form, and eligibility error; keep the draft. |
 | Hierarchy mode changes | Persist the mode while retaining selected Session/Workspace and workbench state. |
 
 ### 5. Good / Base / Bad Cases
 
 - Good: rapidly select Project A then B; A's late Git result is ignored and B's
   manually edited Worktree name/path remain unchanged.
+- Good: choosing the temporary row leaves the trigger reading the temporary
+  name, hides the location control, keeps the prompt draft, and creation
+  resolves the authority's own root.
 - Good: two running Sessions share one Worktree; both retain independent state,
   while the detailed Workspace row aggregates two running Agents.
 - Good: Worktree creation succeeds, Session creation fails, and retry creates
