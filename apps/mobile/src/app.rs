@@ -17371,7 +17371,7 @@ impl MobileApp {
             .flex()
             .flex_col()
             .child(self.render_runtime_sheet_header(
-                locale::text("Session settings", "会话设置", "工作階段設定"),
+                agent_settings_label(),
                 SheetKey::RuntimeOptions,
                 cx,
             ))
@@ -27315,7 +27315,7 @@ impl MobileApp {
                                             |intro, delta| intro.opacity(delta),
                                         )
                                         .child(self.render_pairing_brand())
-                                        .child(new_session_slogan_line(new_session_agent))
+                                        .child(new_session_slogan_line(new_session_agent, cx))
                                         .child(
                                             div()
                                                 .mt(px(theme::SPACING_SM))
@@ -30626,13 +30626,18 @@ fn new_session_slogan_words(locale: Locale) -> (&'static str, &'static str, &'st
 /// The page's chips name the model and the mode it will run with, and neither
 /// names the Agent — the Agent is the choice the page exists to make, so the
 /// sentence carries its mark, in the place the reader's language leaves for it.
-/// The phrase keeps the title's weight and colour; the connector steps back to
-/// the muted ink, so the sentence is still what the page says and the Agent is
-/// what it says it with.
+/// The connector and the phrase share the title's ink, because the line is one
+/// sentence rather than a label with a footnote; the weight alone separates the
+/// words from the grammar between them. The mark is the shortest way into the
+/// Agent's own settings, so it keeps a full touch target of its own inside the
+/// line.
 ///
 /// A page with no Agent chosen yet says only the sentence: naming one before
 /// the reader has picked it would answer a question the page is still asking.
-fn new_session_slogan_line(agent: Option<(&AgentId, &str)>) -> gpui::AnyElement {
+fn new_session_slogan_line(
+    agent: Option<(&AgentId, &str)>,
+    cx: &mut Context<MobileApp>,
+) -> gpui::AnyElement {
     let phrase = |text: &'static str| {
         div()
             .text_size(theme::font_title())
@@ -30643,7 +30648,7 @@ fn new_session_slogan_line(agent: Option<(&AgentId, &str)>) -> gpui::AnyElement 
     let connector = |text: &'static str| {
         div()
             .text_size(theme::font_title())
-            .text_color(theme::text_muted())
+            .text_color(theme::text_primary())
             .child(text)
     };
     let Some((agent_id, agent_label)) = agent else {
@@ -30665,11 +30670,27 @@ fn new_session_slogan_line(agent: Option<(&AgentId, &str)>) -> gpui::AnyElement 
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    let mark = agent_brand_icon(
-        &agent_brand_identity(agent_id.as_str(), agent_label),
-        theme::scaled_px(theme::NEW_SESSION_AGENT_LOGO_SIZE),
-        theme::text_primary(),
-    );
+    let mark = div()
+        .id("mobile-new-session-agent-mark")
+        .debug_selector(|| "mobile-new-session-agent-mark".to_string())
+        .size(px(theme::TOUCH_TARGET))
+        .flex_shrink_0()
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .aria_label(agent_settings_label().to_string())
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(MobileApp::open_runtime_options),
+        )
+        .child(agent_brand_icon(
+            &agent_brand_identity(agent_id.as_str(), agent_label),
+            theme::scaled_px(theme::NEW_SESSION_AGENT_LOGO_SIZE),
+            theme::text_primary(),
+        ));
     let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(4);
     if !lead.is_empty() {
         children.push(phrase(lead).into_any_element());
@@ -30677,7 +30698,7 @@ fn new_session_slogan_line(agent: Option<(&AgentId, &str)>) -> gpui::AnyElement 
     if !connector_text.is_empty() {
         children.push(connector(connector_text).into_any_element());
     }
-    children.push(mark);
+    children.push(mark.into_any_element());
     if !trail.is_empty() {
         children.push(phrase(trail).into_any_element());
     }
@@ -30692,6 +30713,15 @@ fn new_session_slogan_line(agent: Option<(&AgentId, &str)>) -> gpui::AnyElement 
         .aria_label(spoken)
         .children(children)
         .into_any_element()
+}
+
+/// What the screen that picks the Agent is called, in the drawer it opens and
+/// on the mark that opens it.
+///
+/// One name for one surface: the mark under the wordmark says where it leads,
+/// and the drawer's title says where the reader is.
+fn agent_settings_label() -> &'static str {
+    locale::text("Agent settings", "Agent 设置", "Agent 設定")
 }
 
 /// Brand icon for a model id, desktop-style: colored marks render through
@@ -39630,19 +39660,22 @@ fn session_opened(cx: &mut Context<Self>) {
         );
     }
 
-    /// The new-session page says which Agent it will hand the work to.
+    /// The new-session page says which Agent it will hand the work to, and the
+    /// mark it says it with is the way into the Agent's own settings.
     ///
     /// The chips on the page name the model and the mode, and neither names the
     /// Agent — the Agent is the choice the page exists to make. So the sentence
     /// carries its mark, placed where the reader's language leaves room for it,
     /// and the mark is the Agent the page would start the session with rather
-    /// than whichever brand the model happens to belong to.
+    /// than whichever brand the model happens to belong to. It wears a full
+    /// touch target of its own, because tapping it opens the drawer that picks
+    /// the Agent; and one name covers both the mark and the drawer it opens.
     #[test]
     fn the_new_session_sentence_carries_the_chosen_agent_mark() {
         let source = include_str!("app.rs");
         let page = renderer_source(source, "render_new_session");
         assert!(
-            page.contains("new_session_slogan_line(new_session_agent)"),
+            page.contains("new_session_slogan_line(new_session_agent, cx)"),
             "the sentence is the line that names the Agent"
         );
         assert!(
@@ -39661,9 +39694,32 @@ fn session_opened(cx: &mut Context<Self>) {
             "the mark tracks the title it stands in, not a frozen pixel box"
         );
         assert!(
+            !line.contains("text_muted()"),
+            "the connector reads in the sentence's own ink, not a step behind it"
+        );
+        assert!(
             line.contains("let Some((agent_id, agent_label)) = agent else {")
                 && line.contains("mobile-new-session-slogan"),
             "a page with no Agent chosen yet says only the sentence"
+        );
+        assert!(
+            line.contains("theme::TOUCH_TARGET")
+                && line.contains("cx.listener(MobileApp::open_runtime_options)"),
+            "the mark is a touch target that opens the Agent's settings"
+        );
+
+        // One name for the mark and for the drawer it opens: the sentence's
+        // mark says where it leads, and the drawer's title says where the
+        // reader is.
+        assert!(line.contains("agent_settings_label()"));
+        let drawer = renderer_source(source, "render_runtime_options_sheet");
+        assert!(
+            drawer.contains("agent_settings_label()"),
+            "the drawer the mark opens is titled the same way it is named"
+        );
+        assert!(
+            !drawer.contains("\"Session settings\""),
+            "the Agent surface is not called the session's settings"
         );
 
         // Chinese leads with the connector, so the mark lands between it and
