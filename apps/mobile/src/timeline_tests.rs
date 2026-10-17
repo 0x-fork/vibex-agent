@@ -1143,4 +1143,11 @@ fn the_turn_header_leads_with_the_agent_mark() {
         label < chevron,
         "the chevron closes the line, the way the desktop's does"
     );
+
+    // The kit's button centres its content row, so the run of marks has to take
+    // the full width and justify to the start to sit on the leading edge.
+    assert!(
+        body.contains(".w_full()") && body.contains("justify_start()"),
+        "the header starts at the row's leading edge, not in its middle"
+    );
 }

@@ -91,9 +91,15 @@ impl MobileApp {
         let brand_identity = self.turn_agent_brand_identity(turn);
         disclosure_button(format!("turn-process:{id}"), label.clone(), expanded, cx)
             .child(
+                // The button's own content row centres whatever it is given,
+                // so the run has to claim the full width to sit on the leading
+                // edge — the desktop's header starts at the row's first pixel,
+                // not in the middle of it.
                 div()
+                    .w_full()
                     .flex()
                     .items_center()
+                    .justify_start()
                     .gap(px(theme::SPACING_XS))
                     .min_w_0()
                     .when(!brand_identity.is_empty(), |run| {
