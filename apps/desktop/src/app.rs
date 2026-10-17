@@ -44412,16 +44412,24 @@ impl VibexWorkbench {
             } else {
                 title.clone().into_any_element()
             };
-            // The trailing slot is the sidebar's status column in miniature:
-            // the attention glyph while the Agent is parked on the user, the
-            // unread completion dot, and otherwise the same mark the row draws —
-            // the running pulse included.
-            let status_mark: AnyElement = if display_state == AgentSessionState::NeedsInput {
-                sidebar_attention_icon(
-                    format!("session-group-tab-attention-{session_id}"),
-                    self.strings().sidebar_needs_input,
-                    cx,
-                )
+            // The trailing slot is the sidebar's status column in miniature, and
+            // it now asks the same question the row does: the attention glyph
+            // while the Agent is parked on the user, the row's own mark while
+            // the session is working — and nothing at all once it has settled,
+            // exactly as the drawer's row reports its hour instead of an idle
+            // dot. The unread dot and the failure dot are the column's other
+            // lanes, so a single slot keeps their order: unread first, then the
+            // failure.
+            let status_mark: AnyElement = if let Some(mark) = sidebar_session_state_mark(
+                "session-group-tab",
+                session_id.as_str(),
+                display_state,
+                auto_continue_enabled,
+                has_unread_completion,
+                self.strings().sidebar_needs_input,
+                cx,
+            ) {
+                mark
             } else if has_unread_completion {
                 div()
                     .id(SharedString::from(format!(
@@ -44432,13 +44440,13 @@ impl VibexWorkbench {
                     .rounded_full()
                     .bg(cx.theme().primary)
                     .into_any_element()
+            } else if display_state == AgentSessionState::Error {
+                sidebar_status_dot(cx.theme().danger)
             } else {
-                session_status_mark_for(
-                    format!("session-group-tab-activity-{session_id}"),
-                    display_state,
-                    auto_continue_enabled,
-                    cx,
-                )
+                // A settled tab keeps the slot empty rather than drawing a dot:
+                // `session_status_mark_for` would answer `Idle` with one, which
+                // is the mark the row deliberately withholds.
+                div().into_any_element()
             };
             let selected = active_session_id.as_deref() == Some(session_id.as_str());
             let click_entity = cx.weak_entity();
@@ -47802,26 +47810,25 @@ impl VibexWorkbench {
         };
         // The compact mark every row shows for the session's own state: a light
         // pulse while the Agent works, the attention glyph while it is parked on
-        // the user, a dot for the states a dot can carry. A pinned row keeps it
-        // too, drawn in the lane left of the pin mark, so pinning a session
-        // never hides whether it is still working.
-        let status_mark = if awaiting_user {
-            Some(sidebar_attention_icon(
-                format!("{prefix}-attention-{session_id}"),
-                strings.sidebar_needs_input,
-                cx,
-            ))
-        } else if let Some(at_ms) = scheduled_at_ms {
+        // the user, a dot for the states a dot can carry — and nothing at all
+        // once it has settled. A pinned row keeps it too, drawn in the lane left
+        // of the pin mark, so pinning a session never hides whether it is still
+        // working.
+        //
+        // A queued send outranks that mark: the session is already waiting on
+        // the clock, and its countdown stands where the state's mark would.
+        let status_mark = if let Some(at_ms) = scheduled_at_ms {
             Some(self.render_scheduled_session_indicator(session_id.as_str(), at_ms, cx))
-        } else if !has_unread_completion && !has_error && display_state != AgentSessionState::Idle {
-            Some(session_status_mark_for(
-                format!("{prefix}-activity-{session_id}"),
+        } else {
+            sidebar_session_state_mark(
+                prefix,
+                session_id.as_str(),
                 display_state,
                 auto_continue_enabled,
+                has_unread_completion,
+                strings.sidebar_needs_input,
                 cx,
-            ))
-        } else {
-            None
+            )
         };
         // A row that is waiting for a send reads as the time left to wait; the
         // absolute deadline stays in the indicator's own tooltip, where there is
@@ -72090,6 +72097,48 @@ fn session_status_mark_for(
     }
 }
 
+/// Whether a session's state earns a mark at all, and which one.
+///
+/// [`session_status_mark_for`] answers *every* state with a mark, an idle one
+/// included. That is the wrong question for a lane: a session that simply
+/// finished is not reporting a state, it is reporting its hour, and a green dot
+/// beside it reads as news the row never meant to announce. The row has always
+/// applied that gate; the session-group tab used to skip it and wear the idle
+/// dot the drawer never draws.
+///
+/// Both lanes now resolve through this one function: the attention glyph while
+/// the Agent is parked on the user, the row's mark for a state that has one,
+/// and nothing once the session has settled. `None` also covers an unread
+/// completion and a failure, because those own their own marks in the column
+/// rather than sharing the activity lane.
+fn sidebar_session_state_mark(
+    prefix: &'static str,
+    session_id: &str,
+    display_state: AgentSessionState,
+    auto_continue_enabled: bool,
+    has_unread_completion: bool,
+    needs_input_tooltip: &'static str,
+    cx: &App,
+) -> Option<AnyElement> {
+    if display_state == AgentSessionState::NeedsInput {
+        return Some(sidebar_attention_icon(
+            format!("{prefix}-attention-{session_id}"),
+            needs_input_tooltip,
+            cx,
+        ));
+    }
+    let has_error = display_state == AgentSessionState::Error;
+    if has_unread_completion || has_error || display_state == AgentSessionState::Idle {
+        return None;
+    }
+    Some(session_status_mark_for(
+        format!("{prefix}-activity-{session_id}"),
+        display_state,
+        auto_continue_enabled,
+        cx,
+    ))
+}
+
 /// Projects the state a sidebar row shows.
 ///
 /// A locally dispatched turn is optimistic, so the row may show progress before
@@ -93315,7 +93364,7 @@ mod tests {
             .find("Some(self.render_scheduled_session_indicator(session_id.as_str(), at_ms, cx))")
             .expect("the column should render the scheduled indicator");
         let spinner = column
-            .find("Some(session_status_mark_for(")
+            .find("sidebar_session_state_mark(")
             .expect("the column should render the session state mark");
         assert!(mark < spinner);
     }
@@ -93928,11 +93977,21 @@ mod tests {
         );
         assert!(source.contains(".color(if auto_continue_enabled {"));
         assert!(source.contains("cx.theme().success"));
-        assert!(status_column.contains("let status_mark = if awaiting_user {"));
-        assert!(status_column.contains("sidebar_attention_icon("));
-        assert!(status_column.contains("strings.sidebar_needs_input"));
-        assert!(status_column.contains("!has_unread_completion"));
-        assert!(status_column.contains("display_state != AgentSessionState::Idle"));
+        // The column resolves its own state mark through the shared gate, which
+        // owns the attention arm, the unread and failure exclusions, and the
+        // rule that a settled session earns no mark.
+        assert!(status_column.contains("let status_mark = if let Some(at_ms) = scheduled_at_ms {"));
+        assert!(status_column.contains("sidebar_session_state_mark("));
+        let gate = source
+            .split_once("fn sidebar_session_state_mark(")
+            .and_then(|(_, tail)| tail.split_once("\n/// Projects the state a sidebar row shows."))
+            .map(|(body, _)| body)
+            .expect("the shared state gate should remain inspectable");
+        assert!(gate.contains("let has_error = display_state == AgentSessionState::Error"));
+        assert!(gate.contains("sidebar_attention_icon("));
+        assert!(gate.contains("needs_input_tooltip"));
+        assert!(gate.contains("has_unread_completion"));
+        assert!(gate.contains("display_state == AgentSessionState::Idle"));
         assert!(status_column.contains("!pinned && !awaiting_user && !generating"));
         assert!(status_column.contains("state_label.is_none()"));
         assert!(status_column.contains("|this| this.child(time_label)"));
@@ -93942,12 +94001,18 @@ mod tests {
         );
         assert!(status_column.contains("format!(\"{prefix}-status-{session_id}\")"));
         // Every mark the column mounts keeps an id scoped to the row that paints
-        // it: the debug selector, the paused icon, the attention glyph, the
-        // activity mark and the unread dot.
+        // it: the debug selector, the paused icon and the unread dot are the
+        // column's own, and the attention and activity marks take theirs from
+        // the gate, which scopes them by the same `prefix`.
         assert_eq!(
             status_column.matches("format!(\"{prefix}-").count(),
-            5,
-            "the column's ids should all be scoped to the row that paints them"
+            3,
+            "the column's own ids should all be scoped to the row that paints them"
+        );
+        assert_eq!(
+            gate.matches("format!(\"{prefix}-").count(),
+            2,
+            "the gate's attention and activity ids should be scoped too"
         );
         // The pin mark owns the trailing slot of the status column: a pinned
         // session reports its own state in the lane to the mark's left, and the
@@ -99640,9 +99705,9 @@ mod tests {
 
     /// A group tab is the sidebar row in a narrower lane.
     ///
-    /// The same running sweep on the title, and the row's own status mark on
-    /// the right — one projection and one mark builder, so the two surfaces
-    /// cannot drift into disagreeing about a session.
+    /// The same running sweep on the title, and the row's own status gate on the
+    /// right — one projection and one gate function, so the two surfaces cannot
+    /// drift into disagreeing about a session.
     #[test]
     fn session_group_tabs_carry_the_sidebar_running_cue_and_status_mark() {
         let source = include_str!("app.rs");
@@ -99655,8 +99720,14 @@ mod tests {
         assert!(pane.contains("ShimmerText::new(title.clone())"));
         assert!(pane.contains("TIMELINE_SHIMMER_SWEEP"));
         assert!(pane.contains("TIMELINE_SHIMMER_SPREAD"));
-        assert!(pane.contains("session_status_mark_for("));
-        assert!(pane.contains("sidebar_attention_icon("));
+        // The tab asks the row's gate rather than reaching for the mark builder,
+        // which answers every state: asking it directly is what made a settled
+        // tab wear the idle dot its row withholds.
+        assert!(pane.contains("sidebar_session_state_mark("));
+        assert!(
+            !pane.contains("session_status_mark_for("),
+            "the tab must take the row's gate, not the unconditional mark builder"
+        );
         // The tab resolves the row's state through the one projection, so the
         // optimistic dispatch and the parked requests reach it too.
         assert!(pane.contains("self.sidebar_session_row_state(session)"));
@@ -99672,17 +99743,39 @@ mod tests {
         assert!(projection.contains(".pending_user_request_ids"));
         assert!(projection.contains("sidebar_session_display_state(session.state,"));
 
+        // Both lanes resolve their mark through the same gate.
+        let gate = source
+            .split_once("fn sidebar_session_state_mark(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n/// Projects the state a sidebar row shows.")
+            })
+            .map(|(body, _)| body)
+            .expect("the shared state gate should remain inspectable");
+        assert!(gate.contains("display_state == AgentSessionState::NeedsInput"));
+        assert!(
+            gate.contains("display_state == AgentSessionState::Idle"),
+            "a settled session earns no mark on either surface"
+        );
+        assert!(gate.contains("session_status_mark_for("));
+        let column = source
+            .split_once("    fn render_sidebar_status_column(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_session("))
+            .map(|(body, _)| body)
+            .expect("the status column should remain inspectable");
+        assert!(
+            column.contains("sidebar_session_state_mark("),
+            "the row must keep resolving through the same gate"
+        );
+
         let mark = source
             .split_once("fn session_status_mark_for(")
-            .and_then(|(_, tail)| tail.split_once("\n/// Projects the state a sidebar row shows."))
+            .and_then(|(_, tail)| tail.split_once("\n/// Whether a session's state earns a mark at all"))
             .map(|(body, _)| body)
             .expect("the shared status mark should remain inspectable");
         assert!(mark.contains("ActivityIndicator::sidebar(id)"));
-        // The rows that list a session all draw it through the column builder,
-        // which is the only caller left of the mark.
-        assert!(source.contains(
-            "session_status_mark_for(\n                format!(\"{prefix}-activity-{session_id}\"),"
-        ));
+        // The gate is the mark builder's only caller, so neither lane can reach
+        // past it to draw a state the row deliberately withholds.
+        assert!(gate.contains("session_status_mark_for("));
         assert!(pane.contains("session-group-tab-title-{session_id}"));
     }
 
