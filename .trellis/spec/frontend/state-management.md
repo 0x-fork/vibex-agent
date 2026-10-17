@@ -280,6 +280,126 @@ let card = theme::semantic_color("card", cx.theme().is_dark());
 img(path).id("workbench-background-image").size_full();
 ```
 
+## Scenario: Mobile Wallpaper Background
+
+### 1. Scope / Trigger
+
+- Trigger: changing the phone's background image, the Appearance page's image
+  controls, how the phone fades its surfaces over an image, or the persisted
+  wallpaper preference in `apps/mobile/src/storage.rs`.
+
+### 2. Signatures
+
+```rust
+// apps/mobile/src/storage.rs
+AppSettings::background_image: BackgroundImageUiState // the desktop's own record
+
+// apps/mobile/src/background.rs
+import_picked(data_url: &str, data_dir: &Path) -> Result<String, String>
+resolve(data_dir: &Path, state: &BackgroundImageUiState) -> Option<PathBuf>
+wallpaper_layer(state: &BackgroundImageUiState, path: &Path, is_dark: bool) -> AnyElement
+wallpaper_veil(is_dark: bool, dim_percent: u16) -> Hsla
+
+// apps/mobile/src/theme.rs
+theme::set_wallpaper_backdrop(wallpaper: bool)
+theme::page_plate(is_dark: bool) -> Hsla
+
+// apps/mobile/src/attachment.rs
+attachment::launch_background_picker() -> BackendResult<()>
+attachment::subscribe_background_picker() -> UnboundedReceiver<BackgroundPickEvent>
+```
+
+### 3. Contracts
+
+- The phone stores the same `BackgroundImageUiState` the desktop persists — the
+  PNG/JPEG/WebP/GIF file name, the fit, and the veil — so one image and its
+  settings mean the same thing on either shell. The file name is the SHA-256 of
+  the bytes and the image lives under
+  `<app-data-dir>/backgrounds/<sha256>.<extension>`.
+- The Android host reads the picked item whole, at full resolution, and hands it
+  across as a `data:` URL; it never scales or re-encodes a wallpaper, because a
+  wallpaper is stored, not relayed. The importer sniffs the bytes rather than
+  trusting the MIME header, so a mislabelled pick cannot be stored under a name
+  that lies about its format.
+- Only a content-addressed name is honored. A traversal-like name, an absolute
+  path, or an unsupported extension is dropped on load and resolves to no image,
+  and a file that has gone missing degrades to the theme's color.
+- An unconfigured wallpaper serializes no `backgroundImage` key at all, so a
+  phone that has never set one keeps writing the smaller record it wrote before.
+- The image is the page's bottom layer: an opaque plate of the theme's page
+  color, the image, then the veil `dim_percent` mixes from that same color. The
+  plate is what a `Contain` fit's letterbox lands on.
+- While an image resolves, the theme's container roles fade on both paint paths:
+  the catalog accessors in `theme.rs` (`with_wallpaper`) and the kit bridge
+  through `vibex_ui::let_wallpaper_through`. The pass sets an alpha rather than
+  multiplying one, so it is idempotent. Ink, lines, status colors, and selection
+  plates keep the authored color; `bg_card_dim` skips its opaque flattening so a
+  nested row cannot bake the page color back in over the image.
+- A cancelled pick reports nothing on the wallpaper channel, so the Appearance
+  page clears its in-flight flag from the window-activation observer instead:
+  the picker is another Activity, so its return is the only signal that says the
+  trip ended. Without that, one cancellation would leave the row refusing taps.
+- The image element carries an id, because an animated GIF's frame cursor lives
+  in that element's state; the loop is the framework's own gate on window
+  activity and reduced motion. The settings thumbnail keeps no cursor, so a
+  preview stays a still.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Picked item is not a decodable PNG/JPEG/WebP/GIF | Reject with a localized hint; store nothing |
+| Picked image exceeds 32 MiB or 40 million pixels | Reject before it is written |
+| Base64 payload exceeds the byte ceiling | Reject before decoding |
+| Wallpaper directory or rename fails | Keep the previous wallpaper and report failure |
+| Stored name is not `<64 lowercase hex>.<supported extension>` | Drop it on load; paint the theme color |
+| Stored file is missing | Paint the theme color |
+| User cancels the picker | Keep the current wallpaper, report no error |
+| Picker is already out | Ignore the second request |
+
+### 5. Good/Base/Bad Cases
+
+- Good: pick a 4K JPEG on the Appearance page, see it stored once under its
+  content hash, painted behind translucent surfaces in both appearances, and
+  restored after a restart; cycle the fit and the veil and watch the page follow.
+- Base: a settings file written before the feature loads with no image and the
+  theme owns the page; removing the image clears only the preference and leaves
+  the managed file in place.
+- Bad: persist the picked external URI, store the bytes in the settings JSON,
+  scale a wallpaper on the way in, trust the MIME header over the bytes, or leave
+  a cancelled pick marking the picker busy for the life of the process.
+
+### 6. Tests Required
+
+- `apps/mobile/src/background.rs` covers the content-addressed name and reuse,
+  rejection of non-images and malformed data URLs, resolution for a traversal
+  name and a deleted file, and the unconfigured case.
+- `apps/mobile/src/storage.rs` covers the settings round trip, the bounds
+  normalization of a hand-edited record, and a pre-feature file loading with no
+  image.
+- Run `cargo test -p vibex-mobile --locked`, `cargo clippy -p vibex-mobile
+  --all-targets --locked`, and `cargo fmt -p vibex-mobile -- --check`.
+
+### 7. Wrong vs Correct
+
+```rust
+// Wrong: the picked URI can move and the desktop cannot read the phone's home.
+app_settings.background_image.file = Some(picked.uri);
+
+// Wrong: an opaque flatten hides the image behind every nested row.
+fn bg_card_dim() -> Hsla { opaque("secondary", "background") }
+
+// Wrong: decoding and writing a 30 MB wallpaper on the frame thread.
+let name = background::import_picked(&data_url, dir)?;
+
+// Correct: store the original bytes under their hash, resolve a managed name,
+// and paint the image over the page's authored plate.
+let name = background::import_picked(&data_url, data_dir)?;
+app_settings.background_image.file = Some(name);
+let path = background::resolve(data_dir, &app_settings.background_image);
+img(path).id("mobile-background-image").size_full();
+```
+
 ## Scenario: Native First-Launch Locale
 
 ### 1. Scope / Trigger

@@ -205,6 +205,53 @@ fn tone(name: &str) -> Hsla {
     semantic_color(name, is_dark())
 }
 
+/// Whether a user wallpaper is painted behind the page's surfaces.
+///
+/// The theme's container roles fade while it is, so the image shows through,
+/// and the page's own fill turns translucent with them. Kept beside the
+/// semantics because that fade is a property of the palette, not of one page:
+/// every accessor below reads it, so the whole client fades as one surface.
+static WALLPAPER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records whether the page is painting a wallpaper behind its surfaces.
+///
+/// Called by the appearance pass once the configured image resolves, exactly as
+/// the desktop publishes its `Backdrop`. The theme is process-wide, so every
+/// frame reads the same answer.
+pub fn set_wallpaper_backdrop(wallpaper: bool) {
+    WALLPAPER.store(wallpaper, Ordering::Relaxed);
+}
+
+pub fn wallpaper_backdrop() -> bool {
+    WALLPAPER.load(Ordering::Relaxed)
+}
+
+/// A container role as the wallpaper policy resolves it, or the authored color
+/// when no image is behind it.
+///
+/// This is the phone's version of the desktop's `theme::semantic_color`: a
+/// container comes back with the alpha its tier takes, and every other role —
+/// ink, lines, status colors, selection plates — is exactly what the palette
+/// authored.
+fn with_wallpaper(name: &str, color: Hsla) -> Hsla {
+    if wallpaper_backdrop()
+        && let Some(alpha) = vibex_ui::wallpaper_surface_alpha(name, is_dark())
+    {
+        return color.alpha(alpha);
+    }
+    color
+}
+
+/// The authored page color at full opacity.
+///
+/// A wallpaper fades the theme's containers so the image shows through, which
+/// leaves the page translucent — and a `Contain` fit's letterbox would then show
+/// the window's plate instead of the page. The wallpaper layer paints this
+/// underneath, and the veil over the image is mixed from it.
+pub fn page_plate(is_dark: bool) -> Hsla {
+    semantic_color("background", is_dark).alpha(1.0)
+}
+
 // ---------------------------------------------------------------------------
 // Palette (dark values kept as the legacy fallback contract for tests)
 // ---------------------------------------------------------------------------
@@ -840,21 +887,27 @@ pub const SHEET_PULL_TAP_GUARD_MS: u64 = 200;
 // ---------------------------------------------------------------------------
 
 pub fn bg_primary() -> Hsla {
-    tone("background")
+    with_wallpaper("background", tone("background"))
 }
 
 pub fn bg_card() -> Hsla {
-    tone("card")
+    with_wallpaper("card", tone("card"))
 }
 
 pub fn bg_card_dim() -> Hsla {
     // Dense lists need the dimmed fill flattened over the page background so
-    // nested rows keep one consistent contrast step in both appearances.
+    // nested rows keep one consistent contrast step in both appearances. A
+    // wallpaper turns that plate into glass like the card it sits on, so the
+    // flattening is skipped: flattening would bake the page color back in and
+    // hide the image behind every nested row.
+    if wallpaper_backdrop() {
+        return with_wallpaper("secondary", tone("secondary"));
+    }
     opaque("secondary", "background")
 }
 
 pub fn bg_popover() -> Hsla {
-    tone("popover")
+    with_wallpaper("popover", tone("popover"))
 }
 
 pub fn text_primary() -> Hsla {
@@ -1013,14 +1066,17 @@ pub fn workbench_bg() -> Hsla {
 }
 
 pub fn workbench_panel_bg() -> Hsla {
-    tone("card")
+    with_wallpaper("card", tone("card"))
 }
 
 pub fn sidebar_bg() -> Hsla {
-    tone("sidebar")
+    with_wallpaper("sidebar", tone("sidebar"))
 }
 
 pub fn sidebar_selected_bg() -> Hsla {
+    // A selected row is a plate, not a container, so it keeps the authored
+    // color while the drawer behind it becomes glass: a row that faded here
+    // would read as a hole in a list instead of as the one that is chosen.
     opaque("sidebar-accent", "sidebar")
 }
 
@@ -1091,7 +1147,7 @@ pub fn switch_track_on() -> Hsla {
 
 /// The switch track when it is off.
 pub fn switch_track_off() -> Hsla {
-    opaque("muted", "card")
+    with_wallpaper("muted", opaque("muted", "card"))
 }
 
 /// The switch knob: the surface colour, so it reads as a hole in the track.
@@ -1130,7 +1186,11 @@ pub fn apply_component_theme(window: Option<&mut Window>, cx: &mut App) {
         cx,
     );
 
-    let token = |name: &str| semantic_color(name, dark);
+    // The kit reads these roles directly for its own plates, so the wallpaper
+    // policy has to be applied on the way through as well as to the catalog
+    // accessors above: one helper, so a container cannot fade on one path and
+    // stay authored on the other.
+    let token = |name: &str| with_wallpaper(name, semantic_color(name, dark));
     Theme::update(cx, |theme| {
         // The kit's base is the same rem the ladder is written against, so a
         // kit control and the hand-built row beside it resolve to one scale.
@@ -1220,6 +1280,14 @@ pub fn apply_component_theme(window: Option<&mut Window>, cx: &mut App) {
         // result to the base layer that owns scrollbars, resize handles, and text
         // view defaults, and refreshes every window.
         vibex_ui::apply_component_palette(theme, active_theme(model_mode(dark)));
+        // A wallpaper is painted behind the page, so the kit's own container
+        // roles — sheets, popovers, list and table plates — have to let it
+        // through. The pass runs after the palette bridge, which derives some
+        // of those roles from the ones above. It sets an alpha rather than
+        // multiplying one, so a second pass lands on the same colors.
+        if wallpaper_backdrop() {
+            vibex_ui::let_wallpaper_through(theme, dark);
+        }
     });
 }
 

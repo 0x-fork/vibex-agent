@@ -88,10 +88,19 @@ public final class GpuiHostActivity extends Activity {
     private static final int PICK_IMAGE_REQUEST = 4104;
     private static final int PICK_FILE_REQUEST = 4105;
     private static final int CAPTURE_PHOTO_REQUEST = 4106;
+    private static final int PICK_BACKGROUND_REQUEST = 4107;
     /** The longest side a picked image is scaled down to before it is encoded. */
     private static final int ATTACHMENT_MAX_EDGE = 2048;
     /** The encoded attachment budget; a phone photograph has to fit the relay. */
     private static final int ATTACHMENT_MAX_BYTES = 6 * 1024 * 1024;
+    /**
+     * The budget for a wallpaper, which is carried at full resolution.
+     *
+     * A wallpaper is not relayed and never re-encoded on the way in — the phone
+     * keeps the original bytes, exactly as the desktop does — so the ceiling is
+     * the importer's own 32 MiB rather than a wire budget.
+     */
+    private static final int BACKGROUND_IMAGE_MAX_BYTES = 32 * 1024 * 1024;
     /**
      * The budget for a picked file, which is carried whole rather than scaled.
      * It is the same wire the relay already carries a photograph over.
@@ -181,6 +190,9 @@ public final class GpuiHostActivity extends Activity {
     private static native void nativeOnUpdateNotificationActivated();
     private static native void nativeOnAttachmentPicked(String label, String mimeType, String dataUrl);
     private static native void nativeOnAttachmentPickFailed(String message);
+    /** One picked wallpaper, at full resolution, as a data URL. */
+    private static native void nativeOnBackgroundImagePicked(String dataUrl);
+    private static native void nativeOnBackgroundImagePickFailed(String message);
     /** Text shared into Vibex from another app, which lands in the composer. */
     private static native void nativeOnSharedText(String text);
     /** A launcher shortcut was used: open a new session instead of restoring. */
@@ -311,6 +323,25 @@ public final class GpuiHostActivity extends Activity {
     }
 
     /**
+     * Opens the system picker for one image to keep as the page's background.
+     *
+     * The composer's image path scales a photograph to what the relay carries;
+     * a wallpaper is never sent anywhere, so its bytes are read whole and
+     * stored as they are — the desktop keeps its wallpapers the same way, and a
+     * resize on the way in would be the only generation loss in the feature.
+     */
+    public void gpuiPickBackgroundImage() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("image/*");
+        try {
+            startActivityForResult(intent, PICK_BACKGROUND_REQUEST);
+        } catch (ActivityNotFoundException error) {
+            nativeOnBackgroundImagePickFailed("No file picker is available on this device");
+        }
+    }
+
+    /**
      * Opens the system picker for any one file to attach to the composer.
      *
      * The image path scales a photograph down; this one carries the bytes as
@@ -375,6 +406,16 @@ public final class GpuiHostActivity extends Activity {
             return;
         }
         boolean image = requestCode == PICK_IMAGE_REQUEST;
+        if (requestCode == PICK_BACKGROUND_REQUEST) {
+            Uri uri = (resultCode == RESULT_OK && data != null) ? data.getData() : null;
+            if (uri == null) {
+                // A cancelled pick is not a failure: the current wallpaper
+                // stays, and nothing is reported.
+                return;
+            }
+            reportBackgroundImage(uri);
+            return;
+        }
         if (!image && requestCode != PICK_FILE_REQUEST) {
             return;
         }
@@ -385,6 +426,54 @@ public final class GpuiHostActivity extends Activity {
             return;
         }
         reportAttachment(uri, image, image ? "image" : "file");
+    }
+
+    /**
+     * Reads one picked wallpaper whole and reports it to the appearance page.
+     *
+     * The bytes are not scaled: the phone stores the original file, exactly as
+     * the desktop's importer does, so the stored name and the painted image are
+     * the same image the reader chose. Reading a large photograph still takes
+     * long enough to drop frames, so it runs off the UI thread and reports back
+     * through the Activity's own thread.
+     */
+    private void reportBackgroundImage(Uri uri) {
+        new Thread(() -> {
+            try {
+                byte[] encoded = readBackgroundImage(uri);
+                String mimeType = getContentResolver().getType(uri);
+                if (mimeType == null || mimeType.isBlank() || !mimeType.startsWith("image/")) {
+                    mimeType = "application/octet-stream";
+                }
+                String dataUrl = "data:" + mimeType + ";base64,"
+                        + Base64.encodeToString(encoded, Base64.NO_WRAP);
+                runOnUiThread(() -> nativeOnBackgroundImagePicked(dataUrl));
+            } catch (Exception error) {
+                runOnUiThread(() -> nativeOnBackgroundImagePickFailed(
+                        "The picked image could not be read"));
+            }
+        }).start();
+    }
+
+    /** Reads one picked wallpaper whole, up to the importer's own ceiling. */
+    private byte[] readBackgroundImage(Uri uri) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[64 * 1024];
+        long total = 0;
+        try (InputStream stream = getContentResolver().openInputStream(uri)) {
+            if (stream == null) {
+                throw new IllegalStateException("the picked image cannot be opened");
+            }
+            int read;
+            while ((read = stream.read(buffer)) > 0) {
+                total += read;
+                if (total > BACKGROUND_IMAGE_MAX_BYTES) {
+                    throw new IllegalStateException("the picked image is too large");
+                }
+                out.write(buffer, 0, read);
+            }
+        }
+        return out.toByteArray();
     }
 
     /**
