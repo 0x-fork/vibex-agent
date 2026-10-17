@@ -29,6 +29,13 @@
 //!
 //! `--ansi` emits real SGR codes instead of plain text, which is the only way
 //! to review the rails and background bands from a pipeline.
+//!
+//! `--locale zh-CN` draws the interface in one of the shipped languages, so a
+//! translation can be reviewed in the grid that has to hold it: Chinese copy is
+//! twice as wide per character, and a label that no longer fits is a layout
+//! bug, not a translation one. The tags are the client's own (`en`, `zh-CN`,
+//! `zh-TW`), and the sample conversation stays in English — it is the reader's
+//! data, not the client's copy.
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -55,6 +62,7 @@ fn main() {
     let mut paste = false;
     let mut image = false;
     let mut phase = 0u32;
+    let mut locale = Locale::En;
     let mut numbers = Vec::new();
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -80,6 +88,12 @@ fn main() {
                     .next()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(0);
+            }
+            // The language the product copy is drawn in, resolved the way the
+            // client resolves a system locale: a Chinese tag picks its script,
+            // anything else reads as English.
+            "--locale" => {
+                locale = Locale::from_system_tag(arguments.next().as_deref());
             }
             other => {
                 if let Ok(value) = other.parse::<u16>() {
@@ -109,7 +123,7 @@ fn main() {
             } else {
                 vibex_ui::GpuiThemeMode::Dark
             },
-            locale: Locale::En,
+            locale,
             // A preview must not leave state behind.
             sidebar_path: None,
             runtime_path: None,

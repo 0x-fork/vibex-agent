@@ -1033,7 +1033,14 @@ cargo run -p vibex-tui --example preview -- 120 34 --settings
 cargo run -p vibex-tui --example preview -- 120 34 --welcome
 cargo run -p vibex-tui --example preview -- 100 30 --new
 cargo run -p vibex-tui --example preview -- 100 30 --new --glitch --phase 2
+cargo run -p vibex-tui --example preview -- 120 34 --locale zh-CN
 ```
+
+`--locale` draws the interface in one of the shipped languages (`en`, `zh-CN`,
+`zh-TW`), which is how a translation is reviewed in the grid that has to hold
+it: Chinese copy is twice as wide per character, so a label that no longer fits
+is a layout bug rather than a translation one. The sample conversation stays
+English — it is the reader's data, not the client's copy.
 
 `--new` draws the composing page, and `--glitch` swaps the mark it opens on for
 the torn one. `--phase` holds the animation clock on one frame, which is the
