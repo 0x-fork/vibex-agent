@@ -236,6 +236,7 @@ impl MobileApp {
             .child(self.render_overlay_header(
                 "mobile-team",
                 locale::text("Team", "团队", "團隊"),
+                theme::font_heading(),
                 Some(refresh),
                 cx,
             ))

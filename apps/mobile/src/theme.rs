@@ -454,8 +454,11 @@ pub fn line_height_for(font: f32) -> Rems {
 pub const ICON_MD: f32 = 18.0;
 pub const ICON_SM: f32 = 16.0;
 pub const ICON_STATUS: f32 = 6.0;
-/// The plate behind a settings row's glyph.
-pub const ICON_SLOT: f32 = 34.0;
+/// The column a settings row's glyph is drawn in.
+///
+/// The slot is wider than [`ICON_MD`] itself so every title on a page starts
+/// on one vertical rule, whatever the glyph in front of it turns out to be.
+pub const ICON_SLOT: f32 = 24.0;
 /// The Agent mark inside the new-session page's sentence.
 ///
 /// The sentence is set at [`FONT_TITLE`], and the mark stands in the line
@@ -467,8 +470,11 @@ pub const ICON_SLOT: f32 = 34.0;
 /// scale when the reader moves the text-size step.
 pub const NEW_SESSION_AGENT_LOGO_SIZE: f32 = FONT_TITLE + 6.0;
 /// A settings row is title + detail, so it is taller than a single-line list
-/// row while staying a single touch target.
-pub const SETTINGS_ROW_HEIGHT: f32 = 60.0;
+/// row while staying a single touch target. It stops just past
+/// [`TOUCH_TARGET`] on purpose: a settings page is read by scanning down the
+/// column of titles, and a row that keeps growing past its content turns that
+/// scan into a walk.
+pub const SETTINGS_ROW_HEIGHT: f32 = 56.0;
 
 // ---------------------------------------------------------------------------
 // Layout

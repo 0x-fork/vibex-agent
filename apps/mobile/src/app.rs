@@ -2403,9 +2403,15 @@ fn theme_selection_id(selection: &ThemeSelection, dark: bool) -> Option<&str> {
 // ---------------------------------------------------------------------------
 // Settings row primitives
 //
-// Every settings surface is built from these four rows, so a reader learns one
-// row shape instead of the six the flat list used to mix. A row that opens a
-// page always shows a chevron; a row that only reports never does.
+// Every settings surface is built from these rows, so a reader learns one row
+// shape instead of the six the flat list used to mix. A row that opens a page
+// always shows a chevron; a row that only reports never does.
+//
+// A group is a list, not a card. Rows sit straight on the page and are
+// separated by one inset hairline; nothing on a settings page is boxed, and
+// nothing but a warning carries a colour of its own. What a reader scans down
+// is the column of titles, so the page spends its contrast on those rather
+// than on the furniture around them.
 // ---------------------------------------------------------------------------
 
 /// The switch a settings row ends with. The track fades toward the primary
@@ -2446,52 +2452,77 @@ fn settings_toggle(value: bool) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// A titled group of rows. The rows inside share one plate and are separated by
-/// inset dividers instead of each carrying its own border.
+/// A titled group of rows.
+///
+/// The title is quiet on purpose — small, medium weight, muted — because it
+/// names a band of the page rather than a thing on it, and it lines up with
+/// the row content under it so the page has one left edge, not two. An empty
+/// title draws no header at all, which is how a stack that belongs under a
+/// heading someone else already wrote still gets the same separators.
 fn settings_group(
     title: impl Into<gpui::SharedString>,
     rows: Vec<gpui::AnyElement>,
 ) -> gpui::AnyElement {
+    let title = title.into();
+    let has_title = !title.is_empty();
+    let mut body: Vec<gpui::AnyElement> = Vec::with_capacity(rows.len() * 2);
+    for (index, row) in rows.into_iter().enumerate() {
+        if index > 0 {
+            body.push(settings_row_divider());
+        }
+        body.push(row);
+    }
     div()
         .w_full()
-        .mb(px(theme::SPACING_LG))
+        .mb(px(theme::SPACING_XL))
         .flex()
         .flex_col()
-        .child(
-            div()
-                .px(px(theme::SPACING_XS))
-                .pb(px(theme::SPACING_SM))
-                .text_size(theme::font_caption())
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme::text_muted())
-                .child(title.into()),
-        )
-        .child(
-            div()
-                .w_full()
-                .rounded(px(theme::RADIUS_CARD))
-                .border_1()
-                .border_color(theme::border_subtle())
-                .bg(theme::bg_card())
-                .overflow_hidden()
-                .flex()
-                .flex_col()
-                .children(rows),
-        )
+        .when(has_title, |group| {
+            group.child(
+                div()
+                    .px(px(theme::SPACING_MD))
+                    .pb(px(theme::SPACING_SM))
+                    .text_size(theme::font_micro())
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::text_muted())
+                    .child(title),
+            )
+        })
+        .child(div().w_full().flex().flex_col().children(body))
+        .into_any_element()
+}
+
+/// The hairline between two rows of one group.
+///
+/// Inset to the column the rows' own content starts on, and to nothing else:
+/// a separator that ran the full width of the page would read as a wall the
+/// reader has to cross rather than as one list running on.
+fn settings_row_divider() -> gpui::AnyElement {
+    div()
+        .h(px(1.0))
+        .mx(px(theme::SPACING_MD))
+        .bg(theme::border_subtle())
         .into_any_element()
 }
 
 /// The leading glyph slot every settings row shares.
-fn settings_row_icon(path: &'static str, accent: gpui::Hsla) -> gpui::AnyElement {
+///
+/// The glyph is left in the foreground's own tone. A settings list is a set of
+/// destinations, not a legend; a colour per row paints a rainbow that says
+/// nothing about where any row goes. A row whose *state* is coloured — a
+/// runtime that is connected, a warning — passes that one colour in, and it is
+/// then the only colour on the page.
+///
+/// The glyph is drawn flush to the slot's leading edge so that it, the group's
+/// title and the dividers between the rows all stand on one vertical rule.
+fn settings_row_icon(path: &'static str, tint: gpui::Hsla) -> gpui::AnyElement {
     div()
         .size(px(theme::ICON_SLOT))
         .flex_shrink_0()
-        .rounded(px(theme::RADIUS_CONTROL))
-        .bg(accent.opacity(0.14))
         .flex()
         .items_center()
-        .justify_center()
-        .child(svg().path(path).size(px(theme::ICON_SM)).text_color(accent))
+        .justify_start()
+        .child(svg().path(path).size(px(theme::ICON_MD)).text_color(tint))
         .into_any_element()
 }
 
@@ -2541,8 +2572,6 @@ fn settings_row_frame(id: &'static str) -> gpui::Stateful<gpui::Div> {
         .flex()
         .items_center()
         .gap(px(theme::SPACING_MD))
-        .border_b_1()
-        .border_color(theme::border_subtle())
 }
 
 /// A row that opens a page or runs an action.
@@ -2551,14 +2580,14 @@ fn settings_nav_row(
     icon: &'static str,
     title: String,
     detail: String,
-    accent: gpui::Hsla,
+    tint: gpui::Hsla,
     handler: impl Fn(&gpui::MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> gpui::AnyElement {
     settings_row_frame(id)
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
         .on_mouse_up(MouseButton::Left, handler)
-        .child(settings_row_icon(icon, accent))
+        .child(settings_row_icon(icon, tint))
         .child(settings_row_labels(title, detail))
         .child(
             svg()
@@ -2575,10 +2604,10 @@ fn settings_value_row(
     icon: &'static str,
     title: String,
     detail: String,
-    accent: gpui::Hsla,
+    tint: gpui::Hsla,
 ) -> gpui::AnyElement {
     settings_row_frame(id)
-        .child(settings_row_icon(icon, accent))
+        .child(settings_row_icon(icon, tint))
         .child(settings_row_labels(title, detail))
         .into_any_element()
 }
@@ -2594,14 +2623,7 @@ fn settings_switch_row(
     handler: impl Fn(&gpui::MouseUpEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> gpui::AnyElement {
     let frame = settings_row_frame(id)
-        .child(settings_row_icon(
-            icon,
-            if value {
-                theme::primary()
-            } else {
-                theme::text_muted()
-            },
-        ))
+        .child(settings_row_icon(icon, theme::text_secondary()))
         .child(settings_row_labels(title, detail))
         .child(settings_toggle(value));
     if enabled {
@@ -2616,6 +2638,11 @@ fn settings_switch_row(
 }
 
 /// A destructive row, visually separated from the rest of its page.
+///
+/// The one row on a settings page that is allowed a colour, and it is given as
+/// a wash rather than an outline: a red border draws a box around nothing the
+/// reader can act on yet, while the tint says which row is the dangerous one
+/// without making the page look broken.
 fn settings_danger_note(
     id: &'static str,
     title: &'static str,
@@ -2627,10 +2654,9 @@ fn settings_danger_note(
         .debug_selector(|| "mobile-settings-disconnect".to_string())
         .w_full()
         .min_h(px(theme::TOUCH_TARGET))
-        .mb(px(theme::SPACING_LG))
+        .mb(px(theme::SPACING_MD))
         .rounded(px(theme::RADIUS_CARD))
-        .border_1()
-        .border_color(theme::accent_red().opacity(0.55))
+        .bg(theme::accent_red().opacity(0.09))
         .px(px(theme::SPACING_MD))
         .py(px(theme::SPACING_SM))
         .flex()
@@ -2638,7 +2664,7 @@ fn settings_danger_note(
         .justify_center()
         .gap(px(2.0))
         .cursor_pointer()
-        .active(|style| style.bg(theme::row_pressed_bg()))
+        .active(|style| style.bg(theme::accent_red().opacity(0.16)))
         .on_mouse_up(MouseButton::Left, handler)
         .child(
             div()
@@ -3045,10 +3071,12 @@ fn composer_primary_button(
         })
 }
 
+/// The trailing prose of a settings page: one sentence about the rows above
+/// it, set in the same quiet tone as a row's detail and lined up with them.
 fn settings_hint_note(text: &'static str) -> gpui::AnyElement {
     div()
         .w_full()
-        .px(px(theme::SPACING_XS))
+        .px(px(theme::SPACING_MD))
         .pb(px(theme::SPACING_LG))
         .text_size(theme::font_micro())
         .text_color(theme::text_muted())
@@ -3060,7 +3088,7 @@ fn settings_empty_note(text: &'static str) -> gpui::AnyElement {
     div()
         .w_full()
         .py(px(theme::SPACING_XL))
-        .px(px(theme::SPACING_XS))
+        .px(px(theme::SPACING_MD))
         .text_size(theme::font_detail())
         .text_color(theme::text_muted())
         .child(text)
@@ -24942,10 +24970,16 @@ impl MobileApp {
 }
 
 impl MobileApp {
+    /// The bar that names an overlay page.
+    ///
+    /// `title_size` is the caller's: a page that is a list of things the reader
+    /// picks between — Settings — sets its name above the rows it holds, while
+    /// a page that is itself one question keeps the workbench's heading size.
     fn render_overlay_header(
         &self,
         id: &'static str,
         title: &'static str,
+        title_size: gpui::Rems,
         trailing: Option<gpui::AnyElement>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -24981,7 +25015,11 @@ impl MobileApp {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(theme::font_heading())
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(title_size)
+                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::text_primary())
                     .child(locale::common(title)),
             )
@@ -25435,7 +25473,13 @@ impl MobileApp {
             .block_mouse_except_scroll()
             .flex()
             .flex_col()
-            .child(self.render_overlay_header("mobile-host-detail", "Runtime details", None, cx))
+            .child(self.render_overlay_header(
+                "mobile-host-detail",
+                "Runtime details",
+                theme::font_heading(),
+                None,
+                cx,
+            ))
             .child(
                 div()
                     .id("mobile-host-detail-scroll")
@@ -25808,58 +25852,36 @@ fn settings_info_row(
     icon: &'static str,
     title: String,
     detail: String,
-    accent: gpui::Hsla,
+    tint: gpui::Hsla,
 ) -> gpui::AnyElement {
-    settings_info_row_base(id, icon, title, detail, accent).into_any_element()
+    settings_info_row_base(id, icon, title, detail, tint).into_any_element()
 }
 
+/// A settings row that reports rather than navigates, and whose title is not a
+/// destination: the version, the state of the last update check.
+///
+/// It is the same shape as the rows of a group — same height, same glyph
+/// column, same two lines — so a page that stacks one above a group reads as a
+/// single list rather than a list with a box on top. Callers that stack several
+/// put them through [`settings_group`], which is what draws the separators.
 fn settings_info_row_base(
     id: &'static str,
     icon: &'static str,
     title: String,
     detail: String,
-    accent: gpui::Hsla,
+    tint: gpui::Hsla,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .w_full()
-        .min_h(px(theme::TOUCH_TARGET))
-        .mb(px(theme::SPACING_XS))
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme::border_subtle())
-        .bg(theme::bg_card_dim())
+        .min_h(px(theme::SETTINGS_ROW_HEIGHT))
         .px(px(theme::SPACING_MD))
+        .py(px(theme::SPACING_SM))
         .flex()
         .items_center()
-        .gap(px(theme::SPACING_SM))
-        .child(svg().path(icon).size(px(theme::ICON_SM)).text_color(accent))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap(px(1.0))
-                .child(
-                    div()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .text_size(theme::font_body())
-                        .text_color(theme::text_secondary())
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .text_size(theme::font_micro())
-                        .text_color(theme::text_muted())
-                        .child(detail),
-                ),
-        )
+        .gap(px(theme::SPACING_MD))
+        .child(settings_row_icon(icon, tint))
+        .child(settings_row_labels(title, detail))
 }
 
 /// One action inside the update card.
@@ -27500,7 +27522,13 @@ impl MobileApp {
             .block_mouse_except_scroll()
             .flex()
             .flex_col()
-            .child(self.render_overlay_header("mobile-new-session", "New session", None, cx))
+            .child(self.render_overlay_header(
+                "mobile-new-session",
+                "New session",
+                theme::font_heading(),
+                None,
+                cx,
+            ))
             .child(
                 div()
                     .flex_1()
@@ -27980,7 +28008,13 @@ impl MobileApp {
             .block_mouse_except_scroll()
             .flex()
             .flex_col()
-            .child(self.render_overlay_header("mobile-new-project", "New project", None, cx))
+            .child(self.render_overlay_header(
+                "mobile-new-project",
+                "New project",
+                theme::font_heading(),
+                None,
+                cx,
+            ))
             .child(
                 div()
                     .flex_1()
@@ -28069,7 +28103,7 @@ impl MobileApp {
             setting.row_icon(),
             locale::common(setting.row_title()).to_string(),
             detail,
-            theme::text_muted(),
+            theme::text_secondary(),
         )
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
@@ -28096,7 +28130,7 @@ impl MobileApp {
                 timeline_reasoning_mode_label(mode),
                 timeline_setting_source_label(overridden),
             ),
-            theme::accent_purple(),
+            theme::text_secondary(),
         )
         .cursor_pointer()
         .active(|style| style.bg(theme::row_pressed_bg()))
@@ -28299,7 +28333,7 @@ impl MobileApp {
                 "brand/logo.svg",
                 locale::common("Version").to_string(),
                 update::installed_version(),
-                theme::text_muted(),
+                theme::text_secondary(),
             )
             .debug_selector(|| "mobile-settings-version".to_string())
             .into_any_element()
@@ -28313,20 +28347,19 @@ impl MobileApp {
             // A build without the release verification key cannot check, but the
             // section still says so: an empty About is indistinguishable from a
             // missing feature.
-            return div()
-                .flex()
-                .flex_col()
-                .child(version_row())
-                .child(self.render_update_status_row(None, cx))
-                .into_any_element();
+            return settings_group(
+                "",
+                vec![version_row(), self.render_update_status_row(None, cx)],
+            );
         };
         let Some(card) = update_card_model(&snapshot.state) else {
-            return div()
-                .flex()
-                .flex_col()
-                .child(version_row())
-                .child(self.render_update_status_row(Some(&snapshot.state), cx))
-                .into_any_element();
+            return settings_group(
+                "",
+                vec![
+                    version_row(),
+                    self.render_update_status_row(Some(&snapshot.state), cx),
+                ],
+            );
         };
         div()
             .flex()
@@ -28349,7 +28382,7 @@ impl MobileApp {
     ) -> gpui::AnyElement {
         let accent = match state {
             Some(UpdateState::Error { .. }) => theme::accent_red(),
-            _ => theme::text_muted(),
+            _ => theme::text_secondary(),
         };
         let row = settings_info_row_base(
             "mobile-settings-update-check",
@@ -28430,16 +28463,15 @@ impl MobileApp {
             .id("mobile-settings-update-card")
             .debug_selector(|| "mobile-settings-update-card".to_string())
             .w_full()
-            .mb(px(theme::SPACING_XS))
-            .rounded(px(theme::RADIUS_CONTROL))
-            .border_1()
-            .border_color(theme::border_subtle())
+            .mt(px(theme::SPACING_SM))
+            .mb(px(theme::SPACING_MD))
+            .rounded(px(theme::RADIUS_CARD))
             .bg(theme::bg_card_dim())
             .px(px(theme::SPACING_MD))
-            .py(px(theme::SPACING_SM))
+            .py(px(theme::SPACING_MD))
             .flex()
             .flex_col()
-            .gap(px(theme::SPACING_SM))
+            .gap(px(theme::SPACING_MD))
             .child(
                 div()
                     .flex()
@@ -28503,7 +28535,13 @@ impl MobileApp {
             .flex()
             .flex_col()
             .child(if page == SettingsPage::Root {
-                self.render_overlay_header("mobile-settings", page.title(), None, cx)
+                self.render_overlay_header(
+                    "mobile-settings",
+                    page.title(),
+                    theme::font_title(),
+                    None,
+                    cx,
+                )
             } else {
                 self.render_settings_page_header(page, cx)
             })
@@ -28517,7 +28555,8 @@ impl MobileApp {
                     .restrict_scroll_to_axis()
                     .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
                     .px(px(theme::SPACING_LG))
-                    .py(px(theme::SPACING_MD))
+                    .pt(px(theme::SPACING_LG))
+                    .pb(px(theme::SPACING_LG))
                     .children(match page {
                         SettingsPage::Root => self.render_settings_root(cx),
                         SettingsPage::Connection => self.render_settings_connection(cx),
@@ -28535,33 +28574,38 @@ impl MobileApp {
 
     /// A sub-page's header: the same back chevron the rest of the app uses,
     /// then the topic's own name.
+    ///
+    /// It is the root's header with the back chevron retargeted one level in —
+    /// same height, same glyph size, same page-name type — so stepping into a
+    /// topic moves the page under the header rather than rebuilding the header
+    /// around it.
     fn render_settings_page_header(
         &self,
         page: SettingsPage,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         div()
-            .h(px(theme::HEADER_HEIGHT))
+            .h(px(theme::DRAWER_HEADER_HEIGHT))
             .flex_shrink_0()
             .border_b_1()
             .border_color(theme::border_subtle())
-            .px(px(theme::SPACING_XS))
+            .px(px(theme::SPACING_LG))
             .flex()
             .items_center()
-            .gap(px(theme::SPACING_XS))
+            .gap(px(theme::SPACING_SM))
             .child(
                 div()
                     .id("mobile-settings-back")
                     .debug_selector(|| "mobile-settings-back".to_string())
                     .size(px(theme::HEADER_BUTTON_SIZE))
+                    .ml(px(-theme::SPACING_SM))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(theme::RADIUS_CONTROL))
                     .cursor_pointer()
                     .aria_label(locale::common("Back"))
-                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .active(|style| style.opacity(0.65))
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -28571,13 +28615,18 @@ impl MobileApp {
                     .child(
                         svg()
                             .path("icons/chevron-left.svg")
-                            .size(px(theme::ICON_MD))
+                            .size(px(theme::ICON_SM))
                             .text_color(theme::text_secondary()),
                     ),
             )
             .child(
                 div()
-                    .text_size(theme::font_heading())
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(theme::font_title())
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::text_primary())
                     .child(locale::common(page.title())),
@@ -28632,7 +28681,7 @@ impl MobileApp {
                     if connected {
                         theme::accent_success()
                     } else {
-                        theme::text_muted()
+                        theme::text_secondary()
                     },
                     cx.listener(|this, _, _, cx| {
                         this.open_settings_page(SettingsPage::Connection, cx)
@@ -28652,7 +28701,7 @@ impl MobileApp {
                             }
                             None => locale::common(appearance.label()).to_string(),
                         },
-                        theme::accent_purple(),
+                        theme::text_secondary(),
                         cx.listener(|this, _, _, cx| {
                             this.open_settings_page(SettingsPage::Appearance, cx)
                         }),
@@ -28662,7 +28711,7 @@ impl MobileApp {
                         "icons/message-square.svg",
                         locale::text("Conversation", "会话", "會話").to_string(),
                         locale::text("Timeline display", "时间线显示", "時間線顯示").to_string(),
-                        theme::accent_blue(),
+                        theme::text_secondary(),
                         cx.listener(|this, _, _, cx| {
                             this.open_settings_page(SettingsPage::Conversation, cx)
                         }),
@@ -28676,7 +28725,7 @@ impl MobileApp {
                         } else {
                             locale::common("Off").to_string()
                         },
-                        theme::accent_yellow(),
+                        theme::text_secondary(),
                         cx.listener(|this, _, _, cx| {
                             this.open_settings_page(SettingsPage::Notifications, cx)
                         }),
@@ -28686,7 +28735,7 @@ impl MobileApp {
                         "icons/globe.svg",
                         locale::common("Language").to_string(),
                         locale::localized_label(language.label()),
-                        theme::accent_chart3(),
+                        theme::text_secondary(),
                         cx.listener(|this, _, _, cx| this.cycle_language_setting(cx)),
                     ),
                 ],
@@ -28698,7 +28747,7 @@ impl MobileApp {
                     "icons/vibex-mark.svg",
                     locale::common("About").to_string(),
                     env!("CARGO_PKG_VERSION").to_string(),
-                    theme::text_muted(),
+                    theme::text_secondary(),
                     cx.listener(|this, _, _, cx| this.open_settings_page(SettingsPage::About, cx)),
                 )],
             ),
@@ -28744,14 +28793,14 @@ impl MobileApp {
                     "icons/globe.svg",
                     locale::common("Address").to_string(),
                     host_url,
-                    theme::text_muted(),
+                    theme::text_secondary(),
                 ),
                 settings_value_row(
                     "mobile-settings-server-id",
                     "icons/hash.svg",
                     locale::common("Server ID").to_string(),
                     server_id,
-                    theme::text_muted(),
+                    theme::text_secondary(),
                 ),
             ],
         )];
@@ -28768,7 +28817,7 @@ impl MobileApp {
                         "配對、重新命名或移除桌面版",
                     )
                     .to_string(),
-                    theme::text_muted(),
+                    theme::text_secondary(),
                     cx.listener(Self::open_pairing),
                 ),
                 settings_nav_row(
@@ -28781,7 +28830,7 @@ impl MobileApp {
                         "無需重新配對即可重試",
                     )
                     .to_string(),
-                    theme::text_muted(),
+                    theme::text_secondary(),
                     cx.listener(Self::reconnect_active_host),
                 ),
             ],
@@ -28825,7 +28874,7 @@ impl MobileApp {
                     "icons/sun.svg",
                     locale::common("Theme").to_string(),
                     mode_detail.to_string(),
-                    theme::accent_yellow(),
+                    theme::text_secondary(),
                     cx.listener(|this, _, window, cx| {
                         let current = this.app_settings.theme.unwrap_or_default();
                         let next = match current {
@@ -28849,7 +28898,7 @@ impl MobileApp {
                         "選擇淺色與深色調色盤",
                     )
                     .to_string(),
-                    theme::accent_purple(),
+                    theme::text_secondary(),
                     cx.listener(|this, _, _, cx| {
                         this.settings_palette_open = true;
                         cx.notify();
@@ -28884,7 +28933,7 @@ impl MobileApp {
                     "icons/file-type.svg",
                     locale::text("Text size", "文字大小", "文字大小").to_string(),
                     text_size_label(self.app_settings.font_scale_percent),
-                    theme::accent_chart3(),
+                    theme::text_secondary(),
                     cx.listener(|this, _, window, cx| this.cycle_text_size(window, cx)),
                 )],
             ),
@@ -28916,7 +28965,7 @@ impl MobileApp {
                     "icons/globe.svg",
                     locale::common("Language").to_string(),
                     locale::localized_label(self.app_settings.language.unwrap_or_default().label()),
-                    theme::accent_chart3(),
+                    theme::text_secondary(),
                     cx.listener(|this, _, _, cx| this.cycle_language_setting(cx)),
                 )],
             ),
@@ -28968,7 +29017,7 @@ impl MobileApp {
                             timeline_reasoning_mode_label(timeline_settings.reasoning_display_mode),
                             timeline_setting_source_label(reasoning_mode_override),
                         ),
-                        theme::accent_purple(),
+                        theme::text_secondary(),
                         cx.listener(|this, _, _, cx| {
                             this.cycle_timeline_reasoning_display_mode(cx)
                         }),
@@ -29069,7 +29118,7 @@ impl MobileApp {
                         )
                         .to_string()
                     },
-                    theme::text_muted(),
+                    theme::text_secondary(),
                     cx.listener(|this, _, _, cx| this.clear_timeline_display_overrides(cx)),
                 )],
             ),
@@ -29220,7 +29269,7 @@ impl MobileApp {
                 } else {
                     locale::common("Show").to_string()
                 },
-                theme::accent_chart3(),
+                theme::text_secondary(),
                 cx.listener(|this, _, _, cx| {
                     this.release_notes_open = !this.release_notes_open;
                     if this.release_notes_open && this.release_notes_view.is_none() {
@@ -29270,21 +29319,21 @@ impl MobileApp {
                     } else {
                         std::env::consts::OS.to_string()
                     },
-                    theme::text_muted(),
+                    theme::text_secondary(),
                 ),
                 settings_value_row(
                     "mobile-settings-license",
                     "icons/book-open.svg",
                     locale::common("License").to_string(),
                     "AGPL-3.0-or-later".to_string(),
-                    theme::text_muted(),
+                    theme::text_secondary(),
                 ),
                 settings_nav_row(
                     "mobile-settings-source",
                     "icons/globe.svg",
                     locale::common("Source code").to_string(),
                     "github.com/vibex".to_string(),
-                    theme::text_muted(),
+                    theme::text_secondary(),
                     cx.listener(|this, _, _, cx| {
                         this.hint(Tone::Info, "https://github.com/vibex".to_string());
                         cx.notify();
@@ -29351,20 +29400,17 @@ impl MobileApp {
                         let select_id = id.clone();
                         div()
                             .id(format!("palette:{id}"))
-                            .h(px(theme::TOUCH_TARGET + 8.0))
-                            .mb(px(theme::SPACING_XS))
+                            .h(px(theme::TOUCH_TARGET + 4.0))
                             .px(px(theme::SPACING_MD))
                             .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(if active {
-                                theme::primary()
-                            } else {
-                                theme::border_subtle()
-                            })
+                            // The chosen palette is a wash and a check, not an
+                            // outlined pill: the list is a choice of one, and a
+                            // border per option draws every row as a box to be
+                            // weighed instead of a list to be read down.
                             .bg(if active {
                                 theme::sidebar_selected_bg()
                             } else {
-                                theme::bg_card()
+                                theme::bg_primary().opacity(0.0)
                             })
                             .flex()
                             .items_center()
@@ -29395,7 +29441,11 @@ impl MobileApp {
                                     .flex_1()
                                     .min_w_0()
                                     .text_size(theme::font_body())
-                                    .text_color(theme::text_primary())
+                                    .text_color(if active {
+                                        theme::text_primary()
+                                    } else {
+                                        theme::text_secondary()
+                                    })
                                     .child(name),
                             )
                             .when(active, |row| {
