@@ -155,6 +155,25 @@ impl Scramble {
         }
         drawn
     }
+
+    /// The noise a fixed run of cells wears at `phase`, or `None` once settled.
+    ///
+    /// A picture cannot be scrambled, but the cells it stands in can: a mark
+    /// drawn over a line that is arriving is the one thing on that line that did
+    /// not move, which reads as a picture that forgot to change rather than as
+    /// one being replaced. Wearing the line's own noise for the frames the
+    /// transition runs, and landing on the settling frame, is the same effect
+    /// said in the one vocabulary a cell has.
+    fn cells(&self, cells: usize, phase: u32) -> Option<String> {
+        if self.finished(phase) {
+            return None;
+        }
+        Some(
+            (0..cells as u64)
+                .map(|index| noise(index, u64::from(phase), ' '))
+                .collect(),
+        )
+    }
 }
 
 /// What a cell wears while it waits: a character of the same width that is not
@@ -270,6 +289,20 @@ impl Transitions {
             Some(run) => run.drawn(part, target, phase),
             None => target.to_string(),
         }
+    }
+
+    /// The noise a run of picture cells wears, or `None` when it holds still.
+    ///
+    /// A brand mark is a picture the terminal keeps, so the transition cannot
+    /// scramble it — but the cells it will occupy can wear the line's own noise
+    /// for as long as the change is arriving, and the frame the transition
+    /// settles is the frame the picture is placed on. Without this the one thing
+    /// on a changing line that never moved is the mark, which reads as a picture
+    /// the page forgot to update.
+    pub fn cells(&self, slot: Slot, cells: usize, phase: u32) -> Option<String> {
+        self.runs
+            .get(&slot)
+            .and_then(|run| run.cells(cells, phase))
     }
 
     /// Whether any transition is before its settled phase.
@@ -581,5 +614,46 @@ mod tests {
         assert!(transitions.running(32));
         transitions.prune(32 + FRAMES);
         assert!(!transitions.running(32 + FRAMES));
+    }
+
+    /// A brand mark is a picture, so the transition cannot scramble it — but the
+    /// cells it stands in wear the same noise the text does, and settle on the
+    /// same frame. That is what keeps a switch from being the one change on the
+    /// page that never moved.
+    #[test]
+    fn a_picture_slot_wears_the_transition_and_settles_on_its_last_frame() {
+        let mut transitions = Transitions::default();
+        transitions.observe("Codex", "Work", "gpt-5", "/home/peatboy", 0, true);
+        // A page whose Agent has not changed wears nothing: there is no arrival
+        // to draw, and a mark that flickered on every frame would be noise.
+        assert_eq!(transitions.cells(Slot::Runtime, 2, 0), None);
+
+        transitions.observe("Claude", "Work", "opus", "/home/peatboy", 2, true);
+        let cells = transition_cells(&transitions, 2);
+        assert_eq!(cells.chars().count(), 2, "the slot keeps its own width");
+        assert!(
+            cells.chars().all(|character| character != ' '),
+            "a waiting slot shows its own noise: {cells:?}"
+        );
+        // The rows under a mark never move: the noise is the same width as the
+        // cells it stands in, and it settles on the transition's last frame.
+        for phase in 2..2 + FRAMES {
+            assert_eq!(
+                transition_cells(&transitions, phase).chars().count(),
+                2,
+                "phase {phase} changed the slot's width"
+            );
+        }
+        assert_eq!(transitions.cells(Slot::Runtime, 2, 2 + FRAMES), None);
+        // A slot with no transition behind it is drawn as the picture it is:
+        // asking for cells on a line that is not changing answers nothing.
+        assert_eq!(transitions.cells(Slot::Workspace, 2, 2), None);
+    }
+
+    /// The noise a transition puts in a two-cell slot at `phase`.
+    fn transition_cells(transitions: &Transitions, phase: u32) -> String {
+        transitions
+            .cells(Slot::Runtime, 2, phase)
+            .unwrap_or_else(|| "  ".to_string())
     }
 }

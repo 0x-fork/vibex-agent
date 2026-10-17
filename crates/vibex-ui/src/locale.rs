@@ -33,6 +33,46 @@ impl Locale {
         }
     }
 
+    /// The three slots a new-session sentence is drawn from, in the order the
+    /// reader's language puts them: the words before the Agent's mark, the
+    /// connector, and the words after it.
+    ///
+    /// English keeps the phrase whole and ends on the mark — a sentence as
+    /// ordinary as "start something new" has no room for a conjunction on its
+    /// left. Chinese reads the connector first, which is what lands the mark
+    /// between it and the words it governs. Every native client splits the
+    /// sentence here, so the Agent's mark falls in the same place in all of
+    /// them rather than each client deciding again what its language means.
+    pub const fn new_session_slogan(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::En => ("Start something new", "with", ""),
+            Self::ZhCn => ("", "和", "开始新的工作"),
+            Self::ZhTw => ("", "和", "開始新的工作"),
+        }
+    }
+
+    /// The new-session sentence with the Agent's name where its mark stands.
+    ///
+    /// The mark is the one part of the line a screen reader cannot read, so the
+    /// sentence is spoken with the name in its place. A page with no Agent
+    /// chosen yet has nothing to put there and says the plain sentence instead.
+    pub fn new_session_slogan_spoken(self, agent: Option<&str>) -> String {
+        let (lead, connector, trail) = self.new_session_slogan();
+        let agent = agent.map(str::trim).filter(|agent| !agent.is_empty());
+        match agent {
+            Some(agent) => [lead, connector, agent, trail]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
+            None => [lead, connector, trail]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+
     /// Resolve a BCP-47 or POSIX-style locale identifier.
     ///
     /// Chinese script/region variants are kept distinct; all non-Chinese
@@ -75,5 +115,38 @@ mod tests {
         assert_eq!(Locale::from_system_tag(Some("en-US")), Locale::En);
         assert_eq!(Locale::from_system_tag(Some("fr-FR")), Locale::En);
         assert_eq!(Locale::from_system_tag(None), Locale::En);
+    }
+
+    /// The sentence is split by the client's language only, so the shared
+    /// splitter is what puts the Agent's mark in the same place in every
+    /// client. Chinese reads its connector first and English reads its phrase
+    /// whole, and the spoken form is the sentence with the mark's Agent named.
+    #[test]
+    fn the_new_session_sentence_is_split_and_spoken_the_same_way() {
+        assert_eq!(
+            Locale::En.new_session_slogan(),
+            ("Start something new", "with", "")
+        );
+        assert_eq!(Locale::ZhCn.new_session_slogan(), ("", "和", "开始新的工作"));
+        assert_eq!(Locale::ZhTw.new_session_slogan(), ("", "和", "開始新的工作"));
+
+        assert_eq!(
+            Locale::En.new_session_slogan_spoken(Some("Codex")),
+            "Start something new with Codex"
+        );
+        assert_eq!(
+            Locale::ZhCn.new_session_slogan_spoken(Some("Codex")),
+            "和 Codex 开始新的工作"
+        );
+        // A page with no Agent chosen yet says the sentence alone rather than
+        // leaving a hole where the mark would stand.
+        assert_eq!(
+            Locale::ZhCn.new_session_slogan_spoken(None),
+            "和 开始新的工作"
+        );
+        assert_eq!(
+            Locale::En.new_session_slogan_spoken(Some("   ")),
+            "Start something new with"
+        );
     }
 }

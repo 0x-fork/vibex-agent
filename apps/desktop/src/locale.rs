@@ -85,7 +85,6 @@ pub struct Strings {
     pub agent_waiting_confirmation: &'static str,
     pub agent_expand_process: &'static str,
     pub agent_collapse_process: &'static str,
-    pub new_session_slogan: &'static str,
     pub new_session_description: &'static str,
     pub new_session_prompt_placeholder: &'static str,
     pub new_session_project_label: &'static str,
@@ -324,7 +323,6 @@ static STRINGS_EN: Strings = Strings {
     agent_waiting_confirmation: "Waiting for confirmation...",
     agent_expand_process: "Expand reasoning",
     agent_collapse_process: "Collapse reasoning",
-    new_session_slogan: "Start something new",
     new_session_description: "Create a fresh session from a project directory or a temporary workspace",
     new_session_prompt_placeholder: "Describe a task, or type / for commands, @ for files, $ for skills",
     new_session_project_label: "Project directory",
@@ -528,7 +526,6 @@ static STRINGS_ZH_CN: Strings = Strings {
     agent_waiting_confirmation: "等待确认中...",
     agent_expand_process: "展开推理过程",
     agent_collapse_process: "收起推理过程",
-    new_session_slogan: "开始新的工作",
     new_session_description: "从项目目录或临时工作区创建一个新的会话",
     new_session_prompt_placeholder: "描述你的任务，或输入 / 唤出命令、@ 引用文件、$ 调用 Skill",
     new_session_project_label: "项目目录",
@@ -732,7 +729,6 @@ static STRINGS_ZH_TW: Strings = Strings {
     agent_waiting_confirmation: "等待確認中...",
     agent_expand_process: "展開推理過程",
     agent_collapse_process: "收起推理過程",
-    new_session_slogan: "開始新的工作",
     new_session_description: "從專案目錄或臨時工作區建立一個新的會話。",
     new_session_prompt_placeholder: "描述你的任務，或輸入 / 喚出命令、@ 引用檔案、$ 呼叫 Skill",
     new_session_project_label: "專案目錄",
@@ -919,6 +915,20 @@ pub fn apply_locale(mode: LocaleMode) -> ResolvedLocale {
 /// every lookup.
 pub fn current_locale() -> ResolvedLocale {
     ResolvedLocale::from_code(CURRENT_LOCALE.load(Ordering::Relaxed))
+}
+
+/// The process-wide locale in the shared, platform-neutral form.
+///
+/// The desktop's snapshot carries a few strings the shared table cannot know
+/// about, but a split or a phrase that every native client must draw the same
+/// way lives on [`SharedLocale`] so no client owns a second copy of it. This is
+/// the bridge between the desktop's own resolved locale and that table.
+pub fn shared_locale() -> SharedLocale {
+    match current_locale() {
+        ResolvedLocale::En => SharedLocale::En,
+        ResolvedLocale::ZhCn => SharedLocale::ZhCn,
+        ResolvedLocale::ZhTw => SharedLocale::ZhTw,
+    }
 }
 
 /// The resolved locale expressed as the preference a dialog can hold.

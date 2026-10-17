@@ -32027,29 +32027,16 @@ fn runtime_agent_icon(
     agent_brand_icon(&agent_brand_identity(agent_id.as_str(), label), size, tint)
 }
 
-/// The three slots the new-session sentence is drawn from, in the order the
-/// reader's language puts them: the words before the mark, the connector, and
-/// the words after it.
-///
-/// English keeps the phrase whole and ends on the mark — a sentence as ordinary
-/// as "start something new" has no room for a conjunction on its left. Chinese
-/// reads the connector first, which is what lands the mark between it and the
-/// words it governs. Keeping the split in one place is what lets both languages
-/// share a renderer that owns nothing but the order.
-fn new_session_slogan_words(locale: Locale) -> (&'static str, &'static str, &'static str) {
-    match locale {
-        Locale::En => ("Start something new", "with", ""),
-        Locale::ZhCn => ("", "和", "开始新的工作"),
-        Locale::ZhTw => ("", "和", "開始新的工作"),
-    }
-}
-
 /// The new-session page's own sentence, with the Agent that will answer it
 /// inside the line.
 ///
 /// The page's chips name the model and the mode it will run with, and neither
 /// names the Agent — the Agent is the choice the page exists to make, so the
 /// sentence carries its mark, in the place the reader's language leaves for it.
+/// The split itself is [`Locale::new_session_slogan`], shared with the desktop
+/// and the terminal so the mark lands in the same place in every client: this
+/// page owns where it draws the three slots and nothing about their order.
+///
 /// The whole line is one voice: the connector is part of the sentence, so it is
 /// drawn at the same size, weight and ink as the words it joins, and only the
 /// Agent's mark stands out of it. The mark is the shortest way into the Agent's
@@ -32061,6 +32048,8 @@ fn new_session_slogan_line(
     agent: Option<(&AgentId, &str)>,
     cx: &mut Context<MobileApp>,
 ) -> gpui::AnyElement {
+    let locale = locale::current();
+    let (lead, connector_text, trail) = locale.new_session_slogan();
     let words = |text: &'static str| {
         div()
             .text_size(theme::font_title())
@@ -32069,24 +32058,30 @@ fn new_session_slogan_line(
             .child(text)
     };
     let Some((agent_id, agent_label)) = agent else {
+        // The sentence alone: a page that has not chosen an Agent yet says what
+        // it can, in the reader's own word order.
         return div()
+            .id("mobile-new-session-slogan")
             .debug_selector(|| "mobile-new-session-slogan".to_string())
-            .child(words(locale::text(
-                "Start something new",
-                "开始新的工作",
-                "開始新的工作",
-            )))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_center()
+            .gap(px(theme::SPACING_SM))
+            .aria_label(locale.new_session_slogan_spoken(None))
+            .children(
+                [lead, connector_text, trail]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .map(words)
+                    .collect::<Vec<_>>(),
+            )
             .into_any_element();
     };
 
-    let (lead, connector_text, trail) = new_session_slogan_words(locale::current());
     // The mark is the one part of the line a screen reader cannot read, so the
     // sentence is spoken with the Agent's name in its place.
-    let spoken = [lead, connector_text, agent_label, trail]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let spoken = locale.new_session_slogan_spoken(Some(agent_label));
     let mark_size = theme::scaled_px(theme::NEW_SESSION_AGENT_LOGO_SIZE);
     // The target is wider than the mark it holds, so the line takes that slack
     // back out of its own gaps: the words keep the spacing the sentence was set
@@ -42278,20 +42273,13 @@ fn agent_icon_path(",
             "the Agent surface is not called the session's settings"
         );
 
-        // Chinese leads with the connector, so the mark lands between it and
-        // the words it governs; English keeps the phrase whole and ends on the
-        // mark instead of opening on a conjunction.
-        assert_eq!(
-            new_session_slogan_words(Locale::ZhCn),
-            ("", "和", "开始新的工作")
-        );
-        assert_eq!(
-            new_session_slogan_words(Locale::ZhTw),
-            ("", "和", "開始新的工作")
-        );
-        assert_eq!(
-            new_session_slogan_words(Locale::En),
-            ("Start something new", "with", "")
+        // The split is the shared table's, so this page cannot drift from the
+        // desktop and the terminal: it owns where the three slots are drawn,
+        // and the locale owns their order.
+        assert!(
+            line.contains("locale.new_session_slogan()")
+                && line.contains("locale.new_session_slogan_spoken("),
+            "the sentence is the locale's own split, not a second copy of it"
         );
     }
 

@@ -582,6 +582,27 @@ const NEW_SESSION_PROJECT_MENU_CHROME_HEIGHT: f32 = 144.0;
 const NEW_SESSION_PROJECT_MENU_ROW_HEIGHT: f32 = 28.0;
 const NEW_SESSION_AGENT_DRAG_HORIZONTAL_SLOP: f32 = 2.0;
 const NEW_SESSION_AGENT_DRAG_VERTICAL_SLOP: f32 = 8.0;
+/// The cross-cut the new-session sentence's Agent mark wears on a switch.
+///
+/// The outgoing mark and the incoming one are one gesture rather than a page
+/// reload: `EASE_OUT_EXPO` gets the old face away quickly and lets the new one
+/// settle without overshoot, and 220 ms is the shortest span in which both are
+/// legible as separate pictures.
+const NEW_SESSION_LOGO_SWAP: motion::MotionSpec =
+    motion::MotionSpec::new(220, motion::EASE_OUT_EXPO);
+/// The size of the new-session sentence and the Agent mark standing in it.
+///
+/// One number for both, because the mark is part of the sentence rather than a
+/// picture beside it: a mark that did not match the line's own type would read
+/// as a badge on the line instead of a word in it.
+const NEW_SESSION_SLOGAN_SIZE: f32 = 24.0;
+/// How far one mark travels while it crosses the line.
+///
+/// The sentence's mark stands inside a line of 24 px type, so its own height is
+/// as far as it can move without leaving that line: the outgoing mark drops
+/// away downward, the incoming one arrives from above, and the pair reads as one
+/// picture replacing another rather than as a slide.
+const NEW_SESSION_LOGO_SWAP_TRAVEL: f32 = 24.0;
 const NEW_SESSION_COMPACT_SELECTOR_MAX_WIDTH: u32 = 860;
 const AGENT_TIMELINE_FETCH_PAGE_LIMIT: u32 = 500;
 const CHILD_AGENT_TIMELINE_PREVIEW_ROW_LIMIT: usize = 6;
@@ -8350,6 +8371,39 @@ struct NewSessionAgentDropTarget {
     after: bool,
 }
 
+/// A change of the Agent the new-session sentence is wearing.
+///
+/// The page's mark is the one picture of the Agent the reader has before the
+/// session exists, so it cross-cuts rather than swaps: the outgoing mark stays
+/// in place and falls away while the incoming one arrives from above it. Only
+/// one mark-sized box is involved, because the sentence around it must not move
+/// under the reader's hand.
+///
+/// The entry keeps the two identities rather than the two icons: an identity is
+/// the string the desktop, the phone and the terminal all agree a mark is found
+/// by, so the cut cannot draw one Agent's face where another's was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NewSessionLogoSwap {
+    /// The Agent the sentence was wearing when the switch began.
+    from: String,
+    /// The Agent it is changing to.
+    to: String,
+    /// When the switch began.
+    ///
+    /// The pair is held for exactly as long as the cut runs: an element's own
+    /// animation clock is stable across re-renders, but the *pair* is state, and
+    /// a page that repainted for some other reason must not find the switch
+    /// gone. Reading the clock here is what ends it, once, on the right frame.
+    started: Instant,
+}
+
+impl NewSessionLogoSwap {
+    /// Whether the cut has run its course.
+    fn settled(&self) -> bool {
+        self.started.elapsed() >= NEW_SESSION_LOGO_SWAP.total().mul_f32(motion::speed_scale())
+    }
+}
+
 #[derive(Clone)]
 struct ComposerTerminalDrag {
     terminal_id: String,
@@ -9090,6 +9144,16 @@ pub struct VibexWorkbench {
     session_removal_new_session_pending: bool,
     agent_snapshots: Vec<AgentSnapshotEntry>,
     new_session_agent_id: Option<AgentId>,
+    /// The Agent mark the new-session sentence was wearing, and the one it is
+    /// changing to.
+    ///
+    /// The sentence's mark is the page's only picture of the Agent, so a switch
+    /// that swapped the two pictures on one frame would read as a page that
+    /// reloaded rather than as a choice being made. Instead the outgoing mark
+    /// keeps its place while the incoming one arrives above it: the reader sees
+    /// the old face leave and the new one settle, and both are drawn from what
+    /// this records rather than from what `new_session_agent_id` already says.
+    new_session_logo_swap: Option<NewSessionLogoSwap>,
     new_session_runtime_selection: Option<SessionRuntimeSelection>,
     new_session_runtime_menu_open: bool,
     new_session_runtime_menu_view: ComposerRuntimeMenuView,
@@ -10654,6 +10718,7 @@ impl VibexWorkbench {
             session_removal_new_session_pending: false,
             agent_snapshots: Vec::new(),
             new_session_agent_id: None,
+            new_session_logo_swap: None,
             new_session_runtime_selection: None,
             new_session_runtime_menu_open: false,
             new_session_runtime_menu_view: ComposerRuntimeMenuView::AuthSource,
@@ -34074,6 +34139,7 @@ impl VibexWorkbench {
         self.new_session_logo_swap = Some(NewSessionLogoSwap {
             from: agent_brand_identity(&previous),
             to: agent_brand_identity(&chosen),
+            started: Instant::now(),
         });
     }
 
@@ -52012,7 +52078,7 @@ impl VibexWorkbench {
             && self.new_session_draft_has_content(cx)
             && !self.agent_action_pending
             && !creation_pending;
-        let new_session_slogan = strings.new_session_slogan;
+        let new_session_slogan = new_session_slogan_line(self, cx);
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
         let content = v_flex()
@@ -52036,13 +52102,10 @@ impl VibexWorkbench {
                                     .items_center()
                                     .text_center()
                                     .child(startup_loading_wordmark(false, cx))
-                                    .child(
-                                        div()
-                                            .mt_3()
-                                            .text_size(px(24.0))
-                                            .font_semibold()
-                                            .child(new_session_slogan),
-                                    )
+                                    // The sentence sets its own type: the words
+                                    // and the mark inside them are one line at
+                                    // one size, so the wrapper only places it.
+                                    .child(div().mt_3().child(new_session_slogan))
                                     .child(
                                         div()
                                             .mt_1()
@@ -81860,6 +81923,151 @@ fn shortcut_is_valid(value: &str) -> bool {
         && Keystroke::parse(value).is_ok()
 }
 
+/// The new-session page's sentence, with the Agent that will answer it inside
+/// the line.
+///
+/// The page's chips name the model and the mode it will run with, and neither
+/// names the Agent — the Agent is the choice the page exists to make, so the
+/// sentence carries its mark, in the place the reader's language leaves for it.
+/// The split itself is [`SharedLocale::new_session_slogan`], shared with the
+/// phone and the terminal so the mark lands in the same place in every client.
+///
+/// The line is one voice: the words and the connector are drawn at the title's
+/// own size, weight and ink, and only the Agent's mark stands out of it. The
+/// mark is the shortest way into the Agent's own settings, so it is a control
+/// with a tooltip that says where it leads.
+///
+/// A page with no Agent chosen yet says only the sentence: naming one before
+/// the reader has picked it would answer a question the page is still asking.
+fn new_session_slogan_line(
+    this: &mut VibexWorkbench,
+    cx: &mut Context<VibexWorkbench>,
+) -> AnyElement {
+    let locale = locale::shared_locale();
+    let (lead, connector, trail) = locale.new_session_slogan();
+    let agent = this
+        .new_session_agent_id
+        .as_ref()
+        .and_then(|id| this.agent_snapshot(id));
+    let spoken = locale.new_session_slogan_spoken(agent.as_ref().map(|agent| agent.label.as_str()));
+    // The cut is read while it is still running and cleared once it is not, so
+    // a re-render mid-flight keeps drawing the pair rather than snapping the
+    // sentence back to the outgoing mark.
+    let swap = if agent.is_some() {
+        this.new_session_logo_swap.take_if(|swap| swap.settled())
+    } else {
+        None
+    };
+    let words = |text: &'static str| {
+        div()
+            .flex_none()
+            .text_size(px(NEW_SESSION_SLOGAN_SIZE))
+            .font_semibold()
+            .child(text)
+    };
+    let mut children: Vec<AnyElement> = Vec::with_capacity(4);
+    if !lead.is_empty() {
+        children.push(words(lead).into_any_element());
+    }
+    if !connector.is_empty() {
+        children.push(words(connector).into_any_element());
+    }
+    if let Some(agent) = agent {
+        let identity = agent_brand_identity(&agent);
+        children.push(new_session_agent_mark(identity, swap, cx));
+    }
+    if !trail.is_empty() {
+        children.push(words(trail).into_any_element());
+    }
+    div()
+        .id("new-session-slogan")
+        .debug_selector(|| "new-session-slogan".to_string())
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .aria_label(spoken)
+        .children(children)
+        .into_any_element()
+}
+
+/// The Agent's mark inside the new-session sentence, at rest or mid-switch.
+///
+/// The box is one mark wide and one mark tall, and a switch draws two marks in
+/// it: the outgoing face leaves downward as the incoming one arrives from above,
+/// both fading as they go. Because both live in the one fixed box, the words on
+/// either side of the mark are in exactly the same place before, during and
+/// after the cut.
+///
+/// The mark opens the page's Agent menu rather than a settings page: the reader
+/// is already choosing the Agent the session will run, and the menu is where
+/// that choice and the model that goes with it live.
+fn new_session_agent_mark(
+    identity: String,
+    swap: Option<NewSessionLogoSwap>,
+    cx: &mut Context<VibexWorkbench>,
+) -> AnyElement {
+    let size = px(NEW_SESSION_SLOGAN_SIZE);
+    let label = locale::text("Agent settings", "Agent 设置", "Agent 設定");
+    let mark = div()
+        .id("new-session-agent-mark")
+        .debug_selector(|| "new-session-agent-mark".to_string())
+        .flex_none()
+        .size(size)
+        .rounded(px(6.0))
+        .cursor_pointer()
+        .hover(|style| style.bg(cx.theme().muted.opacity(0.5)))
+        .aria_label(label.to_string())
+        .tooltip({
+            let label = label.to_string();
+            move |window, cx| Tooltip::new(label.clone()).build(window, cx)
+        })
+        .on_click(cx.listener(move |this, _, window, cx| {
+            if this.agent_action_pending {
+                return;
+            }
+            this.set_new_session_runtime_menu_open(true, window, cx);
+        }));
+    let Some(swap) = swap else {
+        return mark
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(runtime_agent_icon(&identity))
+            .into_any_element();
+    };
+    // The cross-cut, driven by the element's own animation clock: gpui asks the
+    // view for a frame for as long as the timeline runs, so the page needs no
+    // other tick, and reduced motion snaps the element to its end state — the
+    // new mark, in place — without any work here.
+    let NewSessionLogoSwap { from, to, .. } = swap;
+    let travel = px(NEW_SESSION_LOGO_SWAP_TRAVEL);
+    let layer = |identity: &str, top: Pixels, opacity: f32| {
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .top(top)
+            .opacity(opacity)
+            .child(runtime_agent_icon(identity))
+            .into_any_element()
+    };
+    mark.overflow_hidden()
+        .relative()
+        .with_animation(
+            ElementId::Name("new-session-agent-mark-swap".into()),
+            NEW_SESSION_LOGO_SWAP.animation(),
+            move |this, progress| {
+                this.child(layer(&from, travel * progress, 1.0 - progress))
+                    .child(layer(&to, travel * (progress - 1.0), progress))
+            },
+        )
+        .into_any_element()
+}
+
 fn startup_loading_wordmark(show_shimmer: bool, cx: &App) -> AnyElement {
     let base = cx.theme().muted_foreground.opacity(0.75);
     let glow = cx.theme().foreground;
@@ -96923,6 +97131,113 @@ mod tests {
             .map(|(body, _)| body)
             .expect("new session panel should remain inspectable");
         assert!(!panel.contains("self.new_session_error"));
+    }
+
+    /// The new-session page leads with the same sentence the phone does, and
+    /// the Agent the page would start the session with stands inside it.
+    ///
+    /// The page's mark is its own control — it opens the Agent menu — and the
+    /// split comes from the shared locale table rather than a second copy here,
+    /// so the phone, the desktop and the terminal put the mark in the same
+    /// place. A page with no Agent chosen yet still says the sentence.
+    #[test]
+    fn the_new_session_sentence_carries_the_agent_it_would_start_with() {
+        let source = include_str!("app.rs");
+        let panel = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
+            .map(|(body, _)| body)
+            .expect("new-session panel should remain inspectable");
+        assert!(
+            panel.contains("new_session_slogan_line(self, cx)"),
+            "the page's sentence is the line that names the Agent"
+        );
+
+        let line = source
+            .split_once("fn new_session_slogan_line(")
+            .and_then(|(_, tail)| tail.split_once("\nfn "))
+            .map(|(body, _)| body)
+            .expect("the sentence should remain inspectable");
+        assert!(line.contains("locale::shared_locale()"));
+        assert!(
+            line.contains("new_session_slogan()") && line.contains("new_session_slogan_spoken("),
+            "the split and the spoken form are the shared table's, not a second copy"
+        );
+        assert!(
+            line.contains(".agent_snapshot(id)"),
+            "the mark follows the Agent the page would actually create with"
+        );
+
+        // The mark is the way into the Agent's own menu, and it is a control
+        // rather than a picture: a reader who wants another Agent should not
+        // have to find the chips below the sentence first.
+        let mark = source
+            .split_once("fn new_session_agent_mark(")
+            .and_then(|(_, tail)| tail.split_once("\nfn startup_loading_wordmark("))
+            .map(|(body, _)| body)
+            .expect("the sentence's mark should remain inspectable");
+        assert!(mark.contains("new-session-agent-mark"));
+        assert!(mark.contains("set_new_session_runtime_menu_open(true, window, cx)"));
+        assert!(mark.contains("aria_label(label.to_string())"));
+    }
+
+    /// A switch of Agent is drawn as two marks crossing rather than as one
+    /// picture replaced, and the words around the mark never move.
+    ///
+    /// The outgoing face keeps the box while the incoming one arrives from
+    /// above it, so the cut is visible as a change of Agent rather than as a
+    /// page that reloaded. The box is a fixed mark's size and clips both
+    /// layers, which is what keeps the sentence's own layout still.
+    #[test]
+    fn switching_agent_cross_cuts_the_sentence_mark_in_place() {
+        let source = include_str!("app.rs");
+        let swap = source
+            .split_once("fn new_session_agent_mark(")
+            .and_then(|(_, tail)| tail.split_once("\nfn startup_loading_wordmark("))
+            .map(|(body, _)| body)
+            .expect("the sentence's mark should remain inspectable");
+        assert!(
+            swap.contains("NEW_SESSION_LOGO_SWAP.animation()"),
+            "the cut is a motion catalogue timeline, so reduced motion and the \
+             measurement knob both reach it"
+        );
+        assert!(
+            swap.contains(".overflow_hidden()"),
+            "the pair is clipped to the mark's own box"
+        );
+        assert!(
+            swap.contains("1.0 - progress") && swap.contains("travel * (progress - 1.0)"),
+            "the old mark falls away as the new one arrives from above"
+        );
+
+        let begin = source
+            .split_once("    fn begin_new_session_logo_swap(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn agent_snapshot("))
+            .map(|(body, _)| body)
+            .expect("the switch should remain inspectable");
+        assert!(
+            begin.contains("previous.filter(|previous| *previous != chosen)"),
+            "choosing the Agent already chosen is not a change"
+        );
+        assert!(
+            begin.contains("!self.new_session_open || motion::reduced_motion(cx)"),
+            "a page nobody is looking at begins no animation"
+        );
+        assert!(
+            begin.contains("agent_brand_identity(&previous)")
+                && begin.contains("agent_brand_identity(&chosen)"),
+            "the cut keeps identities, so the same Agent wears the same face"
+        );
+
+        let apply = source
+            .split_once("    fn apply_new_session_agent(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn begin_new_session_logo_swap("))
+            .map(|(body, _)| body)
+            .expect("the Agent switch should remain inspectable");
+        assert!(
+            apply.contains("self.begin_new_session_logo_swap(previous.as_ref(), &agent_id, cx)"),
+            "every path into a new Agent begins the cut"
+        );
     }
 
     #[test]

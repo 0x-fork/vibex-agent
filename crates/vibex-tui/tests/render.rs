@@ -7698,6 +7698,72 @@ fn the_new_session_page_names_the_agent_it_will_be_created_with() {
     );
 }
 
+/// The new-session page leads with the sentence the other clients lead with,
+/// and the Agent the page would start the session with stands inside it.
+///
+/// The words are the reader's language's, from the split every native client
+/// shares. The Agent is a picture where the terminal can hold one and its name
+/// where it cannot, both in the same place, and neither is ever a blank column.
+#[test]
+fn the_new_session_sentence_carries_the_agent_it_would_start_with() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.runtime_options = Some(run_option_catalog());
+    app.perform(Intent::NewSession);
+    let screen = text(&render(&mut app, 120, 40));
+    // The catalogue's first available entry is the Agent the page would use,
+    // so the sentence names claude rather than the codex the session behind it
+    // might have been on.
+    assert!(
+        screen.contains("Start something new with claude"),
+        "the sentence does not name the Agent:\n{screen}"
+    );
+    // It sits above the settings rows rather than replacing them: the page
+    // still answers what the message will run on and where.
+    let sentence = screen
+        .find("Start something new")
+        .expect("the sentence is on the page");
+    let runtime = screen
+        .find(app.strings.session_runtime_label())
+        .expect("the runtime row is on the page");
+    assert!(sentence < runtime, "the sentence does not lead the page");
+
+    // A page with nothing to name — no catalogue yet — still says the sentence,
+    // which is the one thing it can say without an Agent.
+    let mut empty = self::app(120, 40);
+    empty.live = vibex_tui::app::LiveState::Ready;
+    empty.perform(Intent::NewSession);
+    let screen = text(&render(&mut empty, 120, 40));
+    assert!(
+        screen.contains("Start something new"),
+        "the page lost its sentence:\n{screen}"
+    );
+    assert!(
+        screen.contains("with"),
+        "the sentence is missing the word its mark would follow:\n{screen}"
+    );
+}
+
+#[test]
+fn the_new_session_sentence_speaks_each_readers_language() {
+    // The split is shared with the phone and the desktop, so the connector
+    // comes first in Chinese and the mark lands after it — the page's own
+    // language, not the English one with Chinese words in it.
+    let mut app = app_in(Locale::ZhCn, 120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    app.runtime_options = Some(run_option_catalog());
+    app.perform(vibex_tui::action::Intent::NewSession);
+    let screen = text(&render(&mut app, 120, 40));
+    // The buffer pads every wide glyph to the two cells it occupies, so the
+    // sentence is compared with that padding removed rather than with it.
+    let packed = screen.split_whitespace().collect::<String>();
+    assert!(
+        packed.contains("和claude开始新的工作"),
+        "the Chinese sentence is not the shared split:\n{screen}"
+    );
+}
+
 #[test]
 fn the_new_session_page_does_not_wear_the_session_behind_it() {
     // A reader who leaves a running session to write a new one is on a page

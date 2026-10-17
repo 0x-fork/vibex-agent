@@ -111,6 +111,16 @@ without fetching a record before creation has completed.
   A runtime change received behind the picker begins on the first frame after
   it closes. With text transitions disabled, observations still record the
   current labels; re-enabling the setting cannot replay an old change.
+- The New Session page leads with the same sentence the other clients lead
+  with. Its three slots — lead, connector, trail — come from
+  `Locale::new_session_slogan` in `crates/vibex-ui`, shared with the desktop and
+  the phone; the page owns where it draws them and nothing about their order.
+  The Agent's mark fills the slot as a two-cell picture where the terminal
+  supports images (`RowMarks::want`, placed only after the sentence's column is
+  known) and as the Agent's name where it does not. An Agent switch must not
+  leave the mark as the one thing on a changing page that never moves: the
+  mark's cells wear `Transitions::cells` while `Slot::Runtime` runs, and the
+  picture is asked for only on the settling frame.
 - `advance_transcript_animation` must request the final resting frame before
   suppressing repaints. Check whether the landing mark was waiting both before
   and after advancing the phase and pruning finished text transitions. A burst
@@ -173,6 +183,8 @@ without fetching a record before creation has completed.
 | A mark burst or text transition ends | Repaint its resting frame without requiring input, then stop quiet repaints. |
 | An existing session's runtime changes behind its picker | Begin the composer transition only after the overlay closes. |
 | A different composer opens during a transition | Clear the previous labels and transition before its first frame. |
+| The Agent changes on the New Session page | The sentence's slot wears the transition's noise, then the new mark is placed on the settling frame. |
+| A terminal cannot hold a picture, or the Agent has no brand mark | The sentence's slot names the Agent instead of reserving blank cells. |
 | Text transitions are disabled | Show updated labels immediately and do not replay them when re-enabled. |
 | A placeholder snapshot arrives for a session created here | The row keeps the reader's message until a title that is not the placeholder arrives. |
 | A title the authority supplies lands, then a placeholder snapshot follows | The authority's title stands; the reader's recorded name is not consulted again. |
@@ -213,6 +225,9 @@ without fetching a record before creation has completed.
   transition finishes while the mark is resting, and later quiet ticks do not
   repaint. Cover existing-session runtime switches with the picker open/closed,
   the disabled setting, and transitions cleared when changing composer targets.
+  Cover the New Session sentence in each supported language, with and without a
+  catalogue to name an Agent from, and assert that the Agent's name stands in
+  the slot on a terminal without an image protocol.
 - `tests/elicitation.rs` drives the card through public intents and effects and
   asserts on the drawn frame. Cover: a pending request opening itself, the card
   taking the Composer's band with the transcript left readable and the draft
