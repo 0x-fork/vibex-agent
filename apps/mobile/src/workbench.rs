@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -204,11 +205,6 @@ enum DiffLineKind {
     Added,
     Removed,
     Hunk,
-    /// A line that describes the patch rather than changing a file: the
-    /// `diff --git` header, the `index` line, the `---`/`+++` pair. The
-    /// desktop gives these their own dim wash so a reader can tell the
-    /// scaffolding of a patch from its contents.
-    Meta,
 }
 
 /// One painted row of a unified diff: what it is, which line it is, and the
@@ -229,65 +225,182 @@ impl GitDiffRow {
             DiffLineKind::Added => "+",
             DiffLineKind::Removed => "-",
             DiffLineKind::Hunk => "",
-            DiffLineKind::Meta | DiffLineKind::Context => " ",
+            DiffLineKind::Context => " ",
         }
     }
 }
 
-/// Reads a unified diff into paintable rows.
+/// One file's part of a patch: the path it changes and the rows that change it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitPatchFile {
+    path: String,
+    rows: Vec<GitDiffRow>,
+}
+
+/// Reads a patch into one group of rows per file.
 ///
-/// One walk serves both the working-tree diff and a commit's patch, so the two
-/// surfaces cannot drift: the desktop renders both through one row projection
-/// for the same reason. `limit` caps what is returned; the second half of the
-/// pair is how many lines were left over.
-fn parse_unified_diff(patch: &str, limit: usize) -> (Vec<GitDiffRow>, usize) {
+/// The `diff --git`, `index`, `---` and `+++` lines are read but never painted:
+/// they describe the patch's own envelope, and the desktop's patch view starts
+/// at the first hunk. What they are good for is telling one file's part of the
+/// patch from the next, which is what lets the commit screen draw a file's
+/// changes under its own bar.
+///
+/// One walk serves the working-tree diff sheet and a commit's patch, so the two
+/// surfaces cannot disagree about what an addition looks like.
+fn parse_patch_files(patch: &str) -> Vec<GitPatchFile> {
+    let mut files: Vec<GitPatchFile> = Vec::new();
+    let mut path: Option<String> = None;
     let mut old_line = 0u32;
     let mut new_line = 0u32;
     let mut in_hunk = false;
-    let rows = patch
-        .lines()
-        .take(limit)
-        .map(|raw| {
-            let (kind, line, content) = if raw.starts_with("@@") {
-                // A hunk header carries the new file's starting line, which is
-                // what the gutter restarts from.
-                new_line = hunk_new_start(raw).unwrap_or(new_line);
-                old_line = hunk_old_start(raw).unwrap_or(old_line);
-                in_hunk = true;
-                (DiffLineKind::Hunk, None, raw.to_string())
-            } else if !in_hunk {
-                // Everything before the first hunk describes the file.
-                (DiffLineKind::Meta, None, raw.to_string())
-            } else if let Some(rest) = raw.strip_prefix('+') {
-                let line = new_line;
-                new_line += 1;
-                (DiffLineKind::Added, Some(line), rest.to_string())
-            } else if let Some(rest) = raw.strip_prefix('-') {
-                let line = old_line;
-                old_line += 1;
-                (DiffLineKind::Removed, Some(line), rest.to_string())
-            } else if let Some(rest) = raw.strip_prefix(' ') {
-                let line = new_line;
-                old_line += 1;
-                new_line += 1;
-                (DiffLineKind::Context, Some(line), rest.to_string())
-            } else if raw.starts_with("\\ No newline") {
-                (DiffLineKind::Meta, None, raw.to_string())
-            } else if raw.is_empty() {
-                // A blank line inside a hunk is an empty context line.
-                let line = new_line;
-                old_line += 1;
-                new_line += 1;
-                (DiffLineKind::Context, Some(line), String::new())
-            } else {
-                (DiffLineKind::Meta, None, raw.to_string())
-            };
-            GitDiffRow {
-                kind,
-                line,
-                content,
+
+    for raw in patch.lines() {
+        if let Some(rest) = raw.strip_prefix("diff --git ") {
+            // A file's part begins. `rest` is `a/<old> b/<new>`, and the `+++`
+            // line below is the authoritative name when the two differ — a
+            // rename — so this is only the fallback. The new group starts on
+            // the name *this* line carries: the group being closed already has
+            // its own, and borrowing it for the next file is how every file's
+            // bar after the first ends up labelled with the one before it.
+            let target = diff_git_target(rest);
+            files.push(GitPatchFile {
+                path: target.clone().unwrap_or_default(),
+                rows: Vec::new(),
+            });
+            path = target;
+            in_hunk = false;
+            continue;
+        }
+        if raw.starts_with("@@") {
+            new_line = hunk_new_start(raw).unwrap_or(new_line);
+            old_line = hunk_old_start(raw).unwrap_or(old_line);
+            in_hunk = true;
+            push_patch_row(
+                &mut files,
+                &path,
+                GitDiffRow {
+                    kind: DiffLineKind::Hunk,
+                    line: None,
+                    content: raw.to_string(),
+                },
+            );
+            continue;
+        }
+        if !in_hunk {
+            if let Some(target) = raw.strip_prefix("+++ ") {
+                // The destination side, which is where the change lands. It
+                // overrides the `diff --git` line rather than only filling it
+                // in, because a rename makes the two disagree.
+                let target = clean_patch_path(target);
+                path = Some(target.clone());
+                if let Some(file) = files.last_mut() {
+                    file.path = target;
+                }
             }
-        })
+            // Everything else before the first hunk is envelope.
+            continue;
+        }
+        let row = if let Some(rest) = raw.strip_prefix('+') {
+            let line = new_line;
+            new_line += 1;
+            GitDiffRow {
+                kind: DiffLineKind::Added,
+                line: Some(line),
+                content: rest.to_string(),
+            }
+        } else if let Some(rest) = raw.strip_prefix('-') {
+            let line = old_line;
+            old_line += 1;
+            GitDiffRow {
+                kind: DiffLineKind::Removed,
+                line: Some(line),
+                content: rest.to_string(),
+            }
+        } else if let Some(rest) = raw.strip_prefix(' ') {
+            let line = new_line;
+            old_line += 1;
+            new_line += 1;
+            GitDiffRow {
+                kind: DiffLineKind::Context,
+                line: Some(line),
+                content: rest.to_string(),
+            }
+        } else if raw.is_empty() {
+            // A blank line inside a hunk is an empty context line.
+            let line = new_line;
+            old_line += 1;
+            new_line += 1;
+            GitDiffRow {
+                kind: DiffLineKind::Context,
+                line: Some(line),
+                content: String::new(),
+            }
+        } else {
+            // `\ No newline at end of file` and anything else the envelope grew
+            // has no line of its own to stand on.
+            continue;
+        };
+        push_patch_row(&mut files, &path, row);
+    }
+
+    // A diff with no `diff --git` header — which is what a single file's diff
+    // looks like — still opens one group for the rows it has.
+    if files.iter().all(|file| file.rows.is_empty()) {
+        let rows = files.into_iter().flat_map(|file| file.rows).collect();
+        return vec![GitPatchFile {
+            path: path.unwrap_or_default(),
+            rows,
+        }];
+    }
+    files
+}
+
+/// Appends a row to the group it belongs to, opening one for a diff that began
+/// without a `diff --git` header.
+fn push_patch_row(files: &mut Vec<GitPatchFile>, path: &Option<String>, row: GitDiffRow) {
+    if files.is_empty() {
+        files.push(GitPatchFile {
+            path: path.clone().unwrap_or_default(),
+            rows: Vec::new(),
+        });
+    }
+    if let Some(file) = files.last_mut() {
+        file.rows.push(row);
+        if file.path.is_empty()
+            && let Some(path) = path.clone()
+        {
+            file.path = path;
+        }
+    }
+}
+
+/// The destination path in a `diff --git a/<old> b/<new>` line.
+fn diff_git_target(rest: &str) -> Option<String> {
+    rest.rsplit_once(" b/")
+        .map(|(_, target)| target.to_string())
+        .or_else(|| rest.split_whitespace().last().map(clean_patch_path))
+}
+
+/// Strips the `a/` or `b/` prefix and the `/dev/null` marker from a patch path.
+fn clean_patch_path(value: &str) -> String {
+    let value = value.trim();
+    if value == "/dev/null" {
+        return String::new();
+    }
+    value
+        .strip_prefix("b/")
+        .or_else(|| value.strip_prefix("a/"))
+        .unwrap_or(value)
+        .to_string()
+}
+
+/// Every row of a patch, in order, capped at `limit`; the second half of the
+/// pair is how many lines were left over.
+fn parse_unified_diff(patch: &str, limit: usize) -> (Vec<GitDiffRow>, usize) {
+    let rows = parse_patch_files(patch)
+        .into_iter()
+        .flat_map(|file| file.rows)
+        .take(limit)
         .collect::<Vec<_>>();
     let remaining = patch.lines().count().saturating_sub(limit);
     (rows, remaining)
@@ -313,7 +426,7 @@ fn hunk_new_start(header: &str) -> Option<u32> {
 
 /// The wash, the ink, and the marker of one diff row, in the desktop's own
 /// tones: an addition is a green-tinted band, a deletion a red one, a hunk
-/// header a blue one, and the patch's own scaffolding a dim grey.
+/// header a blue one, and a context line the pane's own background.
 fn diff_row_palette(kind: DiffLineKind) -> (gpui::Hsla, gpui::Hsla) {
     match kind {
         DiffLineKind::Added => (
@@ -322,7 +435,6 @@ fn diff_row_palette(kind: DiffLineKind) -> (gpui::Hsla, gpui::Hsla) {
         ),
         DiffLineKind::Removed => (theme::accent_red().opacity(0.10), theme::accent_red()),
         DiffLineKind::Hunk => (theme::accent_blue().opacity(0.10), theme::accent_blue()),
-        DiffLineKind::Meta => (theme::text_muted().opacity(0.18), theme::text_muted()),
         DiffLineKind::Context => (theme::workbench_bg(), theme::text_primary().opacity(0.85)),
     }
 }
@@ -379,25 +491,6 @@ fn render_diff_row(row: GitDiffRow) -> gpui::AnyElement {
                 .child(text),
         )
         .into_any_element()
-}
-
-/// Which face of a file the full-screen viewer shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MobileFilePreviewMode {
-    /// The buffer as text. Read-only on the phone: the workspace is written
-    /// from the desktop, and the rail only browses it.
-    Source,
-    /// The rendered file: Markdown as Markdown, an image as itself.
-    Preview,
-}
-
-impl MobileFilePreviewMode {
-    fn toggle(self) -> Self {
-        match self {
-            Self::Source => Self::Preview,
-            Self::Preview => Self::Source,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,9 +591,6 @@ pub struct MobileWorkbench {
     /// What the sink held after the last forwarded edit, so the next change can
     /// be reduced to the characters the user actually typed or deleted.
     terminal_sink_previous: String,
-    /// Focus handle the grid takes when it is tapped, so key events and the IME
-    /// both land on the terminal instead of the composer.
-    terminal_focus: gpui::FocusHandle,
     /// Whether Ctrl is latched from the accessory bar (⌃ on a phone keyboard
     /// has no physical key to hold).
     terminal_alt_latched: bool,
@@ -523,10 +613,6 @@ pub struct MobileWorkbench {
     /// content-search result names a line, and opening the file without going
     /// there leaves the reader to find it again by hand.
     pending_file_reveal: Option<(String, usize)>,
-    /// Which face of a chosen file the screen shows. A Markdown file opens as
-    /// its rendered self — that is what makes it readable on a phone — with
-    /// the source one tap away; every other kind opens as source.
-    file_preview_mode: MobileFilePreviewMode,
     /// The image a `FilePreviewKind::Image` file turned out to be, once its
     /// bytes have come back from the workspace.
     file_image: Option<Arc<Image>>,
@@ -582,6 +668,10 @@ pub struct MobileWorkbench {
     /// Whether the open commit's message body is unfolded. One flag serves the
     /// one commit the screen can show, and it resets with every new one.
     git_commit_body_expanded: bool,
+    /// The files of the open commit whose patch rows are folded away. A file
+    /// list is read by folding the parts the reader is not on, and the set
+    /// resets with every commit for the same reason the body does.
+    git_commit_collapsed_files: BTreeSet<String>,
     git_commit_confirmation: bool,
     /// Rewrite the previous commit instead of adding one.
     git_commit_amend: bool,
@@ -725,7 +815,6 @@ impl MobileWorkbench {
             terminal_input: None,
             terminal_sink_subscription: None,
             terminal_sink_previous: String::new(),
-            terminal_focus: cx.focus_handle(),
             terminal_alt_latched: false,
             terminal_scrolled_back: false,
             file_search_clear_pending: false,
@@ -735,7 +824,6 @@ impl MobileWorkbench {
             pending_file_editor_content: None,
             file_editor_path: None,
             pending_file_reveal: None,
-            file_preview_mode: MobileFilePreviewMode::Source,
             file_image: None,
             file_image_loading: None,
             file_markdown_view: None,
@@ -761,6 +849,7 @@ impl MobileWorkbench {
             git_commit_detail: None,
             git_commit_detail_loading: false,
             git_commit_body_expanded: false,
+            git_commit_collapsed_files: BTreeSet::new(),
             git_commit_confirmation: false,
             git_commit_amend: false,
             git_commit_push_after: false,
@@ -989,13 +1078,6 @@ impl MobileWorkbench {
             let _ = entity.update(cx, |this, cx| {
                 this.files.apply_file_read(&ticket, outcome);
                 this.hint_failure(failure);
-                this.file_preview_mode = match preview_kind {
-                    FilePreviewKind::Markdown => MobileFilePreviewMode::Preview,
-                    FilePreviewKind::Image if this.file_image.is_some() => {
-                        MobileFilePreviewMode::Preview
-                    }
-                    _ => MobileFilePreviewMode::Source,
-                };
                 if let Some(content) = this.files.state.view().editor_content {
                     this.file_editor_path = Some(ticket.path.clone());
                     this.pending_file_editor_content = Some(content.clone());
@@ -1051,10 +1133,9 @@ impl MobileWorkbench {
                 this.file_image_loading = None;
                 match outcome {
                     Ok(bytes) => {
+                        // The viewer shows an image as itself the moment
+                        // its bytes are here; nothing else has to be switched.
                         this.file_image = Some(Arc::new(Image::from_bytes(format, bytes)));
-                        if this.file_editor_path.as_deref() == Some(requested.as_str()) {
-                            this.file_preview_mode = MobileFilePreviewMode::Preview;
-                        }
                     }
                     Err(error) => this.fail(error),
                 }
@@ -1189,16 +1270,6 @@ impl MobileWorkbench {
         });
         self.file_goto_open = false;
         crate::platform::hide_keyboard();
-        cx.notify();
-    }
-
-    fn toggle_file_preview_mode(
-        &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.file_preview_mode = self.file_preview_mode.toggle();
         cx.notify();
     }
 
@@ -2329,17 +2400,13 @@ impl MobileWorkbench {
                 // the line-number gutter, the indent guides, and the syntax
                 // highlight a source file is read with. The language is set
                 // from the file's path before its text lands.
+                //
+                // Its read-only flag is set on the element that draws it, not
+                // here: see [`file_editor_element`].
                 EditorState::new(window, cx)
                     .folding(false)
                     .placeholder(locale::text("File content", "文件内容", "檔案內容"))
             }));
-            // Read-only, because the rail browses the workspace and the desktop
-            // is what writes it. The kind still answers a caret and a selection,
-            // so a reader can copy a line out of a file; it just cannot be typed
-            // into.
-            if let Some(editor) = self.file_editor_input.clone() {
-                editor.update(cx, |editor, cx| editor.set_readonly(true, cx));
-            }
         }
         if self.terminal_input.is_none() {
             self.terminal_input = Some(cx.new(|cx| InputState::new(window, cx)));
@@ -2735,7 +2802,10 @@ impl MobileWorkbench {
         self.git_commit_detail_loading = true;
         // The message body starts folded, as it does on the desktop: the header
         // already carries the subject, and the diff is what the screen is for.
+        // Every file's patch starts open, so the commit reads the way
+        // `git show` prints it until the reader folds something.
         self.git_commit_body_expanded = false;
+        self.git_commit_collapsed_files.clear();
         let request = GitCommitDetailRequest {
             workspace_id: self.workspace_id.clone(),
             commit_hash,
@@ -2768,6 +2838,14 @@ impl MobileWorkbench {
     ) {
         self.git_commit_detail = None;
         self.git_commit_detail_loading = false;
+        cx.notify();
+    }
+
+    /// Folds or unfolds one file's part of the open commit's patch.
+    fn toggle_git_commit_file(&mut self, path: &str, cx: &mut Context<Self>) {
+        if !self.git_commit_collapsed_files.remove(path) {
+            self.git_commit_collapsed_files.insert(path.to_string());
+        }
         cx.notify();
     }
 
@@ -3958,13 +4036,18 @@ impl MobileWorkbench {
         // under it is what the tree ellipsises away, and it is dropped for a
         // file that sits at the root rather than repeated as the same word.
         let parent = path.rsplit_once('/').map(|(parent, _)| parent.to_string());
-        // A Markdown file and an image both have a face the source cannot show;
-        // everything else is only ever text, so the switch stays off them.
+        // Markdown is shown as Markdown and an image as itself, because a phone
+        // reads those and the source is not what they are for. Every other kind
+        // is text, and text is shown as text.
+        //
+        // There is no switch between the two faces. The phone's buffer is
+        // read-only — the desktop is what writes the workspace — so the source
+        // face of a Markdown file was an edit mode with the editing taken out of
+        // it: a control that only ever changed how a document nobody could
+        // change was presented.
         let preview_kind = file_preview_kind_for_path(&path);
-        let previewable = preview_kind == FilePreviewKind::Markdown
+        let showing_preview = preview_kind == FilePreviewKind::Markdown
             || (preview_kind == FilePreviewKind::Image && self.file_image.is_some());
-        let showing_preview =
-            previewable && self.file_preview_mode == MobileFilePreviewMode::Preview;
         // The plate a code buffer is read on is the appearance's authored
         // `editor.background`, which is what the desktop editor paints and what
         // the syntax palette beside it was tuned against. The kit's own editor
@@ -4020,7 +4103,7 @@ impl MobileWorkbench {
             }
         } else {
             div()
-                .id("file-screen-editor")
+                .id("file-screen-buffer")
                 .flex_1()
                 .min_h_0()
                 .bg(editor_bg)
@@ -4029,7 +4112,9 @@ impl MobileWorkbench {
                 // desktop editor is monospace and so is this one.
                 .font_family("IBM Plex Mono")
                 .text_size(theme::code_font_size())
-                .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
+                // No tap-to-raise-keyboard: opening a file is a request to read
+                // it, and an IME over the source is not what a reader scrolling
+                // a file asked for.
                 .child(file_editor_element(self.file_editor_input.as_ref()))
                 .into_any_element()
         };
@@ -4135,40 +4220,6 @@ impl MobileWorkbench {
                                         }),
                                     ),
                             )
-                    })
-                    // The desktop switches a Markdown file between its render
-                    // and its source with one glyph: a pencil over the preview,
-                    // an eye over the buffer. The phone used to spell the two
-                    // words out, which cost the header a third of its width and
-                    // read as a label rather than the toggle it is.
-                    .when(previewable, |header| {
-                        header.child(
-                            icon_button(
-                                "file-preview-toggle",
-                                if showing_preview {
-                                    "icons/pencil.svg"
-                                } else {
-                                    "icons/eye.svg"
-                                },
-                                if showing_preview {
-                                    locale::text(
-                                        "Edit Markdown source",
-                                        "编辑 Markdown 源文件",
-                                        "編輯 Markdown 原始檔",
-                                    )
-                                } else {
-                                    locale::text(
-                                        "Preview Markdown",
-                                        "预览 Markdown",
-                                        "預覽 Markdown",
-                                    )
-                                },
-                            )
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(Self::toggle_file_preview_mode),
-                            ),
-                        )
                     }),
             )
             .when(self.file_find_open && !showing_preview, |screen| {
@@ -6481,6 +6532,12 @@ impl MobileWorkbench {
                                                         .text_size(theme::font_caption())
                                                         .text_color(theme::primary())
                                                         .child(
+                                                            // The disclosure's own glyph, drawn at
+                                                            // full contrast. Its colour is set on
+                                                            // the glyph rather than inherited from
+                                                            // the label beside it: a chevron that
+                                                            // borrowed the primary tone and faded
+                                                            // into it read as an empty box.
                                                             svg()
                                                                 .path(
                                                                     if self.git_commit_body_expanded
@@ -6490,8 +6547,9 @@ impl MobileWorkbench {
                                                                         "icons/chevron-right.svg"
                                                                     },
                                                                 )
-                                                                .size(px(12.0))
-                                                                .flex_none(),
+                                                                .size(px(14.0))
+                                                                .flex_none()
+                                                                .text_color(theme::text_primary()),
                                                         )
                                                         .child(if self.git_commit_body_expanded {
                                                             locale::text("Collapse", "收起", "收起")
@@ -6551,7 +6609,7 @@ impl MobileWorkbench {
                                     .text_color(theme::text_muted())
                                     .child(locale::text("Patch", "补丁", "補丁")),
                             )
-                            .child(self.render_git_patch_body(&patch))
+                            .child(self.render_git_patch_body(&patch, cx))
                             .when(detail.patch_truncated, |body| {
                                 body.child(
                                     div()
@@ -6668,18 +6726,96 @@ impl MobileWorkbench {
     }
 
     /// A commit's patch, drawn through the same rows the working-tree diff
-    /// sheet uses.
+    /// sheet uses and folded under one bar per file.
     ///
     /// The desktop renders a commit's diff and a working-tree diff with one row
     /// projection, so the two surfaces cannot disagree about what an addition
-    /// looks like. This is that projection: the change rail, the line number,
-    /// and the text, each on the desktop's own wash.
-    fn render_git_patch_body(&self, patch: &str) -> gpui::AnyElement {
-        let (rows, _) = parse_unified_diff(patch, GIT_COMMIT_PATCH_PAGE_LINES);
+    /// looks like. It groups them the same way too: each file's changes sit
+    /// under a bar carrying its path, and a tap on that bar folds them away. A
+    /// commit that touches twenty files is read by folding the ones the reader
+    /// is not on, which is the only way a phone shows a patch of that size.
+    fn render_git_patch_body(&self, patch: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut painted = 0usize;
+        let files = parse_patch_files(patch);
         div()
             .flex()
             .flex_col()
-            .children(rows.into_iter().map(render_diff_row))
+            .children(files.into_iter().filter_map(|file| {
+                if painted >= GIT_COMMIT_PATCH_PAGE_LINES {
+                    return None;
+                }
+                let shown = file
+                    .rows
+                    .len()
+                    .min(GIT_COMMIT_PATCH_PAGE_LINES.saturating_sub(painted));
+                painted += shown;
+                let collapsed = self.git_commit_collapsed_files.contains(&file.path);
+                let toggle_path = file.path.clone();
+                Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            // The file's own bar: the disclosure and the path.
+                            // It is the row the desktop draws above every file's
+                            // part of the patch, so a reader can tell where one
+                            // file ends and the next begins without reading a
+                            // hunk header.
+                            div()
+                                .id(format!("commit-file:{}", file.path))
+                                .flex_none()
+                                .h(px(30.0))
+                                .w_full()
+                                .min_w_0()
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .border_b_1()
+                                .border_color(theme::border_subtle())
+                                .bg(theme::workbench_panel_bg())
+                                .cursor_pointer()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.toggle_git_commit_file(&toggle_path, cx)
+                                    }),
+                                )
+                                .child(
+                                    svg()
+                                        .path(if collapsed {
+                                            "icons/chevron-right.svg"
+                                        } else {
+                                            "icons/chevron-down.svg"
+                                        })
+                                        .size(px(12.0))
+                                        .flex_none()
+                                        .text_color(theme::text_muted()),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .text_size(theme::font_caption())
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme::text_primary())
+                                        .child(if file.path.is_empty() {
+                                            locale::common("Patch").to_string()
+                                        } else {
+                                            file.path.clone()
+                                        }),
+                                ),
+                        )
+                        .when(!collapsed, |body| {
+                            body.children(file.rows.into_iter().take(shown).map(render_diff_row))
+                        })
+                        .into_any_element(),
+                )
+            }))
             .into_any_element()
     }
 
@@ -7066,10 +7202,15 @@ impl MobileWorkbench {
         let graph_colors = git_graph_colors();
         div()
             .id(format!("git-history:{}", commit.hash))
-            .min_h(px(GIT_HISTORY_ROW_HEIGHT))
+            // A definite height, not a minimum. The graph's canvas fills its
+            // row, and a percentage height inside an auto-height box resolves to
+            // nothing: the column had collapsed to the height of its own dot,
+            // which left the lanes drawn as a row of stubs. The desktop pins the
+            // same row to the same height for the same reason.
+            .h(px(GIT_HISTORY_ROW_HEIGHT))
+            .flex_none()
             .mx(px(TREE_ROW_INSET))
             .px(px(theme::SPACING_XS))
-            .py_1()
             .rounded(px(theme::RADIUS_CONTROL))
             .flex()
             .items_center()
@@ -7362,12 +7503,24 @@ impl MobileWorkbench {
                                                 "icons/x.svg",
                                                 "Close terminal",
                                             )
+                                            // The tab underneath opens the terminal
+                                            // it names, and opening one clears the
+                                            // close confirmation on the way in. A
+                                            // close that let the tap through was
+                                            // therefore undone in the same
+                                            // gesture: the tab lit up and nothing
+                                            // else happened. The glyph keeps the
+                                            // press to itself.
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation()
+                                            })
                                             .when(
                                                 can_close && !self.busy,
                                                 |button| {
                                                     button.on_mouse_up(
                                                         MouseButton::Left,
                                                         cx.listener(move |this, _, _, cx| {
+                                                            cx.stop_propagation();
                                                             this.request_close_terminal_id(
                                                                 close_id.clone(),
                                                                 cx,
@@ -7708,7 +7861,12 @@ impl MobileWorkbench {
             .relative()
             .overflow_hidden()
             .bg(theme::workbench_bg())
-            .track_focus(&self.terminal_focus)
+            // The surface does not take focus. It used to, and the platform
+            // delivers committed text only to the element that holds it: a tap
+            // on the grid focused the surface, GPUI registered no input handler
+            // for it, and every character the keyboard sent was dropped. The
+            // sink below is the terminal's one focus target, and
+            // `focus_terminal` hands it the tap.
             .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_terminal))
             .on_scroll_wheel(cx.listener(Self::scroll_terminal))
             // The IME sink: invisible, unfocusable by tap, but the destination
@@ -8179,11 +8337,19 @@ fn commit_message_shell(input: Option<&Entity<TextareaState>>) -> gpui::Div {
 /// The editor draws its own gutter and text surface and the panel around it
 /// draws no frame, so the file's pixels are the file's own: a source buffer
 /// that sits inside a card has a margin the reader pays for on every line.
+///
+/// It is read-only, and the flag is set here rather than on the state. The
+/// element pushes its own `readonly` field into the state on every paint, so a
+/// state that was told once to reject edits had that instruction overwritten on
+/// the next frame — which is why a reader could still type into a file the rail
+/// only browses. Read-only still answers a caret, a selection and a copy, so a
+/// line can be taken out of a file; it cannot be changed.
 fn file_editor_element(input: Option<&Entity<EditorState>>) -> gpui::AnyElement {
     match input {
         Some(input) => Editor::new(input)
             .appearance(false)
             .bordered(false)
+            .readonly(true)
             .size_full()
             .into_any_element(),
         None => div().into_any_element(),
@@ -9772,12 +9938,13 @@ mod tests {
         }));
     }
 
-    /// A unified diff is read once and painted twice — the working-tree sheet and
-    /// a commit's patch — so the parse has to give both the same answer: the
-    /// hunk header restarts the gutter, the marker is stripped from the text and
-    /// carried separately, and everything before the first hunk is scaffolding.
+    /// A patch is read once and painted twice — the working-tree sheet and a
+    /// commit's patch — so the parse has to give both the same answer: the hunk
+    /// header restarts the gutter, the marker is stripped from the text and
+    /// carried separately, the envelope lines are dropped, and each file's rows
+    /// stay together so the commit screen can fold them under their own bar.
     #[test]
-    fn a_unified_diff_parses_into_numbered_rows() {
+    fn a_unified_diff_parses_into_numbered_rows_per_file() {
         let patch = "\
 diff --git a/src/main.rs b/src/main.rs
 index 1111111..2222222 100644
@@ -9788,45 +9955,76 @@ index 1111111..2222222 100644
 -let b = 2;
 +let b = 3;
 +let c = 4;
+diff --git a/docs/guide.md b/docs/guide.md
+index 3333333..4444444 100644
+--- a/docs/guide.md
++++ b/docs/guide.md
+@@ -1,1 +1,1 @@
+-old
++new
 ";
-        let (rows, remaining) = parse_unified_diff(patch, 100);
-        assert_eq!(remaining, 0);
+        let files = parse_patch_files(patch);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "src/main.rs");
+        assert_eq!(files[1].path, "docs/guide.md");
 
-        // The four header lines carry no number and are scaffolding.
-        assert!(rows[..4].iter().all(|row| row.kind == DiffLineKind::Meta));
-        assert!(rows[..4].iter().all(|row| row.line.is_none()));
-
-        let hunk = &rows[4];
-        assert_eq!(hunk.kind, DiffLineKind::Hunk);
-        assert!(hunk.line.is_none());
+        // The envelope is read and dropped: a file's first row is its hunk
+        // header, never a `diff --git` or an `index` line.
+        let rows = &files[0].rows;
+        assert_eq!(rows[0].kind, DiffLineKind::Hunk);
+        assert!(rows[0].line.is_none());
+        assert_eq!(rows.len(), 5);
 
         // The hunk starts at 10 on the new side, so the first context line is
         // line 10; the deletion takes its number from the old side.
-        assert_eq!(rows[5].kind, DiffLineKind::Context);
-        assert_eq!(rows[5].line, Some(10));
-        assert_eq!(rows[5].content, "let a = 1;");
+        assert_eq!(rows[1].kind, DiffLineKind::Context);
+        assert_eq!(rows[1].line, Some(10));
+        assert_eq!(rows[1].content, "let a = 1;");
 
-        assert_eq!(rows[6].kind, DiffLineKind::Removed);
-        assert_eq!(rows[6].line, Some(11));
-        assert_eq!(rows[6].content, "let b = 2;");
+        assert_eq!(rows[2].kind, DiffLineKind::Removed);
+        assert_eq!(rows[2].line, Some(11));
+        assert_eq!(rows[2].content, "let b = 2;");
 
-        assert_eq!(rows[7].kind, DiffLineKind::Added);
-        assert_eq!(rows[7].line, Some(11));
-        assert_eq!(rows[7].content, "let b = 3;");
+        assert_eq!(rows[3].kind, DiffLineKind::Added);
+        assert_eq!(rows[3].line, Some(11));
+        assert_eq!(rows[3].content, "let b = 3;");
 
-        assert_eq!(rows[8].kind, DiffLineKind::Added);
-        assert_eq!(rows[8].line, Some(12));
+        assert_eq!(rows[4].kind, DiffLineKind::Added);
+        assert_eq!(rows[4].line, Some(12));
+
+        // Every file's gutter restarts at its own hunk header.
+        let second = &files[1].rows;
+        assert_eq!(second[0].kind, DiffLineKind::Hunk);
+        assert_eq!(second[1].kind, DiffLineKind::Removed);
+        assert_eq!(second[1].line, Some(1));
+        assert_eq!(second[2].kind, DiffLineKind::Added);
+        assert_eq!(second[2].line, Some(1));
 
         // The marker is what a reader copies, so it is drawn rather than kept
         // in the text.
-        assert_eq!(rows[7].prefix(), "+");
-        assert_eq!(rows[6].prefix(), "-");
-        assert_eq!(rows[5].prefix(), " ");
+        assert_eq!(rows[3].prefix(), "+");
+        assert_eq!(rows[2].prefix(), "-");
+        assert_eq!(rows[1].prefix(), " ");
+
+        // The flat walk is the same rows in the same order.
+        let (flat, remaining) = parse_unified_diff(patch, 100);
+        assert_eq!(remaining, 0);
+        assert_eq!(
+            flat.len(),
+            files.iter().map(|file| file.rows.len()).sum::<usize>()
+        );
+
+        // A single file's diff arrives without a `diff --git` header of its
+        // own, and still opens a group.
+        let bare = parse_patch_files("@@ -1,1 +1,1 @@\n-a\n+b\n");
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].rows.len(), 3);
 
         // A page that runs out reports how much is left rather than dropping it.
+        // The patch is sixteen lines, five of which fit on this page.
         let (short, remaining) = parse_unified_diff(patch, 5);
         assert_eq!(short.len(), 5);
-        assert_eq!(remaining, 4);
+        assert_eq!(remaining, 11);
     }
 
     /// A tap inside an application that asked for mouse reporting has to arrive
