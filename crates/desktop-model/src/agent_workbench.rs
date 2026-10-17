@@ -1708,12 +1708,52 @@ fn merge_runtime_attribution(row: &mut TimelineRow, item: &TimelineItem) {
     }
 }
 
+/// Where the reading position sits, as content rather than as a pixel offset.
+///
+/// A turn's id is not a stable identity across a window change: it is derived
+/// from whichever row the projection saw first — `turn:{user item}` when the
+/// turn's own message is in the window, `turn:continuation:{first response
+/// item}` when the window opens inside the turn. An older page that reaches
+/// back to that message renames the turn the reader is looking at, so an anchor
+/// keyed only by id stops resolving exactly when a page lands, and the offset it
+/// stood in for is lost. The sequence range is the turn's own content and
+/// survives the rename, which is what makes it the anchor's identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineAnchorSpan {
+    pub first_sequence: i64,
+    pub last_sequence: i64,
+}
+
+impl TimelineAnchorSpan {
+    /// How many sequences the span and a turn's own range share.
+    ///
+    /// A window that loses the leading rows of a turn narrows the turn's range
+    /// but still overlaps the recorded one, and a turn that only grew keeps
+    /// every sequence it had. Scoring by overlap therefore picks the same turn
+    /// in either direction, while two different turns never score against each
+    /// other because their ranges are disjoint.
+    pub fn overlap(&self, first_sequence: i64, last_sequence: i64) -> i64 {
+        let start = self.first_sequence.max(first_sequence);
+        let end = self.last_sequence.min(last_sequence);
+        (end - start + 1).max(0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimelineFollowState {
     pub following_bottom: bool,
     pub unread_count: u32,
+    /// The turn id the anchor was captured against.
+    ///
+    /// Tried first: an id that still resolves names the turn exactly, and that
+    /// is the common case. It is not authoritative, because a page landing can
+    /// rename the turn out from under it; [`Self::anchor_span`] is what resolves
+    /// the reader's place when it does.
     pub anchor_row_id: Option<String>,
+    /// The sequence range of the anchored turn, which outlives its id.
+    pub anchor_span: Option<TimelineAnchorSpan>,
     pub anchor_offset_px: i32,
 }
 
@@ -1723,6 +1763,7 @@ impl Default for TimelineFollowState {
             following_bottom: true,
             unread_count: 0,
             anchor_row_id: None,
+            anchor_span: None,
             anchor_offset_px: 0,
         }
     }
@@ -1740,6 +1781,7 @@ impl TimelineFollowState {
         if following {
             self.unread_count = 0;
             self.anchor_row_id = None;
+            self.anchor_span = None;
             self.anchor_offset_px = 0;
         }
     }
@@ -1747,7 +1789,26 @@ impl TimelineFollowState {
     pub fn preserve_anchor(&mut self, row_id: impl Into<String>, offset_px: i32) {
         self.following_bottom = false;
         self.anchor_row_id = Some(row_id.into());
+        self.anchor_span = None;
         self.anchor_offset_px = offset_px;
+    }
+
+    /// Records the reader's place by both names: the id that resolves exactly
+    /// while it still exists, and the sequence range that resolves after a
+    /// window change renames the turn.
+    pub fn preserve_anchor_at(
+        &mut self,
+        row_id: impl Into<String>,
+        span: TimelineAnchorSpan,
+        offset_px: i32,
+    ) {
+        self.preserve_anchor(row_id, offset_px);
+        self.anchor_span = Some(span);
+    }
+
+    /// Whether a reading position has been captured at all.
+    pub fn has_anchor(&self) -> bool {
+        self.anchor_row_id.is_some() || self.anchor_span.is_some()
     }
 }
 
@@ -3992,6 +4053,58 @@ mod tests {
         state.set_following_bottom(true);
         assert_eq!(state.unread_count, 0);
         assert!(state.anchor_row_id.is_none());
+        assert!(state.anchor_span.is_none());
+        assert!(!state.has_anchor());
+    }
+
+    #[test]
+    fn a_span_anchor_outlives_a_renamed_turn_but_not_a_different_one() {
+        let mut state = TimelineFollowState::default();
+        state.preserve_anchor_at(
+            "turn:continuation:timeline_a",
+            TimelineAnchorSpan {
+                first_sequence: 30,
+                last_sequence: 31,
+            },
+            84,
+        );
+        assert!(!state.following_bottom);
+        assert!(state.has_anchor());
+        assert_eq!(state.anchor_offset_px, 84);
+
+        // The turn keeps every sequence it had when it only grows, and still
+        // overlaps when a page widens the window's view of it.
+        let span = state.anchor_span.expect("the span was recorded");
+        assert_eq!(span.overlap(30, 999), 2);
+        assert_eq!(span.overlap(10, 31), 2);
+        // A different turn shares no sequence with it.
+        assert_eq!(span.overlap(40, 41), 0);
+        assert_eq!(span.overlap(1, 29), 0);
+
+        // Returning to the bottom drops both names, so a later capture cannot
+        // resurrect a stale range.
+        state.set_following_bottom(true);
+        assert!(state.anchor_span.is_none());
+        assert!(!state.has_anchor());
+    }
+
+    #[test]
+    fn capturing_a_new_anchor_does_not_keep_the_previous_span() {
+        let mut state = TimelineFollowState::default();
+        state.preserve_anchor_at(
+            "turn:continuation:timeline_a",
+            TimelineAnchorSpan {
+                first_sequence: 30,
+                last_sequence: 31,
+            },
+            84,
+        );
+        // A capture that only knows the id must not leave the old range behind:
+        // the two would then describe different turns and resolve differently.
+        state.preserve_anchor("turn:timeline_b", 12);
+        assert_eq!(state.anchor_row_id.as_deref(), Some("turn:timeline_b"));
+        assert!(state.anchor_span.is_none());
+        assert_eq!(state.anchor_offset_px, 12);
     }
 
     #[test]

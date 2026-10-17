@@ -162,18 +162,18 @@ use vibex_desktop_model::{
     SidebarProjectLogo, SidebarProjectLogoColor, SidebarProjectProjection, SidebarQueuedSend,
     SidebarScheduledSend, SidebarState, SidebarUiState, SidebarWorkspaceProjection,
     StartupDestination, TerminalOpenMode, TerminalWorkingDirectory, ThemeMode as ModelThemeMode,
-    ThrottledUiStateWriter, TimelineConversationTurn, TimelineDelegationProjection,
-    TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
-    UiStateStore, UnifiedDiffLineKind, WorkbenchRoute, WorkspaceContextProjection,
-    WorkspaceLayoutState, WorkspaceStateScope, WorktreeLifecycleDisplayState,
-    active_collaborations, clamp_editor_autosave_delay_ms, complete_string_order,
-    composer_trigger_at, current_active_goal, current_agent_plan, custom_worktree_path_is_absolute,
-    has_managed_child_agent_delegations, move_string_relative, move_strings_relative,
-    ordered_agent_ids, parse_unified_diff, sidebar_project_custom_logo_file_is_valid,
-    sidebar_project_items, sidebar_project_items_for_workspace,
-    sidebar_project_projections_with_workspace_order, sidebar_root_items, split_share,
-    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
-    timeline_conversation_turns_with_leading_turn_start,
+    ThrottledUiStateWriter, TimelineAnchorSpan, TimelineConversationTurn,
+    TimelineDelegationProjection, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
+    TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind, WorkbenchRoute,
+    WorkspaceContextProjection, WorkspaceLayoutState, WorkspaceStateScope,
+    WorktreeLifecycleDisplayState, active_collaborations, clamp_editor_autosave_delay_ms,
+    complete_string_order, composer_trigger_at, current_active_goal, current_agent_plan,
+    custom_worktree_path_is_absolute, has_managed_child_agent_delegations, move_string_relative,
+    move_strings_relative, ordered_agent_ids, parse_unified_diff,
+    sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
+    sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
+    sidebar_root_items, split_share, timeline_agent_message_count_after_sequence,
+    timeline_conversation_turns, timeline_conversation_turns_with_leading_turn_start,
     timeline_conversation_turns_with_reasoning_mode, timeline_row_delegation,
 };
 use vibex_desktop_runtime::DriverState;
@@ -6452,6 +6452,33 @@ fn timeline_scroll_offset_for_anchor(
     }
     let row_top: f32 = row_heights[..row_index].iter().sum();
     Some(-(padding_top + row_top + offset_in_row))
+}
+
+/// The sequence range a turn covers, as an anchor identity.
+///
+/// Every row of the turn carries its own range, so the turn's span is the union
+/// of the rows it still holds. A turn whose rows are all empty has no identity
+/// to anchor on and reports `None`.
+fn timeline_turn_anchor_span(turn: &TimelineConversationTurn) -> Option<TimelineAnchorSpan> {
+    let rows = turn
+        .user_row
+        .iter()
+        .chain(turn.process_rows.iter())
+        .chain(turn.conclusion_row.iter());
+    let mut span: Option<TimelineAnchorSpan> = None;
+    for row in rows {
+        span = Some(match span {
+            Some(current) => TimelineAnchorSpan {
+                first_sequence: current.first_sequence.min(row.first_sequence),
+                last_sequence: current.last_sequence.max(row.last_sequence),
+            },
+            None => TimelineAnchorSpan {
+                first_sequence: row.first_sequence,
+                last_sequence: row.last_sequence,
+            },
+        });
+    }
+    span
 }
 
 fn stable_streaming_timeline_height(
@@ -22045,14 +22072,17 @@ impl VibexWorkbench {
     /// setting) has to re-estimate its rows, otherwise a pane that just joined a
     /// split would paint the previous layout's row heights.
     fn refresh_borrowed_view_geometry(&mut self) {
-        let cached_timeline_layout_width = self.timeline_layout_width;
-        let layout_width_changed =
-            timeline_layout_width_changed(self.timeline_layout_width, cached_timeline_layout_width);
+        // Only the content-width *setting* can be judged here, and it is judged
+        // against the value this view was last laid out with. A change to the
+        // pane's own width is a reflow rather than an invalidation, and it is
+        // handled where the width is actually known: prepaint reports it through
+        // [`Self::sync_session_view_layout_width`], which retargets the table and
+        // keeps the measurements as its seed.
         let content_width_changed = self.view.content_width != self.ui_state.session.content_width;
         self.view.content_width = self.ui_state.session.content_width;
         let turns_cache_changed = self.conversation_turns_cache_key.as_ref()
             != Some(&self.current_conversation_turns_cache_key());
-        let geometry_changed = layout_width_changed || content_width_changed;
+        let geometry_changed = content_width_changed;
         if geometry_changed {
             self.invalidate_timeline_layout_measurements();
         }
@@ -22079,7 +22109,7 @@ impl VibexWorkbench {
         // A reader who was not following the bottom gets the anchored row back
         // under the viewport once the render has rebuilt the row table.
         self.timeline_scroll_anchor_pending =
-            !self.timeline_follow.following_bottom && self.timeline_follow.anchor_row_id.is_some();
+            !self.timeline_follow.following_bottom && self.timeline_follow.has_anchor();
     }
 
     fn refresh_agent_token_usage(
@@ -25996,6 +26026,11 @@ impl VibexWorkbench {
     /// Remember the row under the viewport top while the reader is not
     /// following the bottom, so the same conversation content can be restored
     /// after a session switch or an authoritative replacement.
+    ///
+    /// The row is captured twice over: by the turn id it has now, and by the
+    /// sequence range that turn covers. The id is the fast path, but a page
+    /// landing above the reader renames the leading turn — see
+    /// [`TimelineAnchorSpan`] — and the range is what survives that.
     fn capture_timeline_scroll_anchor(&mut self) {
         if self.timeline_follow.following_bottom
             || self.timeline_row_sizes.len() != self.conversation_turns_cache.len()
@@ -26010,15 +26045,44 @@ impl VibexWorkbench {
         ) else {
             return;
         };
-        let Some(turn_id) = self
+        let Some(span) = self
             .conversation_turns_cache
             .get(row_index)
-            .map(|turn| turn.id.clone())
+            .and_then(|turn| timeline_turn_anchor_span(turn))
         else {
             return;
         };
+        let turn_id = self.conversation_turns_cache[row_index].id.clone();
         self.timeline_follow
-            .preserve_anchor(turn_id, offset_in_row.round() as i32);
+            .preserve_anchor_at(turn_id, span, offset_in_row.round() as i32);
+    }
+
+    /// The row the captured anchor names, in the row table that is current now.
+    ///
+    /// The id wins when it still exists, because it names the turn outright.
+    /// A window change can rename that turn, so the recorded range is the
+    /// fallback: the turn overlapping it most is the one the reader was
+    /// looking at, and a row that shares no sequence with it was not that turn.
+    fn timeline_anchor_row_index(&self) -> Option<usize> {
+        if let Some(turn_id) = self.timeline_follow.anchor_row_id.as_deref()
+            && let Some(row_index) = self
+                .conversation_turns_cache
+                .iter()
+                .position(|turn| turn.id == turn_id)
+        {
+            return Some(row_index);
+        }
+        let span = self.timeline_follow.anchor_span?;
+        self.conversation_turns_cache
+            .iter()
+            .enumerate()
+            .filter_map(|(row_index, turn)| {
+                let turn = timeline_turn_anchor_span(turn)?;
+                let overlap = span.overlap(turn.first_sequence, turn.last_sequence);
+                (overlap > 0).then_some((row_index, overlap))
+            })
+            .max_by_key(|(_, overlap)| *overlap)
+            .map(|(row_index, _)| row_index)
     }
 
     /// Put the captured anchor back under the viewport top against the current
@@ -26027,14 +26091,7 @@ impl VibexWorkbench {
         if self.timeline_follow.following_bottom {
             return false;
         }
-        let Some(turn_id) = self.timeline_follow.anchor_row_id.clone() else {
-            return false;
-        };
-        let Some(row_index) = self
-            .conversation_turns_cache
-            .iter()
-            .position(|turn| turn.id == turn_id)
-        else {
+        let Some(row_index) = self.timeline_anchor_row_index() else {
             return false;
         };
         let row_heights = self.timeline_row_heights();
@@ -91124,12 +91181,15 @@ mod tests {
         assert!(geometry.contains("self.timeline_streaming_shrink_candidates.clear();"));
         assert!(!geometry.contains("self.invalidate_timeline_turn_measurement(&turn_id);"));
         assert!(geometry.contains("self.rebuild_timeline_sizes();"));
-        assert!(geometry.contains("cached_timeline_layout_width"));
+        // A pane's own width is not re-judged here: comparing the cached width
+        // with itself could never report a change, and the real report arrives
+        // from prepaint through `sync_session_view_layout_width`.
+        assert!(!geometry.contains("cached_timeline_layout_width"));
         // Only a real layout change may drop the measured row extents: the
         // turns cache key also moves for view-local session state, and
         // re-estimating the whole table there would scroll the restored view.
         let layout_change = geometry
-            .find("let geometry_changed = layout_width_changed || content_width_changed;")
+            .find("let geometry_changed = content_width_changed;")
             .expect("view geometry should separate layout changes from projection changes");
         let invalidate = geometry
             .find("self.invalidate_timeline_layout_measurements();")
@@ -91138,6 +91198,7 @@ mod tests {
         assert!(geometry.contains("if geometry_changed || turns_cache_changed {"));
         assert!(geometry.contains("self.timeline_scroll_anchor_pending ="));
         assert!(geometry.contains("!self.timeline_follow.following_bottom"));
+        assert!(geometry.contains("self.timeline_follow.has_anchor()"));
 
         // Selecting a session only moves the view onto it. Judging the turn it
         // was left on is the loader's job, and the loader is addressed as its
@@ -91165,6 +91226,127 @@ mod tests {
         assert!(authoritative_load.contains("cache_auto_continue_turn_status"));
         assert!(!authoritative_load.contains("latest_timeline_turn_ended_normally"));
         assert!(source.contains("fn authoritative_loaded_turn_status("));
+    }
+
+    /// An older page that reaches back to the leading turn's own message
+    /// renames that turn, and the anchor has to survive the rename.
+    ///
+    /// This is the shape a reader hits while scrolling up in a windowed
+    /// conversation: the window opens inside a turn, so the turn has no user
+    /// row and its id is derived from its first response item. The page that
+    /// supplies that missing row rebuilds the turn under a new id, and an
+    /// anchor keyed only by id stops resolving — which is what left the offset
+    /// to be clamped and the view to jump.
+    #[test]
+    fn anchor_survives_the_leading_turn_being_renamed_by_an_older_page() {
+        let session = VibexSessionId::parse("session_anchor").unwrap();
+        let item = |sequence: i64, payload: TimelinePayload| TimelineItem {
+            id: TimelineItemId::parse(format!("timeline_anchor-{sequence}")).unwrap(),
+            session_id: session.clone(),
+            sequence,
+            timestamp_ms: sequence,
+            source: TimelineSource::Agent,
+            kind: payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
+            payload,
+        };
+        let user = |sequence: i64| {
+            item(
+                sequence,
+                TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                    text: format!("question {sequence}"),
+                    ..Default::default()
+                }),
+            )
+        };
+        let agent = |sequence: i64| {
+            item(
+                sequence,
+                TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                    text: format!("answer {sequence}"),
+                    is_final: true,
+                }),
+            )
+        };
+
+        // The window before the page: it opens mid-turn, so the leading turn
+        // owns no user row and is named after its first response item.
+        let window_before: Vec<TimelineItem> = vec![agent(30), agent(31), user(40), agent(41)];
+        // The same window after the older page landed: the leading turn's own
+        // message is now here, so the projection renames it.
+        let window_after: Vec<TimelineItem> =
+            vec![user(10), agent(30), agent(31), user(40), agent(41)];
+
+        let before = timeline_conversation_turns_with_leading_turn_start(
+            &window_before,
+            None,
+            false,
+            Default::default(),
+            None,
+        );
+        let after = timeline_conversation_turns_with_leading_turn_start(
+            &window_after,
+            None,
+            false,
+            Default::default(),
+            None,
+        );
+
+        let leading_before = &before[0];
+        let leading_after = &after[0];
+        assert!(
+            leading_before.id.starts_with("turn:continuation:"),
+            "a window cut inside a turn names it after its first response item, got {}",
+            leading_before.id
+        );
+        assert!(
+            leading_after.id.starts_with("turn:"),
+            "the page that supplies the user row renames the turn, got {}",
+            leading_after.id
+        );
+        assert_ne!(
+            leading_before.id, leading_after.id,
+            "this test only means something while the rename still happens"
+        );
+
+        // The anchor recorded against the pre-rename turn must resolve against
+        // the post-rename projection, through the sequence range it kept. The
+        // exact range is the projection's business — repeated updates fold into
+        // one row — so what is asserted is that it still names this turn.
+        let span = timeline_turn_anchor_span(leading_before).expect("a turn of rows has a span");
+        assert!(
+            span.first_sequence >= 10 && span.last_sequence <= 41,
+            "the span stays inside the leading turn, got {span:?}"
+        );
+        assert!(
+            !after.iter().any(|turn| turn.id == leading_before.id),
+            "the old id really is gone, so resolving by id alone cannot work"
+        );
+        let resolved = after
+            .iter()
+            .position(|turn| {
+                timeline_turn_anchor_span(turn)
+                    .is_some_and(|turn| span.overlap(turn.first_sequence, turn.last_sequence) > 0)
+            })
+            .expect("the recorded range still names the reader's turn");
+        assert_eq!(
+            &after[resolved].id, &leading_after.id,
+            "the renamed turn is the one the span resolves to"
+        );
+
+        // A turn that only grew keeps overlapping too, so streaming cannot lose
+        // the anchor either.
+        assert_eq!(
+            span.overlap(30, 999),
+            span.last_sequence - span.first_sequence + 1,
+            "a turn that grew still covers every sequence the span recorded"
+        );
+        // Two different turns never score against each other.
+        assert_eq!(span.overlap(40, 41), 0);
     }
 
     #[test]
@@ -91218,7 +91400,31 @@ mod tests {
             capture
                 .contains("self.timeline_row_sizes.len() != self.conversation_turns_cache.len()")
         );
-        assert!(capture.contains(".preserve_anchor(turn_id, offset_in_row.round() as i32);"));
+        assert!(capture.contains(".preserve_anchor_at(turn_id, span,"));
+        assert!(capture.contains("timeline_turn_anchor_span"));
+
+        // The restore path resolves the turn by id first and falls back to the
+        // recorded sequence range, because a page landing above the reader
+        // renames the leading turn. Resolving by id alone is the bug that made
+        // the view jump when older history arrived.
+        let restore = source
+            .split_once("    fn apply_timeline_scroll_anchor(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn handle_timeline_scroll_wheel("))
+            .map(|(body, _)| body)
+            .expect("timeline anchor restore should remain inspectable");
+        assert!(restore.contains("self.timeline_anchor_row_index()"));
+        assert!(!restore.contains(".position(|turn| turn.id == turn_id)"));
+
+        let resolve = source
+            .split_once("    fn timeline_anchor_row_index(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Put the captured anchor back under the viewport top")
+            })
+            .map(|(body, _)| body)
+            .expect("timeline anchor resolution should remain inspectable");
+        assert!(resolve.contains("self.timeline_follow.anchor_row_id.as_deref()"));
+        assert!(resolve.contains("self.timeline_follow.anchor_span?"));
+        assert!(resolve.contains("span.overlap(turn.first_sequence, turn.last_sequence)"));
 
         let workbench = source
             .split_once("    fn render_agent_workbench(")
