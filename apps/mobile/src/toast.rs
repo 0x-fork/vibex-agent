@@ -67,11 +67,10 @@ impl Tone {
 
 /// What a hint's button does.
 ///
-/// A hint outlives the state it describes, which makes it the one place an undo
-/// can live: archiving takes a session out of the list, and the card that says
-/// so is the only way back to it on a phone. The variant names the work rather
-/// than carrying a closure, so a hint stays comparable and the app keeps the
-/// dispatch.
+/// Archiving takes a session out of the list, and the card that reports it is
+/// where a tap puts it back before the card ages out. The variant names the work
+/// rather than carrying a closure, so a hint stays comparable and the app keeps
+/// the dispatch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HintAction {
     /// Put back the sessions an archive just removed.
@@ -155,14 +154,23 @@ pub fn push(window: &mut Window, cx: &mut App, hint: &Hint, on_action: Option<Hi
         .id1::<MobileHint>(hint.message.clone())
         .on_click(|_, _, _| {});
     if let Some((label, run)) = action {
-        // An action keeps the card up until it is answered: a hint that
-        // offered an undo and then hid itself would be no undo at all.
-        notification = notification.action(move |_, _, _| {
-            let run = run.clone();
-            Button::new("mobile-hint-action")
-                .label(label)
-                .on_click(move |_, window, cx| run(window, cx))
-        });
+        // The kit switches autohide off the moment an action is attached, which
+        // made the archive card the one hint on the phone that never left: it
+        // sat in the corner until it was tapped, long after the screen it
+        // described was gone. The flag is turned back on after the action, so a
+        // card with a button ages out like every other hint and the button is a
+        // shortcut inside that window rather than the only way to dismiss it.
+        // The undo is not lost with the card: the sessions it would have put
+        // back stay archived on the desktop, where the archived list restores
+        // them.
+        notification = notification
+            .action(move |_, _, _| {
+                let run = run.clone();
+                Button::new("mobile-hint-action")
+                    .label(label)
+                    .on_click(move |_, window, cx| run(window, cx))
+            })
+            .autohide(true);
     }
     let notification = notification.content(move |_, _, _| {
         div()
@@ -177,4 +185,76 @@ pub fn push(window: &mut Window, cx: &mut App, hint: &Hint, on_action: Option<Hi
             .into_any_element()
     });
     window.push_notification(notification, cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use gpui::{AppContext as _, Context, Render, TestAppContext, Window, div};
+    use gpui_component::WindowExt as _;
+
+    use super::*;
+
+    /// An empty page: the hint layer belongs to the kit's `Root`, not to the
+    /// screen under it.
+    struct Bare;
+
+    impl Render for Bare {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    fn rooted_window(cx: &mut TestAppContext) -> &mut gpui::VisualTestContext {
+        cx.update(gpui_component::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let bare = cx.new(|_| Bare);
+            gpui_component::Root::new(bare, window, cx)
+        });
+        cx
+    }
+
+    fn mounted_hints(cx: &mut gpui::VisualTestContext) -> usize {
+        cx.update(|window, cx| window.notifications(cx).len())
+    }
+
+    /// A hint that carries an undo still leaves on its own.
+    ///
+    /// The kit clears a notification's autohide as soon as an action is attached,
+    /// which made the card that reports an archive the one hint on the phone that
+    /// outlived the screen it described: it sat in the corner until it was
+    /// tapped. It has to age out on the kit's own clock, exactly like the hint
+    /// without a button beside it.
+    #[gpui::test]
+    fn an_action_hint_leaves_with_the_hints_that_have_none(cx: &mut TestAppContext) {
+        let cx = rooted_window(cx);
+        let run: HintHandler = Rc::new(|_, _| {});
+        cx.update(|window, cx| {
+            push(window, cx, &Hint::new(Tone::Success, "plain"), None);
+            push(
+                window,
+                cx,
+                &Hint::with_action(
+                    Tone::Success,
+                    "archived",
+                    HintAction::UndoArchive(Vec::new()),
+                ),
+                Some(run),
+            );
+        });
+        assert_eq!(mounted_hints(cx), 2, "both hints reach the layer");
+
+        // The enter transition, the kit's five-second hold, and the exit.
+        cx.executor().advance_clock(
+            Duration::from_millis(400) + Duration::from_secs(5) + Duration::from_millis(250),
+        );
+        cx.run_until_parked();
+
+        assert_eq!(
+            mounted_hints(cx),
+            0,
+            "a hint with an action ages out with the rest"
+        );
+    }
 }
