@@ -461,11 +461,6 @@ pub fn line_height_for(font: f32) -> Rems {
 pub const ICON_MD: f32 = 18.0;
 pub const ICON_SM: f32 = 16.0;
 pub const ICON_STATUS: f32 = 6.0;
-/// The column a settings row's glyph is drawn in.
-///
-/// The slot is wider than [`ICON_MD`] itself so every title on a page starts
-/// on one vertical rule, whatever the glyph in front of it turns out to be.
-pub const ICON_SLOT: f32 = 24.0;
 /// The Agent mark inside the new-session page's sentence.
 ///
 /// The sentence is set at [`FONT_TITLE`], and the mark stands in the line

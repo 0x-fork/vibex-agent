@@ -238,6 +238,7 @@ impl MobileApp {
                 locale::text("Team", "团队", "團隊"),
                 theme::font_heading(),
                 Some(refresh),
+                true,
                 cx,
             ))
             .when(count == 0, |root| {
