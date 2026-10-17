@@ -515,9 +515,10 @@ pub const COMPOSER_SEND_SIZE: f32 = 36.0;
 /// controls sit between the model chip and the row's right edge, so they are
 /// narrower than the row's other targets.
 pub const COMPOSER_OPTION_SIZE: f32 = 36.0;
-/// The context-usage ring: the one gauge on the control row, so it is drawn a
-/// step above the glyphs beside it.
-pub const COMPOSER_RING_SIZE: f32 = 26.0;
+/// The context-usage ring: the one gauge on the control row, drawn at the size
+/// of the glyphs it keeps company with. Its target is the same as theirs, so
+/// the row's controls all answer to the same thumb.
+pub const COMPOSER_RING_SIZE: f32 = 20.0;
 
 pub const DRAWER_ROW_HEIGHT: f32 = 56.0;
 /// A phone row is a touch target first: the desktop's 32/40px rows put the

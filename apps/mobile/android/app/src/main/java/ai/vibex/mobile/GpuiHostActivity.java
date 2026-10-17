@@ -829,6 +829,27 @@ public final class GpuiHostActivity extends Activity {
             };
         }
 
+        /** Whether the app is holding a selection the keyboard can delete. */
+        private boolean documentHasSelection() {
+            return imeSelStart != imeSelEnd;
+        }
+
+        /**
+         * Hands the app a request to erase the selection it is holding.
+         *
+         * A keyboard deletes selected text by replacing it with nothing, and
+         * the framework's own `commitText("")` does that by erasing the
+         * widget's selection — which here is an empty scratch pad, so the
+         * request would leave no trace for {@link #endEdit} to forward and the
+         * text would survive the key. The app is told to delete what the
+         * keyboard was told is selected instead. Counts of zero delete the
+         * selection and nothing around it, which is exactly the request.
+         */
+        private boolean forwardSelectionDeletion() {
+            nativeIme(session, 2, "", 0, 0);
+            return true;
+        }
+
         private ExtractedText extractedDocument() {
             ExtractedText extracted = new ExtractedText();
             extracted.text = imeDocument;
@@ -924,6 +945,9 @@ public final class GpuiHostActivity extends Activity {
                 }
                 @Override public boolean setComposingText(CharSequence text, int cursor) {
                     if (connectionSession != session) return false;
+                    if (text.length() == 0 && !holdsComposition() && documentHasSelection()) {
+                        return forwardSelectionDeletion();
+                    }
                     depth++;
                     try { return super.setComposingText(text, cursor); }
                     finally { endEdit(); }
@@ -942,6 +966,9 @@ public final class GpuiHostActivity extends Activity {
                 }
                 @Override public boolean commitText(CharSequence text, int cursor) {
                     if (connectionSession != session) return false;
+                    if (text.length() == 0 && !holdsComposition() && documentHasSelection()) {
+                        return forwardSelectionDeletion();
+                    }
                     depth++;
                     try { return super.commitText(text, cursor); }
                     finally { endEdit(); }

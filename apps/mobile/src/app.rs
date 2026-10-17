@@ -2732,12 +2732,20 @@ fn focused_document(
 /// `arrow` adds the fold-down mark the two new-session chips wear: those chips
 /// name a choice that opens a list, and the mark is what says so before the
 /// thumb finds out.
+///
+/// `spells_value` is the room the row has for the value: a chip that cannot
+/// draw it whole draws the glyph alone rather than a fragment ending in an
+/// ellipsis, which is the shape the desktop takes when its window is narrow.
+/// The value stays the chip's own label either way, so nothing that names the
+/// choice is lost — it is only the drawing that is given up.
+#[allow(clippy::too_many_arguments)]
 fn composer_chip(
     id: &'static str,
     icon: gpui::AnyElement,
     value: String,
     warn: bool,
     arrow: bool,
+    spells_value: bool,
     action: ComposerChipAction,
     cx: &mut Context<MobileApp>,
 ) -> gpui::Stateful<gpui::Div> {
@@ -2769,20 +2777,22 @@ fn composer_chip(
                 .items_center()
                 .gap(px(theme::SPACING_XS))
                 .child(icon)
-                .child(
-                    div()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .text_size(theme::font_caption())
-                        .text_color(if warn {
-                            theme::accent_yellow()
-                        } else {
-                            theme::text_secondary()
-                        })
-                        .child(value),
-                )
+                .when(spells_value, |line| {
+                    line.child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(theme::font_caption())
+                            .text_color(if warn {
+                                theme::accent_yellow()
+                            } else {
+                                theme::text_secondary()
+                            })
+                            .child(value.clone()),
+                    )
+                })
                 .when(arrow, |line| {
                     line.child(
                         svg()
@@ -2840,6 +2850,77 @@ fn composer_option_button(
                     theme::text_secondary()
                 }),
         )
+}
+
+/// What a composer's control row has left for the model's name.
+///
+/// Every other control on the row is as wide whether or not a name is drawn:
+/// the plus against the card's leading edge, one glyph per option the Agent
+/// offers, the usage ring on the page that has a session to measure, and the
+/// send plate. The row is what is left of the window once the card's own
+/// padding is taken out, and this is what is left of the row.
+fn model_chip_share(row_width: f32, option_buttons: usize, usage_ring: bool) -> f32 {
+    let fixed = theme::TOUCH_TARGET - theme::SPACING_MD
+        + theme::COMPOSER_OPTION_SIZE * option_buttons as f32
+        + if usage_ring {
+            theme::COMPOSER_OPTION_SIZE
+        } else {
+            0.0
+        }
+        + theme::COMPOSER_SEND_SIZE;
+    (row_width - fixed).max(0.0)
+}
+
+/// Whether a model's name fits the share of the row its chip was given.
+///
+/// The chip carries a glyph, a gap on either side of its label and the row's
+/// own gap after it, so the name only has what is left of the share. A name
+/// that does not fit is not drawn at all: a model id cut short names nothing.
+fn model_label_fits(label: &str, share: f32) -> bool {
+    const CHIP_CHROME: f32 = theme::ICON_SM + theme::SPACING_XS * 3.0;
+    model_label_width(label, f32::from(theme::scaled_px(theme::FONT_CAPTION)))
+        <= (share - CHIP_CHROME).max(0.0)
+}
+
+/// How wide a model's name draws, near enough to answer [`model_label_fits`].
+///
+/// The row is laid out in one pass and the name is either drawn whole or not at
+/// all, so whether it fits has to be known before the frame is built. The
+/// estimate counts the two scripts a model id is written in: a Latin character
+/// takes [`MODEL_LABEL_LATIN_ADVANCE`] of the type size in the interface face,
+/// and a Han or full-width character takes the whole of it.
+fn model_label_width(label: &str, font_size: f32) -> f32 {
+    label
+        .chars()
+        .map(|ch| {
+            if model_label_char_is_full_width(ch) {
+                font_size
+            } else {
+                font_size * MODEL_LABEL_LATIN_ADVANCE
+            }
+        })
+        .sum()
+}
+
+/// The advance one Latin character takes of the type size.
+///
+/// A little over half: digits and capitals are wider than the lowercase face's
+/// average, and a name measured short is one drawn cut.
+const MODEL_LABEL_LATIN_ADVANCE: f32 = 0.58;
+
+/// Whether a character is drawn the width of the Han characters around it.
+fn model_label_char_is_full_width(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x1100..=0x115F
+            | 0x2E80..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x20000..=0x3FFFD
+    )
 }
 
 /// A bare icon control in a prompt card's control row: something the reader
@@ -14261,7 +14342,13 @@ impl MobileApp {
                                     )
                                 }),
                         )
-                        .child(self.render_composer(running, state, &turns, cx)),
+                        .child(self.render_composer(
+                            running,
+                            state,
+                            &turns,
+                            f32::from(window.viewport_size().width),
+                            cx,
+                        )),
                 )
                 .when_some(drawer_page, |root, page| {
                     let backdrop_base = div()
@@ -18191,6 +18278,9 @@ impl MobileApp {
             .workbench
             .as_ref()
             .is_some_and(|workbench| workbench.read(cx).terminal_is_running());
+        // Recall is offered while there is something to recall: the session's
+        // own prompts, and no operation in flight that owns the composer.
+        let history_enabled = !self.operation_busy && !self.timeline_turns.is_empty();
         // The session's state reads the same way it does on the left screen's
         // session row: the same mark in the same colour, on the title's trailing
         // edge. The phone used to spell the state out on a line of its own, which
@@ -18297,6 +18387,42 @@ impl MobileApp {
                             .path("icons/menu.svg")
                             .size(px(theme::ICON_MD))
                             .text_color(theme::text_secondary()),
+                    ),
+            )
+            // Recall rather than retype: the prompts already sent are one tap
+            // away. It sits beside the title it belongs to — a composer control
+            // gave the row it shared with the model nowhere left to put it.
+            .child(
+                div()
+                    .id("open-composer-history")
+                    .debug_selector(|| "open-composer-history".to_string())
+                    .size(px(theme::HEADER_BUTTON_SIZE))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .aria_label(locale::text("Earlier messages", "历史消息", "歷史訊息"))
+                    .when(history_enabled, |button| {
+                        button
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_composer_history(window, cx)
+                                }),
+                            )
+                    })
+                    .when(!history_enabled, |button| button.opacity(0.42))
+                    .child(
+                        svg()
+                            .path("icons/rotate-ccw.svg")
+                            .size(px(theme::ICON_MD))
+                            .text_color(if history_enabled {
+                                theme::text_secondary()
+                            } else {
+                                theme::text_muted()
+                            }),
                     ),
             )
             .child(
@@ -20509,6 +20635,7 @@ impl MobileApp {
         running: bool,
         state: Option<AgentSessionState>,
         turns: &[TimelineConversationTurn],
+        viewport_width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let latest_ended_normally = turns
@@ -20527,7 +20654,6 @@ impl MobileApp {
             && !self.operation_busy
             && self.composer_attachments.len() < MOBILE_MAX_COMPOSER_ATTACHMENTS;
         let editing_message = self.composer_message_edit.is_some();
-        let history_enabled = !self.operation_busy && !turns.is_empty();
         let stop_enabled = state.is_some() && !self.operation_busy && !runtime_switch_pending;
         // The single primary control is Stop only while a turn runs and there
         // is nothing to send; the moment the reader writes anything it is Send
@@ -20599,6 +20725,18 @@ impl MobileApp {
         let mode_set = runtime_selection.is_some_and(|selection| selection.mode_id.is_some());
         let options_set =
             runtime_selection.is_some_and(|selection| !selection.config_values.is_empty());
+        // The model's name is drawn in full or not at all: the row's other
+        // controls are the width they are, and what is left decides.
+        let option_buttons = [reasoning_offered, modes_offered, features_offered]
+            .into_iter()
+            .filter(|offered| *offered)
+            .count();
+        let model_share = model_chip_share(
+            (viewport_width - theme::SPACING_MD * 4.0).max(0.0),
+            option_buttons,
+            true,
+        );
+        let spells_model = model_label_fits(&model_label, model_share);
         div()
             .flex_shrink_0()
             .bg(theme::bg_primary())
@@ -20694,6 +20832,12 @@ impl MobileApp {
                                 Textarea::new(&self.composer_input)
                                     .appearance(false)
                                     .text_size(theme::font_composer())
+                                    // The field is where the reader writes, so
+                                    // its text is body copy rather than the
+                                    // chrome grey the rest of the window
+                                    // inherits; the placeholder keeps the
+                                    // kit's muted tone.
+                                    .text_color(theme::text_primary())
                                     // The long press hook is the only signal the
                                     // platform gives for "the user selected this
                                     // word": open the touch toolbar instead of the
@@ -20747,6 +20891,7 @@ impl MobileApp {
                                     model_label,
                                     !runtime_summary.available,
                                     false,
+                                    spells_model,
                                     ComposerChipAction::SessionModel,
                                     cx,
                                 )
@@ -20789,26 +20934,13 @@ impl MobileApp {
                                     cx.listener(Self::open_session_options_drawer),
                                 ))
                             })
-                            // Recall rather than retype: the prompts already sent
-                            // in this session are one tap away. The arrow is not
-                            // a clock — the clock belongs to scheduling now.
-                            .child(composer_icon_button(
-                                "composer-history",
-                                "icons/rotate-ccw.svg",
-                                locale::text("Earlier messages", "历史消息", "歷史訊息")
-                                    .to_string(),
-                                history_enabled,
-                                cx.listener(|this, _, window, cx| {
-                                    this.open_composer_history(window, cx)
-                                }),
-                            ))
                             // The ring: the one usage surface a phone gets, and
                             // the only place the reader can tell how full the
                             // context window is before the next turn fails on it.
                             .child(
                                 div()
                                     .id("composer-token-usage")
-                                    .size(px(theme::TOUCH_TARGET))
+                                    .size(px(theme::COMPOSER_OPTION_SIZE))
                                     .flex_shrink_0()
                                     .rounded_full()
                                     .flex()
@@ -20826,10 +20958,10 @@ impl MobileApp {
                                         cx.listener(|this, _, _, cx| this.show_token_usage(cx)),
                                     )
                                     .child(
-                                        // The ring is drawn at the card's own
-                                        // size rather than the kit's: the gauge
-                                        // is the one measure on the row, and it
-                                        // is read at a glance.
+                                        // The ring is drawn at the size of the
+                                        // glyphs beside it rather than the
+                                        // kit's, inside the same target every
+                                        // other control on the row keeps.
                                         div().size(px(theme::COMPOSER_RING_SIZE)).child(
                                             ProgressCircle::new("composer-token-ring")
                                                 .value(usage_percent)
@@ -27241,7 +27373,7 @@ impl MobileApp {
     /// that project is worked. The desktop's creation panel draws the same
     /// split, which is the point: the phone used to open on a stack of cards and
     /// a button at the far end of the screen.
-    fn render_new_session(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_new_session(&self, viewport_width: f32, cx: &mut Context<Self>) -> gpui::AnyElement {
         // The chip names the answer rather than the question: a temporary
         // session has no project, and saying so is more use than leaving the
         // chip on "Choose project" while the session is ready to start.
@@ -27350,6 +27482,16 @@ impl MobileApp {
         let mode_set = runtime_selection.is_some_and(|selection| selection.mode_id.is_some());
         let options_set =
             runtime_selection.is_some_and(|selection| !selection.config_values.is_empty());
+        // The model's name is drawn in full or not at all: the page's own
+        // controls are the width they are, and what is left decides. The last
+        // glyph — the title and the model's options — is always on this row.
+        let option_buttons = 1 + usize::from(reasoning_offered) + usize::from(modes_offered);
+        let model_share = model_chip_share(
+            (viewport_width - (theme::SPACING_LG + theme::SPACING_MD) * 2.0).max(0.0),
+            option_buttons,
+            false,
+        );
+        let spells_model = model_label_fits(&model_label, model_share);
 
         div()
             .absolute()
@@ -27438,7 +27580,8 @@ impl MobileApp {
                                             .child(
                                                 Textarea::new(&self.new_session_prompt_input)
                                                     .appearance(false)
-                                                    .text_size(theme::font_composer()),
+                                                    .text_size(theme::font_composer())
+                                                    .text_color(theme::text_primary()),
                                             ),
                                     )
                                     // The first message opens the same three lists
@@ -27510,6 +27653,7 @@ impl MobileApp {
                                                     model_label,
                                                     !runtime_ready,
                                                     false,
+                                                    spells_model,
                                                     ComposerChipAction::NewSessionModel,
                                                     cx,
                                                 )
@@ -27586,6 +27730,7 @@ impl MobileApp {
                                             !self.new_session_temporary
                                                 && self.new_session_project_id.is_none(),
                                             true,
+                                            true,
                                             ComposerChipAction::NewSessionProject,
                                             cx,
                                         )
@@ -27611,6 +27756,7 @@ impl MobileApp {
                                                     .into_any_element(),
                                                 location_label.clone(),
                                                 false,
+                                                true,
                                                 true,
                                                 ComposerChipAction::NewSessionLocation,
                                                 cx,
@@ -29294,7 +29440,9 @@ impl MobileApp {
                 self.render_settings(sheets.settings_palette, sheets.settings_palette_scroll, cx)
             }
             MobileOverlay::NewProject => self.render_new_project(cx),
-            MobileOverlay::NewSession => self.render_new_session(cx),
+            MobileOverlay::NewSession => {
+                self.render_new_session(f32::from(window.viewport_size().width), cx)
+            }
         }
     }
 }
@@ -33760,6 +33908,48 @@ mod tests {
             assert!(app.runtime_draft.is_none());
             assert_eq!(app.new_session_runtime.as_ref(), Some(&chosen));
         });
+    }
+
+    /// The model's name is drawn whole or not at all, and the row's own rules
+    /// decide which: the same answer the desktop reaches with a window-width
+    /// breakpoint, reached here from the label itself.
+    #[test]
+    fn a_model_name_is_spelled_out_only_when_the_row_can_hold_it() {
+        // A phone's row: window, the composer's and the card's padding, then
+        // the plus, one glyph for each of the Agent's three option groups, the
+        // usage ring and the send plate.
+        let phone = model_chip_share(360.0 - theme::SPACING_MD * 4.0, 3, true);
+        assert!(model_label_fits("gpt-5", phone));
+        assert!(model_label_fits("Opus 5", phone));
+        assert!(
+            !model_label_fits("deepseek-v4.1-flash", phone),
+            "a long id gives way to the glyph rather than to an ellipsis"
+        );
+
+        // A tablet's row holds the longest id the catalogue publishes.
+        let tablet = model_chip_share(820.0 - theme::SPACING_MD * 4.0, 3, true);
+        assert!(model_label_fits("deepseek-v4.1-flash", tablet));
+
+        // Every glyph the row carries is paid for by the name, so an Agent with
+        // one option group has more room for it than one with three.
+        assert!(
+            model_chip_share(360.0, 1, true) > model_chip_share(360.0, 3, true),
+            "the option glyphs come out of the model's share"
+        );
+        assert!(
+            model_chip_share(360.0, 3, true) < model_chip_share(360.0, 3, false),
+            "the usage ring comes out of it too"
+        );
+    }
+
+    #[test]
+    fn a_model_name_is_measured_in_the_script_it_is_written_in() {
+        let size = f32::from(theme::scaled_px(theme::FONT_CAPTION));
+        let latin = model_label_width("abcd", size);
+        assert!((latin - size * 4.0 * MODEL_LABEL_LATIN_ADVANCE).abs() < 0.01);
+        // A Han character is a whole em, not the half a Latin letter takes, so
+        // four of them are wider than four Latin ones.
+        assert!(model_label_width("深度求索", size) > model_label_width("abcd", size));
     }
 
     #[test]
@@ -40239,10 +40429,19 @@ fn session_opened(cx: &mut Context<Self>) {
     fn the_clock_schedules_and_recall_wears_its_own_mark() {
         let source = include_str!("app.rs");
         let composer = renderer_source(source, "render_composer");
+        let header = renderer_source(source, "render_header");
 
+        // Recall sits in the header now, beside the title of the session it
+        // recalls: the arrow is still the mark, and it still opens the list.
         assert!(
-            composer.contains("\"composer-history\"") && composer.contains("icons/rotate-ccw.svg"),
-            "recall is the arrow, not the clock"
+            header.contains("\"open-composer-history\"")
+                && header.contains("icons/rotate-ccw.svg")
+                && header.contains("this.open_composer_history(window, cx)"),
+            "recall is the arrow, and it wears it in the header"
+        );
+        assert!(
+            !composer.contains("composer-history"),
+            "the composer's own row no longer carries recall"
         );
         assert!(
             composer.contains(".id(\"schedule-message\")")
@@ -40250,7 +40449,7 @@ fn session_opened(cx: &mut Context<Self>) {
             "the clock opens the schedule sheet"
         );
         assert!(
-            composer.contains("this.open_composer_history(window, cx)"),
+            !composer.contains("this.open_composer_history(window, cx)"),
             "and a clock tap never opens the history sheet"
         );
     }
