@@ -4545,21 +4545,10 @@ impl MobileApp {
 
     /// Steps the text size through its four settings.
     ///
-    /// Tapping the row reaches the next larger step and wraps at the top, so
-    /// the smallest step is one more tap from the largest rather than the only
-    /// way to reverse the cycle. A stored value that is not on the ladder — an
-    /// older build's step, a hand-edited file — enters the ladder at its
-    /// nearest rung instead of jumping back to the default.
+    /// The step rule lives in [`theme::next_font_scale_percent`], which is pure
+    /// and unit-tested; this only applies and persists its answer.
     fn cycle_text_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let steps = theme::FONT_SCALE_STEPS;
-        let current = self.app_settings.font_scale_percent;
-        let next = match steps.iter().position(|step| *step == current) {
-            Some(index) => steps[(index + 1) % steps.len()],
-            None => *steps
-                .iter()
-                .min_by_key(|step| step.abs_diff(current))
-                .unwrap_or(&theme::FONT_SCALE_DEFAULT),
-        };
+        let next = theme::next_font_scale_percent(self.app_settings.font_scale_percent);
         self.app_settings.font_scale_percent = next;
         // A step has to move the kit's base and the window rem together with
         // the ladder, or half the screen keeps the old size.
@@ -33263,18 +33252,28 @@ fn collaboration_status(status: vibex_core::ToolCallStatus) -> (&'static str, gp
 /// reader who asked for the smaller of the two sees the name of the step they
 /// picked.
 fn text_size_label(percent: u32) -> String {
+    text_size_label_for(locale::current(), percent)
+}
+
+/// [`text_size_label`] in a named language.
+///
+/// Split out so the label table can be asserted without moving the
+/// process-wide language preference that the tests running beside it read.
+fn text_size_label_for(current: Locale, percent: u32) -> String {
     match percent {
-        theme::FONT_SCALE_TINY => locale::text("Smallest", "最小", "最小").to_string(),
-        theme::FONT_SCALE_COMPACT => locale::text("Compact", "紧凑", "緊湊").to_string(),
-        theme::FONT_SCALE_DEFAULT => locale::common("Default").to_string(),
-        theme::FONT_SCALE_LARGE => locale::text("Large", "较大", "較大").to_string(),
+        theme::FONT_SCALE_TINY => locale::text_for(current, "Smallest", "最小", "最小").to_string(),
+        theme::FONT_SCALE_COMPACT => {
+            locale::text_for(current, "Compact", "紧凑", "緊湊").to_string()
+        }
+        theme::FONT_SCALE_DEFAULT => locale::common_for(current, "Default").to_string(),
+        theme::FONT_SCALE_LARGE => locale::text_for(current, "Large", "较大", "較大").to_string(),
         // A value the ladder does not name cannot be reached from the row, so
         // this only covers a stored step the loader let through. Name it by
         // the half it falls in rather than drawing a number.
         value if value < theme::FONT_SCALE_DEFAULT => {
-            locale::text("Compact", "紧凑", "緊湊").to_string()
+            locale::text_for(current, "Compact", "紧凑", "緊湊").to_string()
         }
-        _ => locale::text("Large", "较大", "較大").to_string(),
+        _ => locale::text_for(current, "Large", "较大", "較大").to_string(),
     }
 }
 
@@ -33925,6 +33924,48 @@ mod tests {
             modes: Vec::new(),
             features: Vec::new(),
             availability,
+        }
+    }
+
+    /// Every step the row can cycle to has to read as its own name.
+    ///
+    /// The row used to label anything under 100 "Compact", which was true while
+    /// there was one such step; with a smaller rung under it, both would have
+    /// printed the same word and the reader could not tell which of the two they
+    /// had picked. Asserted per language instead of through the global
+    /// preference, so the tests running beside this one keep their own language.
+    #[test]
+    fn every_text_size_step_has_its_own_label() {
+        let english: Vec<String> = theme::FONT_SCALE_STEPS
+            .iter()
+            .copied()
+            .map(|step| text_size_label_for(Locale::En, step))
+            .collect();
+        assert_eq!(
+            english,
+            vec![
+                "Smallest".to_string(),
+                "Compact".to_string(),
+                "Default".to_string(),
+                "Large".to_string(),
+            ]
+        );
+        // The two sub-default rungs are the pair that used to share a word.
+        assert_ne!(english[0], english[1]);
+        // The same ladder translated, still one label per step.
+        let simplified: Vec<String> = theme::FONT_SCALE_STEPS
+            .iter()
+            .copied()
+            .map(|step| text_size_label_for(Locale::ZhCn, step))
+            .collect();
+        assert_eq!(simplified[0], "最小");
+        assert_eq!(simplified[1], "紧凑");
+        assert_eq!(simplified[2], "默认");
+        assert_eq!(simplified[3], "较大");
+        // A stored step off the ladder still resolves to a name instead of an
+        // empty row value.
+        for off_ladder in [0, 200] {
+            assert!(!text_size_label_for(Locale::En, off_ladder).is_empty());
         }
     }
 

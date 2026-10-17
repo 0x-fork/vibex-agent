@@ -583,9 +583,32 @@ static REDUCE_MOTION: AtomicU8 = AtomicU8::new(0);
 /// an integer because atomics do not carry floats; 100 is the default.
 static FONT_SCALE_PERCENT: AtomicU32 = AtomicU32::new(100);
 
-/// The steps the text-size setting offers. Three is what a phone can show
-/// without turning the choice into a slider nobody can judge.
-pub const FONT_SCALE_STEPS: [u32; 3] = [90, 100, 115];
+/// The smallest step the text-size setting offers: one rung below the compact
+/// step, for a reader who still finds the compact ladder too wide.
+pub const FONT_SCALE_TINY: u32 = 80;
+
+/// The step a phone that has never stored a preference starts on.
+///
+/// The ladder is authored for it, so it is the answer to "what is the text
+/// size on a fresh install" for both the loader and `AppSettings::default`.
+pub const FONT_SCALE_DEFAULT: u32 = 100;
+
+/// The compact step: one rung below the default, and no longer the floor.
+pub const FONT_SCALE_COMPACT: u32 = 90;
+
+/// The largest step, for a reader who has raised the platform's own text
+/// scaling as far as it goes and still wants more.
+pub const FONT_SCALE_LARGE: u32 = 115;
+
+/// The steps the text-size setting offers, smallest first. Four keeps the
+/// choice a tap-to-cycle rather than a slider nobody can judge: two steps
+/// below the default and one above it.
+pub const FONT_SCALE_STEPS: [u32; 4] = [
+    FONT_SCALE_TINY,
+    FONT_SCALE_COMPACT,
+    FONT_SCALE_DEFAULT,
+    FONT_SCALE_LARGE,
+];
 
 /// Stores the reader's text-size step.
 ///
@@ -595,6 +618,24 @@ pub const FONT_SCALE_STEPS: [u32; 3] = [90, 100, 115];
 /// than the next window layout.
 pub fn set_font_scale_percent(percent: u32) {
     FONT_SCALE_PERCENT.store(percent.clamp(75, 150), Ordering::Relaxed);
+}
+
+/// The step after `current` when the reader taps the text-size row.
+///
+/// It steps up the ladder and wraps at the top, so the smallest step is one tap
+/// from the largest rather than reachable only by reversing direction. A value
+/// the ladder does not name — one an older build stored, or one a hand-edited
+/// file carries — snaps to its nearest rung instead of falling back to the
+/// default, so the row always names a size the reader can then step from.
+/// Pure so the rule is testable without a window.
+pub fn next_font_scale_percent(current: u32) -> u32 {
+    match FONT_SCALE_STEPS.iter().position(|step| *step == current) {
+        Some(index) => FONT_SCALE_STEPS[(index + 1) % FONT_SCALE_STEPS.len()],
+        None => *FONT_SCALE_STEPS
+            .iter()
+            .min_by_key(|step| step.abs_diff(current))
+            .unwrap_or(&FONT_SCALE_DEFAULT),
+    }
 }
 
 /// Applies a text-size step to the live window and repaints it.
@@ -1463,6 +1504,70 @@ mod tests {
         }
     }
 
+    /// The text-size row's tap rule: one rung up, wrapping at the top.
+    #[test]
+    fn the_text_size_row_walks_the_ladder_and_wraps() {
+        // Every rung reaches the next larger one, and the largest wraps to the
+        // smallest, so no step is reachable only by tapping the other way.
+        let walked: Vec<u32> = (0..FONT_SCALE_STEPS.len())
+            .scan(FONT_SCALE_DEFAULT, |current, _| {
+                *current = next_font_scale_percent(*current);
+                Some(*current)
+            })
+            .collect();
+        assert_eq!(
+            walked,
+            vec![
+                FONT_SCALE_LARGE,
+                FONT_SCALE_TINY,
+                FONT_SCALE_COMPACT,
+                FONT_SCALE_DEFAULT,
+            ]
+        );
+        // A step the ladder does not name snaps to its nearest rung, so a
+        // hand-edited value still lands on a size the row can name.
+        assert_eq!(next_font_scale_percent(0), FONT_SCALE_TINY);
+        assert_eq!(next_font_scale_percent(87), FONT_SCALE_COMPACT);
+        assert_eq!(next_font_scale_percent(101), FONT_SCALE_DEFAULT);
+        assert_eq!(next_font_scale_percent(1000), FONT_SCALE_LARGE);
+    }
+
+    #[test]
+    fn every_offered_step_survives_the_rem_clamp() {
+        // The reader can only pick a step from the ladder, so every rung has to
+        // be inside the clamp `set_font_scale_percent` and `rem_base_for`
+        // apply. A step outside it would silently render at the boundary and
+        // the label would name a size the screen never shows. Checked in const
+        // blocks so a step that drifted past a bound fails the build, not just
+        // this test.
+        const {
+            assert!(
+                FONT_SCALE_TINY >= 75,
+                "the smallest step must not be clamped away"
+            )
+        };
+        const {
+            assert!(
+                FONT_SCALE_LARGE <= 150,
+                "the largest step must not be clamped away"
+            )
+        };
+        // Ascending and distinct, so the row's cycle visits each step once and
+        // the label can key on the value.
+        for pair in FONT_SCALE_STEPS.windows(2) {
+            assert!(pair[0] < pair[1], "steps must ascend: {pair:?}");
+        }
+        assert_eq!(FONT_SCALE_STEPS.len(), 4);
+        assert_eq!(FONT_SCALE_STEPS[0], FONT_SCALE_TINY);
+        assert_eq!(
+            FONT_SCALE_STEPS[FONT_SCALE_STEPS.len() - 1],
+            FONT_SCALE_LARGE
+        );
+        // The default step is on the ladder, so a fresh install renders the
+        // authored size instead of a clamped fallback.
+        assert!(FONT_SCALE_STEPS.contains(&FONT_SCALE_DEFAULT));
+    }
+
     #[test]
     fn a_two_line_sidebar_row_never_clips_its_second_line() {
         // A row stacking a project title over its metadata must be at least as
@@ -1484,21 +1589,26 @@ mod tests {
         // At the default step the two lines now exceed the touch-target floor,
         // so the row takes the text height: the floor is a minimum, not a cap
         // that would clip the second line.
-        assert!(lines_at(rem_base_for(100)) > SIDEBAR_ROW_HEIGHT);
+        assert!(lines_at(rem_base_for(FONT_SCALE_DEFAULT)) > SIDEBAR_ROW_HEIGHT);
         assert_eq!(
-            sidebar_row_height_for(rem_base_for(100)),
-            px(lines_at(rem_base_for(100)))
+            sidebar_row_height_for(rem_base_for(FONT_SCALE_DEFAULT)),
+            px(lines_at(rem_base_for(FONT_SCALE_DEFAULT)))
         );
         // At the compact step the text still fits inside the floor, so the row
-        // stays at the touch target rather than shrinking with the type.
-        assert!(lines_at(rem_base_for(90)) <= SIDEBAR_ROW_HEIGHT);
-        assert_eq!(
-            sidebar_row_height_for(rem_base_for(90)),
-            px(SIDEBAR_ROW_HEIGHT)
-        );
+        // stays at the touch target rather than shrinking with the type. The
+        // smallest step only leaves more room, so the row must not start
+        // collapsing with the text either.
+        for percent in [FONT_SCALE_COMPACT, FONT_SCALE_TINY] {
+            assert!(lines_at(rem_base_for(percent)) <= SIDEBAR_ROW_HEIGHT);
+            assert_eq!(
+                sidebar_row_height_for(rem_base_for(percent)),
+                px(SIDEBAR_ROW_HEIGHT)
+            );
+        }
         // A larger step keeps growing the row.
         assert!(
-            sidebar_row_height_for(rem_base_for(115)) > sidebar_row_height_for(rem_base_for(100))
+            sidebar_row_height_for(rem_base_for(FONT_SCALE_LARGE))
+                > sidebar_row_height_for(rem_base_for(FONT_SCALE_DEFAULT))
         );
     }
 

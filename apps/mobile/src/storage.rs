@@ -145,7 +145,7 @@ fn clamp_composer_text(text: String) -> String {
 /// Mobile-owned appearance and language preferences. When a value is `None`
 /// the mobile client follows the platform (system appearance and system
 /// locale), matching the desktop's `System` defaults.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppSettings {
     pub theme: Option<crate::theme::AppearanceMode>,
     pub language: Option<crate::locale::LanguagePreference>,
@@ -169,6 +169,30 @@ pub struct AppSettings {
     pub notify_completed: bool,
     pub notify_needs_input: bool,
     pub notify_failed: bool,
+}
+
+/// What a phone with no stored settings file starts on.
+///
+/// Written by hand rather than derived because the text-size step and the four
+/// notification switches do not start at `0` / `false`. A derived default gave
+/// a fresh install 0% text — which the rem base clamps to a step the setting
+/// does not even offer — and left notifications off until the reader found the
+/// switch, even though pairing requests authorization on its own.
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            theme: None,
+            language: None,
+            theme_selection: ThemeSelection::default(),
+            reduce_motion: false,
+            keep_screen_on: false,
+            font_scale_percent: crate::theme::FONT_SCALE_DEFAULT,
+            notifications: true,
+            notify_completed: true,
+            notify_needs_input: true,
+            notify_failed: true,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -744,7 +768,10 @@ impl CredentialStorage {
             theme_selection: stored.theme_selection.unwrap_or_default(),
             reduce_motion: stored.reduce_motion.unwrap_or(false),
             keep_screen_on: stored.keep_screen_on.unwrap_or(false),
-            font_scale_percent: stored.font_scale_percent.unwrap_or(100),
+            font_scale_percent: stored
+                .font_scale_percent
+                .filter(|percent| crate::theme::FONT_SCALE_STEPS.contains(percent))
+                .unwrap_or(crate::theme::FONT_SCALE_DEFAULT),
             notifications: stored.notifications.unwrap_or(true),
             notify_completed: stored.notify_completed.unwrap_or(true),
             notify_needs_input: stored.notify_needs_input.unwrap_or(true),
@@ -1556,6 +1583,61 @@ mod tests {
         let loaded = storage.load_app_settings().unwrap();
         assert_eq!(loaded.theme, Some(crate::theme::AppearanceMode::Dark));
         assert_eq!(loaded.language, None);
+    }
+
+    /// A phone that has never written a settings file must start on the
+    /// default text-size step, not on 0%.
+    ///
+    /// The step is a percentage the rem base clamps, so a derived default of
+    /// zero did not read as "unset": it read as the smallest size the clamp
+    /// allows, which is a step the setting does not even offer. The same
+    /// record also left the notification switches off while pairing requested
+    /// authorization, so the master switch contradicted the permission the app
+    /// had just asked for.
+    #[test]
+    fn a_fresh_install_starts_on_the_default_text_step_and_notifications_on() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        // No file at all: the loader's own fallback, which is what a first
+        // launch reads.
+        let fresh = storage.load_app_settings().unwrap();
+        assert_eq!(fresh.font_scale_percent, crate::theme::FONT_SCALE_DEFAULT);
+        assert!(crate::theme::FONT_SCALE_STEPS.contains(&fresh.font_scale_percent));
+        assert!(fresh.notifications);
+        assert!(fresh.notify_completed);
+        assert!(fresh.notify_needs_input);
+        assert!(fresh.notify_failed);
+        // `AppSettings::default()` and the loader have to agree, or a corrupt
+        // file and a missing one would launch on two different sizes.
+        assert_eq!(fresh, AppSettings::default());
+    }
+
+    /// A stored step the ladder no longer offers is read as the default, and a
+    /// corrupt step cannot smuggle a clamped value into the first frame.
+    #[test]
+    fn an_unknown_stored_text_step_falls_back_to_the_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        fs::create_dir_all(temp.path()).unwrap();
+        for stored in ["0", "101", "50", "1000"] {
+            fs::write(
+                storage.app_settings_path(),
+                format!(
+                    r#"{{"schemaVersion":"vibex-native-mobile-app-settings.v1","fontScalePercent":{stored}}}"#
+                ),
+            )
+            .unwrap();
+            let loaded = storage.load_app_settings().unwrap();
+            assert_eq!(
+                loaded.font_scale_percent,
+                crate::theme::FONT_SCALE_DEFAULT,
+                "stored step {stored} is not on the ladder"
+            );
+            assert!(
+                crate::theme::FONT_SCALE_STEPS.contains(&loaded.font_scale_percent),
+                "a loaded step must always be one the row can name"
+            );
+        }
     }
 
     #[test]
