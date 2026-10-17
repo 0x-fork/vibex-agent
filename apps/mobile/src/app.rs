@@ -21637,9 +21637,17 @@ impl MobileApp {
         Some(
             div()
                 .id("mobile-composer-plan-expanded")
-                .mb(px(theme::SPACING_SM))
+                .debug_selector(|| "mobile-composer-plan-expanded".to_string())
+                // The panel is the bar it was folded out of, plus the rows
+                // above it: the bar keeps its own margin and its own border,
+                // and the panel adds neither below them. Its frame is therefore
+                // open along the bottom edge — the bar's border is the bottom
+                // edge — which is what keeps the bar on exactly the line it was
+                // on before the reader unfolded it.
                 .rounded(px(theme::RADIUS_CARD))
-                .border_1()
+                .border_t_1()
+                .border_l_1()
+                .border_r_1()
                 .border_color(theme::border_default())
                 .bg(theme::bg_card())
                 .overflow_hidden()
@@ -34098,6 +34106,112 @@ mod tests {
         assert!(
             model_chip_share(360.0, 3, true) < model_chip_share(360.0, 3, false),
             "the usage ring comes out of it too"
+        );
+    }
+
+    /// A workspace whose session carries a plan the composer shows above the
+    /// card, laid out the way the reader first meets it.
+    fn app_with_a_composer_plan<'a>(
+        cx: &'a mut TestAppContext,
+        data_dir: &std::path::Path,
+    ) -> (Entity<MobileApp>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        cx.add_window_view(|window, cx| {
+            let mut app = MobileApp::new_for_test(data_dir.to_path_buf(), window, cx);
+            let backend = vibex_backend::DisconnectedBackend::facade();
+            let mut controller =
+                AgentWorkflowController::new(backend.agent().clone(), backend.capabilities().agent);
+            let session_id = VibexSessionId::parse("session_mobile_plan").unwrap();
+            controller.state.selected_session_id = Some(session_id.clone());
+            controller.state.timeline.replace_authoritative(
+                session_id.clone(),
+                vec![TimelineItem {
+                    id: vibex_core::TimelineItemId::parse("timeline_mobile_plan").unwrap(),
+                    session_id: session_id.clone(),
+                    sequence: 1,
+                    timestamp_ms: 1,
+                    source: TimelineSource::Agent,
+                    kind: TimelineItemKind::Plan,
+                    correlation_id: None,
+                    provider_correlation_id: None,
+                    redaction_state: TimelineRedactionState::None,
+                    execution_attribution: None,
+                    payload_depth: vibex_core::TimelinePayloadDepth::Detail,
+                    payload: TimelinePayload::Plan(vibex_core::PlanPayload {
+                        title: "Verify, commit, merge to main".into(),
+                        steps: vec![
+                            vibex_core::PlanStepPayload {
+                                title: "Read the diff".into(),
+                                status: PlanStepStatus::Completed,
+                            },
+                            vibex_core::PlanStepPayload {
+                                title: "Run the gate".into(),
+                                status: PlanStepStatus::Running,
+                            },
+                        ],
+                    }),
+                }],
+            );
+            app.controller = Some(controller);
+            app.mode = RootMode::Workspace;
+            app
+        })
+    }
+
+    /// Expanding the plan grows the panel upward and moves nothing else: the bar
+    /// the reader tapped keeps the line it was on, and so does the card under it.
+    #[gpui::test]
+    fn expanding_the_plan_grows_upward_and_leaves_the_bar_where_it_was(cx: &mut TestAppContext) {
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = app_with_a_composer_plan(cx, data_dir.path());
+        cx.run_until_parked();
+
+        let bar = cx
+            .debug_bounds("mobile-composer-plan")
+            .expect("the plan bar");
+        let card = cx
+            .debug_bounds("composer-runtime-options")
+            .expect("the composer's own control row");
+
+        // The identity the page itself keys the fold on, so the test cannot
+        // drift from the shape the bar reads.
+        let identity = app
+            .update(cx, |app, _| {
+                let session = app.controller.as_ref()?.state.selected_session_id.clone()?;
+                let timeline = app.display_timeline()?;
+                let plan = current_mobile_plan(&timeline.items)?;
+                Some((session.as_str().to_string(), plan.sequence))
+            })
+            .expect("the plan the bar is showing");
+        app.update(cx, |app, cx| {
+            app.composer_plan_expanded = Some(identity);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let panel = cx
+            .debug_bounds("mobile-composer-plan-expanded")
+            .expect("the panel is open");
+        let expanded_bar = cx.debug_bounds("mobile-composer-plan").expect("the bar");
+        let expanded_card = cx
+            .debug_bounds("composer-runtime-options")
+            .expect("the control row");
+        assert_eq!(
+            (bar.top(), bar.bottom()),
+            (expanded_bar.top(), expanded_bar.bottom()),
+            "the bar the reader tapped must stay exactly where it was"
+        );
+        assert_eq!(
+            card.bottom(),
+            expanded_card.bottom(),
+            "and so must the card under it"
+        );
+        assert!(
+            panel.top() < bar.top(),
+            "the rows the fold adds go above the bar, not below it"
         );
     }
 
