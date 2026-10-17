@@ -357,13 +357,25 @@ pub const FONT_CODE: f32 = FONT_CAPTION;
 
 /// The face code, diffs, and terminal output are drawn in.
 ///
-/// The platform's monospace face, not a bundled one: `monospace` resolves to
-/// SF Mono (through Menlo) on iOS and to Droid Sans Mono or Roboto Mono on
-/// Android, and both metric-compatible with the 8 px terminal cell the PTY is
-/// sized against. Naming a family the build does not carry — as the surfaces
-/// once named "IBM Plex Mono" — does not fall back to a monospace at all: GPUI
-/// walks its own cascade and lands on the proportional system UI face, which
-/// breaks the grid the terminal lays out in whole cells.
+/// The platform's monospace face, named as that platform names it. The generic
+/// `monospace` alias is not one of them: `gpui-pre` resolves a family against
+/// the fonts the platform actually loaded, and a name it cannot find panics its
+/// text system rather than falling back — `failed to resolve font 'monospace'`
+/// — which unwinds the process-lived render thread and leaves every later touch
+/// waking a dead looper. Android loads the AOSP `DroidSansMono.ttf`, whose
+/// family is `Droid Sans Mono`, and iOS carries Menlo; both are
+/// metric-compatible with the 8 px terminal cell the PTY is sized against.
+///
+/// A family the build does not carry ends the same way, which is where naming
+/// "IBM Plex Mono" — a face the mobile build never shipped — once led.
+#[cfg(target_os = "android")]
+pub const MONO_FONT_FAMILY: &str = "Droid Sans Mono";
+/// Menlo is the monospace face every iOS release carries; SF Mono is not a
+/// family name its text system resolves.
+#[cfg(target_os = "ios")]
+pub const MONO_FONT_FAMILY: &str = "Menlo";
+/// The host build only measures text; fontconfig gives it the generic alias.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub const MONO_FONT_FAMILY: &str = "monospace";
 /// The floor of the ladder: timestamps, counts, badges. It is the smallest
 /// step the phone renders, kept at the size secondary copy stays legible in.
