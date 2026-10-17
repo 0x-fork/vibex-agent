@@ -2229,7 +2229,10 @@ impl App {
             key.to_string(),
             subject,
             verb,
-            vec![Effect::LoadAgentAuthCatalog { agent_id }],
+            vec![Effect::LoadAgentAuthCatalog {
+                agent_id,
+                refresh: false,
+            }],
         )
     }
 
@@ -2277,8 +2280,20 @@ impl App {
                 let pending_sign_in = view.pending_sign_in.clone();
                 self.overlay = Some(Overlay::AgentAuth { view });
                 match action {
+                    // A refresh is a write: it launches the Agent's own runtime
+                    // to re-probe what it advertises. It is gated on the manage
+                    // grant for that reason, and it is the *only* line that
+                    // re-probes — opening the panel answers from the snapshot.
                     AgentAuthAction::RefreshMethods => {
-                        Outcome::effects(vec![Effect::LoadAgentAuthCatalog { agent_id }])
+                        if let Some(outcome) =
+                            self.unavailable_outcome(BackendOperation::AgentAuthManage)
+                        {
+                            return outcome;
+                        }
+                        Outcome::effects(vec![Effect::LoadAgentAuthCatalog {
+                            agent_id,
+                            refresh: true,
+                        }])
                     }
                     AgentAuthAction::Verify => {
                         Outcome::effects(vec![Effect::VerifyAgentAuth { agent_id }])
@@ -7786,6 +7801,7 @@ impl App {
                 if let Some(catalog) = self.management_data.agent_auth_catalog.as_ref() {
                     effects.push(Effect::LoadAgentAuthCatalog {
                         agent_id: catalog.agent_id.clone(),
+                        refresh: false,
                     });
                 }
                 Outcome::effects(effects)

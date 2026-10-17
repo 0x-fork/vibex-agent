@@ -562,8 +562,16 @@ fn handle_key(
     // it gives the panel back — and the global chords above have already had
     // their chance, so a reader can still leave the surface.
     if let Some(terminal_id) = app.auth_terminal_key_target() {
-        let bytes = terminal_keys_bytes(key);
-        if let Some(bytes) = bytes {
+        // `Esc` gives the panel back rather than being sent: the program inside
+        // reads it as "cancel the prompt", and a reader asking to leave the
+        // surface would be answering a question they meant to walk away from.
+        // The terminal is detached, not closed — the authority still owns the
+        // process, and re-opening the panel attaches to it again.
+        if key.code == KeyCode::Esc && !key.modifiers.contains(KeyModifiers::CONTROL) {
+            app.detach_auth_terminal();
+            return Ok(false);
+        }
+        if let Some(bytes) = terminal_keys_bytes(key) {
             dispatch_all(
                 worker,
                 &crate::reduce::Outcome::effects(vec![Effect::WriteAgentAuthTerminal {
@@ -1476,6 +1484,20 @@ fn handle_composer_key(
 /// keyboard equivalent, and the transcript stays readable if the terminal has no
 /// mouse reporting at all.
 fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
+    // A sign-in terminal that asked for the mouse owns it: the program drew a
+    // list and asked the terminal to report clicks, which is exactly the mode
+    // the emulator records. A click the client kept for itself would be a click
+    // the list never saw, so this comes before every other region.
+    if let Some((terminal_id, bytes)) = app.auth_terminal_mouse_event(mouse) {
+        dispatch_all(
+            worker,
+            &crate::reduce::Outcome::effects(vec![Effect::WriteAgentAuthTerminal {
+                terminal_id,
+                data: bytes,
+            }]),
+        );
+        return true;
+    }
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             // The switcher owns the wheel while it is up: it is the list on
@@ -2448,6 +2470,18 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                     // running, and the operation it named is what "cancel"
                     // would end. A sign-in that finished clears it, because
                     // there is nothing left to call off.
+                    // A cancel is its own verb, and its answer is the panel's:
+                    // the operation is over, so the line that offered to end it
+                    // is gone and the sentence says so.
+                    if key == "agent_auth_cancel"
+                        && let Some(Overlay::AgentAuth { view }) = app.overlay.as_mut()
+                    {
+                        view.pending_sign_in = None;
+                        view.notice = Some((
+                            app.strings.config_auth_cancelled().to_string(),
+                            crate::config_center::ConfigTone::Muted,
+                        ));
+                    }
                     if key == "agent_auth_sign_in"
                         && let Some(Overlay::AgentAuth { view }) = app.overlay.as_mut()
                     {
@@ -3020,10 +3054,20 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
         }
         AppMessage::AgentAuthTerminalEnded { terminal_id } => {
             // The process is gone but the grid it left is not: the last frame
-            // stays on screen so the reader can read what it said. The account
-            // is re-read by the sign-in's own answer, which is the authority's
-            // word on whether it worked.
-            let _ = terminal_id;
+            // stays on screen so the reader can read what it said. What the
+            // panel *does* change is the line that would otherwise leave the
+            // reader typing into a terminal nobody is reading any more.
+            if app
+                .auth_terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.terminal_id == terminal_id)
+                && let Some(Overlay::AgentAuth { view }) = app.overlay.as_mut()
+            {
+                view.notice = Some((
+                    app.strings.config_auth_terminal_ended().to_string(),
+                    crate::config_center::ConfigTone::Muted,
+                ));
+            }
         }
         AppMessage::ConfigSources { module, mcp, skill } => {
             if module == crate::config_center::ConfigModule::Mcp {

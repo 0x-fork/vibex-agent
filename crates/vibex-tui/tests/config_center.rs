@@ -2653,8 +2653,12 @@ fn an_agents_account_is_read_as_one_list() {
         "the account panel did not open"
     );
     match outcome.effects.as_slice() {
-        [vibex_tui::app::Effect::LoadAgentAuthCatalog { agent_id }] => {
+        [vibex_tui::app::Effect::LoadAgentAuthCatalog { agent_id, refresh }] => {
             assert_eq!(agent_id.as_str(), "codex");
+            assert!(
+                !refresh,
+                "opening the panel re-probed the Agent instead of reading the snapshot"
+            );
         }
         other => panic!("the panel read nothing: {other:?}"),
     }
@@ -4550,8 +4554,9 @@ fn the_rows_sign_out_opens_the_panel_on_the_line_it_meant() {
 
     let outcome = app.run_config_action_by_key("codex", ConfigAction::Logout);
     match outcome.effects.as_slice() {
-        [vibex_tui::app::Effect::LoadAgentAuthCatalog { agent_id }] => {
+        [vibex_tui::app::Effect::LoadAgentAuthCatalog { agent_id, refresh }] => {
             assert_eq!(agent_id.as_str(), "codex");
+            assert!(!refresh, "the row's sign-out re-probed the Agent");
         }
         other => panic!("the row's sign-out did not open the account: {other:?}"),
     }
@@ -4633,5 +4638,210 @@ fn a_running_sign_in_is_offered_and_its_cancel_is_asked_for() {
     assert!(
         view.pending_sign_in.is_none(),
         "the panel went on offering to cancel a sign-in it had already called off"
+    );
+}
+
+/// "Refresh methods" re-probes the Agent; opening the panel does not.
+///
+/// They are different questions. Opening is a read, and a read that launched the
+/// Agent every time would be a process the reader never asked for; the refresh
+/// line is the reader saying what they have is stale, and answering it from the
+/// same snapshot is a key that reports reading without reading anything.
+#[test]
+fn the_refresh_line_re_probes_while_opening_the_panel_only_reads() {
+    let mut app = loaded(140, 40);
+    app.capabilities.agent = vibex_backend::DomainCapabilities::available([
+        vibex_backend::BackendOperation::AgentAuthRead,
+        vibex_backend::BackendOperation::AgentAuthManage,
+    ]);
+    app.management_data.agent_auth_catalog = Some(agent_auth_catalog());
+    app.overlay = Some(Overlay::AgentAuth {
+        view: vibex_tui::config_center::AgentAuthView {
+            agent_id: "codex".to_string(),
+            title: "Codex".to_string(),
+            // The refresh line: after two methods and the credentials page.
+            selected: 3,
+            loading: false,
+            confirming_sign_out: false,
+            notice: None,
+            want_line: vibex_tui::config_center::AgentAuthLine::First,
+            pending_sign_in: None,
+        },
+    });
+    let rows = vibex_tui::config_center::agent_auth_rows(
+        app.management_data.agent_auth_catalog.as_ref(),
+        app.strings,
+    );
+    let refresh = rows
+        .iter()
+        .position(|row| {
+            row.action == Some(vibex_tui::config_center::AgentAuthAction::RefreshMethods)
+        })
+        .expect("the refresh line");
+    if let Some(Overlay::AgentAuth { view }) = app.overlay.as_mut() {
+        view.selected = refresh;
+    }
+
+    let outcome = app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    match outcome.effects.as_slice() {
+        [vibex_tui::app::Effect::LoadAgentAuthCatalog { agent_id, refresh }] => {
+            assert_eq!(agent_id.as_str(), "codex");
+            assert!(refresh, "the refresh line answered from the snapshot");
+        }
+        other => panic!("the refresh line produced {other:?}"),
+    }
+}
+
+/// A method the client cannot drive is a line that explains itself.
+///
+/// The rule is the desktop's, so both clients offer the same verbs for the same
+/// catalogue: a terminal method is always drivable, an Agent-managed one only
+/// when the Agent advertised logout.
+#[test]
+fn a_method_the_client_cannot_drive_is_not_offered_as_usable() {
+    let mut catalog = agent_auth_catalog();
+    catalog.supports_logout = false;
+    // The fixture's first method is Agent-managed; with no logout the client
+    // cannot replace that account, so the line must not pretend otherwise.
+    let rows = vibex_tui::config_center::agent_auth_rows(
+        Some(&catalog),
+        vibex_tui::Strings::for_locale(vibex_tui::Locale::En),
+    );
+    let sign_in = rows
+        .iter()
+        .find(|row| row.label == "Sign in with ChatGPT")
+        .expect("the Agent-managed method");
+    assert!(
+        sign_in.action.is_none(),
+        "an Agent-managed method with no logout was offered as usable"
+    );
+    assert_eq!(sign_in.chip, "the Agent's own sign-in");
+
+    // An Agent that supports logout can be re-authenticated, so the same method
+    // becomes a verb.
+    let mut catalog = agent_auth_catalog();
+    catalog.supports_logout = true;
+    let rows = vibex_tui::config_center::agent_auth_rows(
+        Some(&catalog),
+        vibex_tui::Strings::for_locale(vibex_tui::Locale::En),
+    );
+    let sign_in = rows
+        .iter()
+        .find(|row| row.label == "Sign in with ChatGPT")
+        .expect("the Agent-managed method");
+    assert!(
+        sign_in.action.is_some(),
+        "a re-authenticatable method was not offered"
+    );
+
+    // A terminal method is drivable whatever the logout capability says: the
+    // client attaches to the PTY the authority opened.
+    let terminal: vibex_core::AgentAuthCatalog = serde_json::from_value(serde_json::json!({
+        "agentId": "kiro",
+        "methods": [{
+            "id": "vibex-cli-login",
+            "name": "Sign in to Kiro CLI",
+            "kind": "terminal",
+            "effect": "writes_agent_state_home",
+            "environment": []
+        }],
+        "supportsLogout": false,
+        "status": "authentication_required",
+        "refreshedAtMs": 1
+    }))
+    .expect("terminal catalogue");
+    let rows = vibex_tui::config_center::agent_auth_rows(
+        Some(&terminal),
+        vibex_tui::Strings::for_locale(vibex_tui::Locale::En),
+    );
+    assert!(
+        rows.iter().any(|row| matches!(
+            row.action,
+            Some(vibex_tui::config_center::AgentAuthAction::Method {
+                kind: vibex_core::AgentAuthMethodKind::Terminal,
+                ..
+            })
+        )),
+        "a terminal method was withheld without a logout capability"
+    );
+}
+
+/// A terminal that asked for the mouse gets the pointer, in the form a terminal
+/// reports it.
+///
+/// A login flow that draws its own list asks for mouse reporting and expects
+/// clicks to arrive as SGR reports. A client that kept the click for itself
+/// would leave a list that looks clickable and is not.
+#[test]
+fn a_terminal_that_asked_for_the_mouse_receives_the_click() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let mut app = loaded(140, 40);
+    app.overlay = Some(Overlay::AgentAuth {
+        view: vibex_tui::config_center::AgentAuthView {
+            agent_id: "codex".to_string(),
+            title: "Codex".to_string(),
+            selected: 0,
+            loading: false,
+            confirming_sign_out: false,
+            notice: None,
+            want_line: vibex_tui::config_center::AgentAuthLine::First,
+            pending_sign_in: None,
+        },
+    });
+    let terminal_id = vibex_core::TerminalId::new();
+    app.auth_terminal = Some(vibex_tui::auth_terminal::AuthTerminal::new(
+        vibex_core::AgentId::parse("codex").unwrap(),
+        terminal_id,
+        "Sign in".to_string(),
+        10,
+        40,
+    ));
+    // The grid the panel drew, which the click is measured against.
+    app.regions.agent_auth_terminal = Some(ratatui::layout::Rect {
+        x: 10,
+        y: 5,
+        width: 40,
+        height: 10,
+    });
+
+    // A program that has not asked for the mouse keeps the pointer.
+    assert!(
+        app.auth_terminal_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 7,
+            modifiers: KeyModifiers::NONE,
+        })
+        .is_none(),
+        "a click was taken by a program that never asked for the mouse"
+    );
+
+    // The same program asking for it gets the click, grid-relative and
+    // 1-based, in the SGR form.
+    if let Some(terminal) = app.auth_terminal.as_mut() {
+        terminal.advance(b"\x1b[?1000h\x1b[?1006h");
+        terminal.refresh();
+    }
+    let (target, bytes) = app
+        .auth_terminal_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 7,
+            modifiers: KeyModifiers::NONE,
+        })
+        .expect("the click did not reach the program that asked for it");
+    assert_eq!(target, app.auth_terminal.as_ref().unwrap().terminal_id);
+    assert_eq!(bytes, "\x1b[<0;3;3M", "the report is not grid-relative SGR");
+
+    // A click outside the grid is the client's, not the program's.
+    assert!(
+        app.auth_terminal_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 7,
+            modifiers: KeyModifiers::NONE,
+        })
+        .is_none(),
+        "a click beside the grid was sent into it"
     );
 }

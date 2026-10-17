@@ -1050,6 +1050,7 @@ strings! {
     config_auth_action_cancel => { "Cancel sign-in", "取消登录", "取消登入" },
     config_auth_waiting_eyebrow => { "running", "进行中", "進行中" },
     config_auth_cancelled => { "Sign-in cancelled", "已取消登录", "已取消登入" },
+    config_auth_terminal_detached => { "The sign-in is still running in its own terminal.", "登录仍在它自己的终端里运行。", "登入仍在它自己的終端裡執行。" },
     config_hint_fixed_endpoint => { "this Agent always calls {url}; the address cannot be changed", "此 Agent 固定调用 {url}，地址不可更改", "此 Agent 固定呼叫 {url}，位址不可變更" },
     config_result_workspace_default => { "workspace default", "工作区默认", "工作區預設" },
     config_result_global_default => { "global default", "全局默认", "全域預設" },

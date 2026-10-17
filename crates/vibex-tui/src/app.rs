@@ -4820,6 +4820,113 @@ impl App {
         (panel_rows.max(1), panel_columns.max(1))
     }
 
+    /// Give the panel back while leaving the sign-in running.
+    ///
+    /// The terminal is the authority's: detaching is what a viewer can do, and
+    /// closing it would kill a login the reader may still be finishing in a
+    /// browser window. The operation is kept on the view, so the panel still
+    /// offers to call it off when it is opened again.
+    pub fn detach_auth_terminal(&mut self) -> bool {
+        if self.auth_terminal.take().is_none() {
+            return false;
+        }
+        if let Some(Overlay::AgentAuth { view }) = self.overlay.as_mut() {
+            view.notice = Some((
+                self.strings.config_auth_terminal_detached().to_string(),
+                crate::config_center::ConfigTone::Muted,
+            ));
+        }
+        true
+    }
+
+    /// The terminal's own report for a pointer event, when the program inside
+    /// asked for the mouse and the pointer is over the grid.
+    ///
+    /// The encoding is SGR (DECSET 1006), which is what a terminal sends when a
+    /// program asks for it and what every program that asks for the mouse
+    /// understands. The coordinates are grid-relative: the program has no idea
+    /// where its grid sits on the client's screen, and telling it otherwise
+    /// would be a coordinate it could not use.
+    pub fn auth_terminal_mouse_event(
+        &self,
+        mouse: crossterm::event::MouseEvent,
+    ) -> Option<(vibex_core::TerminalId, String)> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let terminal = self.auth_terminal.as_ref()?;
+        if !terminal.wants_mouse() {
+            return None;
+        }
+        let grid = self.regions.agent_auth_terminal?;
+        // The grid's origin is the panel's content, and a click outside it is
+        // not the terminal's.
+        let column = mouse.column.checked_sub(grid.x)?;
+        let row = mouse.row.checked_sub(grid.y)?;
+        if column >= grid.width || row >= grid.height {
+            return None;
+        }
+        // A terminal is 1-based and a buffer is 0-based: the program's own
+        // cursor arithmetic is written against the 1-based form.
+        let column = column + 1;
+        let row = row + 1;
+        let (button, pressed) = match mouse.kind {
+            MouseEventKind::Down(button) => (Some(button), true),
+            MouseEventKind::Up(button) => (Some(button), false),
+            // Motion is only reported while a button is held: a program that
+            // asked for the mode wants drags, not a stream of every cell the
+            // pointer crossed.
+            MouseEventKind::Drag(button) => (Some(button), true),
+            MouseEventKind::ScrollUp => (None, true),
+            MouseEventKind::ScrollDown => (None, true),
+            // Horizontal wheels and a bare move are not something a login flow
+            // asks for; the client keeps them rather than inventing a report.
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight | MouseEventKind::Moved => {
+                return None;
+            }
+        };
+        let scroll = matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        );
+        let mut code = match (button, scroll) {
+            (Some(MouseButton::Left), false) => 0,
+            (Some(MouseButton::Middle), false) => 1,
+            (Some(MouseButton::Right), false) => 2,
+            (None, true) => 64,
+            _ => return None,
+        };
+        if scroll && matches!(mouse.kind, MouseEventKind::ScrollDown) {
+            code += 1;
+        }
+        if !pressed {
+            code += 3;
+        }
+        if mouse
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::SHIFT)
+        {
+            code += 4;
+        }
+        if mouse
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::ALT)
+        {
+            code += 8;
+        }
+        if mouse
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+        {
+            code += 16;
+        }
+        // `M` is a press and `m` a release; the final `M` is part of the SGR
+        // form rather than the button it belongs to.
+        let final_marker = if pressed { 'M' } else { 'm' };
+        Some((
+            terminal.terminal_id.clone(),
+            format!("\x1b[<{code};{column};{row}{final_marker}"),
+        ))
+    }
+
     /// The terminal that should receive this key, when one is attached.
     ///
     /// A key belongs to the terminal only while the account panel is what is on
@@ -9589,6 +9696,15 @@ pub enum Effect {
     /// holds.
     LoadAgentAuthCatalog {
         agent_id: vibex_core::AgentId,
+        /// Whether the authority should re-probe the Agent or answer from the
+        /// snapshot it already holds.
+        ///
+        /// Opening the panel is a read, and a read that launched the Agent every
+        /// time would be a process the reader never asked for. The "refresh
+        /// methods" line is the opposite: it is the reader saying the methods
+        /// they see are stale, and answering it from the same cache is a key
+        /// that reports what it read without reading anything.
+        refresh: bool,
     },
     /// Ask an Agent's own runtime to verify the account it holds.
     VerifyAgentAuth {

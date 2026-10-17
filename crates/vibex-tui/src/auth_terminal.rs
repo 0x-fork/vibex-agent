@@ -243,6 +243,20 @@ mod tests {
     }
 
     #[test]
+    fn a_program_that_asks_for_the_mouse_is_reported_as_wanting_it() {
+        let mut terminal = terminal();
+        terminal.advance(b"plain text");
+        terminal.refresh();
+        assert!(!terminal.wants_mouse());
+
+        // DECSET 1000 is "report mouse presses", which a login list emits to
+        // make its rows clickable.
+        terminal.advance(b"\x1b[?1000h");
+        terminal.refresh();
+        assert!(terminal.wants_mouse());
+    }
+
+    #[test]
     fn resizing_changes_the_grid_and_drops_the_stale_frame() {
         let mut terminal = terminal();
         terminal.advance(b"hello");

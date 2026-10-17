@@ -1857,7 +1857,7 @@ impl Dispatch {
                     result,
                 });
             }
-            Effect::LoadAgentAuthCatalog { agent_id } => {
+            Effect::LoadAgentAuthCatalog { agent_id, refresh } => {
                 // The context is seeded first: a runtime that has never been
                 // asked holds none, and the methods are advertised against one.
                 let result = match self
@@ -1868,6 +1868,16 @@ impl Dispatch {
                     ))
                     .await
                 {
+                    // A refresh re-probes the Agent's own runtime and replaces
+                    // the snapshot; a plain open answers from the snapshot the
+                    // authority already holds, so opening the panel does not
+                    // launch a process.
+                    Ok(_) if refresh => self
+                        .facade
+                        .agent()
+                        .refresh_agent_auth_methods(vibex_backend::MutationRequest::new(agent_id))
+                        .await
+                        .map(Box::new),
                     Ok(_) => self
                         .facade
                         .agent()

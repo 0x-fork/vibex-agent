@@ -4272,8 +4272,18 @@ pub fn agent_auth_rows_with_sign_in(
         // so rather than opening a form whose answer the authority refuses.
         let needs_profile =
             method.effect == vibex_core::AgentAuthMethodEffect::RequiresProviderProfile;
+        // The shared rule the desktop applies, so the two clients offer the same
+        // verbs for the same catalogue: a terminal method is always drivable (the
+        // client attaches to the PTY), while an Agent-managed one is only
+        // drivable when the Agent also advertised logout — which is the
+        // capability that makes a re-authentication replace the account rather
+        // than add a second one.
+        let drivable = method.kind == vibex_core::AgentAuthMethodKind::Terminal
+            || (catalog.supports_logout && method.kind == vibex_core::AgentAuthMethodKind::Agent);
         let (chip, tone) = if needs_profile {
             (strings.config_auth_needs_profile(), ConfigTone::Muted)
+        } else if !drivable {
+            (strings.config_auth_external(), ConfigTone::Muted)
         } else {
             match method.kind {
                 vibex_core::AgentAuthMethodKind::Agent => {
@@ -4319,7 +4329,7 @@ pub fn agent_auth_rows_with_sign_in(
             });
         }
         rows.push(AgentAuthRow {
-            action: (!needs_profile).then(|| AgentAuthAction::Method {
+            action: (drivable && !needs_profile).then(|| AgentAuthAction::Method {
                 method_id: method.id.clone(),
                 kind: method.kind,
                 environment: method.environment.clone(),

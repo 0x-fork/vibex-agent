@@ -4128,7 +4128,7 @@ fn page_frame(
 fn render_new_session(
     frame: &mut Frame<'_>,
     area: Rect,
-    app: &App,
+    app: &mut App,
     theme: &TuiTheme,
     strings: Strings,
 ) {
@@ -4169,11 +4169,37 @@ fn render_new_session(
     ));
     lines.push(Line::from(""));
 
+    // The sentence the other clients lead their page with, in this client's
+    // vocabulary: the reader's own language, the Agent's mark where the words
+    // leave room for it, and the Agent's name where the terminal cannot hold a
+    // picture. The split is [`Locale::new_session_slogan`], the same table the
+    // phone and the desktop use, so the three pages say one thing in one order.
+    let (agent, model) = app.drawn_runtime_parts();
+    // The mark is a picture, so the transition cannot scramble it — but the two
+    // cells it stands in can wear the line's own noise while the Agent is
+    // changing, which is the same effect in the one vocabulary a cell has. The
+    // picture is asked for on the frame the noise stops.
+    let mark_noise = app.transitions.cells(
+        crate::scramble::Slot::Runtime,
+        usize::from(crate::row_marks::MARK_COLS),
+        app.animation_phase(),
+    );
+    let sentence = new_session_slogan_row(
+        area.width,
+        &app.composer_agent_identity(),
+        &agent,
+        app.terminal_images.supports_pixels(),
+        mark_noise.as_deref(),
+        theme,
+        strings,
+    );
+    let sentence_row = lines.len();
+    lines.push(sentence.line);
+
     // What the message will be sent through, and where. Both are answers the
     // reader needs before writing, and both are one key away from changing —
     // which is what the transition is for: the line the reader just changed
     // arrives as itself rather than being swapped out under their eyes.
-    let (agent, model) = app.drawn_runtime_parts();
     let runtime = if model.is_empty() {
         agent
     } else {
@@ -4211,6 +4237,128 @@ fn render_new_session(
         ..area
     };
     frame.render_widget(Paragraph::new(Text::from(lines)), region);
+    // The Agent's mark in the sentence is a picture the terminal holds rather
+    // than a cell this frame draws, so it is *asked* for once the row it belongs
+    // to is known: the sentence is centred, and only the frame that placed it
+    // can say which column the mark's two cells start at.
+    if let Some(mark) = sentence.mark {
+        app.row_marks.want(
+            &app.terminal_images,
+            &crate::row_marks::Mark::Agent(mark.identity),
+            crate::theme::color_rgb(theme.roles.foreground),
+            Rect {
+                x: area.x.saturating_add(mark.column),
+                y: region.y.saturating_add(sentence_row as u16),
+                width: crate::row_marks::MARK_COLS,
+                height: crate::row_marks::MARK_ROWS,
+            },
+        );
+    }
+}
+
+/// One drawn row of the new-session sentence, and where its Agent mark goes.
+struct NewSessionSloganRow {
+    line: Line<'static>,
+    mark: Option<NewSessionSloganMark>,
+}
+
+/// The Agent's mark in the new-session sentence, in the page's own cells.
+struct NewSessionSloganMark {
+    identity: String,
+    /// The column the mark's two cells start at, from the page's left edge.
+    column: u16,
+}
+
+/// The new-session sentence, centred, with a slot for the Agent's mark.
+///
+/// A terminal cannot draw a brand mark in a cell, so the sentence reserves the
+/// two cells a picture needs and asks the frame to put one there. When there is
+/// no picture to have — a terminal without an image protocol, or an Agent with
+/// no brand mark — the Agent's own name fills the slot instead: the same fact,
+/// said the way that terminal can say it, and never a blank column.
+///
+/// The order is the reader's language's, from [`Locale::new_session_slogan`]:
+/// Chinese reads `和 [mark] 开始新的工作`, English reads `Start something new with
+/// [mark]`. The line is one voice at the page's title weight, and only the mark
+/// stands out of it.
+fn new_session_slogan_row(
+    width: u16,
+    identity: &str,
+    agent_name: &str,
+    pictures: bool,
+    mark_noise: Option<&str>,
+    theme: &TuiTheme,
+    strings: Strings,
+) -> NewSessionSloganRow {
+    let (lead, connector, trail) = strings.locale.new_session_slogan();
+    let style = theme.strong();
+    let mark = drawable_agent_mark(identity.to_string(), pictures, theme);
+    // The slot is the picture's width when there is one, and the Agent's own
+    // name when there is not: `None` here means the sentence has no mark to
+    // reserve cells for, so the slot is the name and no picture is asked for. A
+    // page with no Agent chosen yet has no identity to name either, and then the
+    // slot is empty — the sentence is said alone rather than naming a runtime
+    // the page is still loading.
+    // While the change is still arriving the slot wears the transition's own
+    // noise rather than blank cells: a picture that appeared on the first frame
+    // of a cut would be the one thing on the line that did not move.
+    let slot = match mark.as_ref() {
+        Some(_) => mark_noise
+            .map(str::to_string)
+            .unwrap_or_else(|| " ".repeat(usize::from(crate::row_marks::MARK_COLS))),
+        None if identity.is_empty() || agent_name.is_empty() => String::new(),
+        None => agent_name.to_string(),
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut column = None;
+    let push = |text: &str, spans: &mut Vec<Span<'static>>, used: &mut usize| {
+        if text.is_empty() {
+            return;
+        }
+        let piece = if spans.is_empty() {
+            text.to_string()
+        } else {
+            format!(" {text}")
+        };
+        *used += display_width(&piece);
+        spans.push(Span::styled(piece, style));
+    };
+    push(lead, &mut spans, &mut used);
+    push(connector, &mut spans, &mut used);
+    if !slot.is_empty() {
+        if !spans.is_empty() {
+            used += 1;
+            spans.push(Span::raw(" "));
+        }
+        if mark.is_some() {
+            column = Some(used);
+        }
+        used += display_width(&slot);
+        spans.push(Span::raw(slot.clone()));
+    }
+    push(trail, &mut spans, &mut used);
+    // The row is centred as a whole; the mark's column is the one the slot
+    // leaves, shifted by that centring. A sentence wider than the page is not
+    // centred at all — the terminal clips it at the right, which is where the
+    // words after the mark are — so the column is measured from the left edge.
+    let indent = usize::from(width).saturating_sub(used) / 2;
+    let mut out = vec![Span::raw(" ".repeat(indent))];
+    out.extend(spans);
+    NewSessionSloganRow {
+        line: Line::from(out),
+        mark: mark.and_then(|identity| {
+            // A mark asked for on a frame the slot is still wearing noise would
+            // be placed over the noise, which is the one picture a transition
+            // is supposed to be replacing. The settle frame is the one that
+            // places it.
+            let column = mark_noise.is_none().then_some(column).flatten()?;
+            Some(NewSessionSloganMark {
+                identity,
+                column: (indent + column) as u16,
+            })
+        }),
+    }
 }
 
 /// The width of the label column on the new-session page.
@@ -9053,6 +9201,15 @@ fn render_agent_auth(
         lines.push(Line::from(Span::styled(
             format!("  {}", strings.config_auth_sign_out_confirm()),
             Style::default().fg(theme.roles.gray_bright),
+        )));
+    }
+    // A sign-in the authority is still running says what the client can do
+    // about it: the cancel line above is the answer, and this is the sentence
+    // that makes it read as an answer rather than a stray verb.
+    if view.pending_sign_in.is_some() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", strings.config_auth_waiting_hint()),
+            Style::default().fg(theme.roles.gray_dim),
         )));
     }
     if let Some((notice, tone)) = &view.notice {
