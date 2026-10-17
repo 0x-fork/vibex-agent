@@ -2897,56 +2897,65 @@ fn model_chip_share(row_width: f32, option_buttons: usize, usage_ring: bool) -> 
     (row_width - fixed).max(0.0)
 }
 
-/// Whether a model's name fits the share of the row its chip was given.
+/// Whether a name of a drawn width fits the share of the row its chip was
+/// given.
 ///
 /// The chip carries a glyph, a gap on either side of its label and the row's
 /// own gap after it, so the name only has what is left of the share. A name
 /// that does not fit is not drawn at all: a model id cut short names nothing.
-fn model_label_fits(label: &str, share: f32) -> bool {
-    const CHIP_CHROME: f32 = theme::ICON_SM + theme::SPACING_XS * 3.0;
-    model_label_width(label, f32::from(theme::scaled_px(theme::FONT_CAPTION)))
-        <= (share - CHIP_CHROME).max(0.0)
+fn model_label_fits(label_width: f32, share: f32) -> bool {
+    const CHIP_CHROME: f32 = theme::ICON_MD + theme::SPACING_XS * 3.0;
+    // A hair of slack: a shaped line and a laid-out one can differ in the last
+    // fraction of a pixel, and a name that only just fits must still be whole.
+    const SLACK: f32 = 1.0;
+    label_width <= (share - CHIP_CHROME - SLACK).max(0.0)
 }
 
-/// How wide a model's name draws, near enough to answer [`model_label_fits`].
+/// How wide a model's name draws, measured in the face it will be drawn with.
 ///
 /// The row is laid out in one pass and the name is either drawn whole or not at
-/// all, so whether it fits has to be known before the frame is built. The
-/// estimate counts the two scripts a model id is written in: a Latin character
-/// takes [`MODEL_LABEL_LATIN_ADVANCE`] of the type size in the interface face,
-/// and a Han or full-width character takes the whole of it.
-fn model_label_width(label: &str, font_size: f32) -> f32 {
-    label
-        .chars()
-        .map(|ch| {
-            if model_label_char_is_full_width(ch) {
-                font_size
-            } else {
-                font_size * MODEL_LABEL_LATIN_ADVANCE
-            }
-        })
-        .sum()
+/// all, so whether it fits has to be answered before the frame is built. The
+/// answer comes from the window's own text system — the same shaping the label
+/// itself goes through — because an estimate is wrong by a few pixels on the
+/// names that sit closest to the edge, and being wrong there is exactly what
+/// draws a model id ending in an ellipsis.
+fn model_label_width(label: &str, window: &Window) -> f32 {
+    let run = gpui::TextRun {
+        len: label.len(),
+        font: gpui::Font {
+            family: theme::UI_FONT_FAMILY.into(),
+            ..Default::default()
+        },
+        color: theme::text_secondary(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    f32::from(
+        window
+            .text_system()
+            .shape_line(
+                label.to_owned().into(),
+                theme::scaled_px(theme::FONT_CAPTION),
+                &[run],
+                None,
+            )
+            .width(),
+    )
 }
 
-/// The advance one Latin character takes of the type size.
+/// What a composer's control row can spend on a model's name.
 ///
-/// A little over half: digits and capitals are wider than the lowercase face's
-/// average, and a name measured short is one drawn cut.
-const MODEL_LABEL_LATIN_ADVANCE: f32 = 0.58;
-
-/// Whether a character is drawn the width of the Han characters around it.
-fn model_label_char_is_full_width(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x1100..=0x115F
-            | 0x2E80..=0xA4CF
-            | 0xAC00..=0xD7A3
-            | 0xF900..=0xFAFF
-            | 0xFE30..=0xFE4F
-            | 0xFF00..=0xFF60
-            | 0xFFE0..=0xFFE6
-            | 0x20000..=0x3FFFD
-    )
+/// The row is the window minus the card's own padding, and the two pages that
+/// build one pad it differently; what the name may take of the row is decided
+/// by [`model_chip_share`].
+fn composer_row_width(window: &Window, padding: f32) -> f32 {
+    let insets = window.insets().effective();
+    (f32::from(window.viewport_size().width)
+        - f32::from(insets.left)
+        - f32::from(insets.right)
+        - padding)
+        .max(0.0)
 }
 
 /// A bare icon control in a prompt card's control row: something the reader
@@ -14370,13 +14379,7 @@ impl MobileApp {
                                     )
                                 }),
                         )
-                        .child(self.render_composer(
-                            running,
-                            state,
-                            &turns,
-                            f32::from(window.viewport_size().width),
-                            cx,
-                        )),
+                        .child(self.render_composer(running, state, &turns, window, cx)),
                 )
                 .when_some(drawer_page, |root, page| {
                     let backdrop_base = div()
@@ -20663,7 +20666,7 @@ impl MobileApp {
         running: bool,
         state: Option<AgentSessionState>,
         turns: &[TimelineConversationTurn],
-        viewport_width: f32,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let latest_ended_normally = turns
@@ -20760,11 +20763,11 @@ impl MobileApp {
             .filter(|offered| *offered)
             .count();
         let model_share = model_chip_share(
-            (viewport_width - theme::SPACING_MD * 4.0).max(0.0),
+            composer_row_width(window, theme::SPACING_MD * 4.0),
             option_buttons,
             true,
         );
-        let spells_model = model_label_fits(&model_label, model_share);
+        let spells_model = model_label_fits(model_label_width(&model_label, window), model_share);
         div()
             .flex_shrink_0()
             .bg(theme::bg_primary())
@@ -20913,7 +20916,7 @@ impl MobileApp {
                                     "composer-runtime-options",
                                     runtime_model_icon(
                                         model_id.as_deref(),
-                                        px(theme::ICON_SM),
+                                        px(theme::ICON_MD),
                                         theme::text_secondary(),
                                     ),
                                     model_label,
@@ -25700,7 +25703,7 @@ impl Render for MobileApp {
             div()
                 .size_full()
                 .bg(theme::bg_primary())
-                .font_family("IBM Plex Sans")
+                .font_family(theme::UI_FONT_FAMILY)
                 .text_color(theme::text_secondary())
                 .pt(insets.top)
                 .pr(insets.right)
@@ -27395,7 +27398,7 @@ impl MobileApp {
     /// that project is worked. The desktop's creation panel draws the same
     /// split, which is the point: the phone used to open on a stack of cards and
     /// a button at the far end of the screen.
-    fn render_new_session(&self, viewport_width: f32, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_new_session(&self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         // The chip names the answer rather than the question: a temporary
         // session has no project, and saying so is more use than leaving the
         // chip on "Choose project" while the session is ready to start.
@@ -27509,11 +27512,11 @@ impl MobileApp {
         // glyph — the title and the model's options — is always on this row.
         let option_buttons = 1 + usize::from(reasoning_offered) + usize::from(modes_offered);
         let model_share = model_chip_share(
-            (viewport_width - (theme::SPACING_LG + theme::SPACING_MD) * 2.0).max(0.0),
+            composer_row_width(window, (theme::SPACING_LG + theme::SPACING_MD) * 2.0),
             option_buttons,
             false,
         );
-        let spells_model = model_label_fits(&model_label, model_share);
+        let spells_model = model_label_fits(model_label_width(&model_label, window), model_share);
 
         div()
             .absolute()
@@ -27675,7 +27678,7 @@ impl MobileApp {
                                                     "mobile-new-session-model",
                                                     runtime_model_icon(
                                                         model_id.as_deref(),
-                                                        px(theme::ICON_SM),
+                                                        px(theme::ICON_MD),
                                                         theme::text_secondary(),
                                                     ),
                                                     model_label,
@@ -29490,9 +29493,7 @@ impl MobileApp {
                 self.render_settings(sheets.settings_palette, sheets.settings_palette_scroll, cx)
             }
             MobileOverlay::NewProject => self.render_new_project(cx),
-            MobileOverlay::NewSession => {
-                self.render_new_session(f32::from(window.viewport_size().width), cx)
-            }
+            MobileOverlay::NewSession => self.render_new_session(window, cx),
         }
     }
 }
@@ -33962,23 +33963,32 @@ mod tests {
 
     /// The model's name is drawn whole or not at all, and the row's own rules
     /// decide which: the same answer the desktop reaches with a window-width
-    /// breakpoint, reached here from the label itself.
+    /// breakpoint, reached here from the room the row has.
     #[test]
     fn a_model_name_is_spelled_out_only_when_the_row_can_hold_it() {
-        // A phone's row: window, the composer's and the card's padding, then
-        // the plus, one glyph for each of the Agent's three option groups, the
-        // usage ring and the send plate.
+        // A phone's row: the window with the composer's and the card's padding
+        // taken out, then the plus, one glyph for each of the Agent's three
+        // option groups, the usage ring and the send plate.
         let phone = model_chip_share(360.0 - theme::SPACING_MD * 4.0, 3, true);
-        assert!(model_label_fits("gpt-5", phone));
-        assert!(model_label_fits("Opus 5", phone));
+        // The chip keeps its glyph, a gap on either side of the label and the
+        // row's gap after it, so that is what the name is asked to leave.
+        let room = phone - (theme::ICON_MD + theme::SPACING_XS * 3.0);
         assert!(
-            !model_label_fits("deepseek-v4.1-flash", phone),
-            "a long id gives way to the glyph rather than to an ellipsis"
+            model_label_fits(room - 1.0, phone),
+            "a name that fits is drawn"
+        );
+        assert!(
+            !model_label_fits(room + 1.0, phone),
+            "a name that does not is left to the glyph rather than cut short"
+        );
+        assert!(
+            !model_label_fits(phone, phone),
+            "a name wider than the whole chip is not drawn at all"
         );
 
         // A tablet's row holds the longest id the catalogue publishes.
         let tablet = model_chip_share(820.0 - theme::SPACING_MD * 4.0, 3, true);
-        assert!(model_label_fits("deepseek-v4.1-flash", tablet));
+        assert!(tablet > phone + 400.0, "a wider row leaves a wider name");
 
         // Every glyph the row carries is paid for by the name, so an Agent with
         // one option group has more room for it than one with three.
@@ -33992,14 +34002,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_model_name_is_measured_in_the_script_it_is_written_in() {
-        let size = f32::from(theme::scaled_px(theme::FONT_CAPTION));
-        let latin = model_label_width("abcd", size);
-        assert!((latin - size * 4.0 * MODEL_LABEL_LATIN_ADVANCE).abs() < 0.01);
-        // A Han character is a whole em, not the half a Latin letter takes, so
-        // four of them are wider than four Latin ones.
-        assert!(model_label_width("深度求索", size) > model_label_width("abcd", size));
+    /// Whether a name fits is answered by the width it really draws at, not by
+    /// an estimate: a wrong answer is a model id ending in an ellipsis.
+    #[gpui::test]
+    fn a_models_name_is_measured_in_the_face_it_is_drawn_with(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let measured: Rc<Cell<(f32, f32, f32)>> = Rc::new(Cell::new((0.0, 0.0, 0.0)));
+        let slot = measured.clone();
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
+            theme::apply_component_theme(Some(window), cx);
+            window.set_rem_size(gpui_component::Theme::global(cx).font_size);
+            let short = model_label_width("gpt-5", window);
+            let long = model_label_width("deepseek-v4.1-flash", window);
+            // The row the chip is measured against: the window with the
+            // composer's and the card's padding removed.
+            let row = composer_row_width(window, theme::SPACING_MD * 4.0);
+            slot.set((short, long, row));
+            MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
+        });
+        cx.run_until_parked();
+        let _ = app;
+
+        let (short, long, row) = measured.get();
+        assert!(row > 0.0, "the window reports a row to measure against");
+        assert!(short > 0.0, "the face is found and the name has width");
+        assert!(
+            long > short,
+            "a longer id measures longer, so the row's answer follows the name"
+        );
     }
 
     #[test]

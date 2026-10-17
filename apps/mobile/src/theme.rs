@@ -250,6 +250,13 @@ pub const TOAST_MAX_WIDTH: f32 = 420.0;
 /// they cover the content they are talking about.
 pub const TOAST_MAX_VISIBLE: usize = 3;
 
+/// The interface face, named once.
+///
+/// The window inherits it for every surface it draws, and a surface that has to
+/// measure a line before it is laid out — the composer's model chip decides
+/// whether its label fits — shapes it in the same face.
+pub const UI_FONT_FAMILY: &str = "IBM Plex Sans";
+
 /// The rem the ladder below is expressed against. Every value in the type
 /// scale is a logical pixel at this rem; [`ui_rems`] converts it, so the whole
 /// interface tracks the platform's accessibility text scaling the same way
@@ -1093,7 +1100,7 @@ pub fn apply_component_theme(window: Option<&mut Window>, cx: &mut App) {
         // Crucially it carries the reader's text-size step too: the kit's
         // `Root` publishes `theme.font_size` as the window rem, which is what
         // makes a step move the kit controls as well as the ladder.
-        theme.font_family = "IBM Plex Sans".into();
+        theme.font_family = UI_FONT_FAMILY.into();
         theme.font_size = rem_base();
         theme.mono_font_size = scaled_px(FONT_CODE);
         theme.radius = px(RADIUS_CONTROL);
