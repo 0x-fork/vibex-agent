@@ -172,6 +172,23 @@ fn ring_distance(index: f32, head: f32, lap: f32) -> f32 {
     offset.min(lap - offset)
 }
 
+/// The cell coordinates the lit dots are centred on.
+///
+/// The spinner's dots occupy three of the Braille cell's four rows, so the
+/// visual middle of the ring is row 1, not the cell's own 1.5. Anything the
+/// mark is centred against — the status column, the title it reports on — is
+/// lined up with the dots that are actually painted.
+fn ring_center(ring: &[usize]) -> (f32, f32) {
+    let (mut columns, mut rows) = (0.0_f32, 0.0_f32);
+    for dot in ring {
+        let (column, row) = braille_dot_cell(*dot);
+        columns += column;
+        rows += row;
+    }
+    let count = ring.len() as f32;
+    (columns / count, rows / count)
+}
+
 /// The sidebar mark: the spinner's dot ring with one highlight walking it.
 ///
 /// `phase` is the fraction of a lap travelled by the head, or `None` for the
@@ -188,6 +205,11 @@ fn sidebar_mark(color: Hsla, phase: Option<f32>) -> impl IntoElement {
             let diameter = extent * 0.16;
             let pitch = extent * 0.26;
             let lap = SIDEBAR_RING.len() as f32;
+            // The ring lights three of the cell's four rows, so the middle of
+            // the *painted* dots is what meets the slot's centre. Centring the
+            // whole Braille cell would lift the visible ring half a pitch above
+            // the title it reports on.
+            let (middle_column, middle_row) = ring_center(&SIDEBAR_RING);
             // The frame is painted, not shaped: the reader's code font is free
             // to lack the Braille block — JetBrains Mono, for one, draws its
             // replacement box for it — and then the running cue would be that
@@ -204,8 +226,8 @@ fn sidebar_mark(color: Hsla, phase: Option<f32>) -> impl IntoElement {
                 let distance = ring_distance(index as f32, head, lap);
                 let intensity = 0.5 + 0.5 * (distance / lap * TAU).cos();
                 let origin = point(
-                    center.x + (column - 0.5) * pitch - diameter * 0.5,
-                    center.y + (row - 1.5) * pitch - diameter * 0.5,
+                    center.x + (column - middle_column) * pitch - diameter * 0.5,
+                    center.y + (row - middle_row) * pitch - diameter * 0.5,
                 );
                 window.paint_quad(
                     fill(
@@ -335,6 +357,46 @@ mod tests {
                 braille_dots(frame),
                 window,
                 "{frame} is not the ring's step {step}"
+            );
+        }
+    }
+
+    /// The painted ring is centred in its slot by the dots it actually lights.
+    ///
+    /// The slot is a 20px box in a row whose title sits on the row's centre
+    /// line. The dots fill three of the Braille cell's four rows, so centring
+    /// the *cell* leaves the visible ring half a pitch (2.6px at the sidebar
+    /// scale) above the text. The mark must be centred on the dots, and the
+    /// dots must sit symmetrically about that centre.
+    #[test]
+    fn the_sidebar_ring_is_centred_on_the_dots_it_paints() {
+        let (middle_column, middle_row) = ring_center(&SIDEBAR_RING);
+        assert_eq!(middle_column, 0.5);
+        assert_eq!(middle_row, 1.0, "the lit dots span rows 0..=2");
+        // The lit rows are symmetric about the centre: the topmost dot is as
+        // far above it as the bottommost is below it, or the mark would still
+        // read as leaning.
+        let rows = SIDEBAR_RING.map(|dot| braille_dot_cell(dot).1);
+        let top = rows.iter().copied().fold(f32::INFINITY, f32::min);
+        let bottom = rows.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(middle_row - top, bottom - middle_row);
+        // And the whole ring stays inside the slot once shifted onto that
+        // centre: a dot may not be painted past the box that holds it.
+        let extent = 20.0_f32;
+        let pitch = extent * 0.26;
+        let radius = extent * 0.16 * 0.5;
+        let half = extent * 0.5;
+        for dot in SIDEBAR_RING {
+            let (column, row) = braille_dot_cell(dot);
+            let x = (column - middle_column) * pitch;
+            let y = (row - middle_row) * pitch;
+            assert!(
+                x - radius >= -half && x + radius <= half,
+                "dot {dot} overflows the slot horizontally"
+            );
+            assert!(
+                y - radius >= -half && y + radius <= half,
+                "dot {dot} overflows the slot vertically"
             );
         }
     }

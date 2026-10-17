@@ -32417,6 +32417,23 @@ fn sidebar_braille_dot_cell(index: usize) -> (f32, f32) {
     }
 }
 
+/// The cell coordinates the lit dots are centred on.
+///
+/// The spinner's dots occupy three of the Braille cell's four rows, so the
+/// visual middle of the ring is row 1, not the cell's own 1.5. The mark is
+/// centred on the dots that are actually painted, which is what keeps it on
+/// the row's centre line instead of a half pitch above it.
+fn sidebar_activity_ring_center() -> (f32, f32) {
+    let (mut columns, mut rows) = (0.0_f32, 0.0_f32);
+    for dot in SIDEBAR_ACTIVITY_RING {
+        let (column, row) = sidebar_braille_dot_cell(dot);
+        columns += column;
+        rows += row;
+    }
+    let count = SIDEBAR_ACTIVITY_RING.len() as f32;
+    (columns / count, rows / count)
+}
+
 /// The sidebar mark: the spinner's dot ring with one highlight walking it.
 ///
 /// `phase` is the fraction of a lap the head has travelled, or `None` for the
@@ -32434,6 +32451,11 @@ fn sidebar_activity_mark(color: gpui::Hsla, phase: Option<f32>) -> gpui::AnyElem
             let diameter = extent * 0.16;
             let pitch = extent * 0.26;
             let lap = SIDEBAR_ACTIVITY_RING.len() as f32;
+            // The ring lights three of the cell's four rows, so the middle of
+            // the *painted* dots is what meets the slot's centre. Centring the
+            // whole Braille cell would lift the visible ring half a pitch above
+            // the title it reports on.
+            let (middle_column, middle_row) = sidebar_activity_ring_center();
             for (index, dot) in SIDEBAR_ACTIVITY_RING.iter().copied().enumerate() {
                 let (column, row) = sidebar_braille_dot_cell(dot);
                 // Brightness is the cosine of the dot's distance from the head
@@ -32443,8 +32465,8 @@ fn sidebar_activity_mark(color: gpui::Hsla, phase: Option<f32>) -> gpui::AnyElem
                 let distance = offset.min(lap - offset);
                 let intensity = 0.5 + 0.5 * (distance / lap * std::f32::consts::TAU).cos();
                 let origin = point(
-                    center.x + (column - 0.5) * pitch - diameter * 0.5,
-                    center.y + (row - 1.5) * pitch - diameter * 0.5,
+                    center.x + (column - middle_column) * pitch - diameter * 0.5,
+                    center.y + (row - middle_row) * pitch - diameter * 0.5,
                 );
                 window.paint_quad(
                     gpui::fill(
@@ -39484,6 +39506,45 @@ fn session_opened(cx: &mut Context<Self>) {
     #[test]
     fn the_sidebar_activity_cycle_matches_the_desktop() {
         assert_eq!(sidebar_activity_cycle(), Duration::from_millis(800));
+    }
+
+    /// The painted ring is centred in its slot by the dots it actually lights.
+    ///
+    /// The slot is a 20px box beside a one-line title, and the dots fill three
+    /// of the Braille cell's four rows. Centring the *cell* leaves the visible
+    /// ring half a pitch high — the title reads centred and the spinner reads
+    /// above it — so the mark is centred on the dots instead.
+    #[test]
+    fn the_sidebar_activity_ring_is_centred_on_the_dots_it_paints() {
+        let (middle_column, middle_row) = sidebar_activity_ring_center();
+        assert_eq!(middle_column, 0.5);
+        assert_eq!(middle_row, 1.0, "the lit dots span rows 0..=2");
+        let rows = SIDEBAR_ACTIVITY_RING.map(|dot| sidebar_braille_dot_cell(dot).1);
+        let top = rows.iter().copied().fold(f32::INFINITY, f32::min);
+        let bottom = rows.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(
+            middle_row - top,
+            bottom - middle_row,
+            "the lit rows should be symmetric about the centre"
+        );
+        // And a dot may not be painted past the slot that holds it.
+        let extent = SIDEBAR_ACTIVITY_SLOT;
+        let pitch = extent * 0.26;
+        let radius = extent * 0.16 * 0.5;
+        let half = extent * 0.5;
+        for dot in SIDEBAR_ACTIVITY_RING {
+            let (column, row) = sidebar_braille_dot_cell(dot);
+            let x = (column - middle_column) * pitch;
+            let y = (row - middle_row) * pitch;
+            assert!(
+                x - radius >= -half && x + radius <= half,
+                "dot {dot} overflows the slot horizontally"
+            );
+            assert!(
+                y - radius >= -half && y + radius <= half,
+                "dot {dot} overflows the slot vertically"
+            );
+        }
     }
 
     /// The states a mark cannot carry on its own are the ones that get words.
