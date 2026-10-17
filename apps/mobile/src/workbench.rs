@@ -582,10 +582,15 @@ pub struct MobileWorkbench {
     ///
     /// A hardware keyboard can hand a focused element raw key events, but an
     /// Android IME only ever commits text into a real text field. Rendering an
-    /// invisible one-line input behind the grid is what makes the terminal
-    /// typeable with the phone's own keyboard: every committed character is
-    /// forwarded to the PTY and the field is emptied again.
-    terminal_input: Option<Entity<InputState>>,
+    /// invisible field behind the grid is what makes the terminal typeable with
+    /// the phone's own keyboard: every committed character is forwarded to the
+    /// PTY and the field is emptied again.
+    ///
+    /// It is a *multi-line* field, which is what makes Enter work. The host's
+    /// IME target is a multi-line editor, so the keyboard's Enter key commits a
+    /// newline rather than an editor action; a single-line field strips
+    /// newlines as it normalises, so the key never reached the grid at all.
+    terminal_input: Option<Entity<TextareaState>>,
     /// Subscription to the sink's change events, installed on first paint.
     terminal_sink_subscription: Option<gpui::Subscription>,
     /// What the sink held after the last forwarded edit, so the next change can
@@ -923,12 +928,12 @@ impl MobileWorkbench {
                 self.refresh_git(cx);
                 self.refresh_worktree_lifecycle(cx);
             }
-            // Entering the terminal is a request to work in one. If the list
-            // comes back empty, the refresh below opens the first one; the flag
-            // makes that a one-shot answer to this visit rather than a session
-            // created behind the reader's back on every poll.
+            // Entering the terminal is a request to work in one. If no live
+            // session comes back, the refresh below opens one; the flag makes
+            // that a one-shot answer to this visit rather than a session created
+            // behind the reader's back on every poll.
             WorkbenchSurface::Terminal => {
-                self.terminal_auto_create = self.terminal_last_selected.is_none();
+                self.terminal_auto_create = true;
                 self.refresh_terminals(cx)
             }
         }
@@ -2409,7 +2414,7 @@ impl MobileWorkbench {
             }));
         }
         if self.terminal_input.is_none() {
-            self.terminal_input = Some(cx.new(|cx| InputState::new(window, cx)));
+            self.terminal_input = Some(cx.new(|cx| TextareaState::new(window, cx).rows(1)));
             // Every committed character is forwarded to the PTY as it lands, so
             // the field never keeps a value the terminal has not already seen.
             if let Some(sink) = self.terminal_input.clone() {
@@ -2417,7 +2422,7 @@ impl MobileWorkbench {
                     &sink,
                     window,
                     |this: &mut Self,
-                     _: &Entity<InputState>,
+                     _: &Entity<TextareaState>,
                      event: &InputEvent,
                      window: &mut Window,
                      cx: &mut Context<Self>| {
@@ -2985,46 +2990,36 @@ impl MobileWorkbench {
                 this.terminal.apply_refresh(&ticket, outcome);
                 this.hint_failure(failure);
                 if this.terminal.state.active_session.is_none() {
-                    // The tab the reader left first, then any live terminal,
-                    // then the head of the list: coming back to the terminal
-                    // means coming back to work, not to a list.
+                    // The tab the reader left first, then the head of the live
+                    // list. A terminal that has exited or been closed is not a
+                    // place to put them: the desktop drops those from the same
+                    // list, and attaching to one would paint a dead grid.
                     let next = previous
                         .filter(|id| {
                             this.terminal
                                 .state
                                 .sessions
                                 .iter()
-                                .any(|session| &session.id == id)
+                                .any(|session| &session.id == id && is_live_terminal(session))
                         })
                         .or_else(|| {
                             this.terminal
                                 .state
                                 .sessions
                                 .iter()
-                                .find(|session| session.status == TerminalStatus::Running)
-                                .map(|session| session.id.clone())
-                        })
-                        .or_else(|| {
-                            this.terminal
-                                .state
-                                .sessions
-                                .first()
+                                .find(|session| is_live_terminal(session))
                                 .map(|session| session.id.clone())
                         });
                     match next {
-                        Some(terminal_id) => this.attach_terminal(terminal_id, cx),
-                        // Nothing to attach and the reader is standing on the
+                        Some(terminal_id) => {
+                            this.terminal_auto_create = false;
+                            this.attach_terminal(terminal_id, cx);
+                        }
+                        // No live terminal and the reader is standing on the
                         // terminal: open one, once per visit.
                         None => {
-                            if std::mem::take(&mut this.terminal_auto_create)
-                                && this.surface == WorkbenchSurface::Terminal
-                                && this
-                                    .terminal
-                                    .capabilities
-                                    .supports(BackendOperation::TerminalCreate)
-                                && !this.busy
-                            {
-                                this.create_terminal_now(cx);
+                            if std::mem::take(&mut this.terminal_auto_create) {
+                                this.open_terminal_when_idle(cx);
                             }
                         }
                     }
@@ -3040,6 +3035,27 @@ impl MobileWorkbench {
     }
 
     fn create_terminal(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.create_terminal_now(cx);
+    }
+
+    /// Opens a terminal if the reader is on the terminal surface and none is
+    /// running.
+    ///
+    /// Called where the list may have just lost its last live session, so the
+    /// strip the reader is looking at is never empty: an empty terminal pane
+    /// offers a button, and a phone has no room for a screen whose only content
+    /// is a control.
+    fn open_terminal_when_idle(&mut self, cx: &mut Context<Self>) {
+        if self.surface != WorkbenchSurface::Terminal
+            || self.terminal_is_running()
+            || self.busy
+            || !self
+                .terminal
+                .capabilities
+                .supports(BackendOperation::TerminalCreate)
+        {
+            return;
+        }
         self.create_terminal_now(cx);
     }
 
@@ -3277,7 +3293,7 @@ impl MobileWorkbench {
     /// The sink's value changed: forward only what the user just typed or
     /// deleted, then empty the field again so the PTY stays the only buffer.
     fn forward_terminal_sink(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let next = input_value(&self.terminal_input, cx).to_string();
+        let next = textarea_value(&self.terminal_input, cx).to_string();
         let previous = std::mem::replace(&mut self.terminal_sink_previous, next.clone());
         if next == previous {
             return;
@@ -3285,8 +3301,7 @@ impl MobileWorkbench {
         self.terminal_clear_pending = true;
         if let Some(typed) = next.strip_prefix(previous.as_str()) {
             if !typed.is_empty() {
-                let input = TerminalInput::Text(self.apply_terminal_latches(typed));
-                self.send_terminal_value(input, false, cx);
+                self.send_terminal_text(typed, cx);
             }
             return;
         }
@@ -3300,6 +3315,30 @@ impl MobileWorkbench {
         }
         // Anything else (an IME rewriting the whole buffer) is not a keystroke
         // the PTY can be told about; drop it rather than duplicating input.
+    }
+
+    /// Forwards committed text, turning the newlines in it back into Enter.
+    ///
+    /// The phone's keyboard does not send an Enter *key*: the host's IME target
+    /// is a multi-line editor, so its Return key commits a newline character
+    /// into the field instead. Reading that character as the key it stands for
+    /// is what makes a command typed on a phone actually run — without it the
+    /// line reached the shell with no terminator, so the reader saw their
+    /// command echoed and then nothing at all.
+    fn send_terminal_text(&mut self, typed: &str, cx: &mut Context<Self>) {
+        for (after_return, segment) in terminal_text_segments(typed) {
+            if after_return {
+                self.send_terminal_value(
+                    TerminalInput::Key(TerminalKey::Enter, TerminalKeyModifiers::default()),
+                    false,
+                    cx,
+                );
+            }
+            if !segment.is_empty() {
+                let input = TerminalInput::Text(self.apply_terminal_latches(&segment));
+                self.send_terminal_value(input, false, cx);
+            }
+        }
     }
 
     /// Applies the accessory bar's latched modifiers to text typed on the
@@ -3979,8 +4018,16 @@ impl MobileWorkbench {
                 this.busy = false;
                 this.terminal.state.render = None;
                 this.terminal_render_sequence = 0;
+                // The tab that just went may have been the last one. An empty
+                // strip is not a state a reader can leave the terminal on, so
+                // the next terminal opens in its place — the same answer the
+                // surface gives when it is entered with nothing running.
+                this.terminal_auto_create = true;
                 match failure {
-                    None => this.stop_terminal_poll(),
+                    None => {
+                        this.stop_terminal_poll();
+                        this.open_terminal_when_idle(cx);
+                    }
                     Some(error) => this.hint_failure(Some(error)),
                 }
                 cx.notify();
@@ -4045,9 +4092,18 @@ impl MobileWorkbench {
         // face of a Markdown file was an edit mode with the editing taken out of
         // it: a control that only ever changed how a document nobody could
         // change was presented.
+        //
+        // Find and go-to-line are the exception, and they are not a switch: a
+        // rendered document has no lines to step through, so either control
+        // shows the source for as long as it is open and the render comes back
+        // when it is dismissed. Without that, giving Markdown up to its render
+        // would have taken its search away with it.
         let preview_kind = file_preview_kind_for_path(&path);
-        let showing_preview = preview_kind == FilePreviewKind::Markdown
-            || (preview_kind == FilePreviewKind::Image && self.file_image.is_some());
+        let showing_preview = match preview_kind {
+            FilePreviewKind::Markdown => !(self.file_find_open || self.file_goto_open),
+            FilePreviewKind::Image => self.file_image.is_some(),
+            _ => false,
+        };
         // The plate a code buffer is read on is the appearance's authored
         // `editor.background`, which is what the desktop editor paints and what
         // the syntax palette beside it was tuned against. The kit's own editor
@@ -4194,9 +4250,10 @@ impl MobileWorkbench {
                     )
                     // Find and go-to-line are the two things a long file
                     // needs on a phone, where scrolling to a place by hand is
-                    // the only alternative. Both belong to the source face: a
-                    // rendered Markdown preview has no lines to step through.
-                    .when(!showing_preview, |header| {
+                    // the only alternative. Every kind that has text offers
+                    // them, Markdown included: on a rendered Markdown file they
+                    // bring the source forward while they are open.
+                    .when(preview_kind != FilePreviewKind::Image, |header| {
                         header
                             .child(
                                 icon_button("file-find", "icons/search.svg", "Find in file")
@@ -7387,7 +7444,19 @@ impl MobileWorkbench {
     /// not a terminal.
     fn render_terminal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let view = self.terminal.state.view(ShellKind::Compact);
-        let sessions = self.terminal.state.sessions.clone();
+        // Only the terminals that are still running are tabs, which is the rule
+        // the desktop's own list keeps. A closed session stays in the
+        // authority's list — the screen it left is the record of what ran in it
+        // — so a strip drawn from the whole list kept a tab for a terminal the
+        // reader had already closed.
+        let sessions = self
+            .terminal
+            .state
+            .sessions
+            .iter()
+            .filter(|session| is_live_terminal(session))
+            .cloned()
+            .collect::<Vec<_>>();
         let active = self.terminal.state.active_session.clone();
         let can_create = self
             .terminal
@@ -7421,134 +7490,133 @@ impl MobileWorkbench {
             // The tabs are now the whole chrome: each names its terminal, each
             // closes its own, and the new-terminal control sits at the row's
             // right edge where it cannot be scrolled away.
-            .when(!sessions.is_empty(), |terminal| {
-                terminal.child(
-                    div()
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .gap(px(theme::SPACING_XS))
-                        .pl(px(theme::SPACING_MD))
-                        .pr(px(theme::SPACING_XS))
-                        .py(px(theme::SPACING_SM))
-                        .child(
-                            div()
-                                .id("mobile-terminal-sessions")
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_x_scroll()
-                                .restrict_scroll_to_axis()
-                                .flex()
-                                .items_center()
-                                .gap(px(theme::SPACING_XS))
-                                .children(sessions.iter().enumerate().map(|(index, item)| {
-                                    let terminal_id = item.id.clone();
-                                    let close_id = item.id.clone();
-                                    let selected =
-                                        active.as_ref().is_some_and(|active| active.id == item.id);
-                                    div()
-                                        .id(format!("terminal-chip:{}", item.id))
-                                        .flex_shrink_0()
-                                        .h(px(WORKBENCH_CHIP_HEIGHT))
-                                        .rounded_full()
-                                        .bg(if selected {
-                                            theme::accent_blue().opacity(0.16)
-                                        } else {
-                                            theme::workbench_panel_bg()
-                                        })
-                                        .pl(px(theme::SPACING_MD))
-                                        .pr(px(theme::SPACING_XS))
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .cursor_pointer()
-                                        .active(|style| style.bg(theme::row_pressed_bg()))
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.attach_terminal(terminal_id.clone(), cx)
-                                            }),
-                                        )
-                                        .child(
-                                            div()
-                                                .size(px(6.0))
-                                                .flex_shrink_0()
-                                                .rounded_full()
-                                                .bg(terminal_status_color(item.status)),
-                                        )
-                                        .child(
-                                            // Tabs are numbered in the order the
-                                            // strip shows them: "终端 1", "终端
-                                            // 2", and so on. A reader counting
-                                            // tabs on a phone needs the number
-                                            // more than the shell's own name for
-                                            // itself, which is the same word on
-                                            // every tab.
-                                            div()
-                                                .max_w(px(140.0))
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .whitespace_nowrap()
-                                                .text_size(theme::font_caption())
-                                                .text_color(if selected {
-                                                    theme::text_primary()
-                                                } else {
-                                                    theme::text_secondary()
-                                                })
-                                                .child(terminal_tab_label(index)),
-                                        )
-                                        .child(
-                                            inline_icon_button(
-                                                format!("terminal-close:{}", item.id),
-                                                "icons/x.svg",
-                                                "Close terminal",
-                                            )
-                                            // The tab underneath opens the terminal
-                                            // it names, and opening one clears the
-                                            // close confirmation on the way in. A
-                                            // close that let the tap through was
-                                            // therefore undone in the same
-                                            // gesture: the tab lit up and nothing
-                                            // else happened. The glyph keeps the
-                                            // press to itself.
-                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                cx.stop_propagation()
-                                            })
-                                            .when(
-                                                can_close && !self.busy,
-                                                |button| {
-                                                    button.on_mouse_up(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |this, _, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.request_close_terminal_id(
-                                                                close_id.clone(),
-                                                                cx,
-                                                            )
-                                                        }),
-                                                    )
-                                                },
-                                            ),
-                                        )
-                                })),
-                        )
-                        .when(active.is_some(), |row| {
-                            row.child(
-                                toolbar_icon_button("search-terminal", "icons/search.svg", "Find")
+            //
+            // The row is drawn whether or not there is a tab in it. A surface
+            // that hid its own new-terminal control while its list was empty
+            // would be a screen with no way out of being empty.
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    .pl(px(theme::SPACING_MD))
+                    .pr(px(theme::SPACING_XS))
+                    .py(px(theme::SPACING_SM))
+                    .child(
+                        div()
+                            .id("mobile-terminal-sessions")
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_x_scroll()
+                            .restrict_scroll_to_axis()
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACING_XS))
+                            .children(sessions.iter().enumerate().map(|(index, item)| {
+                                let terminal_id = item.id.clone();
+                                let close_id = item.id.clone();
+                                let selected =
+                                    active.as_ref().is_some_and(|active| active.id == item.id);
+                                div()
+                                    .id(format!("terminal-chip:{}", item.id))
+                                    .flex_shrink_0()
+                                    .h(px(WORKBENCH_CHIP_HEIGHT))
+                                    .rounded_full()
+                                    .bg(if selected {
+                                        theme::accent_blue().opacity(0.16)
+                                    } else {
+                                        theme::workbench_panel_bg()
+                                    })
+                                    .pl(px(theme::SPACING_MD))
+                                    .pr(px(theme::SPACING_XS))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
                                     .on_mouse_up(
                                         MouseButton::Left,
-                                        cx.listener(|this, _, window, cx| {
-                                            this.toggle_terminal_search(window, cx)
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.attach_terminal(terminal_id.clone(), cx)
                                         }),
-                                    ),
-                            )
-                        })
-                        .child(
-                            toolbar_icon_button(
-                                "create-terminal",
-                                "icons/plus.svg",
-                                "New terminal",
-                            )
+                                    )
+                                    .child(
+                                        div()
+                                            .size(px(6.0))
+                                            .flex_shrink_0()
+                                            .rounded_full()
+                                            .bg(terminal_status_color(item.status)),
+                                    )
+                                    .child(
+                                        // Tabs are numbered in the order the
+                                        // strip shows them: "终端 1", "终端
+                                        // 2", and so on. A reader counting
+                                        // tabs on a phone needs the number
+                                        // more than the shell's own name for
+                                        // itself, which is the same word on
+                                        // every tab.
+                                        div()
+                                            .max_w(px(140.0))
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_size(theme::font_caption())
+                                            .text_color(if selected {
+                                                theme::text_primary()
+                                            } else {
+                                                theme::text_secondary()
+                                            })
+                                            .child(terminal_tab_label(index)),
+                                    )
+                                    .child(
+                                        inline_icon_button(
+                                            format!("terminal-close:{}", item.id),
+                                            "icons/x.svg",
+                                            "Close terminal",
+                                        )
+                                        // The tab underneath opens the terminal
+                                        // it names, and opening one clears the
+                                        // close confirmation on the way in. A
+                                        // close that let the tap through was
+                                        // therefore undone in the same
+                                        // gesture: the tab lit up and nothing
+                                        // else happened. The glyph keeps the
+                                        // press to itself.
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .when(
+                                            can_close && !self.busy,
+                                            |button| {
+                                                button.on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.request_close_terminal_id(
+                                                            close_id.clone(),
+                                                            cx,
+                                                        )
+                                                    }),
+                                                )
+                                            },
+                                        ),
+                                    )
+                            })),
+                    )
+                    .when(active.is_some(), |row| {
+                        row.child(
+                            toolbar_icon_button("search-terminal", "icons/search.svg", "Find")
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.toggle_terminal_search(window, cx)
+                                    }),
+                                ),
+                        )
+                    })
+                    .child(
+                        toolbar_icon_button("create-terminal", "icons/plus.svg", "New terminal")
                             .when(can_create && !self.busy, |button| {
                                 button.on_mouse_up(
                                     MouseButton::Left,
@@ -7556,9 +7624,8 @@ impl MobileWorkbench {
                                 )
                             })
                             .when(!can_create || self.busy, |button| button.opacity(0.55)),
-                        ),
-                )
-            })
+                    ),
+            )
             .when_some(self.terminal_close_confirmation.clone(), |terminal, _| {
                 terminal.child(
                     div()
@@ -7872,16 +7939,7 @@ impl MobileWorkbench {
             // The IME sink: invisible, unfocusable by tap, but the destination
             // the platform keyboard commits into while the grid holds the
             // user's attention.
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .w(px(1.0))
-                    .h(px(1.0))
-                    .opacity(0.0)
-                    .child(input_element(self.terminal_input.as_ref())),
-            )
+            .child(terminal_sink_element(self.terminal_input.as_ref()))
             .when(
                 self.terminal.state.active_session.is_some() && !has_frame,
                 |surface| {
@@ -8354,6 +8412,29 @@ fn file_editor_element(input: Option<&Entity<EditorState>>) -> gpui::AnyElement 
             .into_any_element(),
         None => div().into_any_element(),
     }
+}
+
+/// The terminal's IME sink.
+///
+/// It is the one text field with no tap hook of its own, and deliberately so:
+/// it is invisible and a single pixel across, so no tap can reach it, and its
+/// focus is handed over by the grid's own tap — `focus_terminal` focuses the
+/// sink and asks the platform for the keyboard in the same gesture. A frame
+/// around it that re-requested the keyboard on a tap would be a hook for a
+/// gesture the reader cannot make.
+fn terminal_sink_element(input: Option<&Entity<TextareaState>>) -> gpui::AnyElement {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .w(px(1.0))
+        .h(px(1.0))
+        .opacity(0.0)
+        .child(match input {
+            Some(input) => Textarea::new(input).appearance(false).into_any_element(),
+            None => div().into_any_element(),
+        })
+        .into_any_element()
 }
 
 /// The text of a lazily-created kit input, or empty before the first paint.
@@ -9575,8 +9656,36 @@ fn terminal_feed_snapshot(
     applied
 }
 
+/// What a stretch of committed text stands for, in order: each part of the
+/// text, and whether a Return came before it.
+///
+/// The phone's keyboard does not send an Enter *key*. The host's IME target is
+/// a multi-line editor, so its Return key commits a newline into the field
+/// instead, and the field hands it over as ordinary text. Reading that newline
+/// as the key it stands for is what makes a command typed on a phone run: the
+/// shell received the line with no terminator and waited, so the reader saw
+/// their command echoed and then nothing. A CRLF pair is one Return.
+fn terminal_text_segments(typed: &str) -> Vec<(bool, String)> {
+    let normalized = typed.replace("\r\n", "\n").replace('\r', "\n");
+    normalized
+        .split('\n')
+        .enumerate()
+        .filter(|(index, segment)| *index > 0 || !segment.is_empty())
+        .map(|(index, segment)| (index > 0, segment.to_string()))
+        .collect()
+}
+
 /// Status colors follow the desktop right-rail treatment: green for live
 /// sessions, red for ended ones, yellow for a stale host connection.
+/// Whether a terminal is one a tab strip shows and a reader can type into.
+///
+/// A session that has exited or been closed is kept by the authority — its
+/// output is the record of what ran — but it is not a place to work, and the
+/// desktop's own list drops it for the same reason.
+fn is_live_terminal(session: &vibex_core::TerminalSession) -> bool {
+    session.status == TerminalStatus::Running
+}
+
 fn terminal_status_color(status: TerminalStatus) -> gpui::Hsla {
     match status {
         TerminalStatus::Running => theme::accent_green(),
@@ -10095,6 +10204,59 @@ index 3333333..4444444 100644
             terminal_mouse_report(TerminalMouseReport::Release, point, true),
             Some(TerminalInput::Text("\u{1b}[<3;1;1m".to_string()))
         );
+    }
+
+    /// A phone's Return key arrives as a newline in the sink, not as a key
+    /// event, so the split has to read it back as the Enter it stands for.
+    #[test]
+    fn a_committed_newline_stands_for_the_return_key() {
+        // A command and its Return, which is one text run and one Enter.
+        assert_eq!(
+            terminal_text_segments("ls\n"),
+            [(false, "ls".to_string()), (true, String::new())]
+        );
+        // The Return on its own: what the sink holds when the reader presses
+        // Enter with the field already emptied by the last forwarded character.
+        assert_eq!(terminal_text_segments("\n"), [(true, String::new())]);
+        // A CRLF pair is one Return, not two.
+        assert_eq!(terminal_text_segments("\r\n"), [(true, String::new())]);
+        assert_eq!(
+            terminal_text_segments("a\r\nb"),
+            [(false, "a".to_string()), (true, "b".to_string())]
+        );
+        // A bare CR is a Return on its own.
+        assert_eq!(
+            terminal_text_segments("a\rb"),
+            [(false, "a".to_string()), (true, "b".to_string())]
+        );
+        // A run of Returns is a run of Enters.
+        assert_eq!(
+            terminal_text_segments("\n\n"),
+            [(true, String::new()), (true, String::new())]
+        );
+        // Ordinary text is left alone.
+        assert_eq!(
+            terminal_text_segments("git status"),
+            [(false, "git status".to_string())]
+        );
+        // Nothing typed is nothing sent.
+        assert!(terminal_text_segments("").is_empty());
+    }
+
+    /// A terminal is a tab while it is running, and stops being one the moment
+    /// it is not: the authority keeps a closed session so its output can still
+    /// be read, and a strip drawn from that list kept a tab for a terminal the
+    /// reader had already closed.
+    #[test]
+    fn only_a_running_terminal_is_a_tab() {
+        let session = |status| TerminalSession {
+            status,
+            ..fixture_terminal_session(24, 80)
+        };
+        assert!(is_live_terminal(&session(TerminalStatus::Running)));
+        assert!(!is_live_terminal(&session(TerminalStatus::Exited)));
+        assert!(!is_live_terminal(&session(TerminalStatus::Killed)));
+        assert!(!is_live_terminal(&session(TerminalStatus::Stale)));
     }
 
     /// The selection's handles sit on the first and last selected cells, in

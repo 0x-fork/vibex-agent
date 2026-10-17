@@ -38171,9 +38171,14 @@ fn session_opened(cx: &mut Context<Self>) {
                     }
                     // The shared renderers return the kit component itself; the
                     // frames that call them carry the hook.
+                    //
+                    // `terminal_sink_element` is the exception that proves the
+                    // rule: the sink is invisible and a pixel across, so no tap
+                    // can reach it, and the grid's own tap hands it both the
+                    // focus and the keyboard request.
                     if matches!(
                         enclosing_function_name(source, index),
-                        Some("input_element" | "textarea_element")
+                        Some("input_element" | "textarea_element" | "terminal_sink_element")
                     ) {
                         continue;
                     }
