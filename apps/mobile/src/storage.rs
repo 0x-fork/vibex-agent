@@ -207,7 +207,7 @@ impl Default for AppSettings {
             reduce_motion: false,
             keep_screen_on: false,
             haptics: true,
-            font_scale_percent: crate::theme::FONT_SCALE_DEFAULT,
+            font_scale_percent: crate::theme::FONT_SCALE_INITIAL,
             notifications: true,
             notify_completed: true,
             notify_needs_input: true,
@@ -855,7 +855,7 @@ impl CredentialStorage {
             font_scale_percent: stored
                 .font_scale_percent
                 .filter(|percent| crate::theme::FONT_SCALE_STEPS.contains(percent))
-                .unwrap_or(crate::theme::FONT_SCALE_DEFAULT),
+                .unwrap_or(crate::theme::FONT_SCALE_INITIAL),
             notifications: notification_switch(stored.notifications),
             notify_completed: notification_switch(stored.notify_completed),
             notify_needs_input: notification_switch(stored.notify_needs_input),
@@ -1740,7 +1740,7 @@ mod tests {
     }
 
     /// A phone that has never written a settings file must start on the
-    /// default text-size step, not on 0%.
+    /// smallest text-size step, not on 0%.
     ///
     /// The step is a percentage the rem base clamps, so a derived default of
     /// zero did not read as "unset": it read as the smallest size the clamp
@@ -1749,13 +1749,16 @@ mod tests {
     /// authorization, so the master switch contradicted the permission the app
     /// had just asked for.
     #[test]
-    fn a_fresh_install_starts_on_the_default_text_step_and_notifications_on() {
+    fn a_fresh_install_starts_on_the_smallest_text_step_and_notifications_on() {
         let temp = tempfile::tempdir().unwrap();
         let storage = CredentialStorage::new(temp.path().to_path_buf());
         // No file at all: the loader's own fallback, which is what a first
         // launch reads.
         let fresh = storage.load_app_settings().unwrap();
-        assert_eq!(fresh.font_scale_percent, crate::theme::FONT_SCALE_DEFAULT);
+        assert_eq!(fresh.font_scale_percent, crate::theme::FONT_SCALE_INITIAL);
+        // A first launch sits on the smallest rung the row offers, so the only
+        // direction an untouched phone can step is up.
+        assert_eq!(fresh.font_scale_percent, crate::theme::FONT_SCALE_TINY);
         assert!(crate::theme::FONT_SCALE_STEPS.contains(&fresh.font_scale_percent));
         assert!(fresh.notifications);
         assert!(fresh.notify_completed);
@@ -1770,10 +1773,11 @@ mod tests {
         assert_eq!(fresh, AppSettings::default());
     }
 
-    /// A stored step the ladder no longer offers is read as the default, and a
-    /// corrupt step cannot smuggle a clamped value into the first frame.
+    /// A stored step the ladder no longer offers is read as the first-launch
+    /// step, and a corrupt step cannot smuggle a clamped value into the first
+    /// frame.
     #[test]
-    fn an_unknown_stored_text_step_falls_back_to_the_default() {
+    fn an_unknown_stored_text_step_falls_back_to_the_initial_step() {
         let temp = tempfile::tempdir().unwrap();
         let storage = CredentialStorage::new(temp.path().to_path_buf());
         fs::create_dir_all(temp.path()).unwrap();
@@ -1788,7 +1792,7 @@ mod tests {
             let loaded = storage.load_app_settings().unwrap();
             assert_eq!(
                 loaded.font_scale_percent,
-                crate::theme::FONT_SCALE_DEFAULT,
+                crate::theme::FONT_SCALE_INITIAL,
                 "stored step {stored} is not on the ladder"
             );
             assert!(

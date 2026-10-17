@@ -34628,12 +34628,18 @@ fn text_size_label_for(current: Locale, percent: u32) -> String {
         theme::FONT_SCALE_COMPACT => {
             locale::text_for(current, "Compact", "紧凑", "緊湊").to_string()
         }
-        theme::FONT_SCALE_DEFAULT => locale::common_for(current, "Default").to_string(),
+        // "Standard", not "Default": a fresh install now starts on the smallest
+        // step, so the rung the ladder was authored around is the reference
+        // size rather than the one the reader is already on. Calling it
+        // "Default" would label a size the app had not chosen.
+        theme::FONT_SCALE_STANDARD => {
+            locale::text_for(current, "Standard", "标准", "標準").to_string()
+        }
         theme::FONT_SCALE_LARGE => locale::text_for(current, "Large", "较大", "較大").to_string(),
         // A value the ladder does not name cannot be reached from the row, so
         // this only covers a stored step the loader let through. Name it by
         // the half it falls in rather than drawing a number.
-        value if value < theme::FONT_SCALE_DEFAULT => {
+        value if value < theme::FONT_SCALE_STANDARD => {
             locale::text_for(current, "Compact", "紧凑", "緊湊").to_string()
         }
         _ => locale::text_for(current, "Large", "较大", "較大").to_string(),
@@ -35518,12 +35524,17 @@ mod tests {
             vec![
                 "Smallest".to_string(),
                 "Compact".to_string(),
-                "Default".to_string(),
+                "Standard".to_string(),
                 "Large".to_string(),
             ]
         );
-        // The two sub-default rungs are the pair that used to share a word.
+        // The two sub-standard rungs are the pair that used to share a word.
         assert_ne!(english[0], english[1]);
+        // A fresh install lands on the first label, and that label is not the
+        // one naming the size the ladder was authored around.
+        let initial = text_size_label_for(Locale::En, theme::FONT_SCALE_INITIAL);
+        assert_eq!(initial, english[0]);
+        assert_ne!(initial, english[2]);
         // The same ladder translated, still one label per step.
         let simplified: Vec<String> = theme::FONT_SCALE_STEPS
             .iter()
@@ -35532,7 +35543,7 @@ mod tests {
             .collect();
         assert_eq!(simplified[0], "最小");
         assert_eq!(simplified[1], "紧凑");
-        assert_eq!(simplified[2], "默认");
+        assert_eq!(simplified[2], "标准");
         assert_eq!(simplified[3], "较大");
         // A stored step off the ladder still resolves to a name instead of an
         // empty row value.
