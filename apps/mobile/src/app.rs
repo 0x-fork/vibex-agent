@@ -93,6 +93,7 @@ use crate::toast::{Hint, Tone};
 use crate::touch_selection::TouchToolbar;
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{locale, markdown, notifications, power, scanner, theme, toast, update};
+use gpui_component::avatar::Avatar;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader};
 use gpui_component::input::InputEvent;
@@ -100,7 +101,7 @@ use gpui_component::input::TextareaState;
 use gpui_component::input::{Input, InputState, Textarea};
 use gpui_component::progress::ProgressCircle;
 use gpui_component::shimmer::ShimmerText;
-use gpui_component::{Disableable as _, StyledExt as _};
+use gpui_component::{Disableable as _, Icon, Sizable as _, StyledExt as _};
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 /// How long a released press still counts as the hold that just fired.
@@ -1814,6 +1815,10 @@ pub struct MobileApp {
     /// Top edge and right edge of the row list in window space, recorded during
     /// paint so a touch pan can be resolved to a row without hit-test plumbing.
     sidebar_list_frame: Rc<Cell<(f32, f32)>>,
+    /// The session-group tab strip's painted vertical span, in window space,
+    /// recorded during paint. A pan that starts on the strip is the strip's to
+    /// scroll; the drawer must not read it as a page swipe.
+    group_tabs_frame: Rc<Cell<Option<(f32, f32)>>>,
     /// The queue's painted top edge, recorded so a long press can be resolved
     /// to a queue row without per-row bounds.
     composer_queue_frame: Rc<Cell<(f32, f32)>>,
@@ -1971,10 +1976,21 @@ const MOBILE_COMPOSER_MIN_ROWS: usize = 1;
 const MOBILE_COMPOSER_MAX_ROWS: usize = 6;
 
 /// One member of the open session's group, as the tab strip draws it.
-type MobileSessionGroupTabs = (
-    vibex_desktop_model::SessionGroupUiState,
-    Vec<(VibexSessionId, String, AgentSessionState)>,
-);
+///
+/// Everything the tab reports is resolved once, the way the desktop resolves
+/// `SessionGroupTabState`: the Agent to lead with, the state the tab answers
+/// for, and the two flags its trailing column reads. Keeping the projection
+/// here rather than inside the renderer is what lets the tab say the same
+/// thing the member's own row says.
+struct MobileSessionGroupTab {
+    session_id: VibexSessionId,
+    title: String,
+    /// The Agent's brand identity, in the form the row's logo is resolved from.
+    agent_identity: String,
+    display_state: AgentSessionState,
+    auto_continue: bool,
+    has_unread_completion: bool,
+}
 
 /// Splits a composer draft into a slash command name and its arguments.
 ///
@@ -2394,18 +2410,6 @@ fn plan_step_status_label(status: PlanStepStatus) -> &'static str {
         PlanStepStatus::Running => locale::text("Running", "进行中", "進行中"),
         PlanStepStatus::Completed => locale::text("Completed", "已完成", "已完成"),
         PlanStepStatus::Failed => locale::text("Failed", "失败", "失敗"),
-    }
-}
-
-/// The colour a session state paints with, shared by every status surface so
-/// "waiting on you" never looks like "idle".
-fn session_state_color(state: AgentSessionState) -> gpui::Hsla {
-    match state {
-        AgentSessionState::Running => theme::accent_success(),
-        AgentSessionState::NeedsInput => theme::accent_yellow(),
-        AgentSessionState::Error => theme::accent_red(),
-        AgentSessionState::Archived => theme::sidebar_archived(),
-        _ => theme::text_muted(),
     }
 }
 
@@ -3958,6 +3962,7 @@ impl MobileApp {
             delegated_expanded: BTreeSet::new(),
             delegated_loading: BTreeSet::new(),
             sidebar_list_frame: Rc::new(Cell::new((0.0, 0.0))),
+            group_tabs_frame: Rc::new(Cell::new(None)),
             composer_queue_frame: Rc::new(Cell::new((0.0, 0.0))),
             attachment_preview_frame: Rc::new(Cell::new((0.0, 0.0))),
             session_action_input: cx.new(|cx| {
@@ -8281,7 +8286,7 @@ impl MobileApp {
     ///
     /// The phone shows one member at a time — there is no split view here — so
     /// the group becomes a tab strip on the session page instead of a layout.
-    fn active_session_group(&self) -> Option<MobileSessionGroupTabs> {
+    fn active_session_group(&self) -> Option<Vec<MobileSessionGroupTab>> {
         let session_id = self
             .controller
             .as_ref()
@@ -8297,13 +8302,53 @@ impl MobileApp {
             .member_session_ids
             .iter()
             .filter_map(|member_id| {
-                sessions
-                    .iter()
-                    .find(|session| session.id.as_str() == member_id.as_str())
-                    .map(|session| (session.id.clone(), session.title.clone(), session.state))
+                let session =
+                    sidebar_row_session(sessions, &self.delegated_sessions, member_id.as_str())?;
+                // The tab shows the Agent the session's view runs, so a session
+                // whose runtime the user switched does not fall back to the
+                // Agent it was created with. The phone carries no desired-runtime
+                // projection of its own, so it names the Agent the synced session
+                // reports, under the label the runtime lists that Agent by.
+                let agent_identity = agent_brand_identity(
+                    session.agent_id.as_str(),
+                    self.runtime_agent_labels
+                        .get(&session.agent_id)
+                        .map(String::as_str)
+                        .unwrap_or_default(),
+                );
+                // The tab answers its member the way that member's row does: a
+                // request can open while the turn is still `Running`, so the
+                // live request index is the tie-breaker the row already uses.
+                let display_state =
+                    if self.session_awaits_user_input(member_id.as_str(), session.state) {
+                        AgentSessionState::NeedsInput
+                    } else {
+                        session.state
+                    };
+                Some(MobileSessionGroupTab {
+                    session_id: session.id.clone(),
+                    title: session.title.clone(),
+                    agent_identity,
+                    display_state,
+                    auto_continue: self
+                        .sidebar_view
+                        .auto_continue_session_ids
+                        .contains(member_id.as_str()),
+                    // Unread means "finished while you were looking elsewhere",
+                    // so the selection clears it exactly as it does for the row.
+                    has_unread_completion: self
+                        .controller
+                        .as_ref()
+                        .and_then(|controller| controller.state.selected_session_id.as_ref())
+                        .is_none_or(|selected| selected.as_str() != member_id.as_str())
+                        && self
+                            .sidebar_view
+                            .unread_session_ids
+                            .contains(member_id.as_str()),
+                })
             })
             .collect::<Vec<_>>();
-        (members.len() >= 2).then(|| (group.clone(), members))
+        (members.len() >= 2).then_some(members)
     }
 
     /// Loads the `/` commands, `@` references and `$` skills the relevant
@@ -13271,6 +13316,16 @@ impl MobileApp {
                 {
                     return;
                 }
+                // The session-group tab strip is a horizontal scroller, so a
+                // pan that starts on it is the strip's, not the page's. Without
+                // this the drawer claimed the same drag the reader meant as a
+                // tab scroll, and the page switched under their finger.
+                if self.group_tabs_frame.get().is_some_and(|(top, bottom)| {
+                    let y = f32::from(event.position.y);
+                    y >= top && y <= bottom
+                }) {
+                    return;
+                }
                 let origin = drawer_drag_origin(self.drawer_offset);
                 self.drawer_gesture = Some(DrawerGesture::Pending {
                     origin,
@@ -14912,8 +14967,8 @@ impl MobileApp {
                         .flex()
                         .flex_col()
                         .child(self.render_header(&title, state, cx))
-                        .when_some(self.active_session_group(), |page, (group, members)| {
-                            page.child(self.render_session_group_tabs(&group, &members, cx))
+                        .when_some(self.active_session_group(), |page, members| {
+                            page.child(self.render_session_group_tabs(&members, cx))
                         })
                         .when_some(self.render_timeline_find_row(cx), |page, bar| {
                             page.child(bar)
@@ -17442,40 +17497,6 @@ impl MobileApp {
             .into_any_element()
     }
 
-    /// What a group's members are doing, as the desktop's group label says it.
-    fn group_team_status(&self, group: &vibex_desktop_model::SessionGroupUiState) -> String {
-        let sessions = self.sessions();
-        let mut status = vibex_desktop_model::SessionGroupTeamStatus::default();
-        for id in &group.member_session_ids {
-            status.record(
-                self.delegated_nodes.get(id.as_str()),
-                sessions
-                    .iter()
-                    .find(|session| session.id.as_str() == id)
-                    .map(|session| session.state)
-                    .unwrap_or(AgentSessionState::Idle),
-            );
-        }
-        [
-            (status.running, locale::text("running", "运行中", "執行中")),
-            (
-                status.waiting,
-                locale::text("waiting", "等待用户", "等待使用者"),
-            ),
-            (status.review, locale::text("in review", "待审阅", "待審閱")),
-            (
-                status.results_ready,
-                locale::text("results ready", "待回收", "待回收"),
-            ),
-            (status.failed, locale::text("failed", "失败", "失敗")),
-        ]
-        .into_iter()
-        .filter(|(count, _)| *count > 0)
-        .map(|(count, label)| format!("{count} {label}"))
-        .collect::<Vec<_>>()
-        .join(" · ")
-    }
-
     /// The membership list for one group: the scope's sessions, ticked.
     fn render_group_members_sheet(
         &self,
@@ -18996,11 +19017,11 @@ impl MobileApp {
             (session_state, auto_continue, column)
         });
         let status_mark = header_column.map(|(state, auto_continue, column)| {
-            // The marks follow the row's own order and its own gates, so a
-            // header and its row cannot disagree about what a session reports —
-            // the pulse while it works, the question mark when it is parked on
-            // the reader, the danger dot when it failed — and a settled session
-            // reports nothing at all, exactly as its row does.
+            // The header resolves its marks through the same gate the tab strip
+            // and the row use, so the three cannot disagree about what a session
+            // reports — the pulse while it works, the question mark when it is
+            // parked on the reader, the danger dot when it failed — and a
+            // settled session reports nothing at all.
             let mut marks: Vec<gpui::AnyElement> = Vec::new();
             if column.show_attention {
                 marks.push(sidebar_attention_glyph(ElementId::from(
@@ -19192,60 +19213,44 @@ impl MobileApp {
     /// Desktop renders a group as side-by-side panes. A phone cannot show two
     /// conversations at once, so the same membership becomes tabs: the desktop
     /// grouping survives, the split layout does not.
+    ///
+    /// The strip is the tabs and nothing else. The group's name and what its
+    /// members are doing already stand on the group's row in the drawer, and
+    /// repeating them here cost a whole line of a phone's height above every
+    /// conversation. Each tab answers for its session the way the desktop's
+    /// group tab does: the Agent's mark, the title, and the row's own status
+    /// mark — one projection, so the tab and the row cannot disagree, and the
+    /// same sweep of animation while the session generates.
     fn render_session_group_tabs(
         &self,
-        group: &vibex_desktop_model::SessionGroupUiState,
-        members: &[(VibexSessionId, String, AgentSessionState)],
+        members: &[MobileSessionGroupTab],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let name = group.name.as_str();
-        let summary = self.group_team_status(group);
         let selected = self
             .controller
             .as_ref()
             .and_then(|controller| controller.state.selected_session_id.clone());
+        // The strip records where it was painted, so a pan that starts on it
+        // scrolls the tabs instead of switching pages. The drawer's capture sits
+        // above every list on the page, and a horizontal drag on the strip is
+        // the one gesture the strip has to keep.
+        let frame = self.group_tabs_frame.clone();
         div()
+            // The prepaint listener has to sit on the `Div` itself: `id`
+            // returns a `Stateful<Div>`, which does not carry it.
+            .on_children_prepainted(move |bounds, _, _| {
+                let strip = bounds.first().copied();
+                frame.set(strip.map(|strip| {
+                    (
+                        f32::from(strip.origin.y),
+                        f32::from(strip.origin.y + strip.size.height),
+                    )
+                }));
+            })
             .id("mobile-session-group-tabs")
             .flex_shrink_0()
             .border_b_1()
             .border_color(theme::border_subtle())
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .px(px(theme::SPACING_MD))
-                    .pt(px(theme::SPACING_SM))
-                    .flex()
-                    .items_center()
-                    .gap(px(theme::SPACING_XS))
-                    .child(
-                        svg()
-                            .path("icons/layers.svg")
-                            .size(px(12.0))
-                            .text_color(theme::accent_purple()),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_size(theme::font_micro())
-                            .text_color(theme::text_muted())
-                            .child(name.to_string()),
-                    )
-                    // What the group's members are doing, where the desktop's
-                    // group label says it: a phone has no panes to read it off.
-                    .when(!summary.is_empty(), |header| {
-                        header.child(
-                            div()
-                                .flex_shrink_0()
-                                .text_size(theme::font_micro())
-                                .text_color(theme::text_muted())
-                                .child(summary),
-                        )
-                    }),
-            )
             .child(
                 div()
                     .id("mobile-session-group-tabs-scroll")
@@ -19256,24 +19261,63 @@ impl MobileApp {
                     .gap(px(theme::SPACING_XS))
                     .px(px(theme::SPACING_MD))
                     .py(px(theme::SPACING_SM))
-                    .children(members.iter().map(|(session_id, title, state)| {
-                        let active = selected.as_ref() == Some(session_id);
-                        let open_id = session_id.clone();
+                    .children(members.iter().map(|tab| {
+                        let active = selected.as_ref() == Some(&tab.session_id);
+                        let open_id = tab.session_id.clone();
+                        // The title carries the run the way the row's does: the
+                        // same sweep, at the same pace and spread, and only while
+                        // the session is actually generating.
+                        let title: gpui::AnyElement =
+                            if tab.display_state == AgentSessionState::Running {
+                                ShimmerText::new(tab.title.clone())
+                                    .id(format!(
+                                        "mobile-session-group-tab-title-{}",
+                                        tab.session_id.as_str()
+                                    ))
+                                    .duration(TIMELINE_SHIMMER_SWEEP)
+                                    .spread(TIMELINE_SHIMMER_SPREAD)
+                                    .into_any_element()
+                            } else {
+                                tab.title.clone().into_any_element()
+                            };
+                        // The trailing slot is the row's status column in
+                        // miniature, through the row's own projection: the
+                        // attention glyph while the Agent is parked on the
+                        // reader, the working mark while it runs, the unread and
+                        // failure lanes in the row's order — and nothing once it
+                        // has settled. One gate, so the tab and the member's row
+                        // cannot report different things.
+                        let status: gpui::AnyElement = sidebar_session_state_mark(
+                            "mobile-session-group-tab",
+                            tab.session_id.as_str(),
+                            tab.display_state,
+                            tab.auto_continue,
+                            tab.has_unread_completion,
+                        )
+                        .unwrap_or_else(|| div().into_any_element());
                         div()
-                            .id(format!("session-group-tab:{}", session_id.as_str()))
+                            .id(format!(
+                                "mobile-session-group-tab:{}",
+                                tab.session_id.as_str()
+                            ))
+                            .relative()
                             .flex_shrink_0()
                             .max_w(px(180.0))
                             .h(px(36.0))
                             .px(px(theme::SPACING_MD))
-                            .rounded_full()
+                            .rounded(px(theme::SIDEBAR_ROW_RADIUS))
                             .border_1()
+                            // The selection wears the green a completion wears
+                            // rather than the group's purple: a selected tab is
+                            // the same fact as a selected row, and purple here
+                            // was a second accent for one state.
                             .border_color(if active {
-                                theme::accent_purple()
+                                theme::accent_green()
                             } else {
                                 theme::border_subtle()
                             })
                             .bg(if active {
-                                theme::accent_purple().opacity(0.14)
+                                theme::accent_green().opacity(0.14)
                             } else {
                                 theme::bg_card()
                             })
@@ -19281,7 +19325,7 @@ impl MobileApp {
                             .items_center()
                             .gap(px(theme::SPACING_XS))
                             .cursor_pointer()
-                            .aria_label(title.clone())
+                            .aria_label(tab.title.clone())
                             .active(|style| style.bg(theme::row_pressed_bg()))
                             .on_mouse_up(
                                 MouseButton::Left,
@@ -19289,13 +19333,7 @@ impl MobileApp {
                                     this.open_session(open_id.clone(), cx)
                                 }),
                             )
-                            .child(
-                                div()
-                                    .size(px(6.0))
-                                    .flex_shrink_0()
-                                    .rounded_full()
-                                    .bg(session_state_color(*state)),
-                            )
+                            .child(sidebar_agent_logo(&tab.agent_identity, active))
                             .child(
                                 div()
                                     .min_w_0()
@@ -19308,8 +19346,22 @@ impl MobileApp {
                                     } else {
                                         theme::text_secondary()
                                     })
-                                    .child(title.clone()),
+                                    .child(title),
                             )
+                            .child(status)
+                            // The top bar the desktop's selected tab wears.
+                            .when(active, |tab| {
+                                tab.child(
+                                    div()
+                                        .absolute()
+                                        .left_0()
+                                        .right_0()
+                                        .top_0()
+                                        .h(px(2.0))
+                                        .rounded_full()
+                                        .bg(theme::accent_green().opacity(0.80)),
+                                )
+                            })
                     })),
             )
             .into_any_element()
@@ -23720,9 +23772,13 @@ impl MobileApp {
             .id(format!("mobile-group-row-{group_id}"))
             .h_full()
             .relative()
-            .left(px(-theme::SIDEBAR_ICON_SLOT_OVERHANG))
+            // A group is a sibling of the sessions beside it, not of the
+            // project above them, so it starts on exactly the columns a session
+            // row uses: the list padding, the row's indent, and the session
+            // content inset. That is what lands the disclosure chevron on the
+            // Agent-logo column every session row puts its mark in.
             .mx(px(theme::SIDEBAR_LIST_PADDING))
-            .pl(px(row.indent))
+            .pl(px(row.indent + theme::SIDEBAR_SESSION_CONTENT_INSET))
             .pr(px(self.sidebar_row_content_inset(row, false)))
             .rounded(px(theme::SIDEBAR_ROW_RADIUS))
             .flex()
@@ -23736,9 +23792,10 @@ impl MobileApp {
                 cx.listener(move |this, _, _, cx| this.toggle_sidebar_group(toggle_id.clone(), cx)),
             )
             // The desktop leads a group with its disclosure and the marks of
-            // the Agents inside it, so the fold and the membership are what the
-            // row says first; the phone follows, and falls back to its own mark
-            // for a group whose members it cannot name.
+            // the Agents inside it, in that order. The chevron is the row's
+            // *first laid-out* content, and the row starts on the session
+            // content column, so it lands on the exact column a sibling session
+            // row puts its Agent logo in; the stack follows it.
             .child(
                 div()
                     .flex_shrink_0()
@@ -23754,18 +23811,28 @@ impl MobileApp {
                             })
                             .size(px(12.0))
                             .flex_shrink_0()
-                            .text_color(theme::sidebar_foreground(0.78)),
+                            .text_color(theme::sidebar_foreground(0.60)),
                     )
                     .when_some(
                         self.group_member_identities(&group_id),
                         |lead, identities| lead.child(sidebar_group_avatars(&identities)),
                     )
+                    // A group whose members the phone cannot name keeps its own
+                    // mark, in the members' column rather than the chevron's.
                     .when(self.group_member_identities(&group_id).is_none(), |lead| {
                         lead.child(
-                            svg()
-                                .path("icons/layers.svg")
-                                .size(px(theme::SIDEBAR_PROJECT_LOGO_SIZE))
-                                .text_color(theme::accent_purple()),
+                            div()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(theme::SIDEBAR_AGENT_LOGO_SIZE))
+                                .child(
+                                    svg()
+                                        .path("icons/layers.svg")
+                                        .size(px(theme::SIDEBAR_AGENT_LOGO_SIZE))
+                                        .text_color(theme::accent_purple()),
+                                ),
                         )
                     }),
             )
@@ -26329,6 +26396,10 @@ impl Render for MobileApp {
         // while the answer has not changed.
         self.sync_keep_screen_on(cx);
         self.sync_ime_document(window, cx);
+        // The tab strip records its own frame while it paints; a frame with no
+        // strip must not leave the last one standing, or the band it occupied
+        // would go on swallowing page swipes after the group closed.
+        self.group_tabs_frame.set(None);
         if let Some(turn_id) = self.timeline_find_scroll_pending.take() {
             self.timeline_list.remeasure();
             self.scroll_to_timeline_turn(&turn_id, cx);
@@ -32536,42 +32607,84 @@ fn mobile_join_session_group_label(group_name: &str) -> String {
 }
 
 /// How many marks a group's stack shows before it counts the rest.
+///
+/// The desktop's `SESSION_GROUP_AVATAR_LIMIT`; past it the stack says how many
+/// Agents did not fit rather than growing without bound.
 const MOBILE_GROUP_AVATAR_LIMIT: usize = 5;
+/// The diameter of one Agent avatar in the stack, the desktop's own.
+const MOBILE_GROUP_AVATAR_SIZE: f32 = 18.0;
+/// How far each avatar overlaps the one before it.
+const MOBILE_GROUP_AVATAR_OVERLAP: f32 = 7.0;
 
 /// The marks of the Agents inside a group, stacked the way the desktop stacks
-/// them: one overlapping chip per Agent, and a count of the ones that did not
-/// fit. A group whose members the phone cannot name draws no stack at all,
-/// which is why the caller falls back to its own mark.
+/// them: one overlapping `Avatar` per Agent, and a chip counting the ones that
+/// did not fit.
+///
+/// The desktop's group row draws its members through the kit's `Avatar` rather
+/// than a bare brand glyph, so the phone does too: an `Avatar` gives the mark
+/// the same round plate, border and clipping on both shells. `identities` are
+/// `agent_brand_identity` strings, so a coloured brand keeps its own palette
+/// while a mark drawn in the current colour is tinted with the sidebar ink.
 fn sidebar_group_avatars(identities: &[String]) -> gpui::AnyElement {
     let shown = identities.len().min(MOBILE_GROUP_AVATAR_LIMIT);
     let hidden = identities.len().saturating_sub(MOBILE_GROUP_AVATAR_LIMIT);
-    let mut stack = div().flex_shrink_0().flex().items_center();
+    // Overlapping avatars are pulled together with negative margins, which
+    // makes the stack's measured width smaller than what it paints. Reserving
+    // the painted width keeps the group name from sliding under the stack.
+    let slots = shown + usize::from(hidden > 0);
+    let stack_width = if slots == 0 {
+        0.0
+    } else {
+        MOBILE_GROUP_AVATAR_SIZE
+            + (slots - 1) as f32 * (MOBILE_GROUP_AVATAR_SIZE - MOBILE_GROUP_AVATAR_OVERLAP)
+    };
+    let tint = theme::sidebar_foreground(0.80);
+    let mut stack = div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .when(slots > 0, |stack| stack.w(px(stack_width)));
     for (index, identity) in identities.iter().take(shown).enumerate() {
+        let avatar = match agent_brand_identity_asset(identity) {
+            Some((path, false)) => Avatar::new()
+                .with_size(px(MOBILE_GROUP_AVATAR_SIZE))
+                .src(path),
+            // A monochrome mark is an alpha mask, so it has to be painted with
+            // the sidebar foreground or it would stay black on the plate.
+            Some((path, true)) => Avatar::new()
+                .with_size(px(MOBILE_GROUP_AVATAR_SIZE))
+                .placeholder(Icon::default().path(path).text_color(tint)),
+            None => Avatar::new()
+                .with_size(px(MOBILE_GROUP_AVATAR_SIZE))
+                .placeholder(Icon::default().path("icons/bot.svg").text_color(tint)),
+        };
         stack = stack.child(
             div()
-                .when(index > 0, |chip| chip.ml(px(-6.0)))
-                .size(px(16.0))
-                .flex_shrink_0()
-                .rounded_full()
-                .bg(theme::bg_card())
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(agent_brand_icon(
-                    identity,
-                    px(14.0),
-                    theme::sidebar_foreground(0.80),
-                )),
+                .flex_none()
+                .when(index > 0, |chip| chip.ml(px(-MOBILE_GROUP_AVATAR_OVERLAP)))
+                .child(avatar),
         );
     }
     if hidden > 0 {
         stack = stack.child(
             div()
-                .ml(px(2.0))
-                .flex_shrink_0()
-                .text_size(theme::font_micro())
-                .text_color(theme::sidebar_text_muted())
-                .child(format!("+{hidden}")),
+                .flex_none()
+                .ml(px(-MOBILE_GROUP_AVATAR_OVERLAP))
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(MOBILE_GROUP_AVATAR_SIZE))
+                        .rounded_full()
+                        .bg(theme::bg_card())
+                        .border_1()
+                        .border_color(theme::border_default())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(theme::font_micro())
+                        .text_color(theme::text_muted())
+                        .child(format!("+{hidden}")),
+                ),
         );
     }
     stack.into_any_element()
@@ -33762,6 +33875,65 @@ fn sidebar_session_status_indicator(
         // if that gate ever moves.
         AgentSessionState::Idle => sidebar_status_dot(theme::accent_green().opacity(0.78)),
     }
+}
+
+/// The trailing mark a session earns on a surface that holds a mark and
+/// nothing else — the group tab strip and the page header.
+///
+/// It is the row's own gate, [`sidebar_session_column`], applied to a mark-only
+/// lane: the attention glyph while the Agent is parked on the reader, the
+/// working pulse while it runs, the unread dot and the failure dot in the row's
+/// order — and nothing once the session has settled. A settled row reports its
+/// hour, which neither of these surfaces has a slot for, so it reports nothing
+/// rather than the green dot `sidebar_session_status_indicator` would answer
+/// with on its own.
+///
+/// This is the phone's `sidebar_session_state_mark`; resolving through the row's
+/// projection is what keeps a tab and the member's own row from disagreeing.
+fn sidebar_session_state_mark(
+    prefix: &'static str,
+    session_id: &str,
+    display_state: AgentSessionState,
+    auto_continue_enabled: bool,
+    has_unread_completion: bool,
+) -> Option<gpui::AnyElement> {
+    let awaiting_user = display_state == AgentSessionState::NeedsInput;
+    let column = sidebar_session_column(
+        display_state,
+        awaiting_user,
+        // Neither surface can show a pin, a suspension or a queued send: they
+        // hold one mark, and the row's own lane answers for those.
+        false,
+        has_unread_completion,
+        false,
+        false,
+        false,
+    );
+    if column.show_attention {
+        return Some(sidebar_attention_glyph(ElementId::from(format!(
+            "{prefix}-attention-{session_id}"
+        ))));
+    }
+    if column.show_status {
+        return Some(sidebar_session_status_indicator(
+            display_state,
+            auto_continue_enabled,
+            ElementId::from(format!("{prefix}-activity-{session_id}")),
+        ));
+    }
+    if column.show_unread {
+        return Some(
+            div()
+                .size(px(theme::SIDEBAR_UNREAD_DOT))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(theme::primary())
+                .into_any_element(),
+        );
+    }
+    column
+        .show_error
+        .then(|| sidebar_status_dot(theme::accent_red()))
 }
 
 fn agent_icon_path(agent_id: &str) -> &'static str {
@@ -41216,6 +41388,124 @@ fn session_opened(cx: &mut Context<Self>) {
         );
     }
 
+    /// The group's tab strip is the tabs and nothing else.
+    ///
+    /// The group's name and its members' aggregate used to ride a line above
+    /// the tabs, which cost a phone a whole row of height over every
+    /// conversation for a fact the drawer's group row already states.
+    #[test]
+    fn the_group_tab_strip_is_only_the_tabs() {
+        let source = include_str!("app.rs");
+        let strip = renderer_source(source, "render_session_group_tabs");
+        assert!(
+            !strip.contains("group_team_status"),
+            "the aggregate belongs to the drawer's group row, not to the strip"
+        );
+        assert!(
+            !strip.contains("icons/layers.svg"),
+            "and so does the group's own mark: the strip is tabs"
+        );
+        assert!(
+            strip.contains("mobile-session-group-tabs-scroll")
+                && strip.contains("overflow_x_scroll()"),
+            "the tabs still scroll"
+        );
+    }
+
+    /// A tab answers for its session the way the row does.
+    #[test]
+    fn a_group_tab_borrows_the_rows_own_status_and_motion() {
+        let source = include_str!("app.rs");
+        let strip = renderer_source(source, "render_session_group_tabs");
+        // One gate, so a tab and its row cannot disagree about what a session
+        // reports — including that a settled one reports nothing.
+        assert!(
+            strip.contains("sidebar_session_state_mark("),
+            "the trailing slot is the row's gate, not a dot per state"
+        );
+        // The run is carried by the same sweep the row's title uses.
+        assert!(
+            strip.contains("ShimmerText::new(tab.title.clone())")
+                && strip.contains("TIMELINE_SHIMMER_SWEEP")
+                && strip.contains("TIMELINE_SHIMMER_SPREAD"),
+            "a generating tab shimmers at the row's own pace"
+        );
+        // The mark leads, as it does on the row.
+        assert!(
+            strip.contains("sidebar_agent_logo(&tab.agent_identity, active)"),
+            "the tab opens on the Agent's mark"
+        );
+        // Selection is green, the one accent a completed/selected thing wears;
+        // the drawer's purple belongs to the group mark, not to a selection.
+        assert!(
+            strip.contains("theme::accent_green()"),
+            "a selected tab is green"
+        );
+        assert!(
+            !strip.contains("accent_purple"),
+            "and never the group's purple"
+        );
+        assert!(
+            !strip.contains("session_state_color"),
+            "the old bare state dot is gone"
+        );
+    }
+
+    /// A pan that starts on the tab strip scrolls the tabs.
+    ///
+    /// The drawer's capture sits above every list on the page, so without a
+    /// frame of its own the strip's horizontal scroll was claimed as a page
+    /// swipe and the screen switched under the reader's finger.
+    #[test]
+    fn a_pan_on_the_tab_strip_does_not_switch_pages() {
+        let source = include_str!("app.rs");
+        let strip = renderer_source(source, "render_session_group_tabs");
+        assert!(
+            strip.contains("group_tabs_frame"),
+            "the strip records where it was painted"
+        );
+        let pan = renderer_source(source, "drawer_pan");
+        assert!(
+            pan.contains("group_tabs_frame") && pan.contains("return;"),
+            "a pan inside that band is left to the strip"
+        );
+    }
+
+    /// The state gate itself withholds an idle mark and asks for attention.
+    #[test]
+    fn the_shared_state_gate_withholds_a_settled_mark() {
+        let source = include_str!("app.rs");
+        let gate = source
+            .split_once("fn sidebar_session_state_mark(")
+            .map(|(_, tail)| {
+                tail.split_once(
+                    "
+fn agent_icon_path(",
+                )
+                .map_or(tail, |(body, _)| body)
+            })
+            .expect("the shared state gate should stay inspectable");
+        // The gate is the row's own projection, not a second set of rules.
+        assert!(
+            gate.contains("sidebar_session_column("),
+            "the mark-only lane asks the row's column what it may draw"
+        );
+        assert!(
+            gate.contains("column.show_attention") && gate.contains("column.show_status"),
+            "a parked session asks, and a working one pulses"
+        );
+        assert!(
+            gate.contains("if column.show_status {"),
+            "the mark builder is reached only through the column's lane, so a \
+             settled session never gets the idle dot the builder would answer"
+        );
+        assert!(
+            gate.ends_with(".then(|| sidebar_status_dot(theme::accent_red()))\n}\n\n")
+                || gate.contains(".then(|| sidebar_status_dot(theme::accent_red()))"),
+            "and the failure lane is the last thing it may add"
+        );
+    }
+
     /// The absolute half of the reschedule sheet reads and refuses a typed hour.
     #[test]
     fn a_typed_hour_names_a_deadline_only_when_it_is_still_ahead() {
@@ -41841,8 +42131,23 @@ fn session_opened(cx: &mut Context<Self>) {
         assert!(stack.contains("MOBILE_GROUP_AVATAR_LIMIT"));
         assert!(stack.contains("format!(\"+{hidden}\")"));
         assert!(
-            stack.contains("chip.ml(px(-6.0))"),
+            stack.contains("chip.ml(px(-MOBILE_GROUP_AVATAR_OVERLAP))"),
             "the marks overlap, the way a stack reads"
+        );
+        // The desktop draws a group's members through the kit's avatar, so the
+        // phone does too: a brand mark is a plate, not a bare glyph.
+        assert!(
+            stack.contains("Avatar::new()"),
+            "each member is an avatar, not a loose brand glyph"
+        );
+
+        // The chevron is the row's first laid-out content on the desktop, which
+        // is what lands it on a session row's Agent-logo column. The phone
+        // indents a session's content, so the group's lead carries the same
+        // inset and the two columns line up.
+        assert!(
+            row.contains("theme::SIDEBAR_SESSION_CONTENT_INSET"),
+            "the fold starts on the session logos' column, not the list edge"
         );
     }
 
