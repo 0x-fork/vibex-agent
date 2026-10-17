@@ -18196,21 +18196,82 @@ impl MobileApp {
         // edge. The phone used to spell the state out on a line of its own, which
         // cost the header a second line and made the drawer and the page describe
         // one session two different ways.
-        let auto_continue = self
+        //
+        // The mark is resolved through the row's own projection rather than by
+        // asking the status helper directly. That helper answers every state
+        // with *something* — an idle session included — while the row's gate is
+        // what decides that a settled session reports its hour instead of a
+        // mark. Asking the helper here made an ordinary completion wear the
+        // green dot the drawer never draws for it.
+        let selected_session = self
             .controller
             .as_ref()
-            .and_then(|controller| controller.state.selected_session_id.as_ref())
-            .is_some_and(|selected| {
+            .and_then(|controller| controller.state.selected_session_id.clone());
+        let session_state = selected_session
+            .as_ref()
+            .and_then(|selected| {
+                self.sessions()
+                    .iter()
+                    .find(|session| session.id.as_str() == selected.as_str())
+            })
+            .map(|session| session.state)
+            .or(state);
+        let header_column = session_state.map(|session_state| {
+            let awaiting_user = selected_session.as_ref().is_some_and(|selected| {
+                self.session_awaits_user_input(selected.as_str(), session_state)
+            });
+            let auto_continue = selected_session.as_ref().is_some_and(|selected| {
                 self.sidebar_view
                     .auto_continue_session_ids
                     .contains(selected.as_str())
             });
-        let status_mark = state.map(|state| {
-            sidebar_session_status_indicator(
-                state,
-                auto_continue,
-                ElementId::from("mobile-header-session-state"),
-            )
+            let scheduled = selected_session.as_ref().is_some_and(|selected| {
+                self.scheduled_send_at(selected.as_str(), session_state)
+                    .is_some()
+            });
+            // The header is the reader's own page, so the row's rules read it
+            // the way they read the open row: never unread, never pinned, and
+            // never suspended by a choice the header cannot show.
+            let column = sidebar_session_column(
+                session_state,
+                awaiting_user,
+                false,
+                false,
+                true,
+                false,
+                scheduled,
+            );
+            (session_state, auto_continue, column)
+        });
+        let status_mark = header_column.map(|(state, auto_continue, column)| {
+            // The marks follow the row's own order and its own gates, so a
+            // header and its row cannot disagree about what a session reports —
+            // the pulse while it works, the question mark when it is parked on
+            // the reader, the danger dot when it failed — and a settled session
+            // reports nothing at all, exactly as its row does.
+            let mut marks: Vec<gpui::AnyElement> = Vec::new();
+            if column.show_attention {
+                marks.push(sidebar_attention_glyph(ElementId::from(
+                    "mobile-header-session-attention",
+                )));
+            }
+            if column.show_status {
+                marks.push(sidebar_session_status_indicator(
+                    state,
+                    auto_continue,
+                    ElementId::from("mobile-header-session-state"),
+                ));
+            }
+            if column.show_error {
+                marks.push(sidebar_status_dot(theme::accent_red()));
+            }
+            // The row draws the words *beside* the mark for the two states a
+            // mark cannot carry (`INIT`, `ARCHIVED`), so the header does too
+            // rather than replacing the mark with a pill.
+            if let Some(label) = column.label {
+                marks.push(sidebar_session_state_pill(label, column.label_attention));
+            }
+            marks
         });
         div()
             .h(px(theme::HEADER_HEIGHT))
@@ -18258,7 +18319,7 @@ impl MobileApp {
                             .text_color(theme::text_primary())
                             .child(title.to_string()),
                     )
-                    .children(status_mark),
+                    .children(status_mark.unwrap_or_default()),
             )
             .child(
                 div()
@@ -32658,9 +32719,10 @@ fn sidebar_session_status_indicator(
         }
         // The desktop paints an idle session's mark in the success colour at a
         // lower opacity: the same green a completion wears, held back so it does
-        // not read as news. The branch is unreachable from a session row — an
-        // idle row reports its hour instead of a mark — but it is the projection
-        // every row would use if that gate ever moved.
+        // not read as news. No surface draws it: a session row reports its hour
+        // instead of a mark, and the header takes the row's own gate. The arm
+        // stays so the match is total, and so the projection is already right
+        // if that gate ever moves.
         AgentSessionState::Idle => sidebar_status_dot(theme::accent_green().opacity(0.78)),
     }
 }
@@ -39056,6 +39118,62 @@ fn session_opened(cx: &mut Context<Self>) {
         );
         assert!(failed.show_error);
         assert!(!failed.show_status && !failed.show_time && failed.label.is_none());
+    }
+
+    /// The header reports a session exactly as its row does, so a settled
+    /// session shows no mark on either.
+    ///
+    /// This is the reported bug: an ordinary completion drew the idle green dot
+    /// beside the title, a mark the drawer's row never shows because its gate
+    /// hands that state the hour instead. The header resolves its marks through
+    /// the row's projection rather than by asking the status helper, which
+    /// answers every state with something.
+    #[test]
+    fn the_header_reports_a_session_the_way_its_row_does() {
+        let source = include_str!("app.rs");
+        let header = renderer_source(source, "render_header");
+        assert!(
+            header.contains("sidebar_session_column("),
+            "the header must take the row's own gate, not call the status helper directly"
+        );
+        for flag in [
+            "column.show_attention",
+            "column.show_status",
+            "column.show_error",
+            "column.label",
+        ] {
+            assert!(header.contains(flag), "the header must honour {flag}");
+        }
+
+        // The rule the header now inherits, stated at the source of truth. The
+        // header reads its own page as the open, unpinned, read row.
+        let idle = sidebar_session_column(
+            AgentSessionState::Idle,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
+        assert!(
+            !idle.show_status,
+            "a settled session must not wear the idle green dot"
+        );
+        assert!(idle.show_time, "its row reports the hour instead");
+
+        // A closed session keeps the quiet dot its row draws, so the header is
+        // aligned with the row rather than stripped of every mark.
+        let closed = sidebar_session_column(
+            AgentSessionState::Closed,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
+        assert!(closed.show_status, "a closed row still reports its state");
     }
 
     /// Only the groups anchored to a session's own Worktree are offered.
