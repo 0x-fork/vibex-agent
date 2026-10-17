@@ -535,6 +535,12 @@ pub const HEADER_HEIGHT: f32 = 48.0;
 /// Every header control is a full touch target, not the 40px the phone used to
 /// reserve: the audit measured those under the platform minimum.
 pub const HEADER_BUTTON_SIZE: f32 = 44.0;
+/// The search and rail controls at the header's trailing edge.
+///
+/// They are a pair rather than two independently spaced stops, so their own
+/// targets are narrower than the leading menu's. The row still gives the thumb
+/// the header's full height, and the glyphs sit on the same centre line.
+pub const HEADER_TRAILING_BUTTON_SIZE: f32 = 36.0;
 /// Drawer and overlay headers have a little more room for the compact action
 /// cluster while the session page keeps the shorter workbench header.
 pub const DRAWER_HEADER_HEIGHT: f32 = 56.0;
@@ -892,6 +898,16 @@ pub fn bg_primary() -> Hsla {
 
 pub fn bg_card() -> Hsla {
     with_wallpaper("card", tone("card"))
+}
+
+/// The surface the reader writes on.
+///
+/// The authored composer surface sits one step above the page in every
+/// appearance, and it is deliberately not the card tone: a card in this theme
+/// can be the same white as the page, which would leave the field the reader
+/// types into with no edge of its own on a light appearance.
+pub fn composer_surface() -> Hsla {
+    tone("composer-surface")
 }
 
 pub fn bg_card_dim() -> Hsla {

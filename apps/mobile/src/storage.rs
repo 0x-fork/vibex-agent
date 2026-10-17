@@ -94,6 +94,11 @@ pub struct StoredComposerAttachment {
     pub mime_type: Option<String>,
     /// The `data:<mime>;base64,<payload>` URI the picker produced.
     pub data_url: String,
+    /// Where the picture sat in the draft, in UTF-16 units, so a restored
+    /// draft keeps the order the reader wrote it in. Absent on records written
+    /// before the offset travelled, which then read as an attachment at the end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_text_offset: Option<u32>,
 }
 
 /// One prompt held behind a running turn.
@@ -1885,6 +1890,7 @@ mod tests {
                 label: "shot.png".to_string(),
                 mime_type: Some("image/png".to_string()),
                 data_url: "data:image/png;base64,aGVsbG8=".to_string(),
+                inline_text_offset: Some(3),
             }],
             queued: vec![StoredComposerQueuedMessage {
                 text: "and another".to_string(),
@@ -1936,6 +1942,7 @@ mod tests {
             label: label.to_string(),
             mime_type: None,
             data_url: format!("data:application/octet-stream;base64,{payload}"),
+            inline_text_offset: None,
         };
         storage
             .save_composer_state(&[StoredComposerSession {

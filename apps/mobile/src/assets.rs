@@ -56,6 +56,9 @@ const ICONS: &[&str] = &[
     "icons/download.svg",
     "icons/upload.svg",
     "icons/rotate-ccw.svg",
+    "icons/history.svg",
+    "icons/panel-right.svg",
+    "icons/text-cursor-input.svg",
     "icons/undo.svg",
     "icons/chevrons-down-up.svg",
     "icons/file-code.svg",
@@ -549,6 +552,14 @@ impl AssetSource for MobileAssets {
             "icons/upload.svg" => Some(include_bytes!("../../desktop/assets/icons/upload.svg")),
             "icons/rotate-ccw.svg" => {
                 Some(include_bytes!("../../desktop/assets/icons/rotate-ccw.svg"))
+            }
+            // The header's recall marks: the clock-faced History glyph opens
+            // the earlier-message list, and the text cursor fills the field
+            // with the message picked there.
+            "icons/history.svg" => Some(include_bytes!("../assets/icons/history.svg")),
+            "icons/panel-right.svg" => Some(include_bytes!("../assets/icons/panel-right.svg")),
+            "icons/text-cursor-input.svg" => {
+                Some(include_bytes!("../assets/icons/text-cursor-input.svg"))
             }
             "icons/undo.svg" => Some(include_bytes!("../assets/icons/undo.svg")),
             "icons/chevrons-down-up.svg" => Some(include_bytes!(

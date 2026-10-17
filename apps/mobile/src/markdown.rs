@@ -8,18 +8,28 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, Context, ElementId, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
-    Window, div,
+    App, ClickEvent, Context, ElementId, IntoElement, ParentElement as _, Render, SharedString,
+    Styled as _, Window, div,
 };
 use gpui_base::text::{TextView, TextViewStyle};
 use vibex_ui::markdown::plain_text;
 
 use crate::theme;
 
+/// What a click on a rendered link does.
+///
+/// The text view is a shared component, so the client that owns the document
+/// hands it the behaviour: the timeline's prose lets the toolkit open URLs,
+/// while a user message's attachment links point at their own message and are
+/// opened by the page.
+pub type MarkdownLinkHandler =
+    Arc<dyn Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync + 'static>;
+
 pub struct MarkdownView {
     source: Arc<str>,
     revision: u64,
     muted: bool,
+    link_handler: Option<MarkdownLinkHandler>,
 }
 
 impl MarkdownView {
@@ -28,7 +38,31 @@ impl MarkdownView {
             source,
             revision,
             muted: false,
+            link_handler: None,
         }
+    }
+
+    /// Hands the view its document and the behaviour of its links.
+    ///
+    /// The handler is replaced on every frame without a repaint of its own: it
+    /// closes over the attachments of the row it was built for, and a row whose
+    /// source has not changed does not need the text view told twice, while the
+    /// handler must follow whatever the newest frame resolved.
+    pub fn set_document(
+        &mut self,
+        source: Arc<str>,
+        revision: u64,
+        link_handler: Option<MarkdownLinkHandler>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.revision == revision && self.source.as_ref() == source.as_ref() {
+            self.link_handler = link_handler;
+            return;
+        }
+        self.source = source;
+        self.revision = revision;
+        self.link_handler = link_handler;
+        cx.notify();
     }
 
     pub fn set_muted(&mut self, muted: bool, cx: &mut Context<Self>) {
@@ -39,12 +73,7 @@ impl MarkdownView {
     }
 
     pub fn set_source(&mut self, source: Arc<str>, revision: u64, cx: &mut Context<Self>) {
-        if self.revision == revision && self.source.as_ref() == source.as_ref() {
-            return;
-        }
-        self.source = source;
-        self.revision = revision;
-        cx.notify();
+        self.set_document(source, revision, self.link_handler.clone(), cx);
     }
 }
 
@@ -89,15 +118,21 @@ impl Render for MarkdownView {
             } else {
                 theme::text_primary()
             })
-            .child(
-                TextView::markdown(
+            .child({
+                let mut view = TextView::markdown(
                     ElementId::Name(SharedString::from(format!(
                         "mobile-markdown:{}",
                         cx.entity_id()
                     ))),
                     self.source.clone(),
                 )
-                .style(text_view_style(self.muted, cx)),
-            )
+                .style(text_view_style(self.muted, cx));
+                if let Some(handler) = self.link_handler.clone() {
+                    view = view.on_link_click(move |url, event, window, cx| {
+                        handler(url, event, window, cx)
+                    });
+                }
+                view
+            })
     }
 }

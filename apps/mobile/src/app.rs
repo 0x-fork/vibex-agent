@@ -632,6 +632,16 @@ struct MobileQueuedMessage {
     created_at_ms: i64,
 }
 
+/// One prompt the history sheet can send the reader back to.
+///
+/// The sheet lists prompts, but what a tap does is a jump into the transcript,
+/// so each row carries the turn it was sent in as well as its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComposerHistoryEntry {
+    turn_id: String,
+    text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingMobileUserMessage {
     session_id: VibexSessionId,
@@ -1482,6 +1492,9 @@ pub struct MobileApp {
     /// Images attached to the open draft. They travel with the prompt as data
     /// URLs, so the phone never needs the desktop's filesystem to name them.
     composer_attachments: Vec<MessageAttachment>,
+    /// The composer's text as the last frame left it, so a change can be told
+    /// from the text it replaced and the pictures anchored in it can follow.
+    composer_text_seen: String,
     /// Attachments per session, like the text drafts: what was attached to A
     /// must not be sent with a prompt typed in B.
     composer_attachment_drafts: BTreeMap<String, Vec<MessageAttachment>>,
@@ -3710,12 +3723,13 @@ impl MobileApp {
             &composer_input,
             window,
             |this: &mut Self,
-             _: &Entity<TextareaState>,
+             composer: &Entity<TextareaState>,
              event: &InputEvent,
              _: &mut Window,
              cx: &mut Context<Self>| {
                 if matches!(event, InputEvent::Change) {
-                    this.mark_composer_state_dirty(cx);
+                    let next = composer.read(cx).value().to_string();
+                    this.record_composer_text(next, cx);
                 }
             },
         );
@@ -3747,6 +3761,7 @@ impl MobileApp {
             composer_armed_command: None,
             composer_armed_mentions: Vec::new(),
             composer_attachments: Vec::new(),
+            composer_text_seen: String::new(),
             composer_attachment_drafts: restored_composer.attachments,
             composer_message_edit: None,
             composer_edit_stashed_draft: None,
@@ -4414,6 +4429,13 @@ impl MobileApp {
         match event {
             crate::attachment::AttachmentPickEvent::Picked(picked) => {
                 let target = self.attach_menu_target;
+                // A picture picked into the session composer lands at the caret,
+                // so the message keeps the order the reader wrote it in; the
+                // first message has no field to anchor to yet, and rides whole.
+                let inline_text_offset = match target {
+                    AttachmentTarget::Composer => Some(self.composer_attachment_offset(cx)),
+                    AttachmentTarget::NewSession => None,
+                };
                 let attached = match target {
                     AttachmentTarget::Composer => &mut self.composer_attachments,
                     AttachmentTarget::NewSession => &mut self.new_session_attachments,
@@ -4434,9 +4456,7 @@ impl MobileApp {
                     label: picked.label,
                     mime_type: picked.mime_type,
                     uri: Some(picked.data_url),
-                    // A phone has no text editor to anchor an inline attachment
-                    // to, so every picked image rides the message as a whole.
-                    inline_text_offset: None,
+                    inline_text_offset,
                 });
                 if target == AttachmentTarget::Composer {
                     self.mark_composer_state_dirty(cx);
@@ -11930,13 +11950,16 @@ impl MobileApp {
     /// Projected from the turns on screen rather than stored: the transcript is
     /// the only list of what was actually sent, including prompts that arrived
     /// from another client.
-    fn composer_history(&self) -> Vec<String> {
+    fn composer_history(&self) -> Vec<ComposerHistoryEntry> {
         let mut history = Vec::new();
         for turn in self.timeline_turns.iter() {
             if let Some(row) = turn.user_row.as_ref()
                 && !row.body.trim().is_empty()
             {
-                history.push(row.body.clone());
+                history.push(ComposerHistoryEntry {
+                    turn_id: turn.id.clone(),
+                    text: row.body.clone(),
+                });
             }
         }
         history
@@ -11964,6 +11987,18 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// Jumps the timeline to the turn a history row stands for.
+    ///
+    /// This is what a tap on a row does: the list exists to take the reader
+    /// back to a prompt in the conversation, the same way the desktop's preview
+    /// rail jumps. Filling the field is the row's explicit second control,
+    /// never the accident of a tap.
+    fn jump_to_composer_history(&mut self, turn_id: String, cx: &mut Context<Self>) {
+        self.composer_history_open = false;
+        self.timeline_find_scroll_pending = Some(turn_id);
+        cx.notify();
+    }
+
     /// Puts a recalled prompt back in the field, appending when the reader had
     /// already started typing: the field is theirs, and a recall must not throw
     /// away a half-written sentence.
@@ -11988,6 +12023,49 @@ impl MobileApp {
         self.composer_history_open = false;
         crate::platform::show_keyboard();
         cx.notify();
+    }
+
+    /// Notes the field's text and moves the pictures anchored in it.
+    ///
+    /// The last text seen is kept on the app rather than in the subscription,
+    /// because the field is also written by the page itself — a restored draft,
+    /// a recalled prompt, an edit — and a picture must follow every one of
+    /// those, not only the keystrokes a subscription hears about.
+    fn record_composer_text(&mut self, next: String, cx: &mut Context<Self>) {
+        let previous = std::mem::replace(&mut self.composer_text_seen, next.clone());
+        self.sync_composer_attachment_offsets(&previous, &next);
+        self.mark_composer_state_dirty(cx);
+    }
+
+    /// Keeps the draft's pictures where the reader wrote them.
+    ///
+    /// A phone has no rich editor, so a picked or pasted picture is not drawn
+    /// in the field itself; instead each one remembers the caret it was added
+    /// at, and those offsets are rewritten as the text around them moves. That
+    /// is what makes a pasted screenshot land where it was pasted once the
+    /// message is sent, the place the desktop pastes it.
+    fn sync_composer_attachment_offsets(&mut self, previous: &str, next: &str) {
+        if previous == next || self.composer_attachments.is_empty() {
+            return;
+        }
+        for attachment in self.composer_attachments.iter_mut() {
+            let Some(offset) = attachment.inline_text_offset else {
+                continue;
+            };
+            attachment.inline_text_offset = Some(shifted_picture_offset(previous, next, offset));
+        }
+    }
+
+    /// The caret a picture being added should be anchored at, in UTF-16 units.
+    fn composer_attachment_offset(&self, cx: &gpui::App) -> u32 {
+        let input = self.composer_input.read(cx);
+        let caret = input.cursor();
+        input
+            .text()
+            .slice(0..caret)
+            .to_string()
+            .encode_utf16()
+            .count() as u32
     }
 
     /// Arms a queue row for reordering from the long press that started it.
@@ -18408,6 +18486,50 @@ impl MobileApp {
             )
     }
 
+    /// The Agent that ran a turn, as a brand identity.
+    ///
+    /// The record behind the turn's rows is the exact answer and the composed
+    /// attribution line is the fallback for a row whose item was evicted, so
+    /// both the turn's process header and its answer metadata resolve the same
+    /// identity this way rather than each parsing its own line.
+    fn turn_agent_brand_identity(&self, turn: &TimelineConversationTurn) -> String {
+        if let Some(attribution) = turn
+            .process_rows
+            .iter()
+            .chain(turn.conclusion_row.iter())
+            .find_map(|row| {
+                self.timeline_row_item(row)
+                    .and_then(|item| item.execution_attribution.as_ref())
+            })
+        {
+            return self.agent_brand_identity_for_label(Some(attribution.agent_label.as_str()));
+        }
+        let attribution = turn
+            .runtime_attribution
+            .as_deref()
+            .map(runtime_attribution_line);
+        let (agent_identity, _) = timeline_runtime_attribution_parts(attribution.as_deref());
+        self.agent_brand_identity_for_label(agent_identity.as_deref())
+    }
+
+    /// The Agent's brand identity for a label a runtime wrote.
+    ///
+    /// A turn's attribution carries the Agent's *name*, not its id — the same
+    /// name the sidebar row has an id for — so the catalogue's own list is what
+    /// turns one into the identity a brand mark is looked up by. A label the
+    /// catalogue does not list is still usable as an identity: the shared table
+    /// matches on names too, and a name it cannot place keeps the bot mark.
+    fn agent_brand_identity_for_label(&self, label: Option<&str>) -> String {
+        let Some(label) = label.map(str::trim).filter(|label| !label.is_empty()) else {
+            return String::new();
+        };
+        self.runtime_agent_labels
+            .iter()
+            .find(|(_, candidate)| candidate.as_str() == label)
+            .map(|(agent_id, candidate)| agent_brand_identity(agent_id.as_str(), candidate))
+            .unwrap_or_else(|| label.to_string())
+    }
+
     /// Every enabled Agent as a horizontally scrolling logo strip. Tapping a
     /// logo moves the draft to that Agent's first available option, which
     /// re-scopes the model list below; the active logo wears an accent bar on
@@ -19084,7 +19206,11 @@ impl MobileApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .aria_label(locale::text("Earlier messages", "历史消息", "歷史訊息"))
+                    .aria_label(locale::text(
+                        "Jump to an earlier message",
+                        "跳转到历史消息",
+                        "跳轉到歷史訊息",
+                    ))
                     .when(history_enabled, |button| {
                         button
                             .cursor_pointer()
@@ -19099,7 +19225,7 @@ impl MobileApp {
                     .when(!history_enabled, |button| button.opacity(0.42))
                     .child(
                         svg()
-                            .path("icons/rotate-ccw.svg")
+                            .path("icons/history.svg")
                             .size(px(theme::ICON_MD))
                             .text_color(if history_enabled {
                                 theme::text_secondary()
@@ -19123,17 +19249,25 @@ impl MobileApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(theme::font_detail())
+                            // The session's name is the page's one title, so
+                            // it reads at the heading step rather than at the
+                            // size of the state mark beside it.
+                            .text_size(theme::font_heading())
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text_primary())
                             .child(title.to_string()),
                     )
                     .children(status_mark.unwrap_or_default()),
             )
+            // The two trailing controls are a pair, not two separate stops:
+            // their targets are narrower than the leading menu's so the search
+            // and the rail's mark read as one cluster at the right edge, while
+            // the header's full height still belongs to the thumb.
             .child(
                 div()
                     .id("open-conversation-find")
-                    .size(px(theme::HEADER_BUTTON_SIZE))
+                    .w(px(theme::HEADER_TRAILING_BUTTON_SIZE))
+                    .h(px(theme::HEADER_HEIGHT))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
@@ -19167,7 +19301,8 @@ impl MobileApp {
             .child(
                 div()
                     .id("open-right-rail")
-                    .size(px(theme::HEADER_BUTTON_SIZE))
+                    .w(px(theme::HEADER_TRAILING_BUTTON_SIZE))
+                    .h(px(theme::HEADER_HEIGHT))
                     .flex_shrink_0()
                     .relative()
                     .flex()
@@ -19428,14 +19563,14 @@ impl MobileApp {
                 container.child(div().flex().flex_col().gap(px(2.0)).children(records))
             })
             .when_some(conclusion_row, |container, row| {
-                // The answer gets air above it and a left rail, so it reads as
-                // the point of the turn instead of the next process line.
+                // The answer gets air above it, so it reads as the point of the
+                // turn instead of the next process line. The rail it used to
+                // carry down its left edge said the same thing twice: the gap
+                // and the answer's own full-width measure already separate it,
+                // and the line ran the height of every wrapped line of prose.
                 container.child(
                     div()
-                        .mt(px(theme::SPACING_SM))
-                        .pl(px(theme::SPACING_SM))
-                        .border_l_2()
-                        .border_color(theme::border_default())
+                        .mt(px(theme::SPACING_MD))
                         .child(self.render_timeline_row(turn, row, true, cx)),
                 )
             })
@@ -19925,68 +20060,13 @@ impl MobileApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let attachments = self.timeline_row_user_attachments(row);
-        let row_id = row.id.clone();
-        let attachment_elements = attachments.iter().enumerate().map(|(index, attachment)| {
-            let attachment = attachment.clone();
-            let is_image = message_attachment_is_image(&attachment);
-            let label = if attachment.label.trim().is_empty() {
-                locale::text("Image", "图片", "圖片").to_string()
-            } else {
-                attachment.label.clone()
-            };
-            let action_attachment = attachment.clone();
-            div()
-                .id(format!("user-attachment:{row_id}:{index}"))
-                .w_full()
-                .min_w_0()
-                .mt_2()
-                .px_2()
-                .py_2()
-                .rounded(px(theme::RADIUS_CONTROL))
-                .border_1()
-                .border_color(theme::border_subtle())
-                .bg(theme::bg_card_dim())
-                .flex()
-                .items_center()
-                .gap_2()
-                .cursor_pointer()
-                .active(|style| style.bg(theme::row_pressed_bg()))
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        this.open_user_attachment(action_attachment.clone(), window, cx)
-                    }),
-                )
-                .child(
-                    svg()
-                        .path(if is_image {
-                            "icons/image.svg"
-                        } else {
-                            "icons/file-text.svg"
-                        })
-                        .size(px(16.0))
-                        .flex_shrink_0()
-                        .text_color(theme::text_secondary()),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .text_size(theme::font_caption())
-                        .text_color(theme::text_secondary())
-                        .child(label),
-                )
-                .child(
-                    svg()
-                        .path("icons/chevron-right.svg")
-                        .size(px(14.0))
-                        .flex_shrink_0()
-                        .text_color(theme::text_muted()),
-                )
-        });
+        // The message is drawn as one document, desktop-style: a picture the
+        // reader pasted sits where they pasted it inside the sentence, and
+        // every attachment is a link the row can open — the picture in the
+        // preview, a file in the workbench. The chips the phone used to stack
+        // under the text could not be tapped at all, and they lost the place
+        // in the message each attachment was written at.
+        let body_view = self.render_user_message_body(row, &attachments, cx);
         let submitted_at = (row.timestamp_ms > 0).then_some(row.timestamp_ms);
         div()
             .id(row.id.clone())
@@ -19998,18 +20078,22 @@ impl MobileApp {
                 div()
                     .w(gpui::relative(0.78))
                     .max_w(px(520.0))
-                    .rounded(px(theme::RADIUS_CARD))
+                    // The same plate the composer draws: one square corner at
+                    // the top-right, the other three round, filled a step above
+                    // the page. A sent message and the field it was written in
+                    // are the same object at two moments.
+                    .rounded(px(theme::RADIUS_COMPOSER))
+                    .rounded_tr(px(0.0))
                     .border_1()
                     .border_color(theme::border_default())
-                    .bg(theme::bg_card())
+                    .bg(theme::composer_surface())
                     .px_3()
                     .py_2()
                     .text_size(theme::font_body())
                     .line_height(theme::line_height_for(theme::FONT_BODY))
                     .text_color(theme::text_primary())
                     .whitespace_normal()
-                    .child(row.body.clone())
-                    .children(attachment_elements),
+                    .child(body_view),
             )
             // A permanent timestamp. The desktop reveals its actions on hover;
             // a phone has no hover, and the row's duration hint needed a press.
@@ -20113,6 +20197,74 @@ impl MobileApp {
             .into_any_element()
     }
 
+    /// One prompt as a document: its text and its attachments in the order the
+    /// reader wrote them.
+    ///
+    /// Desktop parity — `user_message_inline_document`. The body is escaped so
+    /// it renders literally, each attachment becomes a link at its own
+    /// `inline_text_offset`, and an attachment the runtime wrote without one
+    /// follows the text rather than interrupting it. A click on such a link is
+    /// what opens the picture or the file; nothing else in the document links
+    /// anywhere, so the handler only ever answers for a key it placed.
+    fn render_user_message_body(
+        &self,
+        row: &TimelineRow,
+        attachments: &[MessageAttachment],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        // Built even with no attachments: the body is escaped either way, so a
+        // prompt containing `**` or `#` reads exactly as it was written instead
+        // of turning into markup the reader never typed.
+        let (source, actions) = user_message_inline_document(&row.body, attachments);
+        let source: Arc<str> = Arc::from(source);
+        let revision = row.last_sequence.max(0) as u64;
+        let key = format!("user-message:{}", row.id);
+        let view = {
+            let mut views = self.timeline_markdown_views.borrow_mut();
+            match views.get(&key).cloned() {
+                Some((view, _, _)) => {
+                    views.insert(key, (view.clone(), revision, source.clone()));
+                    view
+                }
+                None => {
+                    let view = cx.new(|cx| markdown::render(source.clone(), revision, false, cx));
+                    if views.len() >= TIMELINE_MARKDOWN_VIEW_CACHE_LIMIT
+                        && let Some(evicted) = views.keys().next().cloned()
+                    {
+                        views.remove(&evicted);
+                    }
+                    views.insert(key, (view.clone(), revision, source.clone()));
+                    view
+                }
+            }
+        };
+        let actions = Arc::new(actions);
+        let entity = cx.entity().clone();
+        view.update(cx, |view, cx| {
+            view.set_document(
+                source,
+                revision,
+                Some(Arc::new(
+                    move |url: &gpui::SharedString, _event, window, cx| {
+                        let Some(link) = actions.get(url.as_ref()).cloned() else {
+                            return;
+                        };
+                        entity.update(cx, |this, cx| match link {
+                            UserMessageAttachmentLink::Image(attachment) => {
+                                this.open_user_attachment(attachment, window, cx)
+                            }
+                            UserMessageAttachmentLink::File(attachment) => {
+                                this.open_user_attachment_file(attachment, window, cx)
+                            }
+                        });
+                    },
+                )),
+                cx,
+            );
+        });
+        view.into_any_element()
+    }
+
     fn render_markdown_view(
         &self,
         key: String,
@@ -20195,8 +20347,7 @@ impl MobileApp {
             .runtime_attribution
             .as_deref()
             .map(runtime_attribution_line);
-        let (agent_identity, runtime_label) =
-            timeline_runtime_attribution_parts(attribution.as_deref());
+        let (_, runtime_label) = timeline_runtime_attribution_parts(attribution.as_deref());
         let duration = format_compact_duration(
             turn.started_at_ms,
             (turn.complete || turn.superseded)
@@ -20204,9 +20355,39 @@ impl MobileApp {
                 .flatten(),
         );
         let generation_time = format_generation_time(turn.started_at_ms, turn.ended_at_ms);
-        let runtime_value = runtime_label.unwrap_or_default();
-        let runtime_display =
-            truncate_single_line(&runtime_value, TIMELINE_RUNTIME_LABEL_MAX_CHARS);
+        // The record behind the row still carries the attribution itself, and
+        // reading it is exact: the Agent's own name, the account or Provider
+        // the turn was billed to, and the model's label from the catalogue. The
+        // composed line is the fallback for a row whose item has been evicted.
+        let execution_attribution = self
+            .timeline_row_item(row)
+            .and_then(|item| item.execution_attribution.as_ref());
+        let (provider_label, model_label) = match execution_attribution {
+            Some(attribution) => (
+                Some(runtime_attribution_auth_label(attribution)),
+                Some(attribution.model_label.clone()),
+            ),
+            None => timeline_runtime_model_parts(runtime_label.as_deref()),
+        };
+        let runtime_tip_value = match (provider_label.as_deref(), model_label.as_deref()) {
+            (Some(provider), Some(model)) => format!(
+                "{}: {provider}\n{}: {model}",
+                locale::text("Provider", "模型供应商", "模型供應商"),
+                locale::text("Model", "模型", "模型"),
+            ),
+            (Some(provider), None) => format!(
+                "{}: {provider}",
+                locale::text("Provider", "模型供应商", "模型供應商"),
+            ),
+            (None, Some(model)) => format!("{}: {model}", locale::text("Model", "模型", "模型"),),
+            (None, None) => String::new(),
+        };
+        // The elapsed time and when the answer was generated answer one
+        // question — how long did this take — so they share the clock's tip.
+        let duration_tip_value = format!(
+            "{}: {duration}\n{generation_time}",
+            locale::text("Took", "耗时", "耗時"),
+        );
         let turn_id = turn.id.clone();
         let row_id = row.id.clone();
         let copy_text = row.body.clone();
@@ -20222,11 +20403,11 @@ impl MobileApp {
             });
         let runtime_tip = TimelineMetadataTip::Runtime {
             row_id: row.id.clone(),
-            value: runtime_value.clone(),
+            value: runtime_tip_value.clone(),
         };
         let duration_tip = TimelineMetadataTip::Duration {
             row_id: row.id.clone(),
-            value: generation_time.clone(),
+            value: duration_tip_value.clone(),
         };
         let active_tip = self
             .timeline_metadata_tip
@@ -20240,6 +20421,10 @@ impl MobileApp {
             TimelineMetadataTip::Runtime { value, .. } => value.clone(),
             TimelineMetadataTip::Duration { value, .. } => value.clone(),
         });
+        // The mark the turn ran on, resolved the way the sidebar's row resolves
+        // one: a brand identity in the shared catalogue, never the catalogue
+        // glyph the metadata strip used to paint for every Agent alike.
+        let brand_identity = self.turn_agent_brand_identity(turn);
         Some(
             div()
                 .id(format!("agent-answer-metadata:{}", row.id))
@@ -20265,47 +20450,69 @@ impl MobileApp {
                                 .flex_1()
                                 .flex()
                                 .items_center()
-                                .gap_2()
+                                .gap_1()
+                                // The Agent's mark is the whole of the runtime's
+                                // report: the names behind it are one tap away
+                                // rather than a line of small type that clips
+                                // on a phone.
                                 .child(
-                                    svg()
-                                        .path(agent_icon_path(
-                                            agent_identity.as_deref().unwrap_or("unknown"),
-                                        ))
-                                        .size(px(theme::ICON_SM))
+                                    div()
+                                        .id(format!("answer-agent-logo:{row_id}"))
+                                        .debug_selector({
+                                            let row_id = row_id.clone();
+                                            move || format!("answer-agent-logo:{row_id}")
+                                        })
+                                        .size(px(theme::TOUCH_TARGET))
                                         .flex_shrink_0()
-                                        .text_color(theme::text_muted()),
-                                )
-                                .when(!runtime_value.is_empty(), |left| {
-                                    let runtime_tip = runtime_tip.clone();
-                                    left.child(
-                                        div()
-                                            .id(format!("runtime-label:{row_id}"))
-                                            .min_w_0()
-                                            .flex_1()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .cursor_pointer()
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.toggle_timeline_metadata_tip(
-                                                        runtime_tip.clone(),
-                                                        cx,
-                                                    )
-                                                }),
+                                        .ml(px(-theme::SPACING_SM))
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .aria_label(
+                                            locale::text(
+                                                "Model used for this answer",
+                                                "本轮使用的模型",
+                                                "本輪使用的模型",
                                             )
-                                            .child(runtime_display.clone()),
-                                    )
-                                })
+                                            .to_string(),
+                                        )
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.toggle_timeline_metadata_tip(
+                                                    runtime_tip.clone(),
+                                                    cx,
+                                                )
+                                            }),
+                                        )
+                                        .child(agent_brand_icon(
+                                            &brand_identity,
+                                            px(theme::ICON_MD),
+                                            theme::text_secondary(),
+                                        )),
+                                )
                                 .child(
                                     div()
                                         .id(format!("duration-label:{row_id}"))
+                                        .size(px(theme::TOUCH_TARGET))
                                         .flex_shrink_0()
+                                        .rounded(px(theme::RADIUS_CONTROL))
                                         .flex()
                                         .items_center()
-                                        .gap_1()
+                                        .justify_center()
                                         .cursor_pointer()
+                                        .active(|style| style.bg(theme::row_pressed_bg()))
+                                        .aria_label(
+                                            locale::text(
+                                                "Time taken for this answer",
+                                                "本轮耗时",
+                                                "本輪耗時",
+                                            )
+                                            .to_string(),
+                                        )
                                         .on_mouse_up(
                                             MouseButton::Left,
                                             cx.listener(move |this, _, _, cx| {
@@ -20321,8 +20528,7 @@ impl MobileApp {
                                                 .size(px(theme::ICON_SM))
                                                 .flex_shrink_0()
                                                 .text_color(theme::text_muted()),
-                                        )
-                                        .child(duration),
+                                        ),
                                 ),
                         )
                         .child(
@@ -21491,9 +21697,6 @@ impl MobileApp {
             .when(editing_message, |composer| {
                 composer.child(self.render_composer_edit_banner(cx))
             })
-            .when(!self.composer_attachments.is_empty(), |composer| {
-                composer.child(self.render_composer_attachments(cx))
-            })
             .when(needs_continue, |composer| {
                 composer.child(
                     div()
@@ -21531,16 +21734,28 @@ impl MobileApp {
             // and the ring the second, on the line the reader is already using.
             .child(
                 div()
+                    .id("mobile-composer-card")
                     .relative()
                     .min_h(px(52.0))
+                    // The card is a message being written, and its one square
+                    // corner sits at the top-right where the reader's own
+                    // actions live: the other three stay round so the card
+                    // still reads as a message rather than a panel.
                     .rounded(px(theme::RADIUS_COMPOSER))
+                    .rounded_tr(px(0.0))
                     .border_1()
-                    .border_color(theme::border_subtle())
-                    .bg(theme::bg_card())
+                    .border_color(theme::border_default())
+                    .bg(theme::composer_surface())
                     .p(px(theme::SPACING_MD))
                     .flex()
                     .flex_col()
                     .gap(px(theme::SPACING_SM))
+                    // What the message carries sits inside the field it
+                    // belongs to: the chips are part of the draft, and a phone
+                    // has no text editor to draw them in the typing line.
+                    .when(!self.composer_attachments.is_empty(), |card| {
+                        card.child(self.render_composer_attachments(cx))
+                    })
                     .child(
                         div()
                             .w_full()
@@ -23190,7 +23405,6 @@ impl MobileApp {
         div()
             .id("mobile-composer-attachments")
             .debug_selector(|| "mobile-composer-attachments".to_string())
-            .mb(px(theme::SPACING_SM))
             .flex()
             .flex_wrap()
             .gap(px(theme::SPACING_XS))
@@ -23206,8 +23420,8 @@ impl MobileApp {
                             .pr(px(theme::SPACING_XS))
                             .rounded(px(theme::RADIUS_PILL))
                             .border_1()
-                            .border_color(theme::border_default())
-                            .bg(theme::bg_card())
+                            .border_color(theme::border_subtle())
+                            .bg(theme::bg_card_dim())
                             .flex()
                             .items_center()
                             .gap(px(theme::SPACING_XS))
@@ -26386,6 +26600,14 @@ impl MobileApp {
 
 impl Render for MobileApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The field can be written by the page as well as by a keystroke, and
+        // every one of those writes is a chance for a picture anchored in it to
+        // fall behind. Reading it here, once a frame, keeps the record honest
+        // whatever wrote it.
+        let composer_text = self.composer_input.read(cx).value().to_string();
+        if composer_text != self.composer_text_seen {
+            self.record_composer_text(composer_text, cx);
+        }
         self.sync_elicitation_form(window, cx);
         self.sync_question_form();
         // Notices recorded by paths that have no window. The toast layer needs
@@ -27319,8 +27541,14 @@ impl MobileApp {
             .rev()
             .take(shown)
             .enumerate()
-            .map(|(index, text)| {
-                let recall = text.clone();
+            .map(|(index, entry)| {
+                // The row's own tap is the desktop's preview rail: it takes the
+                // reader back to the turn the prompt was sent in. Filling the
+                // field is the row's trailing control, so a reader who only
+                // wanted to re-read an old prompt never has it land in the
+                // composer by accident.
+                let jump_turn_id = entry.turn_id.clone();
+                let recall = entry.text.clone();
                 div()
                     .id(("composer-history-row", index))
                     .w_full()
@@ -27332,8 +27560,8 @@ impl MobileApp {
                     .active(|style| style.bg(theme::row_pressed_bg()))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            this.recall_composer_history(recall.clone(), window, cx)
+                        cx.listener(move |this, _, _, cx| {
+                            this.jump_to_composer_history(jump_turn_id.clone(), cx)
                         }),
                     )
                     .flex()
@@ -27341,9 +27569,10 @@ impl MobileApp {
                     .gap(px(theme::SPACING_SM))
                     .child(
                         svg()
-                            .path("icons/rotate-ccw.svg")
+                            .path("icons/history.svg")
                             .size(px(theme::ICON_SM))
                             .flex_shrink_0()
+                            .mt(px(2.0))
                             .text_color(theme::text_muted()),
                     )
                     .child(
@@ -27357,7 +27586,40 @@ impl MobileApp {
                             // sheet is for recognition, and the full text is
                             // one tap away in the field.
                             .line_clamp(3)
-                            .child(text),
+                            .child(entry.text),
+                    )
+                    .child(
+                        div()
+                            .id(("composer-history-fill", index))
+                            .debug_selector(move || format!("composer-history-fill:{index}"))
+                            .aria_label(locale::text(
+                                "Put this message in the composer",
+                                "把这条消息填入输入框",
+                                "把這則訊息填入輸入框",
+                            ))
+                            .size(px(36.0))
+                            .flex_shrink_0()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    // The row under the control would otherwise
+                                    // read the same release as a jump.
+                                    cx.stop_propagation();
+                                    this.recall_composer_history(recall.clone(), window, cx)
+                                }),
+                            )
+                            .child(
+                                svg()
+                                    .path("icons/text-cursor-input.svg")
+                                    .size(px(theme::ICON_SM))
+                                    .text_color(theme::text_secondary()),
+                            ),
                     )
             })
             .collect::<Vec<_>>();
@@ -28451,10 +28713,16 @@ impl MobileApp {
                             .child(
                                 div()
                                     .w_full()
+                                    // The first message's field is the same
+                                    // card as the session composer's: one
+                                    // square corner at the top-right, the
+                                    // other three round, and a fill a step
+                                    // above the page.
                                     .rounded(px(theme::RADIUS_COMPOSER))
+                                    .rounded_tr(px(0.0))
                                     .border_1()
-                                    .border_color(theme::border_subtle())
-                                    .bg(theme::bg_card())
+                                    .border_color(theme::border_default())
+                                    .bg(theme::composer_surface())
                                     .p(px(theme::SPACING_MD))
                                     .flex()
                                     .flex_col()
@@ -32788,6 +33056,7 @@ fn stored_composer_attachment(
             label: attachment.label.clone(),
             mime_type: attachment.mime_type.clone(),
             data_url,
+            inline_text_offset: attachment.inline_text_offset,
         })
 }
 
@@ -32801,8 +33070,9 @@ fn restore_composer_attachment(
             label: attachment.label.clone(),
             mime_type: attachment.mime_type.clone(),
             uri: Some(attachment.data_url.clone()),
-            // A phone has no text editor to anchor an inline attachment to.
-            inline_text_offset: None,
+            // The caret the picture was added at, so a restored draft still
+            // reads in the order it was written.
+            inline_text_offset: attachment.inline_text_offset,
         })
 }
 
@@ -34037,6 +34307,56 @@ fn timeline_runtime_attribution_parts(
     (identity.map(str::to_owned), runtime)
 }
 
+/// The account or Provider a turn was billed to, named the reader's way.
+///
+/// Desktop parity — `runtime_attribution_auth_label`. An Agent account is a
+/// product concept, so a client that renders a locale names it from the kind;
+/// a Provider Profile is the reader's own name for it and is shown as written.
+fn runtime_attribution_auth_label(
+    attribution: &vibex_core::TurnExecutionAttributionView,
+) -> String {
+    match attribution.auth_source.as_ref() {
+        Some(vibex_core::RuntimeAuthSource::ProviderProfile { .. }) => {
+            attribution.auth_source_label.clone()
+        }
+        _ => {
+            let account = locale::text("Agent account", "Agent 账户", "Agent 帳戶");
+            match vibex_core::agent_account_label_hint(&attribution.auth_source_label) {
+                Some("") => account.to_string(),
+                Some(hint) => format!("{account} - {hint}"),
+                None => attribution.auth_source_label.clone(),
+            }
+        }
+    }
+}
+
+/// The Provider and the model inside a runtime attribution's trailing part.
+///
+/// The shared projection writes the runtime's line as `Agent · account ·
+/// model`. What the metadata strip wants is the other end of that line: the
+/// account or Provider the answer was billed to, and the model that wrote it.
+/// Both are optional on their own — a record without a provider still has a
+/// model — so each is kept apart rather than printed as one string the reader
+/// has to split.
+fn timeline_runtime_model_parts(runtime: Option<&str>) -> (Option<String>, Option<String>) {
+    let Some(runtime) = runtime.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (None, None);
+    };
+    let mut parts = runtime
+        .split(" · ")
+        .map(str::trim)
+        .filter(|part| !part.is_empty());
+    let first = parts.next();
+    let second = parts.next();
+    match (first, second) {
+        // One part is the model the runtime could distil; a Provider with no
+        // model behind it is not a thing the reader can act on.
+        (Some(only), None) => (None, Some(only.to_string())),
+        (Some(provider), Some(model)) => (Some(provider.to_string()), Some(model.to_string())),
+        _ => (None, None),
+    }
+}
+
 fn sidebar_project_icon_path(
     appearance: &vibex_desktop_model::SidebarProjectAppearance,
 ) -> &'static str {
@@ -34480,6 +34800,156 @@ fn render_mobile_thinking_indicator(turn_id: &str, label: &str) -> gpui::AnyElem
                 ),
         )
         .into_any_element()
+}
+
+/// Where a picture's offset ends up when the text around it changes.
+///
+/// The edit is the shortest run that differs on both ends — one paste, one
+/// word typed, one selection deleted — measured in UTF-16 units because that is
+/// what the wire writes. An offset before the edit stays put, one after it
+/// travels with the tail, and one inside the changed run lands at the edit's
+/// own edge: a picture cannot be left pointing at a coordinate the new text no
+/// longer has.
+///
+/// An attachment sits at the boundary on purpose: text inserted exactly where
+/// it was anchored follows it rather than pushing it, so typing at the end of
+/// a draft reads as writing after the picture. Once the text *before* it moves,
+/// the picture travels with the tail.
+fn shifted_picture_offset(previous: &str, next: &str, offset: u32) -> u32 {
+    if previous == next {
+        return offset;
+    }
+    let previous_chars = previous.chars().collect::<Vec<_>>();
+    let next_chars = next.chars().collect::<Vec<_>>();
+    let mut prefix = 0;
+    while prefix < previous_chars.len()
+        && prefix < next_chars.len()
+        && previous_chars[prefix] == next_chars[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < previous_chars.len().saturating_sub(prefix)
+        && suffix < next_chars.len().saturating_sub(prefix)
+        && previous_chars[previous_chars.len() - 1 - suffix]
+            == next_chars[next_chars.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let utf16_width = |characters: &[char]| {
+        characters
+            .iter()
+            .map(|character| character.len_utf16())
+            .sum::<usize>()
+    };
+    let removed = utf16_width(&previous_chars[prefix..previous_chars.len().saturating_sub(suffix)]);
+    let inserted = utf16_width(&next_chars[prefix..next_chars.len().saturating_sub(suffix)]);
+    let edit_start = utf16_width(&previous_chars[..prefix]);
+    let offset = offset as usize;
+    let shifted = if offset <= edit_start {
+        offset
+    } else if offset >= edit_start.saturating_add(removed) {
+        offset.saturating_add(inserted).saturating_sub(removed)
+    } else {
+        edit_start.saturating_add(inserted)
+    };
+    shifted.min(u32::MAX as usize) as u32
+}
+
+/// What a link in a user message stands for.
+///
+/// Only the attachments the document placed are links, so this is the whole
+/// vocabulary the row's link handler needs: the picture opens in the preview,
+/// a file opens in the workbench.
+#[derive(Debug, Clone)]
+enum UserMessageAttachmentLink {
+    Image(MessageAttachment),
+    File(MessageAttachment),
+}
+
+/// One prompt as a Markdown document, with its attachments at the places they
+/// were written.
+///
+/// Desktop parity — `user_message_inline_document`. The text is escaped so it
+/// renders literally; each attachment becomes a link with its own key, and the
+/// key maps to what opening it does. An offset is in UTF-16 units, the unit the
+/// wire counts in, and it is clamped to the text and to the cursor so two
+/// attachments on one offset cannot reorder it.
+fn user_message_inline_document(
+    text: &str,
+    attachments: &[MessageAttachment],
+) -> (String, BTreeMap<String, UserMessageAttachmentLink>) {
+    let mut source = String::with_capacity(text.len());
+    let mut links = BTreeMap::new();
+    let mut positioned = attachments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, attachment)| {
+            attachment
+                .inline_text_offset
+                .map(|offset| (offset as usize, index, attachment))
+        })
+        .collect::<Vec<_>>();
+    positioned.sort_by_key(|(offset, index, _)| (*offset, *index));
+    let mut cursor = 0usize;
+    for (offset, _, attachment) in positioned {
+        let byte = vibex_core::utf16_offset_to_byte(text, offset).clamp(cursor, text.len());
+        if byte > cursor {
+            source.push_str(&vibex_ui::markdown::escape_markdown_literal(
+                &text[cursor..byte],
+            ));
+        }
+        push_user_message_attachment(&mut source, &mut links, attachment);
+        cursor = byte;
+        if text[cursor..].starts_with(' ') {
+            cursor += 1;
+        }
+    }
+    source.push_str(&vibex_ui::markdown::escape_markdown_literal(
+        &text[cursor..],
+    ));
+    for attachment in attachments
+        .iter()
+        .filter(|attachment| attachment.inline_text_offset.is_none())
+    {
+        push_user_message_attachment(&mut source, &mut links, attachment);
+    }
+    (source, links)
+}
+
+/// Append one attachment to the document, as a link when it can be opened.
+fn push_user_message_attachment(
+    source: &mut String,
+    links: &mut BTreeMap<String, UserMessageAttachmentLink>,
+    attachment: &MessageAttachment,
+) {
+    if source
+        .chars()
+        .next_back()
+        .is_some_and(|character| !character.is_whitespace())
+    {
+        source.push(' ');
+    }
+    let label = if attachment.label.trim().is_empty() {
+        locale::text("Image", "图片", "圖片").to_string()
+    } else {
+        attachment.label.clone()
+    };
+    let link = if message_attachment_is_image(attachment) {
+        UserMessageAttachmentLink::Image(attachment.clone())
+    } else {
+        UserMessageAttachmentLink::File(attachment.clone())
+    };
+    let key = format!("vibex-attachment:{}", links.len());
+    links.insert(key.clone(), link);
+    source.push('[');
+    source.push_str(&vibex_ui::markdown::escape_markdown_literal(&label));
+    source.push_str("](");
+    source.push_str(&key);
+    source.push(')');
+    // A link the parser reads is a word: whatever follows it needs its own
+    // space, or the label and the next word fuse.
+    source.push(' ');
 }
 
 fn message_attachment_is_image(attachment: &MessageAttachment) -> bool {
@@ -42003,22 +42473,23 @@ fn agent_icon_path(",
     /// the recall arrow, and the clock is the schedule control parked in the
     /// card's top-right corner.
     #[test]
-    fn the_clock_schedules_and_recall_wears_its_own_mark() {
+    fn the_clock_schedules_and_history_wears_its_own_mark() {
         let source = include_str!("app.rs");
         let composer = renderer_source(source, "render_composer");
         let header = renderer_source(source, "render_header");
 
-        // Recall sits in the header now, beside the title of the session it
-        // recalls: the arrow is still the mark, and it still opens the list.
+        // History sits in the header, beside the title of the session it
+        // belongs to: the clock-faced mark opens the earlier-message list, and
+        // a tap on one of its rows jumps back to that turn.
         assert!(
             header.contains("\"open-composer-history\"")
-                && header.contains("icons/rotate-ccw.svg")
+                && header.contains("icons/history.svg")
                 && header.contains("this.open_composer_history(window, cx)"),
-            "recall is the arrow, and it wears it in the header"
+            "history is the clock mark, and it opens the list from the header"
         );
         assert!(
             !composer.contains("composer-history"),
-            "the composer's own row no longer carries recall"
+            "the composer's own row no longer carries history"
         );
         assert!(
             composer.contains(".id(\"schedule-message\")")
@@ -42028,6 +42499,75 @@ fn agent_icon_path(",
         assert!(
             !composer.contains("this.open_composer_history(window, cx)"),
             "and a clock tap never opens the history sheet"
+        );
+    }
+
+    /// The session's title is the page's one title, and the trailing pair is a
+    /// pair.
+    ///
+    /// The header used to set the name at the detail step beside an 18px state
+    /// mark, so the page's own subject read smaller than the body under it; and
+    /// the search and rail controls each reserved a full target, which left the
+    /// two glyphs a gap apart at the glass edge.
+    #[test]
+    fn the_header_sets_a_real_title_and_keeps_its_trailing_controls_together() {
+        let source = include_str!("app.rs");
+        let header = renderer_source(source, "render_header");
+        assert!(
+            header.contains("theme::font_heading()"),
+            "the title reads at the heading step"
+        );
+        assert!(
+            header.matches("theme::HEADER_TRAILING_BUTTON_SIZE").count() >= 2,
+            "both trailing controls take the pair's own width"
+        );
+        assert!(
+            header.contains("icons/panel-right.svg"),
+            "the rail's mark is the glyph the asset pack actually serves"
+        );
+        // Guard against a path this pack does not carry, spelled here in pieces
+        // so the scan for drawn literals cannot pick it up.
+        let missing_mark = ["icons/panel-right", "outline.svg"].concat();
+        assert!(
+            !header.contains(&missing_mark),
+            "a mark no asset serves would paint nothing at all"
+        );
+        assert!(
+            include_str!("assets.rs").contains("\"icons/panel-right.svg\" => Some(include_bytes!("),
+            "and the pack registers the path the header draws"
+        );
+    }
+
+    /// A history row jumps; the row's own control fills the field.
+    ///
+    /// The sheet used to fill the composer from any tap on a row, so the
+    /// desktop's preview-rail gesture — take me back to that turn — had no
+    /// phone equivalent at all. Now the row is the jump and a dedicated control
+    /// is the recall, so neither gesture can be mistaken for the other.
+    #[test]
+    fn a_history_row_jumps_and_its_control_fills_the_field() {
+        let source = include_str!("app.rs");
+        let sheet = renderer_source(source, "render_composer_history_sheet");
+        assert!(
+            sheet.contains("this.jump_to_composer_history(jump_turn_id.clone(), cx)"),
+            "a tap on the row takes the reader to the turn it stands for"
+        );
+        assert!(
+            sheet.contains("this.recall_composer_history(recall.clone(), window, cx)"),
+            "the row's own control is what fills the field"
+        );
+        assert!(
+            sheet.contains("icons/text-cursor-input.svg"),
+            "and the control wears the mark that says it writes into the field"
+        );
+        assert!(
+            sheet.contains("cx.stop_propagation()"),
+            "the control's release must not also read as a tap on its row"
+        );
+        assert!(
+            renderer_source(source, "jump_to_composer_history")
+                .contains("timeline_find_scroll_pending"),
+            "a jump uses the same pending scroll a find result does"
         );
     }
 
@@ -42241,5 +42781,24 @@ fn agent_icon_path(",
                 .is_none(),
             "the composer's selection should let go once Copy has taken it"
         );
+    }
+
+    /// A draft's pictures keep their place as the sentence around them changes.
+    ///
+    /// The field is plain text, so the offset is the only record of where a
+    /// pasted screenshot belongs. The maths is exercised through the same
+    /// helper the composer uses, so a change to it cannot leave this behind.
+    #[test]
+    fn composer_picture_offsets_follow_the_text_they_sit_in() {
+        // Typing before the picture pushes it along by what was typed.
+        assert_eq!(shifted_picture_offset("alpha ::", "alpha xx::", 7), 9);
+        // Typing at the picture's own boundary leaves it where it was: the
+        // reader wrote after it, not in front of it.
+        assert_eq!(shifted_picture_offset("look: ", "look: dear", 6), 6);
+        // Deleting across the picture leaves it at the edit's edge.
+        assert_eq!(shifted_picture_offset("abcdef", "af", 3), 1);
+        // A character outside the BMP is two UTF-16 units, the unit the wire
+        // writes, so the picture moves by the width the reader sees.
+        assert_eq!(shifted_picture_offset("a", "\u{1f642}a", 1), 3);
     }
 }

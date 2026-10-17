@@ -83,6 +83,11 @@ impl MobileApp {
                 turn_finished(turn).then_some(turn.ended_at_ms).flatten()
             )
         );
+        // The turn reports which Agent did the work on the right of its header,
+        // the way the desktop's own turn header does. The identity is the same
+        // one the answer metadata resolves, so the two cannot disagree about
+        // which Agent a turn belongs to.
+        let brand_identity = self.turn_agent_brand_identity(turn);
         disclosure_button(format!("turn-process:{id}"), label.clone(), expanded, cx)
             .child(disclosure_icon(expanded))
             .child(
@@ -94,6 +99,27 @@ impl MobileApp {
                     .font_normal()
                     .child(label),
             )
+            .when(!brand_identity.is_empty(), |header| {
+                let header_id = id.clone();
+                header.child(
+                    div()
+                        .id(format!("turn-process-agent:{header_id}"))
+                        .debug_selector({
+                            let header_id = header_id.clone();
+                            move || format!("turn-process-agent:{header_id}")
+                        })
+                        .size(px(theme::ICON_MD))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(agent_brand_icon(
+                            &brand_identity,
+                            px(theme::ICON_SM),
+                            theme::text_secondary(),
+                        )),
+                )
+            })
             .on_click(
                 cx.listener(move |this, _, _, cx| this.toggle_process(id.clone(), expanded, cx)),
             )

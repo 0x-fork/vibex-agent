@@ -1089,3 +1089,25 @@ fn a_settled_question_survives_the_end_of_its_turn(cx: &mut TestAppContext) {
         "and opening the turn's activity keeps it in view"
     );
 }
+
+/// The answer is set apart by air, not by a rail down its left edge.
+///
+/// The rule was drawn the full height of the message beside every wrapped line,
+/// which made the answer read as a quotation of the process above it instead of
+/// the point of the turn.
+#[test]
+fn the_turn_answer_carries_no_left_rail() {
+    let source = include_str!("app.rs");
+    let (_, tail) = source
+        .split_once("fn render_turn(")
+        .expect("the turn renderer should stay inspectable");
+    let body = &tail[..tail.find("\n    fn ").unwrap_or(tail.len())];
+    assert!(
+        !body.contains("border_l_"),
+        "the conclusion must not be drawn against a rule"
+    );
+    assert!(
+        body.contains("conclusion_row"),
+        "the conclusion is still its own block in the turn"
+    );
+}
