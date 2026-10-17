@@ -675,13 +675,29 @@ impl MobileApp {
         (total > 1).then(|| (self.question_form_step.min(total - 1) + 1, total))
     }
 
-    /// A tap on the scrim is a dismissal, not an answer: nothing is sent, and the
-    /// request waits on its timeline row until the reader comes back.
-    pub(super) fn dismiss_question_sheet(&mut self, cx: &mut Context<Self>) {
+    /// Puts the panel's question away without answering it.
+    ///
+    /// Dismissal means the same thing however the reader got there — a tap on
+    /// the scrim, the back gesture, or a finger that threw the panel down the
+    /// screen: nothing is sent, and the request keeps waiting on its timeline
+    /// row for the reader to come back to.
+    ///
+    /// This is the record the page keeps of that decision, and it has to be
+    /// made *before* the panel's fall starts. The panel's own flag is the
+    /// pending request, which the runtime owns; a fall that lands while the
+    /// request is still pending would raise the panel straight back up.
+    pub(super) fn put_away_question(&mut self, cx: &mut Context<Self>) {
         if let Some(question) = self.pending_question() {
             self.dismissed_questions
                 .insert(question.request_id().to_string());
         }
+        cx.notify();
+    }
+
+    /// A tap on the scrim is a dismissal, not an answer: nothing is sent, and the
+    /// request waits on its timeline row until the reader comes back.
+    pub(super) fn dismiss_question_sheet(&mut self, cx: &mut Context<Self>) {
+        self.put_away_question(cx);
         self.close_sheet(SheetKey::AgentQuestion, cx);
     }
 

@@ -12710,6 +12710,15 @@ impl MobileApp {
             }
             SheetPull::Dismissed(key) => {
                 cx.stop_propagation();
+                // A panel thrown down the screen is dismissed exactly as a tap
+                // on the scrim dismisses it, so the question needs its request
+                // put away before the fall lands: the page's flag is that
+                // request, and leaving it pending would raise the panel again
+                // the moment it cleared the screen. The fall the pull already
+                // started is what carries it out, so it is not cut short here.
+                if key == SheetKey::AgentQuestion {
+                    self.put_away_question(cx);
+                }
                 self.lower_sheet(key, cx);
             }
         }
@@ -36629,6 +36638,181 @@ mod tests {
         assert!(
             app.read_with(cx, |app, _| app.sidebar_row_menu.is_none()),
             "a pull this long dismisses the sheet"
+        );
+    }
+
+    /// The request an Agent parked on in [`app_with_a_parked_question`].
+    const PARKED_QUESTION: &str = "request_mobile_parked";
+
+    /// A workspace whose Agent has parked on a question, laid out with the panel
+    /// at rest over the composer — the state every question-panel gesture starts
+    /// from.
+    ///
+    /// The request reaches the controller the way a live one does: as a pending
+    /// elicitation in the session's timeline.
+    fn app_with_a_parked_question<'a>(
+        cx: &'a mut TestAppContext,
+        data_dir: &std::path::Path,
+    ) -> (Entity<MobileApp>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = MobileApp::new_for_test(data_dir.to_path_buf(), window, cx);
+            let backend = vibex_backend::DisconnectedBackend::facade();
+            let mut controller =
+                AgentWorkflowController::new(backend.agent().clone(), backend.capabilities().agent);
+            let session_id = VibexSessionId::parse("session_mobile_question").unwrap();
+            let request = ElicitationRequest {
+                id: RequestId::parse(PARKED_QUESTION).unwrap(),
+                session_id: session_id.clone(),
+                provider_request_id: None,
+                tool_call_id: None,
+                message: "Which state model should the rail use?".into(),
+                title: None,
+                description: None,
+                fields: vec![ElicitationField {
+                    id: "approach".into(),
+                    title: "Approach".into(),
+                    description: None,
+                    required: true,
+                    kind: ElicitationFieldKind::Text {
+                        min_length: None,
+                        max_length: None,
+                        pattern: None,
+                        format: None,
+                        default: None,
+                        options: vec![ElicitationOption {
+                            value: "global".into(),
+                            title: "Global state".into(),
+                            description: None,
+                        }],
+                    },
+                }],
+                status: vibex_core::ElicitationRequestStatus::Pending,
+                requested_at_ms: 1,
+            };
+            controller.state.selected_session_id = Some(session_id.clone());
+            controller.state.timeline.replace_authoritative(
+                session_id.clone(),
+                vec![TimelineItem {
+                    id: vibex_core::TimelineItemId::parse("timeline_mobile_question").unwrap(),
+                    session_id,
+                    sequence: 1,
+                    timestamp_ms: 1,
+                    source: TimelineSource::Agent,
+                    kind: TimelineItemKind::ElicitationRequest,
+                    correlation_id: None,
+                    provider_correlation_id: None,
+                    redaction_state: TimelineRedactionState::None,
+                    execution_attribution: None,
+                    payload_depth: vibex_core::TimelinePayloadDepth::Detail,
+                    payload: TimelinePayload::ElicitationRequest(request),
+                }],
+            );
+            app.controller = Some(controller);
+            app.mode = RootMode::Workspace;
+            app
+        });
+        cx.run_until_parked();
+        // The first frame is what opens the panel; the rest of the rise is then
+        // run out so every gesture starts from the panel the reader sees.
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        settle_rise(&app, cx);
+        (app, cx)
+    }
+
+    /// A finger that throws the question panel down the screen puts it away for
+    /// good — the same thing a tap on the scrim means.
+    ///
+    /// The panel's own flag is the pending request, which the runtime owns, so
+    /// the page has to remember the dismissal itself. Without that, the fall
+    /// lands, the request is still waiting, and the panel rises straight back up
+    /// under the finger that just threw it away.
+    #[gpui::test]
+    fn a_question_panel_thrown_down_stays_away(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = app_with_a_parked_question(cx, data_dir.path());
+        let panel = cx
+            .debug_bounds("mobile-agent-question")
+            .expect("the parked question rises over the composer");
+
+        // The finger lands on the scrim above the panel and drags further than
+        // a dismissal asks for.
+        let touch = point(panel.center().x, panel.origin.y - px(12.0));
+        for (phase, dy) in [(TouchPhase::Started, 20.0), (TouchPhase::Moved, 140.0)] {
+            cx.simulate_event(ScrollWheelEvent {
+                position: touch,
+                delta: ScrollDelta::Pixels(point(px(0.0), px(dy))),
+                modifiers: Default::default(),
+                touch_phase: phase,
+            });
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
+        cx.simulate_event(ScrollWheelEvent {
+            position: touch,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Ended,
+        });
+        settle_sheet(&app, cx);
+        assert!(
+            !app.read_with(cx, |app, _| app.question_form_open()),
+            "a pull past the dismissal distance puts the question away"
+        );
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            cx.debug_bounds("mobile-agent-question").is_none(),
+            "and the panel must not rise back up once its fall has landed"
+        );
+
+        // A dismissal is not a decline: the request is still waiting, and its
+        // timeline row is the way back to the panel.
+        app.update(cx, |app, cx| {
+            app.reopen_question(PARKED_QUESTION.to_string(), cx);
+        });
+        settle_rise(&app, cx);
+        assert!(
+            cx.debug_bounds("mobile-agent-question").is_some(),
+            "the row brings the same question back"
+        );
+    }
+
+    /// A tap on the scrim means the same as a pull: the question is put away
+    /// unanswered, the page behind the panel never sees the tap, and the panel
+    /// stays down.
+    #[gpui::test]
+    fn a_tap_beside_the_question_puts_it_away(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = app_with_a_parked_question(cx, data_dir.path());
+        let panel = cx
+            .debug_bounds("mobile-agent-question")
+            .expect("the parked question rises over the composer");
+
+        cx.simulate_click(
+            point(panel.center().x, panel.origin.y - px(12.0)),
+            gpui::Modifiers::none(),
+        );
+        settle_sheet(&app, cx);
+        assert!(
+            !app.read_with(cx, |app, _| app.question_form_open()),
+            "a tap on the scrim puts the question away"
+        );
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            cx.debug_bounds("mobile-agent-question").is_none(),
+            "and the panel stays down"
         );
     }
 
