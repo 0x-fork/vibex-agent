@@ -30,7 +30,12 @@ const MAX_TIMELINE_DISPLAY_SETTINGS_BYTES: u64 = 128 * 1024;
 const MAX_TIMELINE_DISPLAY_SETTINGS_OVERRIDES: usize = 32;
 const MAX_TIMELINE_DISPLAY_SETTINGS_HOST_ID_BYTES: usize = 256;
 const APP_SETTINGS_FILE: &str = "app-settings.json";
-const APP_SETTINGS_SCHEMA_VERSION: &str = "vibex-native-mobile-app-settings.v1";
+const APP_SETTINGS_SCHEMA_VERSION: &str = "vibex-native-mobile-app-settings.v2";
+/// The v1 settings file carries the notification switches that the build which
+/// wrote it derived from `Default`, which was `false` for all four. It is still
+/// read, so a phone that upgraded keeps its appearance and language, but the
+/// switches are not carried over — see [`CredentialStorage::load_app_settings`].
+const APP_SETTINGS_SCHEMA_VERSION_V1: &str = "vibex-native-mobile-app-settings.v1";
 const MAX_APP_SETTINGS_BYTES: u64 = 4 * 1024;
 /// The summary window of the sessions this phone opened last, kept so a cold
 /// start paints the conversation before the network answers. One file rather
@@ -727,6 +732,10 @@ impl CredentialStorage {
     /// Reads the persisted appearance and language preferences. A missing or
     /// corrupt file falls back to the platform defaults, matching the other
     /// stored payloads' reject-invalid contract.
+    ///
+    /// A v1 file is still read: its appearance, language, text size and motion
+    /// preferences are kept, and only the all-off notification shape the
+    /// first-launch bug wrote is repaired. See the note at the upgrade below.
     pub fn load_app_settings(&self) -> BackendResult<AppSettings> {
         let path = self.app_settings_path();
         let metadata = match fs::metadata(&path) {
@@ -745,9 +754,32 @@ impl CredentialStorage {
             Ok(stored) => stored,
             Err(_) => return self.reject_invalid_app_settings(&path),
         };
-        if stored.schema_version != APP_SETTINGS_SCHEMA_VERSION {
+        if stored.schema_version != APP_SETTINGS_SCHEMA_VERSION
+            && stored.schema_version != APP_SETTINGS_SCHEMA_VERSION_V1
+        {
             return self.reject_invalid_app_settings(&path);
         }
+        // A v1 file can carry the derived `Default` that the first-launch bug
+        // wrote: all four switches `false`, saved along with the first theme or
+        // language change the reader made. That record is indistinguishable
+        // from a reader who turned all four off by hand, so the migration keeps
+        // every switch that reads as a choice — a file with the master on, or
+        // with only some categories off, is left exactly as stored — and
+        // repairs only the all-off shape the bug produced. Once anything is
+        // saved the file is v2 and this never runs again.
+        let carries_derived_notification_defaults = stored.schema_version
+            == APP_SETTINGS_SCHEMA_VERSION_V1
+            && stored.notifications == Some(false)
+            && stored.notify_completed == Some(false)
+            && stored.notify_needs_input == Some(false)
+            && stored.notify_failed == Some(false);
+        let notification_switch = |stored: Option<bool>| {
+            if carries_derived_notification_defaults {
+                true
+            } else {
+                stored.unwrap_or(true)
+            }
+        };
         let theme = match stored.theme.as_deref() {
             None => None,
             Some(value) => match crate::theme::AppearanceMode::from_storage(value) {
@@ -772,10 +804,10 @@ impl CredentialStorage {
                 .font_scale_percent
                 .filter(|percent| crate::theme::FONT_SCALE_STEPS.contains(percent))
                 .unwrap_or(crate::theme::FONT_SCALE_DEFAULT),
-            notifications: stored.notifications.unwrap_or(true),
-            notify_completed: stored.notify_completed.unwrap_or(true),
-            notify_needs_input: stored.notify_needs_input.unwrap_or(true),
-            notify_failed: stored.notify_failed.unwrap_or(true),
+            notifications: notification_switch(stored.notifications),
+            notify_completed: notification_switch(stored.notify_completed),
+            notify_needs_input: notification_switch(stored.notify_needs_input),
+            notify_failed: notification_switch(stored.notify_failed),
         })
     }
 
@@ -1623,7 +1655,7 @@ mod tests {
             fs::write(
                 storage.app_settings_path(),
                 format!(
-                    r#"{{"schemaVersion":"vibex-native-mobile-app-settings.v1","fontScalePercent":{stored}}}"#
+                    r#"{{"schemaVersion":"{APP_SETTINGS_SCHEMA_VERSION}","fontScalePercent":{stored}}}"#
                 ),
             )
             .unwrap();
@@ -1638,6 +1670,101 @@ mod tests {
                 "a loaded step must always be one the row can name"
             );
         }
+    }
+
+    /// A phone that ran the build with the derived `Default` already has a v1
+    /// file whose four switches are `false`, because the first unrelated
+    /// settings change (the theme, the language, the text size) saved the
+    /// derived record. Upgrading must not leave those phones silently muted:
+    /// the switches are read as on, and the rest of the file still applies.
+    #[test]
+    fn a_v1_settings_file_upgrades_with_notifications_on() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        fs::create_dir_all(temp.path()).unwrap();
+        // The shape the old build actually wrote: every field present, the
+        // switches at the derived `false`.
+        fs::write(
+            storage.app_settings_path(),
+            br#"{
+                "schemaVersion":"vibex-native-mobile-app-settings.v1",
+                "theme":"dark",
+                "language":"zh-cn",
+                "reduceMotion":true,
+                "keepScreenOn":false,
+                "fontScalePercent":90,
+                "notifications":false,
+                "notifyCompleted":false,
+                "notifyNeedsInput":false,
+                "notifyFailed":false
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = storage.load_app_settings().unwrap();
+        assert!(loaded.notifications, "the master switch upgrades on");
+        assert!(loaded.notify_completed);
+        assert!(loaded.notify_needs_input);
+        assert!(loaded.notify_failed);
+        // Everything the reader could actually choose is still theirs.
+        assert_eq!(loaded.theme, Some(crate::theme::AppearanceMode::Dark));
+        assert_eq!(
+            loaded.language,
+            Some(crate::locale::LanguagePreference::ZhCn)
+        );
+        assert!(loaded.reduce_motion);
+        assert_eq!(loaded.font_scale_percent, crate::theme::FONT_SCALE_COMPACT);
+    }
+
+    /// A v1 file whose switches are not the all-off shape was written by a
+    /// reader, not by the bug: one category off, or the master on with a
+    /// category off, has to survive the upgrade untouched.
+    #[test]
+    fn a_v1_settings_file_keeps_a_notification_choice_it_can_trust() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(
+            storage.app_settings_path(),
+            br#"{
+                "schemaVersion":"vibex-native-mobile-app-settings.v1",
+                "notifications":true,
+                "notifyCompleted":false,
+                "notifyNeedsInput":true,
+                "notifyFailed":true
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = storage.load_app_settings().unwrap();
+        assert!(loaded.notifications);
+        assert!(
+            !loaded.notify_completed,
+            "a category the reader turned off stays off"
+        );
+        assert!(loaded.notify_needs_input);
+        assert!(loaded.notify_failed);
+    }
+
+    /// Once the file is written again it is v2, so a switch the reader turns
+    /// off from then on is theirs and survives the next load.
+    #[test]
+    fn a_v2_settings_file_keeps_the_switches_the_reader_chose() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        let settings = AppSettings {
+            notifications: true,
+            notify_completed: false,
+            notify_needs_input: true,
+            notify_failed: false,
+            ..AppSettings::default()
+        };
+        storage.save_app_settings(&settings).unwrap();
+
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(storage.app_settings_path()).unwrap()).unwrap();
+        assert_eq!(stored["schemaVersion"], APP_SETTINGS_SCHEMA_VERSION);
+        assert_eq!(storage.load_app_settings().unwrap(), settings);
     }
 
     #[test]
@@ -1754,7 +1881,7 @@ mod tests {
         fs::create_dir_all(temp.path()).unwrap();
         fs::write(
             storage.app_settings_path(),
-            br#"{"schemaVersion":"vibex-native-mobile-app-settings.v1","theme":"sepia"}"#,
+            br#"{"schemaVersion":"vibex-native-mobile-app-settings.v2","theme":"sepia"}"#,
         )
         .unwrap();
 
