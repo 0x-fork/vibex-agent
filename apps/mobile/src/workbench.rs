@@ -467,7 +467,7 @@ fn render_diff_row(row: GitDiffRow) -> gpui::AnyElement {
         .bg(background)
         .border_b_1()
         .border_color(theme::border_subtle())
-        .font_family("IBM Plex Mono")
+        .font_family(theme::MONO_FONT_FAMILY)
         .text_size(theme::font_micro())
         .text_color(foreground)
         .child(diff_change_rail(row.kind))
@@ -4166,7 +4166,7 @@ impl MobileWorkbench {
                 .overflow_hidden()
                 // A code buffer in the interface font reads as prose; the
                 // desktop editor is monospace and so is this one.
-                .font_family("IBM Plex Mono")
+                .font_family(theme::MONO_FONT_FAMILY)
                 .text_size(theme::code_font_size())
                 // No tap-to-raise-keyboard: opening a file is a request to read
                 // it, and an IME over the source is not what a reader scrolling
@@ -5585,7 +5585,7 @@ impl MobileWorkbench {
                     div()
                         .w(px(16.0))
                         .flex_none()
-                        .font_family("IBM Plex Mono")
+                        .font_family(theme::MONO_FONT_FAMILY)
                         .text_size(theme::font_micro())
                         .text_color(file_git_signal_color(signal))
                         .child(signal.short_label()),
@@ -5744,7 +5744,7 @@ impl MobileWorkbench {
                                     .flex()
                                     .items_center()
                                     .gap(px(6.0))
-                                    .font_family("IBM Plex Mono")
+                                    .font_family(theme::MONO_FONT_FAMILY)
                                     .text_size(theme::font_micro())
                                     .child(
                                         div()
@@ -6107,7 +6107,7 @@ impl MobileWorkbench {
             )
             .child(
                 div()
-                    .font_family("IBM Plex Mono")
+                    .font_family(theme::MONO_FONT_FAMILY)
                     .text_size(theme::font_micro())
                     .text_color(theme::text_secondary())
                     .child(listed),
@@ -6296,7 +6296,7 @@ impl MobileWorkbench {
                         .flex()
                         .items_center()
                         .gap(px(6.0))
-                        .font_family("IBM Plex Mono")
+                        .font_family(theme::MONO_FONT_FAMILY)
                         .text_size(theme::font_micro())
                         .child(
                             div()
@@ -6409,7 +6409,7 @@ impl MobileWorkbench {
                                     .text_ellipsis()
                                     .whitespace_nowrap()
                                     .text_size(theme::font_micro())
-                                    .font_family("IBM Plex Mono")
+                                    .font_family(theme::MONO_FONT_FAMILY)
                                     .text_color(theme::text_muted())
                                     .child(short_hash),
                             ),
@@ -6462,13 +6462,13 @@ impl MobileWorkbench {
                                         )
                                         .child(
                                             div()
-                                                .font_family("IBM Plex Mono")
+                                                .font_family(theme::MONO_FONT_FAMILY)
                                                 .text_color(theme::accent_green())
                                                 .child(format!("+{}", stats.0)),
                                         )
                                         .child(
                                             div()
-                                                .font_family("IBM Plex Mono")
+                                                .font_family(theme::MONO_FONT_FAMILY)
                                                 .text_color(theme::accent_red())
                                                 .child(format!("-{}", stats.1)),
                                         ),
@@ -6675,7 +6675,7 @@ impl MobileWorkbench {
                     .border_1()
                     .border_color(theme::border_default())
                     .px_1()
-                    .font_family("IBM Plex Mono")
+                    .font_family(theme::MONO_FONT_FAMILY)
                     .text_size(theme::font_micro())
                     .text_color(color)
                     .child(git_change_label_mobile(file.kind)),
@@ -6700,7 +6700,7 @@ impl MobileWorkbench {
                 div()
                     .w(px(34.0))
                     .flex_none()
-                    .font_family("IBM Plex Mono")
+                    .font_family(theme::MONO_FONT_FAMILY)
                     .text_size(theme::font_micro())
                     .text_color(if file.additions > 0 {
                         theme::accent_green()
@@ -6713,7 +6713,7 @@ impl MobileWorkbench {
                 div()
                     .w(px(34.0))
                     .flex_none()
-                    .font_family("IBM Plex Mono")
+                    .font_family(theme::MONO_FONT_FAMILY)
                     .text_size(theme::font_micro())
                     .text_color(if file.deletions > 0 {
                         theme::accent_red()
@@ -7363,7 +7363,11 @@ impl MobileWorkbench {
                                     .whitespace_nowrap()
                                     .child(commit.author_name),
                             )
-                            .child(div().font_family("IBM Plex Mono").child(commit.short_hash)),
+                            .child(
+                                div()
+                                    .font_family(theme::MONO_FONT_FAMILY)
+                                    .child(commit.short_hash),
+                            ),
                     ),
             )
             .on_mouse_up(
@@ -7716,7 +7720,7 @@ impl MobileWorkbench {
             .child(
                 div()
                     .flex_shrink_0()
-                    .font_family("IBM Plex Mono")
+                    .font_family(theme::MONO_FONT_FAMILY)
                     .text_size(theme::font_micro())
                     .text_color(theme::text_muted())
                     .child(format!("{position}/{total}")),
@@ -7995,7 +7999,7 @@ impl MobileWorkbench {
                         .justify_end()
                         .pt(px(TERMINAL_VERTICAL_PADDING))
                         .pb(px(TERMINAL_VERTICAL_PADDING))
-                        .font_family("IBM Plex Mono")
+                        .font_family(theme::MONO_FONT_FAMILY)
                         .text_size(px(TERMINAL_FONT_SIZE))
                         .line_height(px(TERMINAL_CELL_HEIGHT))
                         .children((0..rows).map(|row| {
@@ -8444,7 +8448,7 @@ fn sync_badge(count: u32, arrow: &'static str, color: gpui::Hsla) -> gpui::AnyEl
         .justify_center()
         .rounded(px(3.0))
         .bg(color.opacity(0.12))
-        .font_family("IBM Plex Mono")
+        .font_family(theme::MONO_FONT_FAMILY)
         .text_size(theme::font_micro())
         .text_color(color)
         .child(format!("{arrow} {count}"))
@@ -8689,7 +8693,7 @@ fn commit_button(
                 .rounded(px(4.0))
                 .bg(theme::primary_foreground().opacity(0.18))
                 .px_1()
-                .font_family("IBM Plex Mono")
+                .font_family(theme::MONO_FONT_FAMILY)
                 .text_size(theme::font_micro())
                 .text_color(theme::primary_foreground())
                 .child(count.to_string()),
@@ -8710,7 +8714,7 @@ fn change_status_pill(kind: GitChangeKind, color: gpui::Hsla) -> gpui::AnyElemen
         .flex()
         .items_center()
         .justify_center()
-        .font_family("IBM Plex Mono")
+        .font_family(theme::MONO_FONT_FAMILY)
         .text_size(theme::font_micro())
         .text_color(color)
         .child(git_change_label_mobile(kind))

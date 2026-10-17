@@ -10349,6 +10349,78 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:gpui-fast@0.1.7:c19b7c6f923b580a",
+      "name": "gpui-fast",
+      "version": "0.1.7",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-fast@0.1.7",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/longbridge/gpui-fast"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui-fast-macros@0.1.7:c19b7c6f923b580a",
+      "name": "gpui-fast-macros",
+      "version": "0.1.7",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-fast-macros@0.1.7",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/longbridge/gpui-fast"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:gpui-fps@0.7.3:c19b7c6f923b580a",
       "name": "gpui-fps",
       "version": "0.7.3",
@@ -27485,6 +27557,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:taffy@0.14.0:c19b7c6f923b580a",
+      "name": "taffy",
+      "version": "0.14.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/taffy@0.14.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/DioxusLabs/taffy"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:tao-core-video-sys@0.2.0:c19b7c6f923b580a",
       "name": "tao-core-video-sys",
       "version": "0.2.0",
@@ -39174,7 +39282,7 @@
     },
     {
       "type": "file",
-      "bom-ref": "asset:vibex-mobile-native-icons:6dea024b39b5d65a",
+      "bom-ref": "asset:vibex-mobile-native-icons:60418f3d673b6ca6",
       "name": "Vibex native mobile Lucide controls",
       "version": "0.1.0-rc.7",
       "licenses": [
@@ -39185,7 +39293,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "6dea024b39b5d65abe4366f865f7d1b0c1779124efc3fec5a8170b2e56cdf182"
+          "content": "60418f3d673b6ca667acad363101e46e50f70fce1406535ccee6b9d8964c265c"
         }
       ],
       "externalReferences": [
@@ -39205,52 +39313,11 @@
         },
         {
           "name": "vibex:file-count",
-          "value": "36"
+          "value": "40"
         },
         {
           "name": "vibex:selected-license",
           "value": "ISC"
-        }
-      ]
-    },
-    {
-      "type": "file",
-      "bom-ref": "font:vibex-mobile-ibm-plex-sans:73c85a21223a7956",
-      "name": "IBM Plex Sans mobile interface fonts",
-      "version": "zed@49d9758",
-      "licenses": [
-        {
-          "expression": "OFL-1.1"
-        }
-      ],
-      "hashes": [
-        {
-          "alg": "SHA-256",
-          "content": "73c85a21223a7956c41bf54613641708be246364aa7386eda38e1d5623a760a0"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/zed-industries/zed/tree/49d9758/assets/fonts/ibm-plex-sans"
-        }
-      ],
-      "properties": [
-        {
-          "name": "vibex:input-kind",
-          "value": "font"
-        },
-        {
-          "name": "vibex:asset-root",
-          "value": "apps/mobile/assets/fonts/ibm-plex-sans"
-        },
-        {
-          "name": "vibex:file-count",
-          "value": "5"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "OFL-1.1"
         }
       ]
     },
@@ -39338,8 +39405,8 @@
     },
     {
       "type": "file",
-      "bom-ref": "font:vibex-mobile-wqy-microhei:a3f978f28b2b2efa",
-      "name": "WenQuanYi Micro Hei mobile CJK fallback",
+      "bom-ref": "font:vibex-desktop-wqy-microhei:a3f978f28b2b2efa",
+      "name": "WenQuanYi Micro Hei desktop CJK fallback",
       "version": "0.2.0-beta",
       "licenses": [
         {
@@ -39613,7 +39680,7 @@
       "dependsOn": []
     },
     {
-      "ref": "asset:vibex-mobile-native-icons:6dea024b39b5d65a",
+      "ref": "asset:vibex-mobile-native-icons:60418f3d673b6ca6",
       "dependsOn": []
     },
     {
@@ -41787,6 +41854,7 @@
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:data-url@0.3.2:c19b7c6f923b580a",
         "cargo:futures@0.3.34:c19b7c6f923b580a",
+        "cargo:gpui-fast@0.1.7:c19b7c6f923b580a",
         "cargo:gpui-pre-macros@0.3.9:c19b7c6f923b580a",
         "cargo:gpui-pre-sum-tree@0.3.9:c19b7c6f923b580a",
         "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
@@ -41833,6 +41901,7 @@
         "cargo:enum-iterator@2.3.0:c19b7c6f923b580a",
         "cargo:gpui-base@0.7.3:c19b7c6f923b580a",
         "cargo:gpui-component-macros@0.7.1:c19b7c6f923b580a",
+        "cargo:gpui-fast@0.1.7:c19b7c6f923b580a",
         "cargo:gpui-kit-assets@0.7.3:c19b7c6f923b580a",
         "cargo:gpui-pre-macros@0.3.9:c19b7c6f923b580a",
         "cargo:gpui-pre-sum-tree@0.3.9:c19b7c6f923b580a",
@@ -41891,6 +41960,81 @@
         "cargo:unicode-width@0.2.2:c19b7c6f923b580a",
         "cargo:uuid@1.23.3:c19b7c6f923b580a",
         "cargo:windows@0.58.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-fast-macros@0.1.7:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:heck@0.5.0:c19b7c6f923b580a",
+        "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
+        "cargo:quote@1.0.46:c19b7c6f923b580a",
+        "cargo:syn@2.0.118:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-fast@0.1.7:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:accesskit@0.24.1:c19b7c6f923b580a",
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:async-channel@2.5.0:c19b7c6f923b580a",
+        "cargo:async-task@4.7.1:c19b7c6f923b580a",
+        "cargo:backtrace@0.3.76:c19b7c6f923b580a",
+        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
+        "cargo:chrono@0.4.45:c19b7c6f923b580a",
+        "cargo:ctor@1.0.13:c19b7c6f923b580a",
+        "cargo:derive_more@2.1.1:c19b7c6f923b580a",
+        "cargo:embed-resource@3.0.9:c19b7c6f923b580a",
+        "cargo:etagere@0.2.15:c19b7c6f923b580a",
+        "cargo:futures-concurrency@7.7.1:c19b7c6f923b580a",
+        "cargo:futures@0.3.34:c19b7c6f923b580a",
+        "cargo:getrandom@0.3.4:c19b7c6f923b580a",
+        "cargo:gpui-fast-macros@0.1.7:c19b7c6f923b580a",
+        "cargo:gpui-pre-collections@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-http-client@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-refineable@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-scheduler@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-shared-string@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-sum-tree@0.3.9:c19b7c6f923b580a",
+        "cargo:gpui-pre-util@0.3.9:c19b7c6f923b580a",
+        "cargo:heapless@0.9.3:c19b7c6f923b580a",
+        "cargo:image@0.25.10:c19b7c6f923b580a",
+        "cargo:inventory@0.3.24:c19b7c6f923b580a",
+        "cargo:itertools@0.14.0:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:lyon@1.0.19:c19b7c6f923b580a",
+        "cargo:num_cpus@1.17.0:c19b7c6f923b580a",
+        "cargo:objc2-core-foundation@0.3.2:c19b7c6f923b580a",
+        "cargo:objc2-core-video@0.3.2:c19b7c6f923b580a",
+        "cargo:parking@2.2.1:c19b7c6f923b580a",
+        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
+        "cargo:pin-project@1.1.13:c19b7c6f923b580a",
+        "cargo:pollster@0.4.0:c19b7c6f923b580a",
+        "cargo:postage@0.5.0:c19b7c6f923b580a",
+        "cargo:profiling@1.0.18:c19b7c6f923b580a",
+        "cargo:proptest@1.11.0:c19b7c6f923b580a",
+        "cargo:rand@0.9.4:c19b7c6f923b580a",
+        "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
+        "cargo:regex@1.12.4:c19b7c6f923b580a",
+        "cargo:resvg@0.46.0:c19b7c6f923b580a",
+        "cargo:schemars@1.2.1:c19b7c6f923b580a",
+        "cargo:seahash@4.1.0:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_json@1.0.150:c19b7c6f923b580a",
+        "cargo:slotmap@1.1.1:c19b7c6f923b580a",
+        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
+        "cargo:spin@0.10.1:c19b7c6f923b580a",
+        "cargo:strum@0.28.0:c19b7c6f923b580a",
+        "cargo:taffy@0.14.0:c19b7c6f923b580a",
+        "cargo:thiserror@2.0.18:c19b7c6f923b580a",
+        "cargo:ttf-parser@0.25.1:c19b7c6f923b580a",
+        "cargo:url@2.5.8:c19b7c6f923b580a",
+        "cargo:usvg@0.46.0:c19b7c6f923b580a",
+        "cargo:uuid@1.23.3:c19b7c6f923b580a",
+        "cargo:waker-fn@1.2.0:c19b7c6f923b580a",
+        "cargo:web-time@1.1.0:c19b7c6f923b580a",
+        "cargo:windows@0.62.2:c19b7c6f923b580a",
+        "cargo:zed-scap@0.0.8-zed:c19b7c6f923b580a"
       ]
     },
     {
@@ -45849,6 +45993,15 @@
       ]
     },
     {
+      "ref": "cargo:taffy@0.14.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:arrayvec@0.7.8:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:slotmap@1.1.1:c19b7c6f923b580a",
+        "cargo:smallvec@1.15.2:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:tao-core-video-sys@0.2.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
@@ -47026,6 +47179,7 @@
         "cargo:vibex-ui@0.1.0-rc.7:5b03b27578a01810",
         "font:vibex-desktop-ibm-plex-sans:550b0b7d6dee90b4",
         "font:vibex-desktop-lilex:8e69f85c04197d91",
+        "font:vibex-desktop-wqy-microhei:a3f978f28b2b2efa",
         "installer:cargo-packager:9aa0f5056c419100",
         "installer:nsis-application-id:1c2772b0edfb0f96",
         "installer:nsis-tauri-utils:0eed48313a7f904d",
@@ -47204,7 +47358,7 @@
       "dependsOn": [
         "asset:vibex-mobile-application-icons:b690a33c976cf781",
         "asset:vibex-mobile-brand-marks:84a77e160e305979",
-        "asset:vibex-mobile-native-icons:6dea024b39b5d65a",
+        "asset:vibex-mobile-native-icons:60418f3d673b6ca6",
         "cargo:gpui-component@0.7.3:c19b7c6f923b580a",
         "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:markdown@1.0.0:c19b7c6f923b580a",
@@ -47215,9 +47369,7 @@
         "cargo:vibex-backend@0.1.0-rc.7:14559522eff35735",
         "cargo:vibex-core@0.1.0-rc.7:a1f32ad3e304847a",
         "cargo:vibex-desktop-model@0.1.0-rc.7:3eccb8226f5ee757",
-        "cargo:vibex-terminal-ui@0.1.0-rc.7:81e25774d4aead5f",
-        "font:vibex-mobile-ibm-plex-sans:73c85a21223a7956",
-        "font:vibex-mobile-wqy-microhei:a3f978f28b2b2efa"
+        "cargo:vibex-terminal-ui@0.1.0-rc.7:81e25774d4aead5f"
       ]
     },
     {
@@ -48639,11 +48791,7 @@
       "dependsOn": []
     },
     {
-      "ref": "font:vibex-mobile-ibm-plex-sans:73c85a21223a7956",
-      "dependsOn": []
-    },
-    {
-      "ref": "font:vibex-mobile-wqy-microhei:a3f978f28b2b2efa",
+      "ref": "font:vibex-desktop-wqy-microhei:a3f978f28b2b2efa",
       "dependsOn": []
     },
     {

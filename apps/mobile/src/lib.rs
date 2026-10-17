@@ -65,7 +65,10 @@ pub(crate) fn open_root_window(data_dir: PathBuf, cx: &mut App) {
     // first window is created so the initial pairing screen is never
     // rendered with a stale English fallback.
     let _ = locale::current();
-    assets::load_fonts(cx).expect("failed to load bundled mobile fonts");
+    // The phone draws in the platform's own faces, so this registers nothing;
+    // it stays as the startup step that would carry a bundled face if one were
+    // ever added back.
+    assets::load_fonts(cx).expect("mobile font registration failed");
     // Point the kit theme at the shared vibex tokens before the first
     // paint, so no component is ever drawn from the framework palette.
     theme::apply_component_theme(None, cx);

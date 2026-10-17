@@ -3,16 +3,6 @@ use std::borrow::Cow;
 use gpui::{App, AssetSource, Result, SharedString};
 use gpui_kit_assets::Assets as ComponentAssets;
 
-const IBM_PLEX_SANS_REGULAR: &[u8] =
-    include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
-const IBM_PLEX_SANS_ITALIC: &[u8] =
-    include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf");
-const IBM_PLEX_SANS_SEMIBOLD: &[u8] =
-    include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf");
-const IBM_PLEX_SANS_SEMIBOLD_ITALIC: &[u8] =
-    include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf");
-const WQY_MICROHEI: &[u8] = include_bytes!("../assets/fonts/wqy-microhei/wqy-microhei.ttc");
-
 const ICONS: &[&str] = &[
     "brand/logo.svg",
     "icons/vibex-mark.svg",
@@ -160,14 +150,22 @@ const ICONS: &[&str] = &[
 
 pub struct MobileAssets;
 
+/// The phone draws entirely in the platform's own faces.
+///
+/// No face is bundled: the interface resolves through GPUI's `.SystemUIFont`,
+/// which is SF on iOS and Roboto on Android, and CJK text falls to the same
+/// system cascade those fonts already carry (PingFang on iOS, Noto Sans CJK on
+/// Android). The platform ships every weight and script the app asks for, which
+/// a two-face bundle could not, so the interface renders at the weight it
+/// declares instead of a synthesized one.
+///
+/// The platform registers its system families before `open_root_window`, so
+/// there is nothing to add here. The call stays as the one place the mobile
+/// client is written down as loading no bundled face, and the contract check
+/// keeps it from disappearing.
 pub fn load_fonts(cx: &mut App) -> Result<()> {
-    cx.text_system().add_fonts(vec![
-        Cow::Borrowed(IBM_PLEX_SANS_REGULAR),
-        Cow::Borrowed(IBM_PLEX_SANS_ITALIC),
-        Cow::Borrowed(IBM_PLEX_SANS_SEMIBOLD),
-        Cow::Borrowed(IBM_PLEX_SANS_SEMIBOLD_ITALIC),
-        Cow::Borrowed(WQY_MICROHEI),
-    ])
+    let _ = cx;
+    Ok(())
 }
 
 // Brand marks bundled from the desktop asset pack under the same `icons/vibex/`

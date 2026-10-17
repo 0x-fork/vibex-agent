@@ -128,9 +128,14 @@ pnpm build:mobile:ios
 - Pairing, route selection, reconnect, and credential storage stay outside View
   rendering. Credentials are validated, atomically persisted, and redacted from
   diagnostics; the PC remains the state authority.
-- Native fonts are loaded before opening the first window. IBM Plex Sans is the
-  interface family and the reviewed WenQuanYi payload is the CJK fallback; both
-  remain registered in the license gate.
+- Native typography is the platform's own: the interface names GPUI's virtual
+  `.SystemUIFont` (SF on iOS, Roboto on Android) and code surfaces name
+  `monospace`, so the phone carries every system weight and the platform's CJK
+  cascade (PingFang, Noto Sans CJK) without bundling a face. Mobile embeds no
+  font payload; the WenQuanYi TTC under `apps/mobile/assets/fonts` is desktop
+  input only and stays registered in the license gate. Naming a family the
+  build does not carry is a defect: GPUI falls through to its own cascade and
+  lands on the proportional UI face, which silently breaks the terminal grid.
 - `Window::insets()` is the only safe-area/IME geometry source. GPUI refreshes
   the window when platform insets change, and the root composition applies the
   effective top/right/bottom/left padding.

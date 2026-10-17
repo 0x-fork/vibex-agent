@@ -266,30 +266,14 @@
       "extensions": [
         ".svg"
       ],
-      "expectedFileCount": 36,
-      "treeSha256": "6dea024b39b5d65abe4366f865f7d1b0c1779124efc3fec5a8170b2e56cdf182",
+      "expectedFileCount": 40,
+      "treeSha256": "60418f3d673b6ca667acad363101e46e50f70fce1406535ccee6b9d8964c265c",
       "licenseExpression": "ISC",
       "source": "https://github.com/lucide-icons/lucide",
       "licenseEvidence": "The native mobile toolbar controls are derived from Lucide SVG paths and redistributed under the Lucide ISC license."
     }
   ],
   "fontInputs": [
-    {
-      "id": "vibex-mobile-ibm-plex-sans",
-      "name": "IBM Plex Sans mobile interface fonts",
-      "version": "zed@49d9758",
-      "ownerPackage": "vibex-ui",
-      "root": "apps/mobile/assets/fonts/ibm-plex-sans",
-      "extensions": [
-        ".ttf",
-        ".txt"
-      ],
-      "expectedFileCount": 5,
-      "treeSha256": "73c85a21223a7956c41bf54613641708be246364aa7386eda38e1d5623a760a0",
-      "licenseExpression": "OFL-1.1",
-      "source": "https://github.com/zed-industries/zed/tree/49d9758/assets/fonts/ibm-plex-sans",
-      "licenseEvidence": "Four upstream IBM Plex Sans faces and the complete SIL Open Font License 1.1 text are bundled for native mobile rendering."
-    },
     {
       "id": "vibex-desktop-ibm-plex-sans",
       "name": "IBM Plex Sans desktop interface fonts",
@@ -323,10 +307,10 @@
       "licenseEvidence": "Four Lilex faces and the complete SIL Open Font License 1.1 text, moved out of the removed vendor/zed submodule into the desktop asset tree so the app no longer reads fonts from a third-party checkout."
     },
     {
-      "id": "vibex-mobile-wqy-microhei",
-      "name": "WenQuanYi Micro Hei mobile CJK fallback",
+      "id": "vibex-desktop-wqy-microhei",
+      "name": "WenQuanYi Micro Hei desktop CJK fallback",
       "version": "0.2.0-beta",
-      "ownerPackage": "vibex-ui",
+      "ownerPackage": "vibex-desktop",
       "root": "apps/mobile/assets/fonts/wqy-microhei",
       "extensions": [
         ".ttc",
@@ -336,7 +320,7 @@
       "treeSha256": "a3f978f28b2b2efa4b59976274ff5da74c6d1e981ef2a46ded9e3533aa4f09f9",
       "licenseExpression": "Apache-2.0",
       "source": "https://sourceforge.net/projects/wqy/files/wqy-microhei/0.2.0-beta/",
-      "licenseEvidence": "The reviewed TTC payload has SHA-256 e4bca8df123ce01b104780f576ea1a58b9a5ff1662a91124b6d3180cb6c88212 and is accompanied by the complete Apache-2.0 license."
+      "licenseEvidence": "The reviewed TTC payload has SHA-256 e4bca8df123ce01b104780f576ea1a58b9a5ff1662a91124b6d3180cb6c88212 and is accompanied by the complete Apache-2.0 license. It is embedded by the desktop shell and its image editor; the native mobile client draws CJK from the platform's own fonts and no longer carries it."
     }
   ],
   "nativeInputs": [

@@ -24,7 +24,6 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "apps/mobile/src/storage.rs",
     "crates/vibex-remote-client/Cargo.toml",
     "crates/vibex-remote-client/src/transport.rs",
-    "apps/mobile/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
     "apps/mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc",
     "apps/mobile/android/app/src/main/AndroidManifest.xml",
     "apps/mobile/android/settings.gradle",
@@ -313,7 +312,9 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "begin_interrupt",
     "begin_continue_turn",
     "window.insets().effective()",
-    'font_family("IBM Plex Sans")',
+    // The phone draws in the platform's own faces; naming the shared constant
+    // keeps every surface on the one family the theme declares.
+    "font_family(theme::UI_FONT_FAMILY)",
     "create_session(request)",
     "elicitation_surfaces(ShellKind::Compact)",
     "apply_elicitation_mutation",
@@ -409,8 +410,6 @@ function runSelfTest() {
     ["apps/mobile/src/update.rs", source("apps/mobile/src/update.rs")],
     ["crates/app-update/src/install.rs", source("crates/app-update/src/install.rs")],
     ["crates/app-update/src/source.rs", source("crates/app-update/src/source.rs")],
-    ["apps/mobile/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf", "font"],
-    ["apps/mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc", "font"],
     ["apps/mobile/android/app/src/main/AndroidManifest.xml", source("apps/mobile/android/app/src/main/AndroidManifest.xml")],
     ["apps/mobile/android/settings.gradle", source("apps/mobile/android/settings.gradle")],
     ["apps/mobile/android/app/build.gradle", source("apps/mobile/android/app/build.gradle")],

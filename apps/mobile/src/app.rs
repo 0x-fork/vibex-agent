@@ -15822,7 +15822,7 @@ impl MobileApp {
                     .min_w_0()
                     .px_2()
                     .bg(background)
-                    .font_family("IBM Plex Mono")
+                    .font_family(theme::MONO_FONT_FAMILY)
                     .text_size(theme::code_font_size())
                     .line_height(theme::line_height_for(theme::FONT_CODE))
                     .text_color(color)
@@ -17410,7 +17410,7 @@ impl MobileApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .font_family("IBM Plex Mono")
+                            .font_family(theme::MONO_FONT_FAMILY)
                             .text_size(theme::font_micro())
                             .text_color(theme::text_secondary())
                             .child(if current.is_empty() {
@@ -22132,7 +22132,7 @@ impl MobileApp {
                             .child(
                                 div()
                                     .flex_shrink_0()
-                                    .font_family("IBM Plex Mono")
+                                    .font_family(theme::MONO_FONT_FAMILY)
                                     .text_size(theme::font_caption())
                                     .text_color(if destructive {
                                         theme::accent_red()
@@ -32436,7 +32436,7 @@ fn host_detail_field(
         .child(value.to_string());
     if monospace {
         value_element = value_element
-            .font_family("monospace")
+            .font_family(theme::MONO_FONT_FAMILY)
             .overflow_hidden()
             .text_ellipsis()
             .whitespace_nowrap();

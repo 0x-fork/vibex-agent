@@ -299,10 +299,15 @@ pub const TOAST_MAX_VISIBLE: usize = 3;
 
 /// The interface face, named once.
 ///
-/// The window inherits it for every surface it draws, and a surface that has to
-/// measure a line before it is laid out — the composer's model chip decides
-/// whether its label fits — shapes it in the same face.
-pub const UI_FONT_FAMILY: &str = "IBM Plex Sans";
+/// The phone draws in the platform's own UI face rather than in a bundled one.
+/// `.SystemUIFont` is GPUI's virtual system family: iOS resolves it to SF
+/// through Core Text and Android to Roboto through the cosmic text system, so
+/// the interface carries the platform's full weight range and its own script
+/// fallbacks (PingFang and Noto Sans CJK for Chinese) instead of the two faces
+/// a bundle could ship. Every surface that measures a line before laying it out
+/// — the composer's model chip decides whether its label fits — shapes it in
+/// this same virtual family, so it measures in the face it draws with.
+pub const UI_FONT_FAMILY: &str = ".SystemUIFont";
 
 /// The rem the ladder below is expressed against. Every value in the type
 /// scale is a logical pixel at this rem; [`ui_rems`] converts it, so the whole
@@ -349,6 +354,17 @@ pub const FONT_CAPTION: f32 = 14.0;
 /// size, so it sits at the caption's step. An alias rather than a second value
 /// so the two can never drift apart.
 pub const FONT_CODE: f32 = FONT_CAPTION;
+
+/// The face code, diffs, and terminal output are drawn in.
+///
+/// The platform's monospace face, not a bundled one: `monospace` resolves to
+/// SF Mono (through Menlo) on iOS and to Droid Sans Mono or Roboto Mono on
+/// Android, and both metric-compatible with the 8 px terminal cell the PTY is
+/// sized against. Naming a family the build does not carry — as the surfaces
+/// once named "IBM Plex Mono" — does not fall back to a monospace at all: GPUI
+/// walks its own cascade and lands on the proportional system UI face, which
+/// breaks the grid the terminal lays out in whole cells.
+pub const MONO_FONT_FAMILY: &str = "monospace";
 /// The floor of the ladder: timestamps, counts, badges. It is the smallest
 /// step the phone renders, kept at the size secondary copy stays legible in.
 pub const FONT_MICRO: f32 = 13.0;
@@ -1215,6 +1231,13 @@ pub fn apply_component_theme(window: Option<&mut Window>, cx: &mut App) {
         // makes a step move the kit controls as well as the ladder.
         theme.font_family = UI_FONT_FAMILY.into();
         theme.font_size = rem_base();
+        // Name the mono face rather than leaving the kit's platform probe to
+        // pick one. The probe would land on an installed family too, but it
+        // also treats the theme's own default as "unconfigured" and may swap it
+        // for an alternate, which would put the kit's code surfaces (the
+        // editor, diffs, the inspector) on a different face than the hand-built
+        // ones beside them.
+        theme.mono_font_family = MONO_FONT_FAMILY.into();
         theme.mono_font_size = scaled_px(FONT_CODE);
         theme.radius = px(RADIUS_CONTROL);
         theme.radius_lg = px(RADIUS_CARD);
