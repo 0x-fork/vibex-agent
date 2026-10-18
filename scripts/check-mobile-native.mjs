@@ -19,6 +19,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "apps/mobile/Cargo.toml",
     "apps/mobile/src/lib.rs",
     "apps/mobile/src/app.rs",
+    "apps/mobile/src/question.rs",
     "apps/mobile/src/pairing.rs",
     "apps/mobile/src/scanner.rs",
     "apps/mobile/src/storage.rs",
@@ -52,6 +53,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   const manifest = read("apps/mobile/Cargo.toml");
   const entry = read("apps/mobile/src/lib.rs");
   const app = read("apps/mobile/src/app.rs");
+  const question = read("apps/mobile/src/question.rs");
   const pairing = read("apps/mobile/src/pairing.rs");
   const scanner = read("apps/mobile/src/scanner.rs");
   const storage = read("apps/mobile/src/storage.rs");
@@ -315,7 +317,6 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "AgentWorkflowController",
     "conversation_turns()",
     "markdown::render",
-    "approval_surfaces(ShellKind::Compact)",
     "composer_input",
     "drawer_open",
     "begin_send_message",
@@ -338,6 +339,13 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   ]) {
     assert(app.includes(marker), `native_agent_gui_contract_missing:${marker}`);
   }
+  // The approval surfaces left app.rs when the phone client was rebuilt around
+  // the desktop's model and its questions moved into their own module, so the
+  // contract follows them to the file that draws them.
+  assert(
+    question.includes("approval_surfaces(ShellKind::Compact)"),
+    "native_agent_gui_contract_missing:approval_surfaces(ShellKind::Compact)"
+  );
   assert(pairing.includes("has_identity_private_key"), "mobile_credential_debug_redaction_missing");
   assert(pairing.includes('url.scheme() != "vibex"'), "mobile_pairing_entry_validation_missing");
   assert(pairing.includes('"/self_hosted_relay"'), "mobile_pairing_transport_selection_missing");
@@ -405,6 +413,7 @@ function runSelfTest() {
     ["apps/mobile/Cargo.toml", source("apps/mobile/Cargo.toml")],
     ["apps/mobile/src/lib.rs", source("apps/mobile/src/lib.rs")],
     ["apps/mobile/src/app.rs", source("apps/mobile/src/app.rs")],
+    ["apps/mobile/src/question.rs", source("apps/mobile/src/question.rs")],
     ["apps/mobile/src/pairing.rs", source("apps/mobile/src/pairing.rs")],
     ["apps/mobile/src/scanner.rs", source("apps/mobile/src/scanner.rs")],
     ["apps/mobile/src/storage.rs", source("apps/mobile/src/storage.rs")],
@@ -438,8 +447,18 @@ function runSelfTest() {
   ]);
 
   function expectRejected(path, from, to, code) {
+    expectRejectedWith(path, (original) => original.replace(from, to), code);
+  }
+
+  // A marker with more than one call site needs every occurrence gone before
+  // the checker can be shown to reject it.
+  function expectRejectedAll(path, from, to, code) {
+    expectRejectedWith(path, (original) => original.split(from).join(to), code);
+  }
+
+  function expectRejectedWith(path, mutate, code) {
     const original = files.get(path);
-    files.set(path, original.replace(from, to));
+    files.set(path, mutate(original));
     let rejected = false;
     try {
       validateContract((candidate) => files.get(candidate), (candidate) => candidate !== "apps/mobile-wasm" && files.has(candidate));
@@ -668,6 +687,12 @@ function runSelfTest() {
     "public static void setText(Activity activity, String text)",
     "public static void putText(Activity activity, String text)",
     "native_mobile_checker_self_test_accepted_renamed_clipboard_entry_point"
+  );
+  expectRejectedAll(
+    "apps/mobile/src/question.rs",
+    "approval_surfaces(ShellKind::Compact)",
+    "approval_surfaces(ShellKind::Roomy)",
+    "native_mobile_checker_self_test_accepted_missing_approval_surfaces"
   );
 }
 
