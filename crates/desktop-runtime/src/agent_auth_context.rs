@@ -164,6 +164,21 @@ impl AgentAuthContextService {
         self.auth_catalog.list(agent_id, None).await
     }
 
+    /// Re-probe the methods an Agent advertises, replacing the cached snapshot.
+    ///
+    /// The read above answers from the snapshot the authority already holds; this
+    /// one launches the Agent's own runtime and asks it again. It is the method
+    /// behind the remote gateway's `RefreshAuthMethods`, and it has to exist as an
+    /// inherent method: the trait implementation below calls
+    /// `self.refresh_auth_methods(agent_id).await`, which without one resolves to
+    /// itself and recurses until the worker thread's stack is gone.
+    pub async fn refresh_auth_methods(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentAuthCatalog> {
+        self.auth_catalog.refresh(agent_id, None).await
+    }
+
     pub async fn authenticate(
         &self,
         request: AgentAuthContextAuthenticateRequest,
@@ -1001,11 +1016,20 @@ impl RemoteAgentAuthContextSource for AgentAuthContextService {
         self.list()
     }
 
+    /// Forwarded through the service the method belongs to, not through a
+    /// method of the same name on `self`.
+    ///
+    /// `self.list_auth_methods(...)` resolves to the inherent method here, but
+    /// the same shape one line down resolved to *this* implementation when the
+    /// inherent `refresh_auth_methods` was missing, recursing until the worker
+    /// thread's stack was gone. Naming the field makes the two impossible to
+    /// confuse: there is no method to resolve, so a missing service fails to
+    /// compile instead of overflowing at run time.
     async fn list_auth_methods(
         &self,
         agent_id: vibex_core::AgentId,
     ) -> VibexResult<vibex_core::AgentAuthCatalog> {
-        self.list_auth_methods(agent_id).await
+        self.auth_catalog.list(agent_id, None).await
     }
 
     async fn ensure_default_auth_context(
@@ -1019,7 +1043,7 @@ impl RemoteAgentAuthContextSource for AgentAuthContextService {
         &self,
         agent_id: vibex_core::AgentId,
     ) -> VibexResult<vibex_core::AgentAuthCatalog> {
-        self.refresh_auth_methods(agent_id).await
+        self.auth_catalog.refresh(agent_id, None).await
     }
 
     async fn authenticate_context(
@@ -1128,6 +1152,59 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    /// The remote-auth trait forwards through the service, never through a
+    /// method of the same name on `self`.
+    ///
+    /// `self.refresh_auth_methods(agent_id)` resolved to the trait
+    /// implementation itself while the inherent method was missing, and a TUI
+    /// pressing "refresh methods" overflowed the desktop's worker stack. The
+    /// recursion cannot be reproduced here without constructing the whole
+    /// runtime, so the shape is asserted instead: every forward in this impl
+    /// names the field it forwards to.
+    #[test]
+    fn the_remote_auth_source_forwards_through_the_service_not_through_itself() {
+        let source = include_str!("agent_auth_context.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("agent auth tests should remain inspectable");
+        let impl_block = production
+            .split_once("impl RemoteAgentAuthContextSource for AgentAuthContextService {")
+            .map(|(_, block)| block)
+            .expect("the remote source impl should be findable");
+        // Only code lines are inspected: the doc comment above names the shape
+        // it warns about, and matching that would fail on an explanation of the
+        // bug rather than on the bug.
+        let code = impl_block
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//") && !trimmed.starts_with("///")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Every `self.<name>(` call in the impl is a forwarding site, and a name
+        // that matches a trait method is the recursion.
+        for name in [
+            "list_auth_methods",
+            "refresh_auth_methods",
+            "ensure_default_auth_context",
+        ] {
+            assert!(
+                !code.contains(&format!("self.{name}(")),
+                "the remote source calls self.{name}, which resolves to itself"
+            );
+        }
+        assert!(
+            impl_block.contains("self.auth_catalog.list("),
+            "the methods read did not forward through the catalog"
+        );
+        assert!(
+            impl_block.contains("self.auth_catalog.refresh("),
+            "the re-probe did not forward through the catalog"
+        );
+    }
 
     #[tokio::test]
     async fn logout_wire_is_polled_only_after_account_process_shutdown() {
