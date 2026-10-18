@@ -588,20 +588,27 @@ const NEW_SESSION_AGENT_DRAG_VERTICAL_SLOP: f32 = 8.0;
 /// settle without overshoot, and 220 ms is the shortest span in which both are
 /// legible as separate pictures.
 const NEW_SESSION_LOGO_SWAP: motion::MotionSpec =
-    motion::MotionSpec::new(220, motion::EASE_OUT_EXPO);
-/// The size of the new-session sentence and the Agent mark standing in it.
+    motion::MotionSpec::new(260, motion::EASE_OUT_EXPO);
+/// The size of the new-session sentence, and of the Agent mark standing in it.
 ///
 /// One number for both, because the mark is part of the sentence rather than a
-/// picture beside it: a mark that did not match the line's own type would read
-/// as a badge on the line instead of a word in it.
+/// picture beside it. It is also deliberately larger than the type: a square
+/// brand mark has a smaller optical mass than the words around it, so a mark set
+/// at the same pixel size as the letters reads as a badge dropped between them
+/// rather than as the line's subject.
 const NEW_SESSION_SLOGAN_SIZE: f32 = 24.0;
-/// How far one mark travels while it crosses the line.
+/// The edge of the Agent mark's square, in pixels.
 ///
-/// The sentence's mark stands inside a line of 24 px type, so its own height is
-/// as far as it can move without leaving that line: the outgoing mark drops
-/// away downward, the incoming one arrives from above, and the pair reads as one
-/// picture replacing another rather than as a slide.
-const NEW_SESSION_LOGO_SWAP_TRAVEL: f32 = 24.0;
+/// Set from the sentence's own size rather than a second magic number, so the
+/// two stay in step if the sentence is ever re-set.
+const NEW_SESSION_AGENT_MARK_SIZE: f32 = NEW_SESSION_SLOGAN_SIZE * 1.5;
+/// How far one mark travels while it crosses the line, in pixels.
+///
+/// The distance the outgoing mark falls has to take it *clear* of the box before
+/// the reader can see it leave, and the incoming one has to start equally far
+/// above: one mark's height is the shortest fall that does not leave the old
+/// face half-visible in the corner while the new one lands on top of it.
+const NEW_SESSION_LOGO_SWAP_TRAVEL: f32 = NEW_SESSION_AGENT_MARK_SIZE;
 const NEW_SESSION_COMPACT_SELECTOR_MAX_WIDTH: u32 = 860;
 const AGENT_TIMELINE_FETCH_PAGE_LIMIT: u32 = 500;
 const CHILD_AGENT_TIMELINE_PREVIEW_ROW_LIMIT: usize = 6;
@@ -34097,7 +34104,13 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The runtime cascade is the page's main way to change Agent, so a
+        // choice made here is the one that most needs the sentence's mark to
+        // cross rather than blink: the same cut the chips start, from the Agent
+        // the page was already wearing.
+        let previous = self.new_session_agent_id.clone();
         self.new_session_agent_id = Some(selection.agent_id.clone());
+        self.begin_new_session_logo_swap(previous.as_ref(), &selection.agent_id, cx);
         self.sync_home_arena_agent(cx);
         self.clear_runtime_provider_keyboard_selection();
         self.runtime_choice_menu_open = None;
@@ -71357,7 +71370,17 @@ fn agent_brand_identity(agent: &AgentSnapshotEntry) -> String {
 }
 
 fn runtime_agent_icon(identity: &str) -> AnyElement {
-    agent_brand_icon(identity, px(16.0), None)
+    runtime_agent_icon_sized(identity, px(16.0))
+}
+
+/// An Agent's brand mark at a surface's own size.
+///
+/// The rows draw one at 16 px because a row is a list, not a page; the
+/// new-session sentence draws one at the size of the word it stands in for, and
+/// a mark painted at the row's size there would read as a stamp beside the
+/// sentence rather than as a word inside it.
+fn runtime_agent_icon_sized(identity: &str, size: Pixels) -> AnyElement {
+    agent_brand_icon(identity, size, None)
 }
 
 /// Enabled Agents in the ordering shared with the new-session home selector, so
@@ -82129,12 +82152,14 @@ fn new_session_slogan_line(
         .as_ref()
         .and_then(|id| this.agent_snapshot(id));
     let spoken = locale.new_session_slogan_spoken(agent.as_ref().map(|agent| agent.label.as_str()));
-    // The cut is read while it is still running and cleared once it is not, so
-    // a re-render mid-flight keeps drawing the pair rather than snapping the
-    // sentence back to the outgoing mark.
+    // The cut is drawn while it is still running. `take_if` removes the entry it
+    // is given, so the predicate has to be the *opposite* of settled: asking for
+    // a settled cut would hold the pair back until it had already finished, and
+    // the page would show the new mark on the first frame with no cut at all.
     let swap = if agent.is_some() {
-        this.new_session_logo_swap.take_if(|swap| swap.settled())
+        this.new_session_logo_swap.take_if(|swap| !swap.settled())
     } else {
+        this.new_session_logo_swap = None;
         None
     };
     let words = |text: &'static str| {
@@ -82187,14 +82212,17 @@ fn new_session_agent_mark(
     swap: Option<NewSessionLogoSwap>,
     cx: &mut Context<VibexWorkbench>,
 ) -> AnyElement {
-    let size = px(NEW_SESSION_SLOGAN_SIZE);
+    let size = px(NEW_SESSION_AGENT_MARK_SIZE);
     let label = locale::text("Agent settings", "Agent 设置", "Agent 設定");
     let mark = div()
         .id("new-session-agent-mark")
         .debug_selector(|| "new-session-agent-mark".to_string())
         .flex_none()
         .size(size)
-        .rounded(px(6.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.0))
         .cursor_pointer()
         .hover(|style| style.bg(cx.theme().muted.opacity(0.5)))
         .aria_label(label.to_string())
@@ -82210,10 +82238,7 @@ fn new_session_agent_mark(
         }));
     let Some(swap) = swap else {
         return mark
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(runtime_agent_icon(&identity))
+            .child(runtime_agent_icon_sized(&identity, size))
             .into_any_element();
     };
     // The cross-cut, driven by the element's own animation clock: gpui asks the
@@ -82222,7 +82247,9 @@ fn new_session_agent_mark(
     // new mark, in place — without any work here.
     let NewSessionLogoSwap { from, to, .. } = swap;
     let travel = px(NEW_SESSION_LOGO_SWAP_TRAVEL);
-    let layer = |identity: &str, top: Pixels, opacity: f32| {
+    // `size` is captured by value: the animator runs after this function has
+    // returned, so a borrowed pixel value would not outlive it.
+    let layer = move |identity: &str, top: Pixels, opacity: f32| {
         div()
             .absolute()
             .inset_0()
@@ -82231,7 +82258,7 @@ fn new_session_agent_mark(
             .justify_center()
             .top(top)
             .opacity(opacity)
-            .child(runtime_agent_icon(identity))
+            .child(runtime_agent_icon_sized(identity, size))
             .into_any_element()
     };
     mark.overflow_hidden()
@@ -97557,14 +97584,87 @@ mod tests {
             "the cut keeps identities, so the same Agent wears the same face"
         );
 
-        let apply = source
-            .split_once("    fn apply_new_session_agent(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn begin_new_session_logo_swap("))
-            .map(|(body, _)| body)
-            .expect("the Agent switch should remain inspectable");
+        // The cut has to be *held* while it runs. `take_if` removes the entry it
+        // is given, so the predicate must ask for the opposite of settled:
+        // asking for a settled cut holds the pair back until it has finished and
+        // the page shows the new mark on the first frame — no animation at all.
         assert!(
-            apply.contains("self.begin_new_session_logo_swap(previous.as_ref(), &agent_id, cx)"),
-            "every path into a new Agent begins the cut"
+            !swap.contains("take_if(|swap| swap.settled())"),
+            "the cut must not be read only after it has finished"
+        );
+        let slogan = source
+            .split_once("fn new_session_slogan_line(")
+            .and_then(|(_, tail)| tail.split_once("\nfn "))
+            .map(|(body, _)| body)
+            .expect("the sentence should remain inspectable");
+        assert!(
+            slogan.contains("take_if(|swap| !swap.settled())"),
+            "a running cut is what the sentence draws; a finished one is dropped"
+        );
+        assert!(
+            slogan.contains("this.new_session_logo_swap = None;"),
+            "a page with no Agent lets go of a cut it can no longer draw"
+        );
+
+        // Every way into a new Agent begins the cut, the runtime cascade
+        // included: it is the page's main switch, and a chip-only cut would
+        // leave the menu's own choice blinking.
+        for opener in [
+            "    fn apply_new_session_agent(",
+            "    fn choose_new_session_runtime(",
+        ] {
+            let switch = source
+                .split_once(opener)
+                .and_then(|(_, tail)| tail.split_once("\n    fn "))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{opener} should remain inspectable"));
+            assert!(
+                switch.contains("self.begin_new_session_logo_swap("),
+                "{opener} does not begin the sentence's cut"
+            );
+        }
+    }
+
+    /// The sentence's mark is a picture of the Agent, not a footnote to it: it
+    /// is set above the type's own size so a square brand mark reads as the
+    /// line's subject, and the cut that carries a switch has to travel far
+    /// enough to actually clear the box.
+    #[test]
+    fn the_sentence_mark_is_sized_to_the_line_and_travels_out_of_its_box() {
+        let source = include_str!("app.rs");
+        let mark = source
+            .split_once("fn new_session_agent_mark(")
+            .and_then(|(_, tail)| tail.split_once("\nfn startup_loading_wordmark("))
+            .map(|(body, _)| body)
+            .expect("the sentence's mark should remain inspectable");
+        assert!(
+            mark.contains("NEW_SESSION_AGENT_MARK_SIZE"),
+            "the mark is drawn at the sentence's own mark size"
+        );
+        assert!(
+            !mark.contains("runtime_agent_icon(&"),
+            "the row-sized 16 px icon is not the sentence's mark"
+        );
+        assert!(
+            mark.contains("runtime_agent_icon_sized("),
+            "the mark is drawn at the size the page asks for"
+        );
+
+        let size = source
+            .split_once("const NEW_SESSION_AGENT_MARK_SIZE: f32 =")
+            .map(|(_, tail)| tail.split(';').next().unwrap_or_default())
+            .expect("the mark's size should be a named constant");
+        assert!(
+            size.contains("NEW_SESSION_SLOGAN_SIZE"),
+            "the mark is derived from the sentence's size, not a second number: {size}"
+        );
+        let travel = source
+            .split_once("const NEW_SESSION_LOGO_SWAP_TRAVEL: f32 =")
+            .map(|(_, tail)| tail.split(';').next().unwrap_or_default())
+            .expect("the cut's travel should be a named constant");
+        assert!(
+            travel.contains("NEW_SESSION_AGENT_MARK_SIZE"),
+            "a mark that travels less than its own height never leaves its box: {travel}"
         );
     }
 
