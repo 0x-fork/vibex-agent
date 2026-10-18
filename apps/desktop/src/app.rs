@@ -52406,9 +52406,14 @@ impl VibexWorkbench {
                                     // and the mark inside them are one line at
                                     // one size, so the wrapper only places it.
                                     .child(div().mt_3().child(new_session_slogan))
+                                    // The sentence's line is taller than its
+                                    // type — the Agent's mark stands in it — so
+                                    // it takes the next step up rather than the
+                                    // 4 px that would read as the description
+                                    // crowding the mark's baseline.
                                     .child(
                                         div()
-                                            .mt_1()
+                                            .mt_3()
                                             .max_w(px(560.0))
                                             .text_sm()
                                             .text_color(cx.theme().muted_foreground)
