@@ -265,8 +265,7 @@ fn main() {
     // A settled turn is not running: the work is behind the divider and the
     // turn line says what the session is, not what it is doing.
     if !settled {
-        app.turn_started =
-            Some(std::time::Instant::now() - std::time::Duration::from_secs(72));
+        app.turn_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(72));
     }
 
     let backend = TestBackend::new(width, height);
@@ -659,11 +658,7 @@ fn showcase_sessions(locale: Locale) -> Vec<vibex_core::AgentSession> {
             0,
         ),
         (
-            title(
-                "Draft the release notes",
-                "起草发布说明",
-                "起草發佈說明",
-            ),
+            title("Draft the release notes", "起草发布说明", "起草發佈說明"),
             vibex_core::AgentSessionState::Idle,
             27 * 60 * 60_000,
             repo,
