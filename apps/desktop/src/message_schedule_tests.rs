@@ -675,9 +675,26 @@ fn the_queue_switches_a_client_sets_are_the_ones_the_dispatcher_reads() {
         pause.contains("composer_queue_paused_session_ids"),
         "the pause a client sets is the set the dispatcher reads, not a copy"
     );
+    // The switch and the release are split, because the release needs a window
+    // and the bridge request that sets the switch is already inside an update
+    // of the workbench. Lifting a pause must still release the head rather than
+    // wait for an event that may never come.
     assert!(
-        pause.contains("ComposerQueueDispatchBehavior::ForceNext"),
-        "lifting a pause releases the head now instead of waiting for an event"
+        pause.contains("!paused"),
+        "lifting a pause is the caller's cue to release the head"
+    );
+    let release = schedule
+        .split_once("    pub(super) fn release_queue_after_hold_lifted(")
+        .and_then(|(_, tail)| tail.split_once("\n    /// "))
+        .map(|(body, _)| body)
+        .expect("the release should remain inspectable");
+    assert!(
+        release.contains("maybe_dispatch_next_composer_queue_message("),
+        "the release re-evaluates the head"
+    );
+    assert!(
+        source.contains("ComposerQueueDispatchBehavior::ForceNext"),
+        "and a lifted pause releases it now instead of waiting for an event"
     );
 
     let manual = schedule
@@ -690,8 +707,12 @@ fn the_queue_switches_a_client_sets_are_the_ones_the_dispatcher_reads() {
         "the mode a client sets is the set the dispatcher reads"
     );
     assert!(
-        manual.contains("ComposerQueueDispatchBehavior::Automatic"),
-        "switching back to automatic drains the head"
+        manual.contains("!manual"),
+        "switching back to automatic is the cue to drain the head"
+    );
+    assert!(
+        source.contains("ComposerQueueDispatchBehavior::Automatic"),
+        "and it drains through the same release"
     );
 
     // Publishing the switches is what lets a client draw them at all: a queue
@@ -711,5 +732,57 @@ fn the_queue_switches_a_client_sets_are_the_ones_the_dispatcher_reads() {
     assert!(
         source.contains("queued_sends: self.published_queued_sends()"),
         "every held message is published, not just the ones with an hour"
+    );
+}
+
+/// A queue mutation from a client never re-enters the workbench.
+///
+/// `serve_sidebar_organization` runs inside `entity.update`, so a mutation that
+/// opened the window and updated the entity again would take a second lease on
+/// a view that is already being updated, and GPUI aborts the process. The work
+/// that genuinely needs a window is deferred instead. This pins that split,
+/// because the failure is a runtime panic on a path no unit test otherwise
+/// walks: a phone sending a prompt during a running turn.
+#[test]
+fn a_client_queue_mutation_never_re_enters_the_workbench() {
+    let source = include_str!("app.rs");
+    let serve = source
+        .split_once("    fn serve_sidebar_organization(")
+        .and_then(|(_, tail)| {
+            tail.split_once("\n    /// Runs the queue work a bridge mutation could not do")
+        })
+        .map(|(body, _)| body)
+        .expect("the bridge handler should remain inspectable");
+    assert!(
+        !serve.contains("entity.update("),
+        "the handler already runs inside an update of this entity"
+    );
+    assert!(
+        !serve.contains("cx.update_window("),
+        "and it cannot open a window without re-entering that same view"
+    );
+    // The queue's own work is still done, just later: the mutation lands in the
+    // state the response reports, and the window work is collected.
+    assert!(
+        serve.contains("self.enqueue_queued_send("),
+        "the accepted message is in the queue before the response is built"
+    );
+    assert!(
+        serve.contains("self.run_deferred_queue_work(deferred_queue_work, cx)"),
+        "and the work needing a window runs after this update returns"
+    );
+
+    let deferred = source
+        .split_once("    fn run_deferred_queue_work(")
+        .and_then(|(_, tail)| tail.split_once("\n    fn start_sidebar_auto_archive_schedule("))
+        .map(|(body, _)| body)
+        .expect("the deferred pass should remain inspectable");
+    assert!(
+        deferred.contains("cx.defer("),
+        "it waits for the current effect cycle to finish"
+    );
+    assert!(
+        deferred.contains("cx.update_window(") && deferred.contains("entity.update("),
+        "and only then opens the window and updates the view once"
     );
 }

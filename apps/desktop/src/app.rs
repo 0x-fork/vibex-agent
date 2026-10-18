@@ -1500,6 +1500,27 @@ enum ComposerQueueInterruptBehavior {
     Steer,
 }
 
+/// What a queue mutation from a client needs a window for.
+///
+/// A bridge request arrives inside an update of this entity, so it cannot open
+/// the window that owns the queue and re-enter itself. The mutation lands in
+/// the state immediately — that is what the response reports — and these run
+/// afterwards, in one deferred pass.
+#[derive(Debug, Clone)]
+enum QueueWorkDeferred {
+    /// Arm the clock that releases scheduled messages.
+    ArmClock,
+    /// Re-evaluate one session's head, because the reader lifted its hold.
+    ReleaseHead {
+        session_id: VibexSessionId,
+        behavior: ComposerQueueDispatchBehavior,
+    },
+    /// Promote one message and send it now, stopping the turn holding it back.
+    ///
+    /// The message names its own session, so only the id travels.
+    SendNow { message_id: u64 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposerQueueDispatchBehavior {
     Automatic,
@@ -12306,6 +12327,9 @@ impl VibexWorkbench {
                     return;
                 }
                 let previous_groups = view.organization.groups.clone();
+                // Work a queue mutation needs a window for, collected while the
+                // mutation is applied and run after this update returns.
+                let mut deferred_queue_work: Vec<QueueWorkDeferred> = Vec::new();
                 let session_projects = self.sidebar_session_projects();
                 let session_workspaces = self.sidebar_session_workspaces();
                 let folder_id = RequestId::new().to_string();
@@ -12406,109 +12430,93 @@ impl VibexWorkbench {
                                 _ => {}
                             }
                         }
-                        // Pausing, resuming, and switching the send mode all
-                        // need a window: resuming and switching back to
-                        // automatic release the head right here, and the send
-                        // itself runs on the window that owns the queue.
-                        if let Some(handle) = self.window_handle {
-                            let mutation = mutation.clone();
-                            let entity = cx.weak_entity();
-                            let _ = cx.update_window(handle, move |_, window, cx| {
-                                let _ = entity.update(cx, |this, cx| {
-                                    match &mutation {
-                                        vibex_core::RemoteSidebarOrganizationMutation::SetQueuePaused {
-                                            session_id,
-                                            paused,
-                                        } => {
-                                            if let Ok(session_id) =
-                                                VibexSessionId::parse(session_id)
-                                            {
-                                                this.set_queue_paused(
-                                                    &session_id,
-                                                    *paused,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }
-                                        }
-                                        vibex_core::RemoteSidebarOrganizationMutation::EnqueueQueuedSend {
-                                            session_id,
-                                            text,
-                                            attachments,
-                                            mentions,
-                                        } => {
-                                            if let Ok(session_id) =
-                                                VibexSessionId::parse(session_id)
-                                            {
-                                                this.enqueue_queued_send(
-                                                    &session_id,
-                                                    text,
-                                                    attachments,
-                                                    mentions,
-                                                );
-                                                this.start_message_schedule_timer(window, cx);
-                                            }
-                                        }
-                                        vibex_core::RemoteSidebarOrganizationMutation::MoveQueuedSend {
-                                            session_id,
-                                            message_id,
-                                            before_message_id,
-                                        } => {
-                                            if let Ok(session_id) =
-                                                VibexSessionId::parse(session_id)
-                                            {
-                                                this.move_queued_send(
-                                                    &session_id,
-                                                    *message_id,
-                                                    *before_message_id,
-                                                );
-                                            }
-                                        }
-                                        vibex_core::RemoteSidebarOrganizationMutation::SendQueuedSendNow {
-                                            session_id,
-                                            message_id,
-                                        } => {
-                                            if let Ok(parsed) =
-                                                VibexSessionId::parse(session_id)
-                                                && this
-                                                    .composer_queue
-                                                    .iter()
-                                                    .any(|queued| {
-                                                        queued.session_id == parsed
-                                                            && queued.id == *message_id
-                                                    })
-                                            {
-                                                // The same gesture the panel's own
-                                                // arrow makes: promote the message,
-                                                // lift any pause, and either stop the
-                                                // turn that is holding it or release
-                                                // it now.
-                                                this.steer_composer_queue_message(
-                                                    *message_id,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }
-                                        }
-                                        vibex_core::RemoteSidebarOrganizationMutation::SetQueueManual {
-                                            session_id,
-                                            manual,
-                                        } => {
-                                            if let Ok(session_id) =
-                                                VibexSessionId::parse(session_id)
-                                            {
-                                                this.set_queue_manual(
-                                                    &session_id,
-                                                    *manual,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }
-                                        }
-                                        _ => {}
-                                    }
+                        // Everything a client does to the queue lands in the
+                        // state this shell owns right here, in the same update
+                        // that builds the response: a snapshot that reported a
+                        // queue the shell had not accepted yet would show the
+                        // client its own message missing.
+                        //
+                        // What needs a window — arming the clock that releases a
+                        // scheduled message, stopping a running turn, releasing
+                        // a head the reader just unpaused — cannot run here. A
+                        // bridge request arrives inside an update of this very
+                        // entity, so opening a window and re-entering it panics
+                        // on the double lease. Those are collected and run from
+                        // one deferred pass once this update has returned.
+                        match &mutation {
+                            vibex_core::RemoteSidebarOrganizationMutation::SetQueuePaused {
+                                session_id,
+                                paused,
+                            } => {
+                                if let Ok(session_id) = VibexSessionId::parse(session_id)
+                                    && self.set_queue_paused(&session_id, *paused)
+                                {
+                                    deferred_queue_work.push(QueueWorkDeferred::ReleaseHead {
+                                        session_id,
+                                        behavior: ComposerQueueDispatchBehavior::ForceNext,
+                                    });
+                                }
+                            }
+                            vibex_core::RemoteSidebarOrganizationMutation::SetQueueManual {
+                                session_id,
+                                manual,
+                            } => {
+                                if let Ok(session_id) = VibexSessionId::parse(session_id)
+                                    && self.set_queue_manual(&session_id, *manual)
+                                {
+                                    deferred_queue_work.push(QueueWorkDeferred::ReleaseHead {
+                                        session_id,
+                                        behavior: ComposerQueueDispatchBehavior::Automatic,
+                                    });
+                                }
+                            }
+                            vibex_core::RemoteSidebarOrganizationMutation::EnqueueQueuedSend {
+                                session_id,
+                                text,
+                                attachments,
+                                mentions,
+                            } => {
+                                if let Ok(session_id) = VibexSessionId::parse(session_id)
+                                    && self.enqueue_queued_send(
+                                        &session_id,
+                                        text,
+                                        attachments,
+                                        mentions,
+                                    )
+                                {
+                                    // A message that is already due — a client
+                                    // asking for it now — is released by the
+                                    // same pass rather than by a clock that may
+                                    // not have been running at all.
+                                    deferred_queue_work.push(QueueWorkDeferred::ArmClock);
+                                    deferred_queue_work.push(QueueWorkDeferred::ReleaseHead {
+                                        session_id,
+                                        behavior: ComposerQueueDispatchBehavior::Automatic,
+                                    });
+                                }
+                            }
+                            vibex_core::RemoteSidebarOrganizationMutation::MoveQueuedSend {
+                                session_id,
+                                message_id,
+                                before_message_id,
+                            } => {
+                                if let Ok(session_id) = VibexSessionId::parse(session_id) {
+                                    self.move_queued_send(
+                                        &session_id,
+                                        *message_id,
+                                        *before_message_id,
+                                    );
+                                }
+                            }
+                            vibex_core::RemoteSidebarOrganizationMutation::SendQueuedSendNow {
+                                message_id,
+                                ..
+                            } => {
+                                deferred_queue_work.push(QueueWorkDeferred::SendNow {
+                                    message_id: *message_id,
                                 });
-                            });
+                            }
+                            _ => {}
                         }
                         if let vibex_core::RemoteSidebarOrganizationMutation::SetSessionAutoContinuePaused {
                             session_ids,
@@ -12563,15 +12571,11 @@ impl VibexWorkbench {
                                 // The clock is the shell's, so the message is
                                 // armed on the window that owns it rather than on
                                 // whichever pass happened to accept the write.
-                                if let Some(handle) = self.window_handle {
-                                    let entity = cx.weak_entity();
-                                    let _ = cx.update_window(handle, move |_, window, cx| {
-                                        let _ = entity.update(cx, |this, cx| {
-                                            this.start_message_schedule_timer(window, cx);
-                                            cx.notify();
-                                        });
-                                    });
-                                }
+                                // It goes through the same deferred pass as every
+                                // other queue mutation: this handler already runs
+                                // inside an update of this entity, and reopening
+                                // it from here would take a second lease.
+                                deferred_queue_work.push(QueueWorkDeferred::ArmClock);
                                 self.publish_sidebar_invalidation();
                                 self.composer_queue_changed();
                                 cx.notify();
@@ -12607,6 +12611,7 @@ impl VibexWorkbench {
                         cx.notify();
                         let snapshot = self.sidebar_organization_view_for(authority).to_remote();
                         request.respond(Ok(snapshot));
+                        self.run_deferred_queue_work(deferred_queue_work, cx);
                     }
                     // The request was already reflected in the tree — a toggle
                     // that raced the authoritative refresh, a drop that landed
@@ -12621,6 +12626,67 @@ impl VibexWorkbench {
                 }
             }
         }
+    }
+
+    /// Runs the queue work a bridge mutation could not do inside its own
+    /// update.
+    ///
+    /// The window is opened on the next turn of the loop, once the update that
+    /// accepted the mutation has returned its lease. Everything here is a
+    /// consequence of state that stored change already made, so a shell that
+    /// has no window, or a window that closed in between, simply leaves the
+    /// queue as it stands: the messages are held, which is the safe direction.
+    fn run_deferred_queue_work(&mut self, work: Vec<QueueWorkDeferred>, cx: &mut Context<Self>) {
+        if work.is_empty() {
+            return;
+        }
+        let Some(handle) = self.window_handle else {
+            return;
+        };
+        // Deferred so the lease the bridge request holds has been returned:
+        // this update is the one that re-enters the workbench, and re-entering
+        // it *while* it is already being updated is the panic this path exists
+        // to avoid.
+        let entity = cx.weak_entity();
+        cx.defer(move |cx| {
+            // The window is opened first, because only it can hand out the
+            // `App` a send needs; the workbench is then updated once, inside
+            // that window, with the request's own lease long gone.
+            let _ = cx.update_window(handle, move |_, window, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    let mut release: Vec<(VibexSessionId, ComposerQueueDispatchBehavior)> =
+                        Vec::new();
+                    let mut arm_clock = false;
+                    let mut send_now: Vec<u64> = Vec::new();
+                    for item in work {
+                        match item {
+                            QueueWorkDeferred::ArmClock => arm_clock = true,
+                            QueueWorkDeferred::ReleaseHead {
+                                session_id,
+                                behavior,
+                            } => release.push((session_id, behavior)),
+                            QueueWorkDeferred::SendNow { message_id } => {
+                                send_now.push(message_id);
+                            }
+                        }
+                    }
+                    if arm_clock {
+                        this.start_message_schedule_timer(window, cx);
+                    }
+                    for (session_id, behavior) in release {
+                        this.release_queue_after_hold_lifted(&session_id, behavior, window, cx);
+                    }
+                    // A send-now is the one gesture allowed to overtake the
+                    // queue, and it is the panel's own arrow: promoting the
+                    // message, lifting any pause, and stopping the turn that
+                    // holds it all happen there.
+                    for message_id in send_now {
+                        this.steer_composer_queue_message(message_id, window, cx);
+                    }
+                    cx.notify();
+                });
+            });
+        });
     }
 
     fn start_sidebar_auto_archive_schedule(&mut self, cx: &mut Context<Self>) {

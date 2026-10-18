@@ -1084,17 +1084,13 @@ impl VibexWorkbench {
 
     /// Holds, or releases, one session's queue.
     ///
-    /// Releasing re-evaluates the head immediately rather than waiting for the
-    /// next event that would have released it: a reader who lifts a pause has
-    /// said the queue may go now, and a message that waits for an unrelated
-    /// completion would look like the pause never lifted.
-    pub(super) fn set_queue_paused(
-        &mut self,
-        session_id: &VibexSessionId,
-        paused: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    /// Only the switch moves here. Releasing has to re-evaluate the head, and
+    /// that needs a window — so the answer says whether the caller should,
+    /// rather than this reaching for one. A caller already inside an update of
+    /// this entity cannot open a window without re-entering it, and a bridge
+    /// request is exactly that: the mutation has to land in the state the
+    /// response reports, and the release can follow.
+    pub(super) fn set_queue_paused(&mut self, session_id: &VibexSessionId, paused: bool) -> bool {
         let changed = if paused {
             self.composer_queue_paused_session_ids
                 .insert(session_id.as_str().to_string())
@@ -1105,32 +1101,16 @@ impl VibexWorkbench {
         if !changed {
             return false;
         }
-        if !paused {
-            self.maybe_dispatch_next_composer_queue_message(
-                Some(session_id),
-                ComposerQueueDispatchBehavior::ForceNext,
-                window,
-                cx,
-            );
-        }
         self.publish_sidebar_invalidation();
-        cx.notify();
-        true
+        !paused
     }
 
     /// Switches one session's queue between automatic and manual sending.
     ///
     /// Switching back to automatic is itself the instruction to release
-    /// whatever is at the head, which is why it dispatches here instead of
-    /// waiting for a later event: a reader who turned manual mode off has said
-    /// the queue may drain.
-    pub(super) fn set_queue_manual(
-        &mut self,
-        session_id: &VibexSessionId,
-        manual: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    /// whatever is at the head, so it answers the same way [`Self::set_queue_
+    /// paused`] does: the caller that has a window does the release.
+    pub(super) fn set_queue_manual(&mut self, session_id: &VibexSessionId, manual: bool) -> bool {
         let changed = if manual {
             self.composer_queue_manual_session_ids
                 .insert(session_id.as_str().to_string())
@@ -1141,17 +1121,24 @@ impl VibexWorkbench {
         if !changed {
             return false;
         }
-        if !manual {
-            self.maybe_dispatch_next_composer_queue_message(
-                Some(session_id),
-                ComposerQueueDispatchBehavior::Automatic,
-                window,
-                cx,
-            );
-        }
         self.publish_sidebar_invalidation();
+        !manual
+    }
+
+    /// Releases one session's queue now that a client has lifted its hold.
+    ///
+    /// Separate from the switch above because it needs a window and the request
+    /// that set the switch did not have one to give: the caller runs this after
+    /// its own update has finished.
+    pub(super) fn release_queue_after_hold_lifted(
+        &mut self,
+        session_id: &VibexSessionId,
+        behavior: ComposerQueueDispatchBehavior,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.maybe_dispatch_next_composer_queue_message(Some(session_id), behavior, window, cx);
         cx.notify();
-        true
     }
 
     /// Loads the queue the previous session left behind.
