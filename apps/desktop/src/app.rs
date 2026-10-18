@@ -35626,7 +35626,11 @@ impl VibexWorkbench {
             self.open_agent_auth_management(state.agent_id, cx);
             return;
         }
-        if !crate::management::agent_auth_method_is_drivable(supports_logout, &method) {
+        if !crate::management::agent_auth_method_is_drivable(
+            &state.agent_id,
+            supports_logout,
+            &method,
+        ) {
             return;
         }
         let (Some(backend), Some(context)) = (self.backend.clone(), state.context) else {
@@ -49975,8 +49979,11 @@ impl VibexWorkbench {
                 // credential store it can rewrite; otherwise the row explains
                 // that the credential lives outside Vibex instead of offering a
                 // sign-in that cannot change anything.
-                let drivable =
-                    crate::management::agent_auth_method_is_drivable(supports_logout, &method);
+                let drivable = crate::management::agent_auth_method_is_drivable(
+                    &agent_id,
+                    supports_logout,
+                    &method,
+                );
                 Button::new(format!("runtime-auth-method:{}", method.id))
                     .small()
                     .ghost()

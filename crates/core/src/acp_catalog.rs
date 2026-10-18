@@ -491,6 +491,65 @@ pub fn acp_agent_catalog_entries() -> &'static [AcpAgentCatalogEntry] {
 /// install and nothing to roll back to.
 pub const ACP_AGENT_MANUAL_VERSION: &str = "manual";
 
+/// `(agent_id, method_id)` pairs whose ACP `authenticate` call actually starts a
+/// sign-in the host can hand to the user.
+///
+/// ACP's `Agent` method kind only means "the Agent handles authentication
+/// itself". It does not promise that the call does anything: some Agents answer
+/// it with an empty result and no side effect, expecting the credential to be
+/// configured out of band. ACP advertises no capability that separates the two,
+/// so the only reliable evidence is what the pinned binary does when asked.
+///
+/// Every pair here was verified by launching the Agent's pinned build, sending
+/// `initialize` followed by `authenticate` for that method, and observing a
+/// browser launch rather than an immediate empty `{}` result or an error:
+///
+/// | Agent | method | observed |
+/// | --- | --- | --- |
+/// | antigravity | `oauth-personal`, `oauth-business` | opens the Google OAuth consent page |
+/// | cline | `cline`, `cline-pass` | opens the `authkit.cline.bot` device page |
+/// | cline | `openai-codex` | opens the OpenAI OAuth consent page |
+/// | codebuddy-code | `external`, `internal`, `iOA`, `selfhosted` | opens its product login page |
+/// | cursor | `cursor_login` | opens `cursor.com/loginDeepControl` |
+/// | devin | `devin-browser` | opens `app.devin.ai/auth/cli/continue` |
+/// | gemini | `oauth-personal` | opens the Google OAuth consent page |
+/// | grok | `grok.com` | opens `accounts.x.ai/oauth2/device` |
+///
+/// Pairs deliberately *absent* are the no-op cases, and the granularity matters:
+/// inside the same Agent, Grok's `xai.api_key`, Gemini's `gemini-api-key`, Codex's
+/// `api-key` and Cursor's API-key surface answer with an immediate error when the
+/// variable is unset, while Gemini's `vertex-ai`/`gateway` return an empty `{}`;
+/// none of them opens anything. `zcode`'s `zcode-credentials` is not even
+/// implemented (`-32601 Method not found`), and `glm-acp-agent` documents an
+/// empty result.
+///
+/// This is deliberately a table and not a heuristic on the method name or kind:
+/// an Agent that later changes behaviour must fail visibly here rather than
+/// silently start presenting a no-op as a sign-in.
+pub const ACP_AGENT_HOST_BROWSER_LOGIN_METHODS: &[(&str, &str)] = &[
+    ("antigravity", "oauth-personal"),
+    ("antigravity", "oauth-business"),
+    ("cline", "cline"),
+    ("cline", "cline-pass"),
+    ("cline", "openai-codex"),
+    ("codebuddy-code", "external"),
+    ("codebuddy-code", "internal"),
+    ("codebuddy-code", "iOA"),
+    ("codebuddy-code", "selfhosted"),
+    ("cursor", "cursor_login"),
+    ("devin", "devin-browser"),
+    ("gemini", "oauth-personal"),
+    ("grok", "grok.com"),
+];
+
+/// Whether this exact `(agent, method)` sign-in opens a browser the host can
+/// hand to the user. See [`ACP_AGENT_HOST_BROWSER_LOGIN_METHODS`].
+pub fn acp_agent_method_opens_host_browser(agent_id: &str, method_id: &str) -> bool {
+    ACP_AGENT_HOST_BROWSER_LOGIN_METHODS
+        .iter()
+        .any(|(agent, method)| *agent == agent_id && *method == method_id)
+}
+
 /// The Adapter version Vibex verified for an Agent — its catalog pin.
 ///
 /// `None` when the Agent is not catalog-managed or its catalog entry declares

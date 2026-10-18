@@ -3380,18 +3380,39 @@ AgentAuthModelCatalogSnapshot {
   advertising the reserved `_meta["terminal-auth"]` key is what makes the method
   arrive as `Terminal` kind with a real login command instead of a silent no-op.
 - Method kind is not evidence that a sign-in will do anything, so the offer is
-  gated on the client being able to carry the change. A method is drivable when
-  it is `Terminal` kind (the catalog holds a login command) or when the Agent
-  advertises `supports_logout` and the method is `Agent` kind (the Agent owns a
-  credential store it can rewrite). The second clause is what keeps Codex: its
-  `chat-gpt` method is `Agent` kind with no terminal descriptor, but the adapter
-  opens the browser itself and blocks until the OAuth round trip finishes.
-  `glm-acp-agent` is the counterexample the rule exists for — it advertises an
-  `Agent` method, has no logout capability, and its `authenticate` returns an
-  empty result while the credential is configured out of band, so the surface
-  explains that the credential lives outside Vibex instead of offering an action
-  that cannot change anything. The same gate applies to the composer's
-  authentication menu, which must not run an undrivable method either.
+  gated on the client being able to carry the change. The rule lives once on
+  `vibex_core::AgentAuthMethod::is_client_drivable` / `AgentAuthCatalog` so the
+  desktop and TUI cannot drift. A method is drivable when:
+  - it is `Terminal` kind (the catalog holds a login command), or
+  - the Agent advertises `supports_logout` and the method is `Agent` kind (the
+    Agent owns a credential store it can rewrite), or
+  - the exact `(agent_id, method_id)` pair appears in
+    `ACP_AGENT_HOST_BROWSER_LOGIN_METHODS`: the pinned build answers
+    `authenticate` by starting a browser flow.
+  The logout clause is what keeps Codex: its `chat-gpt` method is `Agent` kind
+  with no terminal descriptor, but the adapter opens the browser itself and
+  blocks until the OAuth round trip finishes. The browser clause is what keeps
+  Cursor (`cursor_login`), Grok (`grok.com`), Gemini (`oauth-personal`), Cline
+  (`cline`, `cline-pass`, `openai-codex`), CodeBuddy (its four login methods) and
+  Antigravity (`oauth-personal`, `oauth-business`): they open a browser but
+  advertise no logout capability, so gating on logout alone hid a working
+  sign-in and told the user the credential was managed outside Vibex.
+  `glm-acp-agent` and `zcode` are the counterexamples the rule exists for —
+  `glm-acp-agent`'s `authenticate` returns an empty result while the credential
+  is configured out of band, and ZCode's bridge does not implement
+  `authenticate` at all (`Method not found`), so both explain that the credential
+  lives outside Vibex instead of offering an action that changes nothing.
+  The granularity is per method, not per Agent: Grok's `xai.api_key`, Gemini's
+  `gemini-api-key`/`vertex-ai`/`gateway`, Codex's `api-key` and Cursor's API-key
+  surface sit beside a browser method and still fail closed, because they answer
+  with an immediate error (or an empty result) rather than a sign-in. The same
+  gate applies to the composer's authentication menu, which must not run an
+  undrivable method either.
+- `ACP_AGENT_HOST_BROWSER_LOGIN_METHODS` is evidence, not configuration. Every
+  pair was established by launching the pinned build, sending `initialize` and
+  then `authenticate`, and observing a browser launch. A release that changes
+  this must be re-probed when its pin moves; adding a pair without that
+  observation would re-introduce the no-op button the gate removed.
 - Verification shuts down old account-source processes first, increments the
   context revision for a credential change, probes models with that exact
   revision, then commits `Authenticated` and the snapshot. A successful RPC

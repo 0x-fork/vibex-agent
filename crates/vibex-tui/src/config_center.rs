@@ -4272,14 +4272,14 @@ pub fn agent_auth_rows_with_sign_in(
         // so rather than opening a form whose answer the authority refuses.
         let needs_profile =
             method.effect == vibex_core::AgentAuthMethodEffect::RequiresProviderProfile;
-        // The shared rule the desktop applies, so the two clients offer the same
-        // verbs for the same catalogue: a terminal method is always drivable (the
-        // client attaches to the PTY), while an Agent-managed one is only
-        // drivable when the Agent also advertised logout — which is the
-        // capability that makes a re-authentication replace the account rather
-        // than add a second one.
-        let drivable = method.kind == vibex_core::AgentAuthMethodKind::Terminal
-            || (catalog.supports_logout && method.kind == vibex_core::AgentAuthMethodKind::Agent);
+        // One shared rule for both clients: a terminal method is always
+        // drivable (the client attaches to the PTY), while an Agent-managed one
+        // needs either an advertised logout — a credential store the Agent can
+        // rewrite — or a verified browser flow for this exact Agent and method.
+        // The latter is what keeps Cursor, Grok's `grok.com`, Gemini's
+        // `oauth-personal`, Cline, CodeBuddy and Antigravity's OAuth methods
+        // offered: they start a browser sign-in but advertise no logout.
+        let drivable = method.is_client_drivable(&catalog.agent_id, catalog.supports_logout);
         let (chip, tone) = if needs_profile {
             (strings.config_auth_needs_profile(), ConfigTone::Muted)
         } else if !drivable {

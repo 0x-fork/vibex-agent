@@ -4694,9 +4694,10 @@ fn the_refresh_line_re_probes_while_opening_the_panel_only_reads() {
 
 /// A method the client cannot drive is a line that explains itself.
 ///
-/// The rule is the desktop's, so both clients offer the same verbs for the same
-/// catalogue: a terminal method is always drivable, an Agent-managed one only
-/// when the Agent advertised logout.
+/// The rule is `AgentAuthMethod::is_client_drivable`, shared with the desktop so
+/// both clients offer the same verbs for the same catalogue: a terminal method is
+/// always drivable, and an Agent-managed one needs either an advertised logout or
+/// a verified browser flow for that exact `(agent, method)` pair.
 #[test]
 fn a_method_the_client_cannot_drive_is_not_offered_as_usable() {
     let mut catalog = agent_auth_catalog();
@@ -4733,6 +4734,43 @@ fn a_method_the_client_cannot_drive_is_not_offered_as_usable() {
         sign_in.action.is_some(),
         "a re-authenticatable method was not offered"
     );
+
+    // A verified browser flow is a sign-in even with no logout: `cursor` and
+    // `grok.com` open a browser, advertise no credential store, and would
+    // otherwise be drawn as an external credential the reader cannot change.
+    for (agent, method) in [
+        ("cursor", "cursor_login"),
+        ("grok", "grok.com"),
+        ("gemini", "oauth-personal"),
+    ] {
+        let browser: vibex_core::AgentAuthCatalog = serde_json::from_value(serde_json::json!({
+            "agentId": agent,
+            "methods": [{
+                "id": method,
+                "name": "Sign in",
+                "kind": "agent",
+                "effect": "writes_agent_state_home",
+                "environment": []
+            }],
+            "supportsLogout": false,
+            "status": "authentication_required",
+            "refreshedAtMs": 1
+        }))
+        .expect("browser catalogue");
+        let rows = vibex_tui::config_center::agent_auth_rows(
+            Some(&browser),
+            vibex_tui::Strings::for_locale(vibex_tui::Locale::En),
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.label == "Sign in")
+            .expect("the row");
+        assert!(
+            row.action.is_some(),
+            "{agent}/{method} opens a browser but was drawn as external"
+        );
+        assert_ne!(row.chip, "the Agent's own sign-in", "{agent}/{method} chip");
+    }
 
     // A terminal method is drivable whatever the logout capability says: the
     // client attaches to the PTY the authority opened.

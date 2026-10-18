@@ -280,6 +280,75 @@ pub struct AgentAuthCatalog {
     pub refreshed_at_ms: i64,
 }
 
+impl AgentAuthCatalog {
+    /// Whether any advertised method can carry a credential change this client
+    /// can actually drive. See [`AgentAuthMethod::is_client_drivable`].
+    pub fn supports_reauthentication(&self) -> bool {
+        self.methods
+            .iter()
+            .any(|method| method.is_client_drivable(&self.agent_id, self.supports_logout))
+    }
+
+    /// Whether the Agent advertises sign-in methods but none this client can
+    /// act on, so its credentials live entirely outside Vibex.
+    ///
+    /// This gates an explanation, not an action: such an Agent still deserves an
+    /// honest statement rather than a button that cannot do anything.
+    pub fn is_externally_managed(&self) -> bool {
+        !self.supports_reauthentication() && self.methods.iter().any(AgentAuthMethod::is_visible)
+    }
+}
+
+impl AgentAuthMethod {
+    /// Whether an Agent-account surface may list this method at all.
+    ///
+    /// `Environment` methods belong to a Provider Profile and are edited through
+    /// the profile's credential fields, so they are not part of Agent sign-in.
+    pub fn is_visible(&self) -> bool {
+        self.effect != AgentAuthMethodEffect::RequiresProviderProfile
+            && self.kind != AgentAuthMethodKind::Environment
+    }
+
+    /// Whether this method can carry a credential change the client can drive.
+    ///
+    /// A method kind is not evidence that the Agent will do anything. `Agent`
+    /// kind only means the Agent handles authentication itself, and several
+    /// Agents answer `authenticate` with an empty result and no side effect —
+    /// `glm-acp-agent` documents exactly that, configuring its credential out of
+    /// band instead. Offering "re-authenticate" for such a method runs a no-op
+    /// and still reports success, which is worse than offering nothing.
+    ///
+    /// A method is drivable when the client itself can carry the sign-in:
+    ///
+    /// - `Terminal`: the catalog holds a login command, so the client opens a
+    ///   terminal. This also covers Agents whose login is declared as an `Agent`
+    ///   method with the reserved `_meta.terminal-auth` descriptor, because the
+    ///   parser upgrades that shape to `Terminal` on the way in.
+    /// - `supports_logout`: the Agent advertises a credential store it can
+    ///   rewrite. Codex is the reference case — its `chat-gpt` method is `Agent`
+    ///   kind with no terminal descriptor, but the adapter opens the browser
+    ///   itself and blocks until the OAuth round trip finishes.
+    /// - A verified host-browser pair: the Agent answers `authenticate` by
+    ///   starting a browser flow. Cursor, Grok's `grok.com`, Gemini's
+    ///   `oauth-personal`, Cline, CodeBuddy and Antigravity's OAuth methods are
+    ///   the observed cases. They advertise no `logout`, so `supports_logout`
+    ///   alone would hide a sign-in that genuinely works.
+    ///
+    /// `Environment` methods are excluded: they belong to a Provider Profile and
+    /// are edited through the profile's credential fields, not through Agent
+    /// sign-in.
+    pub fn is_client_drivable(&self, agent_id: &AgentId, supports_logout: bool) -> bool {
+        match self.kind {
+            AgentAuthMethodKind::Terminal => true,
+            AgentAuthMethodKind::Environment => false,
+            AgentAuthMethodKind::Agent => {
+                supports_logout
+                    || crate::acp_agent_method_opens_host_browser(agent_id.as_str(), &self.id)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentAuthenticateRequest {
     pub operation_id: AgentAuthenticationOperationId,
@@ -387,5 +456,151 @@ mod tests {
         assert!(debug.contains("EXAMPLE_API_KEY"));
         assert!(debug.contains("has_value: true"));
         assert!(!debug.contains("secret-value"));
+    }
+
+    fn agent_method(id: &str) -> AgentAuthMethod {
+        AgentAuthMethod {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: None,
+            kind: AgentAuthMethodKind::Agent,
+            effect: AgentAuthMethodEffect::WritesAgentStateHome,
+            environment: Vec::new(),
+            credential_link: None,
+        }
+    }
+
+    fn catalog(
+        agent: &str,
+        methods: Vec<AgentAuthMethod>,
+        supports_logout: bool,
+    ) -> AgentAuthCatalog {
+        AgentAuthCatalog {
+            agent_id: AgentId::parse(agent).unwrap(),
+            methods,
+            supports_logout,
+            status: AgentAuthStatus::Authenticated,
+            refreshed_at_ms: 0,
+        }
+    }
+
+    /// An `Agent` method is only a sign-in when the Agent's own `authenticate`
+    /// actually starts one. Cursor, Grok's `grok.com`, Gemini's `oauth-personal`,
+    /// Cline, CodeBuddy and Antigravity's OAuth methods open a browser but
+    /// advertise no logout; treating "no logout" as "nothing to drive" hid a
+    /// working sign-in and told the user the credential was managed elsewhere.
+    #[test]
+    fn host_browser_agents_are_drivable_without_advertising_logout() {
+        for (agent, method) in [
+            ("cursor", "cursor_login"),
+            ("grok", "grok.com"),
+            ("gemini", "oauth-personal"),
+            ("cline", "cline"),
+            ("codebuddy-code", "external"),
+            ("antigravity", "oauth-personal"),
+            ("devin", "devin-browser"),
+        ] {
+            let catalog = catalog(agent, vec![agent_method(method)], false);
+            assert!(
+                catalog.supports_reauthentication(),
+                "{agent}/{method} opens a browser but was called undrivable"
+            );
+            assert!(
+                !catalog.is_externally_managed(),
+                "{agent}/{method} must not be explained as externally managed"
+            );
+        }
+    }
+
+    /// The no-op cases must keep failing closed, and the granularity is per
+    /// method: inside one Agent, one method can open a browser while its
+    /// sibling API-key method just reports a missing variable.
+    #[test]
+    fn methods_that_answer_without_a_sign_in_stay_external() {
+        // zcode's bridge does not implement `authenticate` at all.
+        let zcode = catalog("zcode", vec![agent_method("zcode-credentials")], false);
+        assert!(!zcode.supports_reauthentication());
+        assert!(zcode.is_externally_managed());
+
+        // glm-acp-agent documents an empty result and configures out of band.
+        let glm = catalog("glm-acp-agent", vec![agent_method("z-ai-api-key")], false);
+        assert!(!glm.supports_reauthentication());
+        assert!(glm.is_externally_managed());
+
+        // Grok and Gemini have one browser method each; their API-key methods
+        // fail immediately when the variable is unset, so they stay external on
+        // their own.
+        for (agent, method) in [
+            ("grok", "xai.api_key"),
+            ("gemini", "gemini-api-key"),
+            ("gemini", "vertex-ai"),
+            ("gemini", "gateway"),
+            ("cursor", "cursor_api_key"),
+            ("codex", "api-key"),
+        ] {
+            let method = agent_method(method);
+            assert!(
+                !method.is_client_drivable(&AgentId::parse(agent).unwrap(), false),
+                "{agent}/{method:?} does not start a sign-in but was called drivable"
+            );
+        }
+    }
+
+    /// An Agent that advertises ACP `logout` owns a credential store it can
+    /// rewrite, which makes its `Agent` methods drivable without any per-Agent
+    /// evidence — Codex is the reference case.
+    #[test]
+    fn advertised_logout_makes_agent_methods_drivable() {
+        let codex = catalog("codex", vec![agent_method("chat-gpt")], true);
+        assert!(codex.supports_reauthentication());
+        assert!(!codex.is_externally_managed());
+    }
+
+    /// A terminal method is always drivable: the client attaches to the PTY the
+    /// authority opened, whatever the logout capability says.
+    #[test]
+    fn terminal_methods_are_drivable_and_environment_methods_are_not() {
+        let terminal = AgentAuthMethod {
+            kind: AgentAuthMethodKind::Terminal,
+            ..agent_method("vibex-cli-login")
+        };
+        let catalog = catalog("kiro", vec![terminal.clone()], false);
+        assert!(catalog.supports_reauthentication());
+        assert!(terminal.is_visible());
+        assert!(terminal.is_client_drivable(&AgentId::parse("kiro").unwrap(), false));
+
+        let environment = AgentAuthMethod {
+            kind: AgentAuthMethodKind::Environment,
+            effect: AgentAuthMethodEffect::RequiresProviderProfile,
+            ..agent_method("shared-profile")
+        };
+        assert!(!environment.is_visible());
+        assert!(!environment.is_client_drivable(&AgentId::parse("kiro").unwrap(), true));
+    }
+
+    /// The verified table and the drivability rule cannot drift: every pair the
+    /// table lists must be Agent-kind (a terminal change would make the entry a
+    /// lie) and must resolve to a real catalog Agent.
+    #[test]
+    fn verified_browser_pairs_name_real_agents_and_agent_kind_methods() {
+        let agents = crate::acp_agent_catalog_entries()
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for (agent, method) in crate::ACP_AGENT_HOST_BROWSER_LOGIN_METHODS {
+            assert!(
+                agents.contains(agent),
+                "{agent} has a verified browser method but is not a catalog Agent"
+            );
+            assert!(!method.is_empty(), "{agent} lists an empty method id");
+            assert!(
+                crate::acp_agent_method_opens_host_browser(agent, method),
+                "{agent}/{method} was listed but does not resolve"
+            );
+        }
+        assert!(!crate::acp_agent_method_opens_host_browser(
+            "grok",
+            "xai.api_key"
+        ));
     }
 }

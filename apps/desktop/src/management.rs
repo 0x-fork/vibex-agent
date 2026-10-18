@@ -15354,8 +15354,12 @@ impl ManagementCenter {
         }
         if let Some(catalog) = catalog {
             // `catalog.methods` is destructured below; the drivability rule
-            // needs one more field of the catalog than the method list carries.
+            // needs two more fields of the catalog than the method list carries —
+            // the logout capability and the Agent id, because an Agent-kind
+            // method is only actionable for the Agents whose pinned build really
+            // opens a sign-in.
             let catalog_supports_logout = catalog.supports_logout;
+            let catalog_agent_id = catalog.agent_id.clone();
             let methods = catalog
                 .methods
                 .into_iter()
@@ -15422,8 +15426,11 @@ impl ManagementCenter {
                 // A method the client cannot drive would run a no-op
                 // `authenticate` and still report success, so it is not offered
                 // as an action at all.
-                let method_drivable =
-                    agent_auth_method_is_drivable(catalog_supports_logout, &method);
+                let method_drivable = agent_auth_method_is_drivable(
+                    &catalog_agent_id,
+                    catalog_supports_logout,
+                    &method,
+                );
                 let submit_disabled =
                     pending || !method_drivable || (native_authenticated && !reauthenticating);
                 let submit_method_id = method.id.clone();
@@ -20932,48 +20939,30 @@ fn agent_auth_input_key(method_id: &str, variable_name: &str) -> String {
 /// Whether "re-authenticate" can actually replace the shared credentials for
 /// this catalog.
 ///
-/// A method kind is not evidence that the Agent will do anything. `Agent` kind
-/// only means the Agent handles authentication itself, and several Agents answer
-/// `authenticate` with an empty result and no side effect — `glm-acp-agent`
-/// documents exactly that ("the agent has nothing to do here"), configuring its
-/// credential out of band instead. Offering "re-authenticate" for such a method
-/// runs a no-op and still reports success, which is worse than offering nothing.
-///
-/// A method is drivable when the client itself can carry the sign-in:
-///
-/// - `Terminal`: the catalog carries a login command, so the client opens a
-///   terminal. This also covers Agents whose login is declared as an `Agent`
-///   method with the reserved `_meta.terminal-auth` descriptor, because the
-///   parser upgrades that shape to `Terminal` on the way in.
-/// - `supports_logout`: the Agent advertises a credential store it can rewrite.
-///   Codex is the reference case — its `chat-gpt` method is `Agent` kind with no
-///   terminal descriptor, but the adapter opens the browser itself and blocks
-///   until the OAuth round trip finishes.
-///
-/// `Environment` methods are excluded: they belong to a Provider Profile and are
-/// edited through the profile's credential fields, not through Agent sign-in.
+/// The rule lives on [`AgentAuthCatalog::supports_reauthentication`] so the
+/// desktop, the TUI and any future client answer this the same way. Method kind
+/// alone is not evidence: `Agent` kind only means the Agent handles
+/// authentication itself, and several Agents answer `authenticate` with an empty
+/// result and no side effect.
 pub(crate) fn agent_auth_catalog_supports_reauthentication(catalog: &AgentAuthCatalog) -> bool {
-    catalog
-        .methods
-        .iter()
-        .any(|method| agent_auth_method_is_drivable(catalog.supports_logout, method))
+    catalog.supports_reauthentication()
 }
 
 /// Whether one advertised method can carry a credential change the client can
-/// drive. See [`agent_auth_catalog_supports_reauthentication`] for the rule.
+/// drive. Thin wrapper over [`vibex_core::AgentAuthMethod::is_client_drivable`]
+/// so this module keeps one spelling of the rule for its callers.
 pub(crate) fn agent_auth_method_is_drivable(
+    agent_id: &AgentId,
     supports_logout: bool,
     method: &vibex_core::AgentAuthMethod,
 ) -> bool {
-    method.kind == AgentAuthMethodKind::Terminal
-        || (supports_logout && method.kind == AgentAuthMethodKind::Agent)
+    method.is_client_drivable(agent_id, supports_logout)
 }
 
 /// Whether an advertised method is one a client may act on at all — the shared
 /// filter for which methods an Agent-account surface lists.
 pub(crate) fn agent_auth_method_is_visible(method: &vibex_core::AgentAuthMethod) -> bool {
-    method.effect != AgentAuthMethodEffect::RequiresProviderProfile
-        && method.kind != AgentAuthMethodKind::Environment
+    method.is_visible()
 }
 
 /// Whether this Agent advertises sign-in methods but none the client can act
@@ -20982,8 +20971,7 @@ pub(crate) fn agent_auth_method_is_visible(method: &vibex_core::AgentAuthMethod)
 /// This gates the explanation, not re-authentication: such an Agent still
 /// deserves an honest statement rather than a button that cannot do anything.
 fn agent_auth_catalog_is_externally_managed(catalog: &AgentAuthCatalog) -> bool {
-    !agent_auth_catalog_supports_reauthentication(catalog)
-        && catalog.methods.iter().any(agent_auth_method_is_visible)
+    catalog.is_externally_managed()
 }
 
 fn agent_auth_scope_matches(
@@ -28956,7 +28944,8 @@ mod tests {
             "catalog.supports_logout",
             "when(supports_logout",
             "let method_drivable =",
-            "agent_auth_method_is_drivable(catalog_supports_logout, &method)",
+            "let method_drivable = agent_auth_method_is_drivable(",
+            "&catalog_agent_id,",
             "pending || !method_drivable || (native_authenticated && !reauthenticating)",
             "externally_managed_credentials",
             "cannot be replaced here",
@@ -29087,6 +29076,50 @@ mod tests {
         )];
         assert!(agent_auth_catalog_supports_reauthentication(&catalog));
         assert!(!agent_auth_catalog_is_externally_managed(&catalog));
+    }
+
+    /// A verified browser flow is a sign-in even without an advertised logout.
+    ///
+    /// Cursor, Grok's `grok.com`, Gemini's `oauth-personal`, Cline, CodeBuddy
+    /// and Antigravity's OAuth methods answer `authenticate` by opening a
+    /// browser, so gating them on `supports_logout` hid a working sign-in and
+    /// claimed the credential was managed outside Vibex. The distinction is per
+    /// method, not per Agent: the same Agent's API-key methods still fail
+    /// closed.
+    #[test]
+    fn verified_browser_methods_are_offered_without_logout() {
+        let method = |id: &str| vibex_core::AgentAuthMethod {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: None,
+            kind: AgentAuthMethodKind::Agent,
+            effect: AgentAuthMethodEffect::WritesAgentStateHome,
+            environment: Vec::new(),
+            credential_link: None,
+        };
+        let mut catalog = AgentAuthCatalog {
+            agent_id: AgentId::parse("cursor").expect("valid Agent id"),
+            methods: vec![method("cursor_login")],
+            supports_logout: false,
+            status: AgentAuthStatus::Authenticated,
+            refreshed_at_ms: 0,
+        };
+
+        assert!(
+            agent_auth_catalog_supports_reauthentication(&catalog),
+            "cursor_login opens a browser, so re-authentication is drivable"
+        );
+        assert!(!agent_auth_catalog_is_externally_managed(&catalog));
+
+        // The same Agent's API-key method does not open anything.
+        catalog.methods = vec![method("cursor_api_key")];
+        assert!(!agent_auth_catalog_supports_reauthentication(&catalog));
+
+        // zcode advertises a method its bridge does not implement.
+        catalog.agent_id = AgentId::parse("zcode").expect("valid Agent id");
+        catalog.methods = vec![method("zcode-credentials")];
+        assert!(!agent_auth_catalog_supports_reauthentication(&catalog));
+        assert!(agent_auth_catalog_is_externally_managed(&catalog));
     }
 
     /// The explanation must not appear for an Agent whose methods are simply

@@ -42,10 +42,12 @@ pub mod workbench;
 pub mod workspace;
 
 pub use acp_catalog::{
-    ACP_AGENT_MANUAL_VERSION, AcpAgentCatalogEntry, DEEPSEEK_HARNESS_MISTRAL_WIRE_SINCE,
-    DEEPSEEK_HARNESS_MODEL_SUBSTITUTION_SINCE, DEEPSEEK_HARNESS_SESSION_FORK_SINCE,
-    acp_agent_catalog_entries, acp_agent_verified_version, adapter_substitutes_unavailable_models,
-    adapter_version_at_least, installed_adapter_version, model_interface_available_for_adapter,
+    ACP_AGENT_HOST_BROWSER_LOGIN_METHODS, ACP_AGENT_MANUAL_VERSION, AcpAgentCatalogEntry,
+    DEEPSEEK_HARNESS_MISTRAL_WIRE_SINCE, DEEPSEEK_HARNESS_MODEL_SUBSTITUTION_SINCE,
+    DEEPSEEK_HARNESS_SESSION_FORK_SINCE, acp_agent_catalog_entries,
+    acp_agent_method_opens_host_browser, acp_agent_verified_version,
+    adapter_substitutes_unavailable_models, adapter_version_at_least, installed_adapter_version,
+    model_interface_available_for_adapter,
 };
 
 pub use agent::{
