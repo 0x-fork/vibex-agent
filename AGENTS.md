@@ -195,17 +195,19 @@ function tgit --wraps git; git --git-dir=(git rev-parse --show-toplevel)/.trelli
 
 ## 2. Project state
 
-Vibex is a Rust-first, local-first AI coding workbench, `0.1.0-rc.7`,
-AGPL-3.0-or-later. Two product clients share one GPUI design system:
+Vibex is a Rust-first, local-first AI coding workbench, `0.1.0-rc.8`,
+AGPL-3.0-or-later. Two GPUI surfaces share one design system, and a terminal
+client renders the same runtime:
 
 | Surface | Source | Stack |
 | --- | --- | --- |
 | Native desktop | `apps/desktop` | Rust + GPUI |
 | Native mobile | `apps/mobile` | Rust + GPUI with `gpui-pre-mobile` (Android/iOS platform layer) |
+| Terminal | `apps/tui` | Rust, character grid over the runtime protocol |
 
-Layout: `apps/` (desktop, mobile, relay-server) · `crates/` (~25 Rust
+Layout: `apps/` (desktop, mobile, tui, relay-server, server) · `crates/` (~25 Rust
 crates: agent/ACP adapters, db, fs, git, terminal, relay, remote, content,
-diagnostics, vibex-ui, vibex-terminal-ui, ...) · `scripts/` (Node build,
+diagnostics, vibex-ui, vibex-terminal-ui, vibex-tui, ...) · `scripts/` (Node build,
 release, and license tooling) · `.trellis/` (workflow, spec, tasks).
 
 The pnpm workspace covers `apps/*` only; there is no top-level `packages/`.
