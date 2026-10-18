@@ -127,8 +127,14 @@ mod tests {
             Locale::En.new_session_slogan(),
             ("Start something new", "with", "")
         );
-        assert_eq!(Locale::ZhCn.new_session_slogan(), ("", "和", "开始新的工作"));
-        assert_eq!(Locale::ZhTw.new_session_slogan(), ("", "和", "開始新的工作"));
+        assert_eq!(
+            Locale::ZhCn.new_session_slogan(),
+            ("", "和", "开始新的工作")
+        );
+        assert_eq!(
+            Locale::ZhTw.new_session_slogan(),
+            ("", "和", "開始新的工作")
+        );
 
         assert_eq!(
             Locale::En.new_session_slogan_spoken(Some("Codex")),

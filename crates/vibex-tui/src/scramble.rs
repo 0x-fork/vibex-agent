@@ -300,9 +300,7 @@ impl Transitions {
     /// on a changing line that never moved is the mark, which reads as a picture
     /// the page forgot to update.
     pub fn cells(&self, slot: Slot, cells: usize, phase: u32) -> Option<String> {
-        self.runs
-            .get(&slot)
-            .and_then(|run| run.cells(cells, phase))
+        self.runs.get(&slot).and_then(|run| run.cells(cells, phase))
     }
 
     /// Whether any transition is before its settled phase.
