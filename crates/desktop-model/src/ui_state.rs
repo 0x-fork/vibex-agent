@@ -4236,7 +4236,7 @@ mod tests {
     #[test]
     fn the_fastest_clear_time_is_kept_and_only_a_faster_win_replaces_it() {
         let dir = tempfile::tempdir().unwrap();
-        let store = UiStateStore::new(&dir.path().join("desktop-ui-state.json"));
+        let store = UiStateStore::new(dir.path().join("desktop-ui-state.json"));
 
         let mut state = DesktopUiStateV1::default();
         assert_eq!(state.arena.best_time("claude"), None);
