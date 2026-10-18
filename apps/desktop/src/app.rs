@@ -599,9 +599,11 @@ const NEW_SESSION_LOGO_SWAP: motion::MotionSpec =
 const NEW_SESSION_SLOGAN_SIZE: f32 = 24.0;
 /// The edge of the Agent mark's square, in pixels.
 ///
-/// Set from the sentence's own size rather than a second magic number, so the
-/// two stay in step if the sentence is ever re-set.
-const NEW_SESSION_AGENT_MARK_SIZE: f32 = NEW_SESSION_SLOGAN_SIZE * 1.5;
+/// A step rather than a jump: the mark reads as part of the sentence when it
+/// clears the cap height by a little, and as a badge hung beside it when it
+/// clears it by half again. Set from the sentence's own size rather than a
+/// second magic number, so the two stay in step if the sentence is re-set.
+const NEW_SESSION_AGENT_MARK_SIZE: f32 = NEW_SESSION_SLOGAN_SIZE * 1.3;
 /// How far one mark travels while it crosses the line, in pixels.
 ///
 /// The distance the outgoing mark falls has to take it *clear* of the box before
