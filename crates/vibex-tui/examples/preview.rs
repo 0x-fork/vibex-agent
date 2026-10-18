@@ -549,7 +549,7 @@ fn showcase_catalog(
         value: value.to_string(),
         label: Some(label.to_string()),
     };
-    let mut option = vibex_core::SessionRuntimeOption {
+    let option = vibex_core::SessionRuntimeOption {
         // The same selection the session runs on: an entry built from a second
         // call would carry a fresh account id and never match the page.
         selection: selection.clone(),
