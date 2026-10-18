@@ -5,6 +5,11 @@
 //! face painted as merged rectangles on whole pixels. Nothing here goes through
 //! a font, so a running clock reads as part of the field instead of as chrome
 //! floating over it.
+//!
+//! The face sits on its own stepped pixel plate rather than directly on the
+//! floor. Every sanctuary has a bright stone floor somewhere under the clock,
+//! and ivory digits alone disappear into it; the plate guarantees contrast on
+//! every encounter and reads as the same hand-drawn HUD as the exit mark.
 
 use super::combat::{Arena, Phase};
 use crate::locale::text;
@@ -14,14 +19,17 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 
-/// One raster pixel of the face, in logical pixels. The face sits in the
-/// field's corner without covering play, and is still legible at a glance.
-const CELL: f32 = 2.0;
-/// Digits are three cells wide; the colon is one.
+/// One raster pixel of the face, in logical pixels. Four keeps a 3 × 5 digit
+/// legible at arm's length on a 1x display while the finished plate still fits
+/// comfortably in the field's top-left corner.
+const CELL: f32 = 4.0;
+/// Digits are three cells wide; the colon and the tenths period are one.
 const DIGIT_WIDTH: usize = 3;
 const COLON_WIDTH: usize = 1;
 /// One clear cell between characters, so the face does not run together.
 const GAP: usize = 1;
+/// The plate's outer frame, in cells; the content sits one more cell inside it.
+const FRAME: usize = 1;
 
 /// A 3 × 5 pixel face per character, top row first. `#` is ink, `.` is clear.
 ///
@@ -42,12 +50,26 @@ const GLYPHS: [(char, [&str; 5]); 12] = [
     ('.', [".", ".", ".", ".", "#"]),
 ];
 
-/// The clock's own ink and its one-cell drop shadow. They are authored here
-/// rather than taken from a guardian's material ramp: the clock belongs to the
-/// duel, not to one encounter, and keeps the same colors on every field.
-const INK: Hsla = hsla(0.0, 0.0, 0.98, 1.0);
-const SHADOW: Hsla = hsla(0.0, 0.0, 0.0, 0.55);
-const NEW_RECORD: Hsla = hsla(0.12, 0.85, 0.68, 1.0);
+/// The clock's own inks. They are authored here rather than taken from a
+/// guardian's material ramp: the clock belongs to the duel, not to one encounter,
+/// and keeps the same colors on every field.
+///
+/// The plate is a dark navy rather than black so it reads as the same warm
+/// palette as the guardians' shadow ink, and its border is one step lighter so
+/// the plate has an edge on both a bright floor and a dark lagoon.
+const PLATE: Hsla = hsla(0.55, 0.30, 0.08, 0.86);
+/// The lit top and left edge of the plate's bevel.
+const PLATE_LIGHT: Hsla = hsla(0.55, 0.22, 0.42, 0.95);
+/// The shaded bottom and right edge, so the plate reads as raised even on the
+/// darkest sanctuary floor.
+const PLATE_DARK: Hsla = hsla(0.58, 0.38, 0.03, 0.95);
+const INK: Hsla = hsla(0.0, 0.0, 1.0, 1.0);
+/// The tenths, one step back so they animate without competing for the eye.
+const TENTHS: Hsla = hsla(0.0, 0.0, 0.72, 1.0);
+const DIGIT_SHADOW: Hsla = hsla(0.0, 0.0, 0.0, 0.65);
+const NEW_RECORD: Hsla = hsla(0.12, 0.90, 0.62, 1.0);
+/// The quiet line under the face, on the plate's dark ground.
+const PACE: Hsla = hsla(0.55, 0.12, 0.78, 1.0);
 
 /// The live run plus the pace to beat, resolved once per frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -103,15 +125,44 @@ pub(super) fn face(arena: &Arena, best_ms: Option<u64>) -> ClockFace {
 
 /// Paints one clock string as merged rectangles on whole pixels.
 ///
-/// Every cell is snapped to the device grid before painting, so the face stays
-/// crisp at fractional scale factors instead of dissolving into grey seams.
-fn paint_time(millis: u64, origin: Point<Pixels>, color: Hsla, window: &mut Window) {
+/// The shadow is painted as its own pass under the entire face rather than cell
+/// by cell: a per-cell shadow at (+1, +1) would land on the bottom-right of the
+/// character before it and close the counters, joining neighbours into a white
+/// smear. One pass keeps the shadow on the outer contour only.
+///
+/// The tenths are drawn in a dimmer ink than minutes and seconds. The eye reads
+/// the steady part of the time first, and the tenths become the part that moves
+/// without pulling attention away from play.
+fn paint_time(millis: u64, origin: Point<Pixels>, color: Hsla, tenths: Hsla, window: &mut Window) {
     let cell = px(CELL);
     let scale = window.scale_factor();
     let snap = |value: Pixels| px((f32::from(value) * scale).round() / scale);
+    let text = format_time(millis);
+    let fraction = text.find('.').unwrap_or(text.len());
+    // First the whole face's shadow, one cell down and right.
     let mut cursor = origin.x;
-    for character in format_time(millis).chars() {
+    for character in text.chars() {
         let (rows, width) = glyph(character);
+        for (row, line) in rows.iter().enumerate() {
+            for (col, mark) in line.bytes().enumerate() {
+                if mark != b'#' {
+                    continue;
+                }
+                let left = snap(cursor + cell * (col as f32 + 1.0));
+                let top = snap(origin.y + cell * (row as f32 + 1.0));
+                window.paint_quad(fill(
+                    Bounds::new(point(left, top), size(cell, cell)),
+                    DIGIT_SHADOW,
+                ));
+            }
+        }
+        cursor += cell * (width + GAP) as f32;
+    }
+    // Then the lit cells, with the fraction dimmed.
+    let mut cursor = origin.x;
+    for (index, character) in text.chars().enumerate() {
+        let (rows, width) = glyph(character);
+        let ink = if index >= fraction { tenths } else { color };
         for (row, line) in rows.iter().enumerate() {
             for (col, mark) in line.bytes().enumerate() {
                 if mark != b'#' {
@@ -119,16 +170,69 @@ fn paint_time(millis: u64, origin: Point<Pixels>, color: Hsla, window: &mut Wind
                 }
                 let left = snap(cursor + cell * col as f32);
                 let top = snap(origin.y + cell * row as f32);
-                window.paint_quad(fill(
-                    Bounds::new(point(left, top), size(cell, cell)),
-                    SHADOW,
-                ));
-                let left = snap(cursor + cell * (col as f32 + 1.0));
-                let top = snap(origin.y + cell * (row as f32 + 1.0));
-                window.paint_quad(fill(Bounds::new(point(left, top), size(cell, cell)), color));
+                window.paint_quad(fill(Bounds::new(point(left, top), size(cell, cell)), ink));
             }
         }
         cursor += cell * (width + GAP) as f32;
+    }
+}
+
+/// Paints the clock's stepped plate and its border across the element it fills.
+///
+/// The corners are cut one cell in, so the plate reads as a pixel HUD panel
+/// rather than a rounded card: the same square-cornered language as the exit
+/// mark, scaled up to hold the face. The plate is painted from the bounds it is
+/// given, so the content inside decides its height — a translated pace line is
+/// never assumed to be a whole number of cells.
+fn paint_plate(bounds: Bounds<Pixels>, window: &mut Window) {
+    let cell = px(CELL);
+    let scale = window.scale_factor();
+    let snap = |value: Pixels| px((f32::from(value) * scale).round() / scale);
+    let cells_w = (f32::from(bounds.size.width) / CELL).ceil().max(4.0) as usize;
+    let cells_h = (f32::from(bounds.size.height) / CELL).ceil().max(4.0) as usize;
+    let right_edge = bounds.origin.x + bounds.size.width;
+    let bottom_edge = bounds.origin.y + bounds.size.height;
+    for row in 0..cells_h {
+        for col in 0..cells_w {
+            // A one-cell notch at each corner, so the plate is stepped rather
+            // than rounded.
+            let near_left = col == 0;
+            let near_right = col + 1 == cells_w;
+            let near_top = row == 0;
+            let near_bottom = row + 1 == cells_h;
+            if (near_left || near_right) && (near_top || near_bottom) {
+                continue;
+            }
+            let left_band = col == 0;
+            let top_band = row == 0;
+            let right_band = col + 1 == cells_w;
+            let bottom_band = row + 1 == cells_h;
+            let ink = if top_band || left_band {
+                PLATE_LIGHT
+            } else if bottom_band || right_band {
+                PLATE_DARK
+            } else {
+                PLATE
+            };
+            let left = snap(bounds.origin.x + cell * col as f32);
+            let top = snap(bounds.origin.y + cell * row as f32);
+            // The last column and row take the remainder, so a fractional plate
+            // still covers its own element exactly.
+            let right = if right_band {
+                snap(right_edge)
+            } else {
+                snap(bounds.origin.x + cell * (col + 1) as f32)
+            };
+            let bottom = if bottom_band {
+                snap(bottom_edge)
+            } else {
+                snap(bounds.origin.y + cell * (row + 1) as f32)
+            };
+            window.paint_quad(fill(
+                Bounds::new(point(left, top), size(right - left, bottom - top)),
+                ink,
+            ));
+        }
     }
 }
 
@@ -182,8 +286,13 @@ fn pace_copy(best_ms: Option<u64>, new_record: bool) -> String {
     }
 }
 
-/// The duel's clock overlay: a small pixel face in the top-left corner of the
-/// field, with the pace to beat on a quiet line beneath it.
+/// The duel's clock overlay: a pixel HUD plate in the top-left corner of the
+/// field, carrying the live run and the pace to beat.
+///
+/// The plate guarantees contrast on every sanctuary — the ivory digits never sit
+/// directly on a bright stone floor. It is still small enough to leave play
+/// visible, and the field's own overlays (the hint line, the exit mark) keep
+/// their corners.
 ///
 /// The overlay never takes an arrow or a click from the field. Its numbers are
 /// exposed as one accessible label, so a reader who cannot see the face still
@@ -194,49 +303,77 @@ pub(super) fn clock_overlay(face: ClockFace, opacity: f32, cx: &mut App) -> AnyE
     let is_record = face.improved();
     let pace = pace_copy(record, is_record);
     let label = format!("{live} · {pace}");
-    let width = face_width(face.elapsed_ms);
+    let face_width = face_width(face.elapsed_ms);
     let color = if is_record { NEW_RECORD } else { INK };
-    let mono = cx.theme().mono_font_family.clone();
-    let pace_color = if is_record {
+    let tenths = if is_record {
         NEW_RECORD
     } else {
-        cx.theme().muted_foreground
+        TENTHS.opacity(0.85)
     };
+    let pace_color = if is_record { NEW_RECORD } else { PACE };
+    let mono = cx.theme().mono_font_family.clone();
+    // Two frame cells: the bevelled border and the plate's inner padding. The
+    // padding is a full two cells on each side, so the plate stays symmetric
+    // around a face whose last character has no trailing gap.
+    let inset = px(CELL * (FRAME + 1) as f32);
     div()
         .id("unbound-clock")
         .debug_selector(|| "unbound-clock".into())
         .absolute()
         .top_3()
         .left_3()
-        .flex()
-        .flex_col()
-        .items_start()
-        .gap_1()
         .opacity(opacity)
         .aria_label(label)
         .child(
             div()
-                .id("unbound-clock-face")
-                .debug_selector(|| "unbound-clock-face".into())
-                .w(width + px(CELL))
-                .h(px(CELL * 5.0 + CELL))
+                .id("unbound-clock-plate")
+                .debug_selector(|| "unbound-clock-plate".into())
+                .relative()
+                .px(inset)
+                .pt(inset)
+                .pb(px(CELL * (FRAME + 1) as f32))
                 .child(
                     canvas(
                         |_, _, _| (),
-                        move |bounds, _, window, _| {
-                            paint_time(face.elapsed_ms, bounds.origin, color, window);
-                        },
+                        |bounds, _, window, _| paint_plate(bounds, window),
                     )
+                    .absolute()
+                    .inset_0()
                     .size_full(),
+                )
+                .child(
+                    div()
+                        .id("unbound-clock-face")
+                        .debug_selector(|| "unbound-clock-face".into())
+                        .relative()
+                        .w(face_width + px(CELL))
+                        .h(px(CELL * 5.0 + CELL))
+                        .child(
+                            canvas(
+                                |_, _, _| (),
+                                move |bounds, _, window, _| {
+                                    paint_time(
+                                        face.elapsed_ms,
+                                        bounds.origin,
+                                        color,
+                                        tenths,
+                                        window,
+                                    );
+                                },
+                            )
+                            .size_full(),
+                        ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "unbound-clock-best".into())
+                        .relative()
+                        .mt(px(CELL))
+                        .font_family(mono)
+                        .text_size(px(12.0))
+                        .text_color(pace_color)
+                        .child(pace),
                 ),
-        )
-        .child(
-            div()
-                .debug_selector(|| "unbound-clock-best".into())
-                .font_family(mono)
-                .text_size(px(10.0))
-                .text_color(pace_color)
-                .child(pace),
         )
         .into_any_element()
 }
@@ -302,6 +439,27 @@ mod tests {
         // While the run is live, the stored pace is the target.
         assert_eq!(face(4_000, Some(9_500), false).record_ms(), Some(9_500));
         assert!(!face(4_000, Some(9_500), false).improved());
+    }
+
+    /// The face has to be readable without a screenshot, and the plate has to
+    /// be large enough to frame it: a one-cell cell, a zero-size plate, or a
+    /// plate narrower than its face is the failure this pins.
+    #[test]
+    fn the_face_is_large_enough_to_read_and_its_plate_frames_it() {
+        assert!(
+            CELL >= 4.0,
+            "a 3x5 digit needs at least four logical pixels"
+        );
+        let face = face_width(61_500);
+        assert!(
+            f32::from(face) >= 13.0 * CELL,
+            "the mm:ss.t row keeps every one of its cells"
+        );
+        // What the element reserves around the face: the bevelled frame plus one
+        // padding cell on each side, so the plate is strictly larger.
+        let inset = CELL * (FRAME + 1) as f32;
+        assert!(f32::from(face) + 2.0 * inset > f32::from(face));
+        assert!(inset >= 2.0 * CELL, "the border and padding are both drawn");
     }
 
     #[test]

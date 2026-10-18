@@ -158,10 +158,21 @@ Geometry::world(Point<Pixels>) -> Option<Vec2>
   win's time and the workbench persists it, so the next duel opens with it.
 - The clock face is authored raster content, not a font: a 3 × 5 cell face per
   digit, a one-cell colon, and a one-cell period for the tenths, painted as
-  merged rectangles on whole pixels with a one-cell drop shadow
-  (`clock::clock_overlay`). It is pointer-transparent and never takes an aim
-  from the field. Its numbers are exposed as one accessible label. It fades
-  with the field's reveal so it cannot outlive the encounter.
+  merged rectangles on whole pixels (`clock::clock_overlay`). The face sits on a
+  stepped, bevelled pixel plate — dark navy ground, one lit edge and one shaded
+  edge, corners notched by one cell — so ivory digits never land directly on a
+  bright stone floor. The plate is drawn as cells from the bounds it is given,
+  not from an assumed height, so a localized pace line of any length still has
+  its ground and its frame.
+- Contrast and legibility rules for the face: the cell is large enough
+  (`clock::CELL`) that a 3 × 5 digit reads at arm's length; the drop shadow is
+  painted as one pass under the whole face, never cell by cell, because a
+  per-cell offset shadow closes counters and joins neighbours into a smear; the
+  tenths are drawn in a dimmer ink than minutes and seconds so the steady part
+  of the time reads first while the tenths still animate. The overlay is
+  pointer-transparent and never takes an aim from the field, exposes its numbers
+  as one accessible label, and fades with the field's reveal so it cannot
+  outlive the encounter.
 - The workbench owns the record. It reads `ArenaUiState::best_time` when it
   syncs the home Agent (`select_agent(id, best_ms)`) and when it renders a
   session composer's lane, and hands the value down; the arena never reads UI
@@ -419,7 +430,9 @@ rebirth, without a damage override.
   the format can emit, the reserved row matching the painted digits, and the
   run clock freezing on the victory it records. GPUI tests retain the clock's
   top-left placement away from the exit mark, the winning run becoming the pace
-  to beat, and a slower replay keeping a faster record.
+  to beat, a slower replay keeping a faster record, and the face staying large
+  enough to read: pin the cell size and assert the plate is wider and taller
+  than the face it frames.
 - Run `cargo test -p vibex-desktop --lib arena:: --locked`,
   `cargo test -p vibex-desktop-model --locked`, formatting, and scoped Clippy.
   Measure dynamic rasterization and rectangle counts after artwork changes;
