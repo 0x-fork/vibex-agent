@@ -312,3 +312,26 @@ pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeKey<'caller>(
         })
         .resolve::<jni::errors::LogErrorAndDefault>();
 }
+
+/// Forwards one phase of the system's back gesture.
+///
+/// Gesture navigation owns the screen's side strips, so a swipe there never
+/// reaches the app as a touch; the activity's back callback is what carries it,
+/// and the edge and progress are what let the matching side page be pulled out
+/// under the finger. The numeric contract is fixed by
+/// [`crate::back_gesture`], which also clamps what the platform reports.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_vibex_mobile_GpuiHostActivity_nativeBackGesture<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    phase: jint,
+    edge: jint,
+    progress: jfloat,
+) {
+    unowned_env
+        .with_env(|_| -> jni::errors::Result<()> {
+            platform::notify_back_gesture(phase, edge, progress);
+            Ok(())
+        })
+        .resolve::<jni::errors::LogErrorAndDefault>();
+}

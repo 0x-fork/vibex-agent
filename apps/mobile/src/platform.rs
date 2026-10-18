@@ -279,21 +279,23 @@ pub fn long_press_feedback() {
 /// cannot see is noise, and the system's own notification is the signal that
 /// belongs there.
 pub fn haptic(kind: Haptic) {
-    if !plays(haptics_enabled(), crate::lifecycle::is_backgrounded()) {
-        return;
-    }
     // A burst of the same pattern is one event seen several times — a hint
     // pushed from a batch of events, a state that settles over two frames.
     // Distinct patterns still play back to back, which is what lets one action
     // be followed by its notice.
-    if repeats_within_window(kind) {
-        return;
-    }
-    #[cfg(test)]
-    FEEDBACKS.with(|count| count.set(count.get() + 1));
-    #[cfg(any(target_os = "android", target_os = "ios"))]
+    //
+    // Both refusals are one condition rather than two early returns: on a host
+    // build every line below is compiled out, so a trailing `return` would be
+    // the whole body the lint sees, and the second guard must still not run
+    // when the first one refuses — short-circuiting keeps that.
+    if plays(haptics_enabled(), crate::lifecycle::is_backgrounded()) && !repeats_within_window(kind)
     {
-        let _ = gpui_mobile::packages::vibration::haptic_feedback(platform_pattern(kind));
+        #[cfg(test)]
+        FEEDBACKS.with(|count| count.set(count.get() + 1));
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            let _ = gpui_mobile::packages::vibration::haptic_feedback(platform_pattern(kind));
+        }
     }
 }
 
@@ -393,6 +395,16 @@ impl WindowInsetsExt for Window {
 /// the Activity's `onResume`/`onPause`.
 pub fn notify_lifecycle(phase: gpui::AppLifecyclePhase) {
     crate::lifecycle::notify(phase);
+}
+
+/// Forward one phase of the system's back gesture to the subscribers.
+///
+/// The Android activity reports the phases its `OnBackInvokedCallback` /
+/// `OnBackAnimationCallback` receives; the edge and progress it carries are
+/// what let a swipe from a side strip pull the matching page out (see
+/// [`crate::back_gesture`]).
+pub fn notify_back_gesture(phase: i32, edge: i32, progress: f32) {
+    crate::back_gesture::notify_from_host(phase, edge, progress);
 }
 
 /// Installs the platform's logging and panic handling.

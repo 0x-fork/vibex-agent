@@ -44,6 +44,9 @@ import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputConnectionWrapper;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
+import android.window.BackEvent;
+import android.window.OnBackAnimationCallback;
+import android.window.OnBackInvokedDispatcher;
 
 import androidx.core.content.FileProvider;
 import androidx.core.graphics.Insets;
@@ -123,6 +126,15 @@ public final class GpuiHostActivity extends Activity {
      * reports one; this is the floor for the devices that do not.
      */
     private static final int DRAWER_EDGE_DP = 24;
+    /** Phases of the system's back gesture, as {@code nativeBackGesture} numbers them. */
+    private static final int BACK_GESTURE_STARTED = 0;
+    private static final int BACK_GESTURE_PROGRESSED = 1;
+    private static final int BACK_GESTURE_CANCELLED = 2;
+    private static final int BACK_GESTURE_INVOKED = 3;
+    /** Edges {@code BackEvent} reports; anything else is an edge it did not name. */
+    private static final int BACK_GESTURE_EDGE_LEFT = 0;
+    private static final int BACK_GESTURE_EDGE_RIGHT = 1;
+    private static final int BACK_GESTURE_EDGE_UNKNOWN = 2;
     /**
      * The host id every native call carries.
      *
@@ -175,6 +187,12 @@ public final class GpuiHostActivity extends Activity {
     private static native void nativeIme(long session, int kind, String text, int start, int end);
     private static native void nativeTouch(int action, int pointerId, float x, float y);
     private static native void nativeKey(int keyCode, int action, int metaState);
+    /**
+     * One phase of the system's back gesture: its kind, the edge it came from, and
+     * how far it has travelled. The numbers are fixed by the platform layer's own
+     * back-gesture module.
+     */
+    private static native void nativeBackGesture(int phase, int edge, float progress);
     private static native void nativeOnLanDiscoveryEvent(String payload);
     private static native void nativeOnNotificationActivated(
             String notificationId, String opaqueLocator);
@@ -229,11 +247,78 @@ public final class GpuiHostActivity extends Activity {
             return insets;
         });
 
+        registerBackGesture();
+
         createAgentNotificationChannel();
         createUpdateNotificationChannel();
         handleNotificationIntent(getIntent());
         handleIncomingIntent(getIntent());
         nativeStart(this, getFilesDir().getAbsolutePath());
+    }
+
+    /**
+     * Hands the system's back gesture to the app, one phase at a time.
+     *
+     * <p>Gesture navigation owns the screen's side strips: a swipe from an edge
+     * belongs to the system from its first pixel, so the page underneath never
+     * receives the touch and a side page cannot be dragged out by a touch pan
+     * there. The gesture itself is the app's, and Android 14 and up reports
+     * which edge the finger came from and how far it has travelled, which is
+     * what lets the matching side page be pulled out under the finger. Below
+     * Android 14 the callback carries neither edge nor progress, so a gesture
+     * there is only ever the app's ordinary back.
+     */
+    private void registerBackGesture() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            // Older platforms send the back key, which GPUI binds to the app's
+            // own back action, so there is no callback to register.
+            return;
+        }
+        OnBackInvokedDispatcher dispatcher = getOnBackInvokedDispatcher();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            dispatcher.registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                    new OnBackAnimationCallback() {
+                        @Override
+                        public void onBackStarted(BackEvent event) {
+                            nativeBackGesture(BACK_GESTURE_STARTED, backGestureEdge(event), 0f);
+                        }
+
+                        @Override
+                        public void onBackProgressed(BackEvent event) {
+                            nativeBackGesture(BACK_GESTURE_PROGRESSED, backGestureEdge(event),
+                                    event.getProgress());
+                        }
+
+                        @Override
+                        public void onBackCancelled() {
+                            nativeBackGesture(BACK_GESTURE_CANCELLED, BACK_GESTURE_EDGE_UNKNOWN, 0f);
+                        }
+
+                        @Override
+                        public void onBackInvoked() {
+                            // The edge is already known to the app: a gesture
+                            // reported it when it started, and a button never
+                            // had one.
+                            nativeBackGesture(BACK_GESTURE_INVOKED, BACK_GESTURE_EDGE_UNKNOWN, 1f);
+                        }
+                    });
+        } else {
+            dispatcher.registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                    () -> nativeBackGesture(BACK_GESTURE_INVOKED, BACK_GESTURE_EDGE_UNKNOWN, 1f));
+        }
+    }
+
+    /** The edge a back gesture was swiped in from. */
+    private static int backGestureEdge(BackEvent event) {
+        if (event.getSwipeEdge() == BackEvent.EDGE_LEFT) {
+            return BACK_GESTURE_EDGE_LEFT;
+        }
+        if (event.getSwipeEdge() == BackEvent.EDGE_RIGHT) {
+            return BACK_GESTURE_EDGE_RIGHT;
+        }
+        return BACK_GESTURE_EDGE_UNKNOWN;
     }
 
     @Override

@@ -12,6 +12,7 @@ mod android_insets;
 mod app;
 mod assets;
 mod attachment;
+mod back_gesture;
 mod background_connection;
 mod bottom_sheet;
 mod device;

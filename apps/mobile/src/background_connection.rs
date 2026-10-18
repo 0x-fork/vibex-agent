@@ -546,6 +546,66 @@ mod tests {
         );
     }
 
+    /// The system's back gesture is what reaches the side strips, and the edge
+    /// it came from is what chooses the page it pulls out.
+    ///
+    /// Gesture navigation claims an edge swipe from its first pixel, so a pan
+    /// capture never sees it: swallowing the gesture — or forwarding it without
+    /// its edge — leaves both side pages with no swipe at all. The platform
+    /// reporting the phases is only half of it, so the app's own mapping from
+    /// edge to page is part of the contract too.
+    #[test]
+    fn android_back_gesture_edge_chooses_the_page_it_pulls_out() {
+        assert!(
+            ANDROID_MANIFEST.contains("android:enableOnBackInvokedCallback=\"true\""),
+            "the Android app must take the system's back callback"
+        );
+        assert!(
+            ANDROID_ACTIVITY.contains("registerOnBackInvokedCallback"),
+            "the Android host must register a back callback"
+        );
+        for marker in [
+            // The edge and the distance travelled are what make the page follow
+            // the finger; the callback for API 34 and up is the only source of
+            // either.
+            "OnBackAnimationCallback",
+            "getSwipeEdge()",
+            "getProgress()",
+            "nativeBackGesture",
+        ] {
+            assert!(
+                ANDROID_ACTIVITY.contains(marker),
+                "the Android back callback must report {marker}"
+            );
+        }
+        assert!(
+            !ANDROID_ACTIVITY.contains("finish()")
+                && !ANDROID_ACTIVITY.contains("gpuiBackgroundApp")
+                && !ANDROID_ACTIVITY.contains("moveTaskToBack"),
+            "the back callback must not leave the app: the app's own back runs instead"
+        );
+        let back_gesture_source = include_str!("back_gesture.rs");
+        assert!(
+            back_gesture_source.contains("pub fn notify_from_host"),
+            "the platform layer must publish what the callback reports"
+        );
+        let app_source = include_str!("app.rs");
+        assert!(
+            app_source.contains("BackGestureEdge::Left => Some(DrawerPage::Sessions)"),
+            "a back gesture from the left edge must pull out the sessions page"
+        );
+        assert!(
+            app_source.contains("BackGestureEdge::Right => Some(DrawerPage::Workbench)"),
+            "a back gesture from the right edge must pull out the workbench page"
+        );
+        // The gesture moves the pages it pulls; a page that only appeared once
+        // the finger had already lifted is the thing this replaced.
+        assert!(
+            app_source.contains("self.drawer_offset = page.open_offset() * progress;"),
+            "the page must follow the gesture's progress"
+        );
+    }
+
     #[test]
     fn android_battery_allowlist_guidance_contract_is_complete() {
         let power_source = include_str!("power.rs");

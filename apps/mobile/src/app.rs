@@ -1391,6 +1391,7 @@ struct PlatformEventStreams {
     update_actions: UnboundedReceiver<update::UpdateAction>,
     lan_discovery_events: UnboundedReceiver<LanDiscoveryEvent>,
     lifecycle_events: UnboundedReceiver<MobileLifecycleEvent>,
+    back_gestures: UnboundedReceiver<crate::back_gesture::BackGestureEvent>,
     launch_shortcuts: UnboundedReceiver<crate::shortcut::LaunchShortcut>,
 }
 
@@ -1403,6 +1404,7 @@ impl PlatformEventStreams {
             update_actions: update::subscribe_actions(),
             lan_discovery_events: crate::discovery::subscribe(),
             lifecycle_events: crate::lifecycle::subscribe(),
+            back_gestures: crate::back_gesture::subscribe(),
             launch_shortcuts: crate::shortcut::subscribe(),
         }
     }
@@ -1416,6 +1418,7 @@ impl PlatformEventStreams {
             update_actions: futures_channel::mpsc::unbounded().1,
             lan_discovery_events: futures_channel::mpsc::unbounded().1,
             lifecycle_events: futures_channel::mpsc::unbounded().1,
+            back_gestures: futures_channel::mpsc::unbounded().1,
             launch_shortcuts: futures_channel::mpsc::unbounded().1,
         }
     }
@@ -1633,6 +1636,15 @@ pub struct MobileApp {
     /// owner: left unclaimed it scrolls whichever list the drawer just
     /// revealed — a leftward swipe always drags a vertical list up.
     drawer_fling_owned: bool,
+    /// The side page the system's own back gesture is pulling out, while its
+    /// finger is on the edge strip the app never sees a touch from.
+    ///
+    /// The system owns that strip, so this drag arrives as back-gesture phases
+    /// rather than pan events; the page here is what those phases move, and it
+    /// is `None` for a back that is not pulling a page out — a button, a
+    /// version whose callback reports no edge, or a gesture with something else
+    /// for back to close.
+    back_gesture_page: Option<DrawerPage>,
     /// The finger pan currently travelling over a page that was opened on top of
     /// another one, and how far it has moved. A rightward swipe that clears the
     /// back gesture's own travel leaves that page, exactly as the system back
@@ -1900,8 +1912,11 @@ pub struct MobileApp {
     /// filters as the user types.
     runtime_sheet_search_subscription: Option<gpui::Subscription>,
     /// Desktop agent snapshots keyed by id, providing the labels the desktop
-    /// uses for brand lookup and the `order_index` ordering its menus show.
+    /// uses for brand lookup.
     runtime_agent_labels: BTreeMap<AgentId, String>,
+    /// The snapshots' own order, `order_index` first. The strip prefers the
+    /// catalogue's published list — the one the desktop's Agent settings show —
+    /// and falls back to this for a runtime that publishes none.
     runtime_agent_order: Vec<AgentId>,
     /// Keeps the selected Agent logo inside the strip's viewport whenever the
     /// selection or the strip contents change.
@@ -3809,6 +3824,7 @@ impl MobileApp {
             sheet_task: None,
             drawer_pan_last_at: None,
             drawer_fling_owned: false,
+            back_gesture_page: None,
             overlay_swipe: None,
             expanded_process: BTreeMap::new(),
             expanded_timeline_rows: BTreeSet::new(),
@@ -4036,6 +4052,7 @@ impl MobileApp {
         app.start_notification_action_stream(events.notification_actions, cx);
         app.start_lan_discovery_event_stream(events.lan_discovery_events, cx);
         app.start_lifecycle_stream(events.lifecycle_events, cx);
+        app.start_back_gesture_stream(events.back_gestures, cx);
         app.start_launch_shortcut_stream(events.launch_shortcuts, cx);
         if updates_enabled {
             app.start_update_streams(events.update_actions, cx);
@@ -4117,6 +4134,112 @@ impl MobileApp {
                 self.wait_for_resume_recovery(backend, cx);
             }
         }
+    }
+
+    /// Follows the system's own back gesture.
+    ///
+    /// Gesture navigation owns the screen's side strips: a swipe there is the
+    /// system's from its first pixel, so the page underneath never sees the
+    /// touch and the pan capture in `scroll_capture` cannot pull a side page
+    /// out. The gesture itself is the app's — through the platform's back
+    /// callback — and Android 14 and up reports which edge it came from and how
+    /// far it has travelled, which is all a side page needs to follow the
+    /// finger. Below that the callback carries no edge, so nothing is pulled
+    /// and every phase is the app's ordinary back.
+    fn start_back_gesture_stream(
+        &mut self,
+        mut events: UnboundedReceiver<crate::back_gesture::BackGestureEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            while let Some(event) = events.next().await {
+                if !run_back_gesture_phase(&entity, event, cx) {
+                    break;
+                }
+            }
+        });
+        self.tasks.push(task);
+    }
+
+    fn handle_back_gesture_event(
+        &mut self,
+        event: crate::back_gesture::BackGestureEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::back_gesture::BackGestureEvent;
+        match event {
+            BackGestureEvent::Started { edge } => {
+                self.back_gesture_page = None;
+                let Some(page) = back_gesture_drawer(edge) else {
+                    return;
+                };
+                if !self.back_gesture_can_pull_a_page() {
+                    return;
+                }
+                // The page starts where the finger is: the system reports the
+                // gesture from its first recognized pixel, so the panel is out
+                // by whatever the platform has already counted.
+                self.back_gesture_page = Some(page);
+                self.drawer_offset = 0.0;
+                cx.notify();
+            }
+            BackGestureEvent::Progressed { progress, .. } => {
+                let Some(page) = self.back_gesture_page else {
+                    return;
+                };
+                self.drawer_offset = page.open_offset() * progress;
+                cx.notify();
+            }
+            BackGestureEvent::Cancelled => {
+                // Nothing was pulled, so there is nothing to give back: a
+                // button press and a version without the animation callback
+                // both arrive here with no page of their own.
+                if self.back_gesture_page.take().is_none() {
+                    return;
+                }
+                self.start_drawer_snap(0.0, Some(window), cx);
+            }
+            BackGestureEvent::Invoked => {
+                let Some(page) = self.back_gesture_page.take() else {
+                    self.handle_navigate_back(&NavigateBack, window, cx);
+                    return;
+                };
+                self.start_drawer_snap(page.open_offset(), Some(window), cx);
+            }
+        }
+    }
+
+    /// Whether a back gesture from a side strip has a page to pull out.
+    ///
+    /// A page is only pulled when the workspace's own page is what the reader
+    /// is looking at: anything back would close first — a sheet, an overlay, a
+    /// drawer that is already open, a prompt — keeps the gesture as a back, so
+    /// the finger that meant "close this" never opens something else. The check
+    /// is deliberately wider than [`Self::handle_navigate_back`] runs to: a
+    /// gesture that opens a page where back would have closed one is the one
+    /// mistake the reader cannot undo by swiping again.
+    fn back_gesture_can_pull_a_page(&mut self) -> bool {
+        if self.mode != RootMode::Workspace
+            || self.overlay.is_some()
+            || self.pairing_panel != PairingPanel::None
+            || self.drawer_open
+            || self.workbench_open
+            || self.drawer_snap.is_some()
+            || self.sheet.is_up()
+            || self.session_action.is_some()
+            || self.runtime_options_open
+            || self.runtime_option_page.is_some()
+            || self.group_members_editor.is_some()
+            || self.project_remove_confirmation.is_some()
+            || self.composer_attach_menu_open
+            || self.timeline_file_diff.is_some()
+            || self.new_session_picker.is_some()
+        {
+            return false;
+        }
+        self.sync_back_stack_with_ui();
+        self.back_stack.is_empty()
     }
 
     /// Waits out a resume whose transport is still trying to get back.
@@ -6067,9 +6190,10 @@ impl MobileApp {
     }
 
     /// Pulls the desktop's agent snapshots so the runtime sheet's Agent strip
-    /// orders its logos exactly like the desktop menus (`order_index`, then
-    /// label, then id) and can borrow the same display labels for brand
-    /// lookup. Unknown Agents fall back to catalog order with the id as label.
+    /// can borrow the same display labels for brand lookup and keeps an order
+    /// of its own (`order_index`, then label, then id) for a runtime whose
+    /// catalogue publishes no Agent list. Unknown Agents fall back to catalog
+    /// order with the id as label.
     fn refresh_runtime_agents(&mut self, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
@@ -10572,10 +10696,12 @@ impl MobileApp {
         }
     }
 
-    /// The Android back key/gesture: close the topmost screen and keep the app
-    /// in the foreground. An empty stack leaves the page exactly as it is — the
-    /// root has no back behaviour, because the system's back gesture is the same
-    /// rightward swipe the sessions drawer is dragged open with.
+    /// The Android back action: close the topmost screen and keep the app in
+    /// the foreground. An empty stack leaves the page exactly as it is — the
+    /// root has no back behaviour of its own, because the system's back
+    /// *gesture* is also how a side page is pulled out (see
+    /// [`Self::handle_back_gesture_event`]), and leaving the app on it would
+    /// turn a swipe meant for a side page into an exit.
     fn handle_navigate_back(
         &mut self,
         _: &NavigateBack,
@@ -12824,6 +12950,7 @@ impl MobileApp {
         self.drawer_snap = None;
         self.drawer_snap_task = None;
         self.drawer_fling_owned = false;
+        self.back_gesture_page = None;
         Self::remove_back_screens(&mut self.back_stack, |screen| {
             matches!(
                 screen,
@@ -18695,9 +18822,15 @@ impl MobileApp {
     }
 
     /// The strip's tabs in display order: catalog-available Agents labelled
-    /// with the desktop's snapshots, ordered like the desktop runtime menus
-    /// (`order_index`, then label, then id). A snapshot that has not landed
-    /// yet falls back to the label ordering.
+    /// with the desktop's snapshots, ordered the way the desktop lists them.
+    ///
+    /// That order arrives with the catalogue rather than being worked out here:
+    /// `agents` is the Desktop's own Agent list — its sort strategy, any manual
+    /// drag, and the usage it counts — which is the same list the desktop's
+    /// Agent settings show, so the strip reads it instead of inventing an order
+    /// of its own. An Agent the catalogue does not name (a runtime too old to
+    /// publish that list) keeps the snapshots' own ordering: `order_index`,
+    /// then label, then id, which is the label ordering until a snapshot lands.
     fn runtime_agent_strip_agents(
         &self,
         catalog: Option<&SessionRuntimeOptionCatalog>,
@@ -18722,18 +18855,22 @@ impl MobileApp {
             agents.push((agent_id.clone(), label));
         }
         agents.sort_by(|(left_id, left_label), (right_id, right_label)| {
-            let left_rank = self
-                .runtime_agent_order
-                .iter()
-                .position(|id| id == left_id)
-                .unwrap_or(usize::MAX);
-            let right_rank = self
-                .runtime_agent_order
-                .iter()
-                .position(|id| id == right_id)
-                .unwrap_or(usize::MAX);
-            left_rank
-                .cmp(&right_rank)
+            let listed = |agent_id: &AgentId| {
+                catalog
+                    .agents
+                    .iter()
+                    .position(|summary| &summary.agent_id == agent_id)
+                    .unwrap_or(usize::MAX)
+            };
+            let rank = |agent_id: &AgentId| {
+                self.runtime_agent_order
+                    .iter()
+                    .position(|id| id == agent_id)
+                    .unwrap_or(usize::MAX)
+            };
+            listed(left_id)
+                .cmp(&listed(right_id))
+                .then_with(|| rank(left_id).cmp(&rank(right_id)))
                 .then_with(|| left_label.cmp(right_label))
                 .then_with(|| left_id.cmp(right_id))
         });
@@ -30946,6 +31083,48 @@ fn sessions_button_target(drawer_open: bool) -> f32 {
         0.0
     } else {
         DrawerPage::Sessions.open_offset()
+    }
+}
+
+/// Drives one phase of the system's back gesture into the app.
+///
+/// The stream has no window of its own, and a page a finger is pulling needs
+/// one to snap it once the finger lifts, so the phase goes in through the root
+/// window the app recorded when it was built — the same window the gesture,
+/// being the system's, would otherwise never touch. Returns whether the app is
+/// still there, which is what ends the stream.
+fn run_back_gesture_phase(
+    entity: &WeakEntity<MobileApp>,
+    event: crate::back_gesture::BackGestureEvent,
+    cx: &mut gpui::AsyncApp,
+) -> bool {
+    let Ok(handle) = entity.update(cx, |this, _| this.window_handle) else {
+        return false;
+    };
+    // The window is entered before the entity is updated: re-entering the app
+    // from inside its own update panics, and a phase can arrive before any
+    // paint has borrowed either.
+    cx.update_window(handle, |_, window, cx| {
+        entity
+            .update(cx, |this, cx| {
+                this.handle_back_gesture_event(event, window, cx);
+            })
+            .is_ok()
+    })
+    .unwrap_or(false)
+}
+
+/// The side page a back gesture from `edge` pulls out.
+///
+/// The phone's own back gesture is the only way to reach the edge strips, so
+/// the finger's edge is what chooses between the two pages; an edge the
+/// platform could not name — a back button, or a version whose callback reports
+/// neither edge nor progress — chooses neither and leaves back as it was.
+fn back_gesture_drawer(edge: crate::back_gesture::BackGestureEdge) -> Option<DrawerPage> {
+    match edge {
+        crate::back_gesture::BackGestureEdge::Left => Some(DrawerPage::Sessions),
+        crate::back_gesture::BackGestureEdge::Right => Some(DrawerPage::Workbench),
+        crate::back_gesture::BackGestureEdge::Unknown => None,
     }
 }
 

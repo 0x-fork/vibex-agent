@@ -17,11 +17,16 @@
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
-    <!-- The app navigates back inside GPUI, so it keeps receiving the back key
-         instead of opting into the system's onBackInvokedCallback. -->
+    <!-- The app navigates back inside GPUI, so it takes the system's back
+         callback rather than letting the platform finish the activity. That
+         callback is also the only place the app is told which screen edge a
+         back gesture came from: gesture navigation owns the side strips, so a
+         swipe there never reaches a page as a touch, and the edge is what pulls
+         the matching side page out. Below Android 13 the back key keeps
+         arriving instead, and the app's own binding answers it. -->
     <application
         android:allowBackup="false"
-        android:enableOnBackInvokedCallback="false"
+        android:enableOnBackInvokedCallback="true"
         android:icon="@mipmap/ic_launcher"
         android:label="Vibex"
         android:roundIcon="@mipmap/ic_launcher"

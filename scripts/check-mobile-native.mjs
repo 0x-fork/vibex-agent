@@ -180,9 +180,19 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
 
   assert(android.includes('android:name=".GpuiHostActivity"'), "android_gpui_activity_missing");
   assert(android.includes('android:windowSoftInputMode="adjustResize"'), "android_keyboard_resize_missing");
+  // The system's back callback is the only place the app is told which edge a
+  // back gesture was swiped from, so losing it costs the side pages their swipe
+  // along with the app's own back handling.
   assert(
-    android.includes('android:enableOnBackInvokedCallback="false"'),
-    "android_back_navigation_legacy_callback_missing"
+    android.includes('android:enableOnBackInvokedCallback="true"'),
+    "android_back_navigation_callback_missing"
+  );
+  assert(androidActivity.includes("registerOnBackInvokedCallback"), "android_back_gesture_callback_missing");
+  assert(androidActivity.includes("OnBackAnimationCallback"), "android_back_gesture_progress_missing");
+  assert(androidActivity.includes("getSwipeEdge()"), "android_back_gesture_edge_missing");
+  assert(
+    androidActivity.includes("nativeBackGesture"),
+    "android_back_gesture_bridge_missing"
   );
   assert(!android.includes('android:hasCode="false"'), "android_java_host_disabled");
   assert(!android.includes("WebView"), "android_webview_host_present");
