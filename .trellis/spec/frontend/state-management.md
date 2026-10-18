@@ -2364,6 +2364,17 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   A manual stop of an auto-continue countdown or continuation turn also writes
   a session-level disabled override; the project default must not re-enable
   automatic continuation until the user explicitly enables it again.
+  A turn verdict is keyed to the session revision it judges, and only a verdict
+  may settle one: a completion probe answer that carries no verdict may neither
+  displace a cached verdict for the same revision nor cancel the probe still
+  running for it. A timeline load is the ordinary source of an unjudged answer —
+  its page is cut to a turn window and routinely ends mid-turn — so the load
+  paths reconcile through that same cache rather than dropping the probe
+  themselves. Cancelling the only outstanding probe while its attempt stayed
+  recorded made the sync report an answer as on its way when nothing was
+  coming, which left the selected session's restored unfinished turn without a
+  countdown on startup; unselected sessions were unaffected because only the
+  selected one loads a timeline at launch.
 - Claude/Codex JSONL support in this surface is offline import only. Adding the
   offline import crates must not introduce a Native online runtime route or
   provider-specific timeline rendering.

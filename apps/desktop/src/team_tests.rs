@@ -3003,6 +3003,121 @@ fn a_loaded_page_caches_the_normal_completion_it_can_see() {
     assert_eq!(authoritative_loaded_turn_status(&items), Some(true));
 }
 
+/// A page that ends mid-turn leaves the answer and the reader alone.
+///
+/// The selected session is loaded as soon as the desktop starts, and that read
+/// is what an unfinished restored turn reaches first. The page it returns
+/// routinely ends mid-turn, so it carries no verdict. Caching that reading used
+/// to overwrite the verdict a probe had already supplied for the same revision
+/// and cancel the probe still running for it — after recording the attempt, so
+/// the sync believed an answer was on its way while nothing was coming. The
+/// countdown was therefore missing for exactly the session the reader had
+/// selected, and only appeared after a reselect loaded the page once more.
+#[gpui::test]
+fn a_loaded_page_with_no_verdict_keeps_the_verdict_and_the_probe(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    cx.update(|_, cx| {
+        workbench.update(cx, |workbench, cx| {
+            let session_id = session(0).id.clone();
+            let revision = session(0).updated_at_ms;
+            // The authority already judged the revision, and a probe for it is
+            // still running: a load that cannot judge it may not displace
+            // either.
+            workbench.cache_auto_continue_turn_status(&session_id, revision, Some(false), cx);
+            workbench.auto_continue_probe_tasks.insert(
+                session_id.to_string(),
+                AutoContinueProbeTask {
+                    session_updated_at_ms: revision,
+                    _task: cx.spawn(async move |_, _| std::future::pending::<()>().await),
+                },
+            );
+            assert!(
+                !workbench.cache_auto_continue_turn_status(&session_id, revision, None, cx),
+                "an unjudged reading changes nothing"
+            );
+            assert_eq!(
+                workbench
+                    .cached_auto_continue_turn_status(&session_id, revision)
+                    .map(|status| status.ended_normally),
+                Some(Some(false)),
+                "a page without a verdict may not erase the one the probe gave"
+            );
+            assert!(
+                workbench
+                    .auto_continue_probe_tasks
+                    .contains_key(session_id.as_str()),
+                "the probe is the only reader left that can judge the revision"
+            );
+
+            // A verdict still settles the revision and retires that probe.
+            assert!(workbench.cache_auto_continue_turn_status(
+                &session_id,
+                revision,
+                Some(true),
+                cx
+            ));
+            assert_eq!(
+                workbench
+                    .cached_auto_continue_turn_status(&session_id, revision)
+                    .map(|status| status.ended_normally),
+                Some(Some(true))
+            );
+            assert!(
+                !workbench
+                    .auto_continue_probe_tasks
+                    .contains_key(session_id.as_str()),
+                "a settled revision needs no further probe"
+            );
+        });
+    });
+}
+
+/// An unjudged load answer does not strand the countdown of an enabled session.
+///
+/// This is the reported shape end to end: the session is enabled, its restored
+/// turn is unfinished, and the load answers for the current revision with no
+/// verdict. The countdown must not be cancelled by that answer, and the probe
+/// whose result would start it must not be cancelled with it.
+#[gpui::test]
+fn an_unjudged_load_answer_leaves_an_enabled_session_counting(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    cx.update(|_, cx| {
+        workbench.update(cx, |workbench, cx| {
+            let session_id = session(0).id.clone();
+            let revision = session(0).updated_at_ms;
+            workbench
+                .auto_continue_session_ids
+                .insert(session_id.to_string());
+            // A probe was asked for the revision and is waiting on the
+            // authority; meanwhile the startup load answers without a verdict.
+            workbench.auto_continue_probe_tasks.insert(
+                session_id.to_string(),
+                AutoContinueProbeTask {
+                    session_updated_at_ms: revision,
+                    _task: cx.spawn(async move |_, _| std::future::pending::<()>().await),
+                },
+            );
+            workbench.record_auto_continue_probe_attempt(&session_id, revision);
+            workbench.cache_auto_continue_turn_status(&session_id, revision, None, cx);
+            assert!(
+                workbench
+                    .auto_continue_probe_tasks
+                    .contains_key(session_id.as_str()),
+                "the answer that would start the countdown is still on its way"
+            );
+            // The probe answering normally settles the same revision, which is
+            // what starts the countdown.
+            workbench.cache_auto_continue_turn_status(&session_id, revision, Some(false), cx);
+            assert!(
+                workbench
+                    .auto_continue_countdowns
+                    .contains_key(session_id.as_str()),
+                "the restored unfinished turn counts down once it is judged"
+            );
+        });
+    });
+}
+
 /// An authoritative whole-list read wakes a queue waiting on a settled row.
 ///
 /// A client that draws the sidebar projection never sees the per-session

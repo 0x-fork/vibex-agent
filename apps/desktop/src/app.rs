@@ -16371,23 +16371,48 @@ impl VibexWorkbench {
             self.mark_composer_queue_for_recheck(session_id);
             return false;
         }
-        let changed = self
-            .auto_continue_turn_statuses
-            .insert(
-                session_id.as_str().to_string(),
-                AutoContinueTurnStatus {
-                    session_updated_at_ms,
-                    ended_normally,
-                },
-            )
-            .is_none_or(|previous| {
-                previous.session_updated_at_ms != session_updated_at_ms
-                    || previous.ended_normally != ended_normally
-            });
-        if self
-            .auto_continue_probe_tasks
-            .get(session_id.as_str())
-            .is_some_and(|probe| probe.session_updated_at_ms == session_updated_at_ms)
+        // Only a verdict may displace a verdict, and only a verdict may make
+        // the probe still running for this revision redundant. An answer with
+        // no verdict has to leave both alone. A load whose turn-window page
+        // ends mid-turn is the ordinary source of such an answer, and erasing a
+        // probe there canceled the one reader that could still judge the
+        // revision after its attempt had been recorded — the sync below then
+        // reported an answer as on its way while nothing was coming, so an
+        // enabled session restored onto an unfinished turn waited for an event
+        // that never arrived. Reselecting the session looked like a fix only
+        // because its next load ran before the next probe did.
+        let judged_revision = ended_normally.is_some();
+        let keeps_cached_verdict = !judged_revision
+            && self
+                .auto_continue_turn_statuses
+                .get(session_id.as_str())
+                .is_some_and(|status| {
+                    status.session_updated_at_ms == session_updated_at_ms
+                        && status.ended_normally.is_some()
+                });
+        let changed = if keeps_cached_verdict {
+            // The verdict already cached for this revision stands, and the sync
+            // below still runs against it.
+            false
+        } else {
+            self.auto_continue_turn_statuses
+                .insert(
+                    session_id.as_str().to_string(),
+                    AutoContinueTurnStatus {
+                        session_updated_at_ms,
+                        ended_normally,
+                    },
+                )
+                .is_none_or(|previous| {
+                    previous.session_updated_at_ms != session_updated_at_ms
+                        || previous.ended_normally != ended_normally
+                })
+        };
+        if judged_revision
+            && self
+                .auto_continue_probe_tasks
+                .get(session_id.as_str())
+                .is_some_and(|probe| probe.session_updated_at_ms == session_updated_at_ms)
         {
             self.auto_continue_probe_tasks.remove(session_id.as_str());
         }
@@ -23535,6 +23560,10 @@ impl VibexWorkbench {
                             // loader, so an enabled session opened onto a
                             // failed turn starts its countdown here instead of
                             // waiting for a probe that this load just replaced.
+                            // The cache owns the reconciliation: it retires the
+                            // probe only for a verdict, because this page may
+                            // end mid-turn and the probe is then the only reader
+                            // left that can judge the revision.
                             if let Some(session_updated_at_ms) = load_revision {
                                 let ended_normally =
                                     authoritative_loaded_turn_status(&this.timeline.items);
@@ -23545,7 +23574,6 @@ impl VibexWorkbench {
                                     cx,
                                 );
                             }
-                            this.auto_continue_probe_tasks.remove(session_id.as_str());
                             if this.timeline_follow.following_bottom {
                                 this.request_timeline_scroll_to_latest();
                             } else {
@@ -23675,6 +23703,12 @@ impl VibexWorkbench {
                             if this.timeline.needs_authoritative_refetch {
                                 this.refresh_selected_agent_timeline(cx);
                             }
+                            // A load attributes its page to the revision it was
+                            // asked for. The cache refuses to displace a verdict
+                            // with an unjudged reading and retires the probe only
+                            // for a verdict, so a page that ends mid-turn can
+                            // neither erase an answer nor cancel the reader that
+                            // is still going to give one.
                             if let Some(session_updated_at_ms) = load_revision {
                                 let ended_normally =
                                     authoritative_loaded_turn_status(&this.timeline.items);
@@ -96894,8 +96928,26 @@ mod tests {
             assert!(load.contains("let load_revision = self"));
             assert!(load.contains("cache_auto_continue_turn_status("));
             assert!(load.contains("session_updated_at_ms"));
+            // The cache decides what a page may do to a revision. A loader that
+            // cancelled the probe itself would undo that guard behind its back:
+            // a page which ends mid-turn carries no verdict, and the probe is
+            // then the only reader left that can judge the revision.
+            assert!(!load.contains("auto_continue_probe_tasks.remove"));
         }
 
+        // Only a verdict settles a revision and retires its probe. A page that
+        // ends mid-turn carries no verdict, so treating it as one — by
+        // overwriting the cached verdict or by cancelling the probe — is what
+        // left an enabled session restored onto an unfinished turn without a
+        // countdown until the reader happened to reselect it.
+        let cache = source
+            .split_once("    fn cache_auto_continue_turn_status(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Flags a waiting auto-send queue"))
+            .map(|(body, _)| body)
+            .expect("the turn-status cache should remain inspectable");
+        assert!(cache.contains("let judged_revision = ended_normally.is_some();"));
+        assert!(cache.contains("status.ended_normally.is_some()"));
+        assert!(cache.contains("if judged_revision"));
         let live = source
             .split_once("    fn apply_timeline_events_to_borrowed_view(")
             .and_then(|(_, tail)| {
