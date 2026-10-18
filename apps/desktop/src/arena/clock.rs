@@ -446,10 +446,12 @@ mod tests {
     /// plate narrower than its face is the failure this pins.
     #[test]
     fn the_face_is_large_enough_to_read_and_its_plate_frames_it() {
-        assert!(
-            CELL >= 4.0,
-            "a 3x5 digit needs at least four logical pixels"
-        );
+        const {
+            assert!(
+                CELL >= 4.0,
+                "a 3x5 digit needs at least four logical pixels"
+            );
+        }
         let face = face_width(61_500);
         assert!(
             f32::from(face) >= 13.0 * CELL,
