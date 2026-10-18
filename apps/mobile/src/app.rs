@@ -258,10 +258,23 @@ fn install_timeline_scroll_handler(state: &ListState, owner: WeakEntity<MobileAp
 }
 
 /// The reader's place in the timeline, as the list last reported it.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct TimelineViewport {
     first_visible: usize,
     visible: usize,
+}
+
+/// A reading position that survives the item table being replaced.
+///
+/// The list's own position is a logical offset into the item table it was last
+/// laid out with, so replacing the table — which an authoritative refetch does
+/// — leaves that offset describing a different item. Naming the turn keeps the
+/// reader where they were across the swap.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum TimelineScrollAnchor {
+    /// The turn at the top of the viewport, and how far into it the viewport
+    /// starts. The offset is in pixels within that turn.
+    Turn(String, i32),
 }
 
 /// Whether a reported viewport sits within the older-history prefetch band.
@@ -11275,6 +11288,17 @@ impl MobileApp {
             return;
         };
         let should_follow = self.timeline_follow;
+        // The history this view has already loaded past the cold window. A
+        // refetch answers with the newest window only, so replacing the
+        // projection with it would throw away every older page the reader
+        // scrolled up to fetch — the conversation would collapse to the tail
+        // under their finger. The answer is merged into what is on screen
+        // instead, which is also what keeps the reading position meaningful.
+        let loaded_before = self
+            .controller
+            .as_ref()
+            .map(|controller| controller.state.timeline.items.clone())
+            .unwrap_or_default();
         let Some(controller) = self.controller.as_mut() else {
             return;
         };
@@ -11295,6 +11319,19 @@ impl MobileApp {
                     && controller.apply_session_snapshot(&ticket, outcome)
                     && !failed
                 {
+                    let merged = merge_refetched_timeline(
+                        loaded_before,
+                        std::mem::take(&mut controller.state.timeline.items),
+                    );
+                    let leading_turn_start = controller.state.timeline.leading_turn_start;
+                    controller
+                        .state
+                        .timeline
+                        .replace_authoritative_with_leading_turn_start(
+                            ticket.session_id.clone(),
+                            merged,
+                            leading_turn_start,
+                        );
                     this.timeline_cache_timeline = None;
                     this.rebuild_timeline_turns();
                     this.timeline_list.remeasure();
@@ -13092,6 +13129,64 @@ impl MobileApp {
         (!item.has_complete_payload()).then_some(item.sequence)
     }
 
+    /// The reader's place in the list, captured before the item set changes.
+    ///
+    /// The list only knows a logical offset into its own item table, and a
+    /// projection that is replaced wholesale hands it a different table. The
+    /// turn identity is what survives that: a refetch can land fewer turns
+    /// than the reader has loaded, but the turn they were parked on is
+    /// normally still there, under the same id.
+    ///
+    /// Read from the list rather than from the reported viewport, because the
+    /// report is a frame behind and a reset has to be anchored against the
+    /// position the list actually holds right now.
+    fn timeline_scroll_anchor(&self) -> Option<TimelineScrollAnchor> {
+        if self.timeline_list.item_count() == 0 || self.timeline_turns.is_empty() {
+            return None;
+        }
+        let offset = self.timeline_list.logical_scroll_top();
+        self.timeline_turns
+            .get(offset.item_ix.min(self.timeline_turns.len() - 1))
+            .map(|turn| {
+                TimelineScrollAnchor::Turn(
+                    turn.id.clone(),
+                    (f32::from(offset.offset_in_item).round() as i32).max(0),
+                )
+            })
+    }
+
+    /// Puts a captured anchor back once the new item table is in place.
+    ///
+    /// A turn the new window no longer holds cannot be restored exactly, and
+    /// the nearest survivor is the best remaining answer: it keeps the reader
+    /// inside the same stretch of conversation instead of dropping them at the
+    /// top of the window, which is where a bare `reset` lands.
+    fn restore_timeline_scroll_anchor(&mut self, anchor: Option<TimelineScrollAnchor>) {
+        let Some(TimelineScrollAnchor::Turn(turn_id, offset_in_item)) = anchor else {
+            return;
+        };
+        if self.timeline_turns.is_empty() {
+            return;
+        }
+        let index = match self
+            .timeline_turns
+            .iter()
+            .position(|turn| turn.id == turn_id)
+        {
+            Some(index) => index,
+            None => {
+                // The window keeps the newest turns, so a turn that was above
+                // it has no survivor below; the end of the table is the
+                // closest place to what the reader was reading.
+                self.timeline_turns.len() - 1
+            }
+        };
+        self.timeline_list.scroll_to(ListOffset {
+            item_ix: index,
+            offset_in_item: px(offset_in_item as f32),
+        });
+    }
+
     fn timeline_is_near_bottom(&self) -> bool {
         timeline_distance_to_bottom(
             f32::from(self.timeline_list.scroll_px_offset_for_scrollbar().y),
@@ -13106,18 +13201,28 @@ impl MobileApp {
         })
     }
 
-    fn sync_timeline_list(&mut self, turn_count: usize) {
+    /// Matches the list's item count to `turn_count`.
+    ///
+    /// `anchor` is the reading position captured against the table the list
+    /// holds *now*, before the turns were replaced. A reset drops the list's
+    /// logical offset, so it is restored from that anchor once the new table is
+    /// in place.
+    fn sync_timeline_list(&mut self, turn_count: usize, anchor: Option<TimelineScrollAnchor>) {
         let current_count = self.timeline_list.item_count();
         if current_count == turn_count {
             return;
         }
         if current_count == 0 || current_count > turn_count {
-            // Reset in place rather than swapping in a fresh state: the list
-            // carries the scroll handler that prefetches older history. The
-            // uniform height is what a fresh state used to give the extent
-            // before the offscreen turns are measured.
+            // A shrinking projection has to keep the reader's place. `reset`
+            // drops `logical_scroll_top`, which under `ListAlignment::Top`
+            // means item 0 — the top of the window. An authoritative refetch
+            // routinely lands a shorter window than the one on screen: the cold
+            // window is bounded by turns *and* by bytes, so a single large turn
+            // can fill it alone. Resetting there is what threw the reader back
+            // to the top of the conversation in the middle of a scroll.
             self.timeline_list
                 .reset_with_uniform_height(turn_count, px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX));
+            self.restore_timeline_scroll_anchor(anchor);
         } else {
             self.timeline_list
                 .splice(current_count..current_count, turn_count - current_count);
@@ -13181,11 +13286,21 @@ impl MobileApp {
             }
         } else if turns.len() < previous_count {
             // The projection's item budget dropped the newest turns to make
-            // room for the page. The window is no longer a superset, so there
-            // is no anchor to preserve.
-            self.timeline_list
-                .reset_with_uniform_height(turns.len(), px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX));
+            // room for the page, so the new window is not a superset of the one
+            // on screen. The turn the reader is on usually survives above the
+            // drop, so it is re-resolved against the new table instead of
+            // letting the reset put the viewport back at the top. The anchor is
+            // read before the table is replaced: the list's logical offset
+            // still describes the outgoing turns.
+            let anchor = self.timeline_scroll_anchor();
+            self.timeline_turns = Arc::new(turns);
+            self.timeline_list.reset_with_uniform_height(
+                self.timeline_turns.len(),
+                px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX),
+            );
             self.timeline_viewport = None;
+            self.restore_timeline_scroll_anchor(anchor);
+            return;
         }
         self.timeline_turns = Arc::new(turns);
     }
@@ -13287,9 +13402,15 @@ impl MobileApp {
     }
 
     fn rebuild_timeline_turns(&mut self) {
+        // The anchor is read against the table the list is laid out with right
+        // now, and re-applied against the one this rebuild installs: the reader
+        // is on a turn of the outgoing projection, which is the only table the
+        // list's current logical offset describes.
+        let anchor = self.timeline_scroll_anchor();
         let turns = self.build_timeline_turns();
-        self.sync_timeline_list(turns.len());
         self.timeline_turns = Arc::new(turns);
+        let turn_count = self.timeline_turns.len();
+        self.sync_timeline_list(turn_count, anchor);
     }
 
     fn refresh(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -34629,6 +34750,49 @@ fn timeline_distance_to_bottom(offset_y: f32, max_offset_y: f32) -> f32 {
     (max_offset_y + offset_y).max(0.0)
 }
 
+/// Merges an authoritative refetch into the history already on screen.
+///
+/// A refetch answers with the newest window only, bounded by turns and by
+/// bytes. Replacing the projection with it drops every older page the reader
+/// scrolled up to fetch, which collapses the conversation to its tail. The
+/// refetched rows win where the two overlap — they are the authority for the
+/// items both describe — while the older rows the window did not cover are
+/// kept, so the history survives the refresh.
+///
+/// The result stays bounded by the same item cap the projection already uses,
+/// and it drops the newest items last: older history can only be reached a page
+/// at a time, so it is the expensive half to lose.
+fn merge_refetched_timeline(
+    loaded: Vec<TimelineItem>,
+    refetched: Vec<TimelineItem>,
+) -> Vec<TimelineItem> {
+    if loaded.is_empty() || refetched.is_empty() {
+        return if refetched.is_empty() {
+            loaded
+        } else {
+            refetched
+        };
+    }
+    // The refetch is authoritative for the stretch it covers, so its rows are
+    // laid over the loaded ones and only the loaded rows below its start are
+    // carried over.
+    let Some(oldest_refetched) = refetched.first().map(|item| item.sequence) else {
+        return loaded;
+    };
+    let mut merged: Vec<TimelineItem> = loaded
+        .into_iter()
+        .filter(|item| item.sequence < oldest_refetched)
+        .chain(refetched)
+        .collect();
+    merged.sort_by_key(|item| item.sequence);
+    merged.dedup_by_key(|item| item.sequence);
+    if merged.len() > vibex_ui::agent::AGENT_TIMELINE_MAX_ITEMS {
+        let excess = merged.len() - vibex_ui::agent::AGENT_TIMELINE_MAX_ITEMS;
+        merged.drain(..excess);
+    }
+    merged
+}
+
 fn timeline_process_activity_groups_for_display(
     turn: &TimelineConversationTurn,
     enhanced_command_display: bool,
@@ -35358,6 +35522,61 @@ fn flatten_join<T>(outcome: Result<BackendResult<T>, gpui_tokio::JoinError>) -> 
 mod tests {
     use super::*;
     use gpui::{TestAppContext, point};
+
+    fn merge_item(sequence: i64, text: &str) -> TimelineItem {
+        TimelineItem {
+            id: vibex_core::TimelineItemId::parse(format!("timeline_merge{sequence}")).unwrap(),
+            session_id: vibex_core::VibexSessionId::parse("session_merge").unwrap(),
+            sequence,
+            timestamp_ms: sequence,
+            source: vibex_core::TimelineSource::Agent,
+            kind: TimelineItemKind::AgentMessage,
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: vibex_core::TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::Detail,
+            payload: vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: text.to_string(),
+                is_final: true,
+            }),
+        }
+    }
+
+    /// A refetch answers with the newest window only, so the older pages the
+    /// reader scrolled up to fetch have to survive it. Replacing the projection
+    /// outright is what collapsed a long conversation back to its tail.
+    #[test]
+    fn a_refetch_merges_into_the_history_already_loaded() {
+        let loaded = vec![
+            merge_item(1, "oldest"),
+            merge_item(2, "older"),
+            merge_item(3, "replaced"),
+        ];
+        let refetched = vec![merge_item(3, "authoritative"), merge_item(4, "newest")];
+
+        let merged = merge_refetched_timeline(loaded, refetched);
+        let sequences: Vec<i64> = merged.iter().map(|item| item.sequence).collect();
+        assert_eq!(sequences, vec![1, 2, 3, 4], "the loaded history survives");
+        assert!(
+            matches!(
+                &merged[2].payload,
+                vibex_core::TimelinePayload::AgentMessage(message) if message.text == "authoritative"
+            ),
+            "the refetched row wins where the two overlap"
+        );
+    }
+
+    /// The history below the window is kept even when the window covers none of
+    /// it, which is the case that used to drop every older page at once.
+    #[test]
+    fn a_refetch_above_the_loaded_window_keeps_every_older_row() {
+        let loaded = vec![merge_item(10, "a"), merge_item(11, "b")];
+        let refetched = vec![merge_item(20, "c"), merge_item(21, "d")];
+        let merged = merge_refetched_timeline(loaded, refetched);
+        let sequences: Vec<i64> = merged.iter().map(|item| item.sequence).collect();
+        assert_eq!(sequences, vec![10, 11, 20, 21]);
+    }
 
     fn runtime_option(
         selection: SessionRuntimeSelection,
