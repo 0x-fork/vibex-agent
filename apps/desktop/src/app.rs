@@ -82152,12 +82152,22 @@ fn new_session_slogan_line(
         .as_ref()
         .and_then(|id| this.agent_snapshot(id));
     let spoken = locale.new_session_slogan_spoken(agent.as_ref().map(|agent| agent.label.as_str()));
-    // The cut is drawn while it is still running. `take_if` removes the entry it
-    // is given, so the predicate has to be the *opposite* of settled: asking for
-    // a settled cut would hold the pair back until it had already finished, and
-    // the page would show the new mark on the first frame with no cut at all.
+    // The cut *clones* while it runs rather than being taken, because the pair
+    // has to stay in the tree for the whole timeline: `with_animation` schedules
+    // its own frames only for as long as its element is mounted, so a swap that
+    // was consumed by the first frame would unmount the animation and leave the
+    // page on the new mark with a single frame of the cut played. It is cleared
+    // here instead, once the timeline has run, which is also what lets a later
+    // repaint draw the resting mark.
     let swap = if agent.is_some() {
-        this.new_session_logo_swap.take_if(|swap| !swap.settled())
+        if this
+            .new_session_logo_swap
+            .as_ref()
+            .is_some_and(|swap| swap.settled())
+        {
+            this.new_session_logo_swap = None;
+        }
+        this.new_session_logo_swap.clone()
     } else {
         this.new_session_logo_swap = None;
         None
@@ -97584,22 +97594,26 @@ mod tests {
             "the cut keeps identities, so the same Agent wears the same face"
         );
 
-        // The cut has to be *held* while it runs. `take_if` removes the entry it
-        // is given, so the predicate must ask for the opposite of settled:
-        // asking for a settled cut holds the pair back until it has finished and
-        // the page shows the new mark on the first frame — no animation at all.
-        assert!(
-            !swap.contains("take_if(|swap| swap.settled())"),
-            "the cut must not be read only after it has finished"
-        );
+        // The pair has to stay in the tree for the whole timeline, because
+        // `with_animation` schedules frames only while its element is mounted.
+        // Consuming it would play one frame and then leave the page on the new
+        // mark — the blink this cut exists to replace.
         let slogan = source
             .split_once("fn new_session_slogan_line(")
             .and_then(|(_, tail)| tail.split_once("\nfn "))
             .map(|(body, _)| body)
             .expect("the sentence should remain inspectable");
         assert!(
-            slogan.contains("take_if(|swap| !swap.settled())"),
-            "a running cut is what the sentence draws; a finished one is dropped"
+            !slogan.contains("new_session_logo_swap.take_if"),
+            "a consumed cut unmounts its own animation after one frame"
+        );
+        assert!(
+            slogan.contains("this.new_session_logo_swap.clone()"),
+            "the cut is drawn from a clone so it stays mounted while it runs"
+        );
+        assert!(
+            slogan.contains("swap.settled()"),
+            "the cut is released once the timeline has run, not before it starts"
         );
         assert!(
             slogan.contains("this.new_session_logo_swap = None;"),
