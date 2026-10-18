@@ -865,6 +865,14 @@ pub const SHEET_GRABBER_HEIGHT: f32 = 5.0;
 /// How far a finger must pull the panel before the sheet follows it, so a tap
 /// that wobbles on the way down is still a tap.
 pub const SHEET_PULL_THRESHOLD: f32 = 8.0;
+/// How much further a finger must travel down — or up — than across before the
+/// gesture is a pull on the sheet rather than a scroll of something inside it.
+///
+/// Distance alone is not enough: the Agent strip in the runtime sheet scrolls
+/// sideways under the same finger, and a drag that comes further across than
+/// down is that strip's, never the panel's. The ratio is the drawer's own
+/// vertical-cancel ratio, so both gestures read a pan the same way.
+pub const SHEET_PULL_VERTICAL_RATIO: f32 = 1.6;
 /// How far the panel must be pulled for the finger's release to dismiss the
 /// sheet. A fixed distance rather than a share of the sheet: what the reader
 /// judges it against is the rows that slid up under the finger.

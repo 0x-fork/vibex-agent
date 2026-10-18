@@ -17,6 +17,13 @@
 //! Both heights are bounded by the body inside the panel: a list that outgrows
 //! the sheet scrolls once the sheet has no more height to give.
 //!
+//! Only a gesture that is actually vertical is either. A panel can hold a list
+//! that scrolls sideways — the runtime sheet's Agent strip is one — and a
+//! finger moving along it drifts down a little on the way; a sheet that read
+//! that drift as a pull would leave from under a reader who was only moving a
+//! logo. So the two translations a pan carries are weighed against each other,
+//! and the ones that go across stay with the list that owns them.
+//!
 //! A page keeps its sheet's own flag as the source of truth for what the sheet
 //! shows. Closing a sheet does not clear that flag: the flag stays set for as
 //! long as the panel is on screen, the fall included, and the page clears it
@@ -346,12 +353,17 @@ fn scrim_curve(motion: Option<Motion>, offset: f32, travel: f32) -> impl Fn(f32)
 }
 
 /// What a page tells the sheet about the pan the platform reported.
+///
+/// A pan is reported in both axes, not only the one the sheet works in: a
+/// finger dragging a horizontal list inside the panel is making the same kind
+/// of event, and only the translation it has accumulated in each direction
+/// says which of the two the gesture belongs to.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum SheetPan {
     /// A finger arrived, having already moved this far.
-    Started { dy: f32 },
+    Started { dx: f32, dy: f32 },
     /// A finger moved by this many pixels since the last report.
-    Moved { dy: f32 },
+    Moved { dx: f32, dy: f32 },
     /// A finger let go.
     Ended,
     /// The platform took the pan away — a call, a system gesture.
@@ -377,17 +389,19 @@ pub enum SheetPull {
 /// Mobile platforms report a finger drag as a scroll wheel carrying a touch
 /// phase; a mouse wheel carries none, and never pulls a sheet.
 pub fn sheet_pan(event: &ScrollWheelEvent) -> Option<SheetPan> {
-    let dy = |delta: ScrollDelta| match delta {
-        ScrollDelta::Pixels(delta) => Some(f32::from(delta.y)),
+    let movement = |delta: ScrollDelta| match delta {
+        ScrollDelta::Pixels(delta) => Some((f32::from(delta.x), f32::from(delta.y))),
         ScrollDelta::Lines(_) => None,
     };
     match event.touch_phase {
-        TouchPhase::Started => Some(SheetPan::Started {
-            dy: dy(event.delta)?,
-        }),
-        TouchPhase::Moved => Some(SheetPan::Moved {
-            dy: dy(event.delta)?,
-        }),
+        TouchPhase::Started => {
+            let (dx, dy) = movement(event.delta)?;
+            Some(SheetPan::Started { dx, dy })
+        }
+        TouchPhase::Moved => {
+            let (dx, dy) = movement(event.delta)?;
+            Some(SheetPan::Moved { dx, dy })
+        }
         TouchPhase::Ended => Some(SheetPan::Ended),
         TouchPhase::Cancelled => Some(SheetPan::Cancelled),
     }
@@ -563,12 +577,12 @@ impl BottomSheet {
             return SheetPull::Ignored;
         }
         match pan {
-            SheetPan::Started { dy } => {
+            SheetPan::Started { dx, dy } => {
                 let opened = panel.placement_now().extent;
                 panel.pull = Some(Pull::started(Instant::now(), opened));
-                panel.advance(dy)
+                panel.advance(dx, dy)
             }
-            SheetPan::Moved { dy } => panel.advance(dy),
+            SheetPan::Moved { dx, dy } => panel.advance(dx, dy),
             SheetPan::Ended => panel.release(),
             SheetPan::Cancelled => panel.cancelled(),
         }
@@ -623,13 +637,22 @@ impl Panel {
     /// finger on its way up is the reader pulling the sheet open — from
     /// anywhere on the panel, which is what makes the gesture worth having —
     /// and only becomes the body's once there is no height left to take.
-    fn advance(&mut self, dy: f32) -> SheetPull {
+    ///
+    /// Distance in the sheet's own axis is only half the question. The panel
+    /// holds lists that scroll the other way — the Agent strip above the model
+    /// list is one — and a finger dragging one of those makes the same pan: it
+    /// travels a little way down as it goes across, and a pull that took that
+    /// drift for a dismissal would drop the sheet out from under a reader who
+    /// was only moving a logo. So the two translations are compared as they
+    /// accumulate, and a gesture that has come further across than down stays
+    /// with whatever the finger is actually on.
+    fn advance(&mut self, dx: f32, dy: f32) -> SheetPull {
         let at_top = self.body_at_top();
         let extra = self.size.extra();
         let Some(pull) = self.pull.as_mut() else {
             return SheetPull::Ignored;
         };
-        pull.record(dy);
+        pull.record(dx, dy);
         if !pull.claimed {
             let opening = pull.travel < 0.0;
             let moves_the_panel = if opening {
@@ -637,7 +660,9 @@ impl Panel {
             } else {
                 at_top
             };
-            if !moves_the_panel || pull.travel.abs() < theme::SHEET_PULL_THRESHOLD {
+            let vertical =
+                pull.travel.abs() >= pull.across.abs() * theme::SHEET_PULL_VERTICAL_RATIO;
+            if !moves_the_panel || !vertical || pull.travel.abs() < theme::SHEET_PULL_THRESHOLD {
                 return SheetPull::Ignored;
             }
             pull.claimed = true;
@@ -898,6 +923,11 @@ impl Easing {
 struct Pull {
     /// The gesture's own translation so far, positive downward.
     travel: f32,
+    /// The gesture's translation so far across the panel, positive rightward.
+    ///
+    /// The sheet never spends it — it is what tells a pull on the panel from a
+    /// drag along a list inside it.
+    across: f32,
     /// How far open the panel was when the gesture began.
     extent: f32,
     /// Where the gesture has put the panel below its resting place.
@@ -919,6 +949,7 @@ impl Pull {
     fn started(now: Instant, extent: f32) -> Self {
         Self {
             travel: 0.0,
+            across: 0.0,
             extent,
             offset: 0.0,
             opened: extent,
@@ -935,11 +966,12 @@ impl Pull {
     /// speed is folded in with a fixed blend rather than accumulated from raw
     /// distances: a fast flick right before the finger lifts still dominates
     /// the estimate, which is what tells a flick from a drag.
-    fn record(&mut self, dy: f32) {
+    fn record(&mut self, dx: f32, dy: f32) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.sampled_at);
         self.sampled_at = now;
         self.travel += dy;
+        self.across += dx;
         if elapsed < VELOCITY_SAMPLE_FLOOR {
             // Reports that arrive back to back describe coalesced input: the
             // gap between them is the platform's own jitter, and dividing by it
@@ -1249,7 +1281,14 @@ mod tests {
     /// Pulls a settled sheet open, the way a reader does.
     fn open(sheet: &mut BottomSheet, key: SheetKey) {
         assert_eq!(
-            sheet.pull(key, SheetPan::Started { dy: -EXTRA }, SIZE),
+            sheet.pull(
+                key,
+                SheetPan::Started {
+                    dx: 0.0,
+                    dy: -EXTRA
+                },
+                SIZE
+            ),
             SheetPull::Pulling
         );
         sheet.pull(key, SheetPan::Ended, SIZE);
@@ -1387,7 +1426,11 @@ mod tests {
         let body = sheet.body_scroll(SheetKey::GitBranches);
 
         assert_eq!(
-            sheet.pull(SheetKey::GitBranches, SheetPan::Started { dy: 2.0 }, SIZE),
+            sheet.pull(
+                SheetKey::GitBranches,
+                SheetPan::Started { dx: 0.0, dy: 2.0 },
+                SIZE
+            ),
             SheetPull::Ignored,
             "a tap that wobbles is a tap"
         );
@@ -1398,6 +1441,7 @@ mod tests {
             sheet.pull(
                 SheetKey::GitBranches,
                 SheetPan::Started {
+                    dx: 0.0,
                     dy: theme::SHEET_PULL_THRESHOLD
                 },
                 SIZE
@@ -1412,6 +1456,7 @@ mod tests {
             sheet.pull(
                 SheetKey::GitBranches,
                 SheetPan::Moved {
+                    dx: 0.0,
                     dy: theme::SHEET_PULL_THRESHOLD
                 },
                 SIZE
@@ -1422,12 +1467,78 @@ mod tests {
         // would have had somewhere to scroll.
         body.set_offset(point(px(0.0), px(-240.0)));
         assert_eq!(
-            sheet.pull(SheetKey::GitBranches, SheetPan::Moved { dy: 10.0 }, SIZE),
+            sheet.pull(
+                SheetKey::GitBranches,
+                SheetPan::Moved { dx: 0.0, dy: 10.0 },
+                SIZE
+            ),
             SheetPull::Pulling
         );
         assert_eq!(
             sheet.pull(SheetKey::GitBranches, SheetPan::Ended, SIZE),
             SheetPull::Restored
+        );
+    }
+
+    /// A gesture that is going across the panel belongs to whatever is under
+    /// the finger, even when it drifts a long way down on the way.
+    ///
+    /// This is the Agent strip in the runtime sheet: a finger swiping it back
+    /// to the first Agent also travels down, and a sheet that read that drift
+    /// as a pull left the reader without their settings.
+    #[test]
+    fn a_sideways_gesture_stays_with_the_list_under_the_finger() {
+        let mut sheet = BottomSheet::default();
+        settled(&mut sheet, SheetKey::RuntimeOptions);
+        let body = sheet.body_scroll(SheetKey::RuntimeOptions);
+        body.set_offset(point(px(0.0), px(0.0)));
+
+        // The finger crosses further than it descends, so the pan is the
+        // strip's — even once the drift is past the distance that would pull
+        // the panel on its own.
+        assert_eq!(
+            sheet.pull(
+                SheetKey::RuntimeOptions,
+                SheetPan::Started { dx: 6.0, dy: 2.0 },
+                SIZE
+            ),
+            SheetPull::Ignored,
+            "the strip keeps a pan that is only starting to cross"
+        );
+        assert_eq!(
+            sheet.pull(
+                SheetKey::RuntimeOptions,
+                SheetPan::Moved {
+                    dx: 120.0,
+                    dy: theme::SHEET_PULL_DISMISS_TRAVEL / 2.0
+                },
+                SIZE
+            ),
+            SheetPull::Ignored,
+            "a swipe along the strip is not a pull, however far it has drifted"
+        );
+        assert!(
+            (up(&mut sheet, SheetKey::RuntimeOptions).offset).abs() < 1.0,
+            "the panel never followed the sideways gesture"
+        );
+        assert_eq!(
+            sheet.pull(SheetKey::RuntimeOptions, SheetPan::Ended, SIZE),
+            SheetPull::Ignored,
+            "and letting go leaves the sheet where it was"
+        );
+        assert!(!sheet.is_leaving(SheetKey::RuntimeOptions));
+
+        // The same panel still answers a finger that pulls it straight down.
+        assert_eq!(
+            sheet.pull(
+                SheetKey::RuntimeOptions,
+                SheetPan::Started {
+                    dx: 0.0,
+                    dy: theme::SHEET_PULL_THRESHOLD
+                },
+                SIZE
+            ),
+            SheetPull::Pulling
         );
     }
 
@@ -1440,7 +1551,7 @@ mod tests {
         assert_eq!(
             sheet.pull(
                 SheetKey::ComposerAttach,
-                SheetPan::Started { dy: 40.0 },
+                SheetPan::Started { dx: 0.0, dy: 40.0 },
                 SIZE
             ),
             SheetPull::Pulling
@@ -1460,6 +1571,7 @@ mod tests {
         let _ = sheet.pull(
             SheetKey::AgentQuestion,
             SheetPan::Started {
+                dx: 0.0,
                 dy: theme::SHEET_PULL_THRESHOLD / 2.0,
             },
             SIZE,
@@ -1474,7 +1586,7 @@ mod tests {
         // resting height, which is where it already was.
         let _ = sheet.pull(
             SheetKey::AgentQuestion,
-            SheetPan::Started { dy: 60.0 },
+            SheetPan::Started { dx: 0.0, dy: 60.0 },
             SIZE,
         );
         let _ = sheet.pull(SheetKey::AgentQuestion, SheetPan::Ended, SIZE);
@@ -1488,6 +1600,7 @@ mod tests {
         let _ = sheet.pull(
             SheetKey::AgentQuestion,
             SheetPan::Started {
+                dx: 0.0,
                 dy: -(EXTRA / 2.0 + 20.0),
             },
             SIZE,
@@ -1511,6 +1624,7 @@ mod tests {
         let _ = sheet.pull(
             SheetKey::AgentQuestion,
             SheetPan::Started {
+                dx: 0.0,
                 dy: -(EXTRA / 2.0 + 20.0),
             },
             SIZE,
@@ -1528,7 +1642,11 @@ mod tests {
         settled(&mut sheet, SheetKey::GitBranches);
 
         assert_eq!(
-            sheet.pull(SheetKey::GitBranches, SheetPan::Started { dy: 40.0 }, SIZE),
+            sheet.pull(
+                SheetKey::GitBranches,
+                SheetPan::Started { dx: 0.0, dy: 40.0 },
+                SIZE
+            ),
             SheetPull::Pulling
         );
         let pulled = sheet
@@ -1544,7 +1662,11 @@ mod tests {
         assert!(pulled.scrim_opacity() < theme::SHEET_BACKDROP_OPACITY);
 
         // And it keeps following the finger, rather than only the first sample.
-        sheet.pull(SheetKey::GitBranches, SheetPan::Moved { dy: 20.0 }, SIZE);
+        sheet.pull(
+            SheetKey::GitBranches,
+            SheetPan::Moved { dx: 0.0, dy: 20.0 },
+            SIZE,
+        );
         let further = sheet
             .presentation(SheetKey::GitBranches, true, SIZE)
             .expect("a pulled sheet is on screen");
@@ -1590,7 +1712,11 @@ mod tests {
         );
 
         assert_eq!(
-            sheet.pull(SheetKey::GitBranches, SheetPan::Started { dy: -40.0 }, SIZE),
+            sheet.pull(
+                SheetKey::GitBranches,
+                SheetPan::Started { dx: 0.0, dy: -40.0 },
+                SIZE
+            ),
             SheetPull::Pulling,
             "an upward pull belongs to the sheet wherever the finger landed"
         );
@@ -1603,7 +1729,14 @@ mod tests {
         assert_place(pulled.offset, 0.0, "and it should not have moved down");
 
         assert_eq!(
-            sheet.pull(SheetKey::GitBranches, SheetPan::Moved { dy: -400.0 }, SIZE),
+            sheet.pull(
+                SheetKey::GitBranches,
+                SheetPan::Moved {
+                    dx: 0.0,
+                    dy: -400.0
+                },
+                SIZE
+            ),
             SheetPull::Pulling
         );
         let wide = up(&mut sheet, SheetKey::GitBranches);
@@ -1633,7 +1766,11 @@ mod tests {
         let mut sheet = BottomSheet::default();
         settled(&mut sheet, SheetKey::GitBranches);
         assert_eq!(
-            sheet.pull(SheetKey::GitBranches, SheetPan::Started { dy: -20.0 }, SIZE),
+            sheet.pull(
+                SheetKey::GitBranches,
+                SheetPan::Started { dx: 0.0, dy: -20.0 },
+                SIZE
+            ),
             SheetPull::Pulling
         );
         assert_eq!(
@@ -1661,7 +1798,10 @@ mod tests {
         assert_eq!(
             sheet.pull(
                 SheetKey::GitBranches,
-                SheetPan::Started { dy: EXTRA / 2.0 },
+                SheetPan::Started {
+                    dx: 0.0,
+                    dy: EXTRA / 2.0
+                },
                 SIZE
             ),
             SheetPull::Pulling
@@ -1681,6 +1821,7 @@ mod tests {
             sheet.pull(
                 SheetKey::GitBranches,
                 SheetPan::Moved {
+                    dx: 0.0,
                     dy: EXTRA / 2.0 + theme::SHEET_PULL_DISMISS_TRAVEL
                 },
                 SIZE
@@ -1708,7 +1849,11 @@ mod tests {
         settled(&mut sheet, SheetKey::GitBranches);
         open(&mut sheet, SheetKey::GitBranches);
         assert_eq!(
-            sheet.pull(SheetKey::GitBranches, SheetPan::Started { dy: -40.0 }, SIZE),
+            sheet.pull(
+                SheetKey::GitBranches,
+                SheetPan::Started { dx: 0.0, dy: -40.0 },
+                SIZE
+            ),
             SheetPull::Ignored,
             "nothing left to open"
         );
@@ -1743,7 +1888,7 @@ mod tests {
         assert_eq!(
             sheet.pull(
                 SheetKey::NewSessionPicker,
-                SheetPan::Started { dy: 120.0 },
+                SheetPan::Started { dx: 0.0, dy: 120.0 },
                 SIZE
             ),
             SheetPull::Pulling
@@ -1760,7 +1905,11 @@ mod tests {
     fn a_pan_on_a_page_with_no_sheet_is_ignored() {
         let mut sheet = BottomSheet::default();
         assert_eq!(
-            sheet.pull(SheetKey::FileGoto, SheetPan::Started { dy: 40.0 }, SIZE),
+            sheet.pull(
+                SheetKey::FileGoto,
+                SheetPan::Started { dx: 0.0, dy: 40.0 },
+                SIZE
+            ),
             SheetPull::Ignored
         );
         assert_eq!(
@@ -1777,7 +1926,7 @@ mod tests {
         up(&mut sheet, SheetKey::WorktreePaths);
         sheet.pull(
             SheetKey::WorktreePaths,
-            SheetPan::Started { dy: 120.0 },
+            SheetPan::Started { dx: 0.0, dy: 120.0 },
             SIZE,
         );
         assert_eq!(

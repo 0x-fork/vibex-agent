@@ -191,6 +191,12 @@ pnpm build:mobile:ios
   capture host from later move/end events and leaves the page at its first
   partial offset. The overlay must consume scroll events that are not claimed
   by the horizontal drawer gesture so the page underneath remains isolated.
+- A bottom sheet's own pull claims only vertical gestures: a pan becomes the
+  sheet's once it has travelled at least 1.6× further down (or up) than across.
+  A sideways-dominant pan stays with the list under the finger — the runtime
+  sheet's Agent strip swiped back to its first logo, drift downward included —
+  and a page's back swipe must stand down for a pan that started inside a strip
+  that scrolls sideways, whose band each such strip records as it paints.
 - A mobile client can create a session through the shared typed backend using
   an available runtime and desktop-owned workspace. Pending ACP elicitation
   forms render as explicit text/number/boolean/single/multi controls and resolve

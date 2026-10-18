@@ -1921,6 +1921,9 @@ pub struct MobileApp {
     /// Keeps the selected Agent logo inside the strip's viewport whenever the
     /// selection or the strip contents change.
     runtime_agent_strip_scroll: ScrollHandle,
+    /// Where the Agent strip was painted, so a pan that starts on it scrolls
+    /// the logos instead of leaving the page the sheet is drawn over.
+    runtime_agent_strip_frame: Rc<Cell<Option<(f32, f32)>>>,
     runtime_feature_inputs: BTreeMap<String, Entity<InputState>>,
     /// Runtime feature values waiting to be turned into kit inputs. The sync
     /// function reads the runtime catalog from paths without a window, and
@@ -4005,6 +4008,7 @@ impl MobileApp {
             runtime_agent_labels: BTreeMap::new(),
             runtime_agent_order: Vec::new(),
             runtime_agent_strip_scroll: ScrollHandle::new(),
+            runtime_agent_strip_frame: Rc::new(Cell::new(None)),
             runtime_feature_inputs: BTreeMap::new(),
             pending_runtime_features: None,
             runtime_switch_generation: 0,
@@ -13585,14 +13589,10 @@ impl MobileApp {
                 {
                     return;
                 }
-                // The session-group tab strip is a horizontal scroller, so a
-                // pan that starts on it is the strip's, not the page's. Without
-                // this the drawer claimed the same drag the reader meant as a
-                // tab scroll, and the page switched under their finger.
-                if self.group_tabs_frame.get().is_some_and(|(top, bottom)| {
-                    let y = f32::from(event.position.y);
-                    y >= top && y <= bottom
-                }) {
+                // The strips that scroll sideways keep their own drags — the
+                // session-group tabs and the runtime sheet's Agent logos —
+                // rather than switching the page under the reader's finger.
+                if self.pan_starts_on_a_horizontal_list(event.position) {
                     return;
                 }
                 let origin = drawer_drag_origin(self.drawer_offset);
@@ -13624,6 +13624,26 @@ impl MobileApp {
         }
     }
 
+    /// Whether a pan that landed at `position` belongs to a horizontal list
+    /// rather than to the page it was drawn on.
+    ///
+    /// The drawer's swipe and a page's back swipe are both captured above every
+    /// list on the page, and a strip that scrolls the other way is the one
+    /// gesture they must not take: a reader dragging the session-group tabs or
+    /// the runtime sheet's Agent logos is moving a list, not leaving the page.
+    /// Each strip records the band it was painted in, so where the pan started
+    /// is what decides between the two.
+    fn pan_starts_on_a_horizontal_list(&self, position: Point<Pixels>) -> bool {
+        let y = f32::from(position.y);
+        [
+            self.group_tabs_frame.get(),
+            self.runtime_agent_strip_frame.get(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|(top, bottom)| y >= top && y <= bottom)
+    }
+
     /// The back gesture for a page opened on top of another one — the runtime
     /// switcher, Settings, a runtime's own pages, a pairing sheet: a rightward
     /// finger swipe leaves that page exactly as the system back event does.
@@ -13643,6 +13663,14 @@ impl MobileApp {
         }
         match drawer_pan_input(event) {
             DrawerPanInput::Started { delta_x, delta_y } => {
+                // A strip that scrolls sideways keeps its own drags: the Agent
+                // strip on the runtime sheet is swiped back to its first logo
+                // with just this rightward gesture, and the page must not leave
+                // while the reader is only moving along that list.
+                if self.pan_starts_on_a_horizontal_list(event.position) {
+                    self.overlay_swipe = None;
+                    return;
+                }
                 // Android reports the translation that broke its touch slop on
                 // this very event, so the gesture starts from it.
                 self.overlay_swipe = Some(OverlaySwipe {
@@ -18757,6 +18785,11 @@ impl MobileApp {
     /// logo moves the draft to that Agent's first available option, which
     /// re-scopes the model list below; the active logo wears an accent bar on
     /// the strip's bottom hairline and stays scrolled into view.
+    ///
+    /// The strip also records the band it was painted in. The drawer's back
+    /// swipe is captured above every list on the page, and scrolling these logos
+    /// is a rightward drag like that swipe is: the band is what tells the two
+    /// apart, so only a pan that started here scrolls the strip.
     fn render_runtime_agent_strip(
         &self,
         catalog: Option<&SessionRuntimeOptionCatalog>,
@@ -18766,7 +18799,17 @@ impl MobileApp {
     ) -> gpui::AnyElement {
         let agents = self.runtime_agent_strip_agents(catalog);
         let draft_agent = draft.map(|draft| draft.agent_id.clone());
+        let frame = self.runtime_agent_strip_frame.clone();
         div()
+            .on_children_prepainted(move |bounds, _, _| {
+                let strip = bounds.first().copied();
+                frame.set(strip.map(|strip| {
+                    (
+                        f32::from(strip.origin.y),
+                        f32::from(strip.origin.y + strip.size.height),
+                    )
+                }));
+            })
             .flex_shrink_0()
             .border_b_1()
             .border_color(theme::border_subtle())
@@ -27092,6 +27135,10 @@ impl Render for MobileApp {
         // strip must not leave the last one standing, or the band it occupied
         // would go on swallowing page swipes after the group closed.
         self.group_tabs_frame.set(None);
+        // The same for the runtime sheet's Agent strip: it is drawn only while
+        // that sheet is up, and the band it filled is a page swipe's again the
+        // moment it is not.
+        self.runtime_agent_strip_frame.set(None);
         if let Some(turn_id) = self.timeline_find_scroll_pending.take() {
             self.timeline_list.remeasure();
             self.scroll_to_timeline_turn(&turn_id, cx);
@@ -36272,6 +36319,77 @@ mod tests {
         assert!(summary.available);
     }
 
+    /// The Agent strip draws its logos in the order the desktop's Agent settings
+    /// list them.
+    ///
+    /// That order comes with the catalogue — the runtime publishes the list the
+    /// Desktop draws, its sort strategy and manual arrangement included — so the
+    /// strip must not put it back into the agent snapshots' own order. An Agent
+    /// the catalogue does not name keeps that snapshot order, after the ones it
+    /// does.
+    #[gpui::test]
+    fn the_agent_strip_follows_the_desktops_agent_order(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().unwrap();
+        let listed = |agent: &str| vibex_core::AgentId::parse(agent).unwrap();
+        let option = |agent: &str, availability| {
+            runtime_option(
+                SessionRuntimeSelection::agent_default(
+                    listed(agent),
+                    vibex_core::AgentAuthContextId::new(),
+                ),
+                availability,
+            )
+        };
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            // The snapshots' order is the other one: every Agent is in it, and
+            // it disagrees with the catalogue at every place.
+            app.runtime_agent_order = ["opencode", "codex", "claude"]
+                .into_iter()
+                .map(listed)
+                .collect();
+            app
+        });
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: [
+                ("claude", "Claude"),
+                ("codex", "Codex"),
+                ("opencode", "OpenCode"),
+            ]
+            .into_iter()
+            .map(|(agent_id, label)| vibex_core::RuntimeAgentSummary {
+                agent_id: listed(agent_id),
+                label: label.to_string(),
+            })
+            .collect(),
+            auth_sources: Vec::new(),
+            // Neither of the other two orders agrees: the options are grouped
+            // some other way, and the Agent the list does not name is left for
+            // the snapshots to place.
+            options: vec![
+                option("opencode", RuntimeOptionAvailability::Available),
+                option("gemini", RuntimeOptionAvailability::Available),
+                option("codex", RuntimeOptionAvailability::Available),
+                option("claude", RuntimeOptionAvailability::Available),
+            ],
+        };
+
+        let strip = app.read_with(cx, |app, _| {
+            app.runtime_agent_strip_agents(Some(&catalog))
+                .into_iter()
+                .map(|(agent_id, _)| agent_id.as_str().to_string())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            strip,
+            vec!["claude", "codex", "opencode", "gemini"],
+            "the catalogue's order is the one the desktop's settings show"
+        );
+    }
+
     #[test]
     fn the_agent_account_is_named_the_readers_way() {
         let selection = SessionRuntimeSelection::agent_default(
@@ -39496,6 +39614,78 @@ mod tests {
         );
     }
 
+    /// A finger dragging a sheet's own horizontal list is not pulling the
+    /// sheet, nor leaving the page the sheet is drawn over.
+    ///
+    /// The Agent strip in the runtime sheet is that list: moving it back to the
+    /// first Agent takes the finger sideways, and the runtime sheet must still
+    /// be on screen — at the height it was — when the finger lifts.
+    #[gpui::test]
+    fn a_swipe_along_a_sheets_list_does_not_take_the_sheet(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app.runtime_options_open = true;
+            app.runtime_options_target = RuntimeOptionsTarget::ActiveSession;
+            // The sheet is a page in the back stack, so a rightward swipe over
+            // it is the page's own way out — the gesture this test is keeping
+            // the strip's drag out of.
+            app.push_back_screen(BackScreen::RuntimeOptions);
+            app
+        });
+        settle_rise(&app, cx);
+        let sheet = cx
+            .debug_bounds("mobile-runtime-options")
+            .expect("the Agent settings should be laid out");
+        let band = app
+            .read_with(cx, |app, _| app.runtime_agent_strip_frame.get())
+            .expect("the Agent strip should have recorded the band it was painted in");
+
+        // The finger crosses the strip faster than it descends, the way a thumb
+        // swiping back to the first logo does.
+        let touch = point(sheet.center().x, px((band.0 + band.1) / 2.0));
+        for (phase, dx, dy) in [
+            (TouchPhase::Started, 18.0, 3.0),
+            (TouchPhase::Moved, 90.0, 10.0),
+            (TouchPhase::Moved, 90.0, 10.0),
+        ] {
+            cx.simulate_event(ScrollWheelEvent {
+                position: touch,
+                delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+                modifiers: Default::default(),
+                touch_phase: phase,
+            });
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
+        let crossed = cx
+            .debug_bounds("mobile-runtime-options")
+            .expect("a swipe along a list leaves the sheet on screen");
+        assert_eq!(
+            crossed.origin.y, sheet.origin.y,
+            "the panel must not have travelled under the finger"
+        );
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: touch,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Ended,
+        });
+        settle_sheet(&app, cx);
+        assert!(
+            app.read_with(cx, |app, _| app.runtime_options_open),
+            "letting go of a sideways swipe leaves the sheet up"
+        );
+        assert!(
+            cx.debug_bounds("mobile-runtime-options").is_some(),
+            "and the panel is still drawn"
+        );
+    }
+
     /// The request an Agent parked on in [`app_with_a_parked_question`].
     const PARKED_QUESTION: &str = "request_mobile_parked";
 
@@ -42706,24 +42896,37 @@ fn session_opened(cx: &mut Context<Self>) {
         );
     }
 
-    /// A pan that starts on the tab strip scrolls the tabs.
+    /// A pan that starts on a strip that scrolls sideways scrolls that strip.
     ///
-    /// The drawer's capture sits above every list on the page, so without a
-    /// frame of its own the strip's horizontal scroll was claimed as a page
-    /// swipe and the screen switched under the reader's finger.
+    /// The drawer's swipe and a page's back swipe are both captured above every
+    /// list on the page, so without a frame of its own a strip's horizontal
+    /// drag was claimed as a page gesture. The tab strip switched the screen
+    /// under the reader's finger, and the runtime sheet's Agent strip left the
+    /// sheet the reader was only moving a logo across.
     #[test]
-    fn a_pan_on_the_tab_strip_does_not_switch_pages() {
+    fn a_pan_on_a_strip_that_scrolls_sideways_stays_with_the_strip() {
         let source = include_str!("app.rs");
-        let strip = renderer_source(source, "render_session_group_tabs");
+        for (renderer, frame) in [
+            ("render_session_group_tabs", "group_tabs_frame"),
+            ("render_runtime_agent_strip", "runtime_agent_strip_frame"),
+        ] {
+            assert!(
+                renderer_source(source, renderer).contains(frame),
+                "{renderer} records where it was painted"
+            );
+        }
+        let guard = renderer_source(source, "pan_starts_on_a_horizontal_list");
         assert!(
-            strip.contains("group_tabs_frame"),
-            "the strip records where it was painted"
+            guard.contains("group_tabs_frame") && guard.contains("runtime_agent_strip_frame"),
+            "the guard reads every strip's own frame"
         );
-        let pan = renderer_source(source, "drawer_pan");
-        assert!(
-            pan.contains("group_tabs_frame") && pan.contains("return;"),
-            "a pan inside that band is left to the strip"
-        );
+        for page in ["drawer_pan", "overlay_swipe_back"] {
+            let gesture = renderer_source(source, page);
+            assert!(
+                gesture.contains("pan_starts_on_a_horizontal_list") && gesture.contains("return;"),
+                "a pan inside a strip's band is left to that strip by {page}"
+            );
+        }
     }
 
     /// The state gate itself withholds an idle mark and asks for attention.
