@@ -1034,7 +1034,18 @@ cargo run -p vibex-tui --example preview -- 120 34 --welcome
 cargo run -p vibex-tui --example preview -- 100 30 --new
 cargo run -p vibex-tui --example preview -- 100 30 --new --glitch --phase 2
 cargo run -p vibex-tui --example preview -- 120 34 --locale zh-CN
+cargo run -p vibex-tui --example preview -- 100 32 --showcase --settled
+cargo run -p vibex-tui --example preview -- 100 32 --showcase --welcome
+cargo run -p vibex-tui --example preview -- 100 32 --showcase --cursor
 ```
+
+`--showcase` fills the frame the way a reader's own client is filled — attached
+to a running desktop, with the desktop's session list behind it and the Agent,
+account, model and run options the composer's line names — rather than the
+empty state a preview builds on its own, and `--settled` finishes the sample
+turn so its work folds behind the answer's divider. `--cursor` prints the cell
+the client asked the terminal for after the grid (`#cursor <column> <row>`, or
+`#cursor hidden`), which is the one thing in a frame that is not a cell.
 
 `--locale` draws the interface in one of the shipped languages (`en`, `zh-CN`,
 `zh-TW`), which is how a translation is reviewed in the grid that has to hold
