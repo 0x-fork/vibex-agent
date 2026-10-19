@@ -2322,6 +2322,9 @@ pub enum RemoteProviderOperationKind {
     ModelCapabilitySuggestion,
     ModelGatewaySnapshot,
     UpdateModelGatewaySettings,
+    AddModelProviderCredential,
+    RemoveModelProviderCredential,
+    SetModelGatewayEnabled,
     SetModelGatewayAgent,
     ListModelGatewayRequests,
     ClearModelGatewayRequests,
@@ -2812,6 +2815,27 @@ pub struct RemoteModelGatewaySnapshotResponse {
 pub struct RemoteModelGatewaySettingsUpdateRequest {
     pub auth: RemoteAuthProof,
     pub request: crate::GatewaySettingsUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAddModelProviderCredentialRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AddModelProviderCredentialRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteRemoveModelProviderCredentialRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::RemoveModelProviderCredentialRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelGatewayEnabledRequest {
+    pub auth: RemoteAuthProof,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3769,6 +3793,9 @@ pub enum RemoteProviderRequest {
     ModelCapabilitySuggestion(RemoteModelCapabilitySuggestionRequest),
     ModelGatewaySnapshot(RemoteModelGatewaySnapshotRequest),
     UpdateModelGatewaySettings(RemoteModelGatewaySettingsUpdateRequest),
+    AddModelProviderCredential(RemoteAddModelProviderCredentialRequest),
+    RemoveModelProviderCredential(RemoteRemoveModelProviderCredentialRequest),
+    SetModelGatewayEnabled(RemoteModelGatewayEnabledRequest),
     SetModelGatewayAgent(RemoteModelGatewayAgentUpdateRequest),
     ListModelGatewayRequests(RemoteModelGatewayRequestListRequest),
     ClearModelGatewayRequests(RemoteModelGatewayClearRequest),
@@ -3967,6 +3994,13 @@ impl RemoteProviderRequest {
             Self::UpdateModelGatewaySettings(_) => {
                 RemoteProviderOperationKind::UpdateModelGatewaySettings
             }
+            Self::AddModelProviderCredential(_) => {
+                RemoteProviderOperationKind::AddModelProviderCredential
+            }
+            Self::RemoveModelProviderCredential(_) => {
+                RemoteProviderOperationKind::RemoveModelProviderCredential
+            }
+            Self::SetModelGatewayEnabled(_) => RemoteProviderOperationKind::SetModelGatewayEnabled,
             Self::SetModelGatewayAgent(_) => RemoteProviderOperationKind::SetModelGatewayAgent,
             Self::ListModelGatewayRequests(_) => {
                 RemoteProviderOperationKind::ListModelGatewayRequests

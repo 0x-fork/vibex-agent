@@ -4020,6 +4020,62 @@ impl ManagementBackend for WebRemoteBackend {
         )
     }
 
+    fn add_model_provider_credential(
+        &self,
+        request: MutationRequest<vibex_core::AddModelProviderCredentialRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+        let request = request.payload;
+        self.gateway_rpc(
+            vibex_core::RemoteProviderRequest::AddModelProviderCredential(
+                vibex_core::RemoteAddModelProviderCredentialRequest {
+                    auth: self.auth(),
+                    request,
+                },
+            ),
+            |value| {
+                decode::<vibex_core::RemoteModelProviderProfileResponse>(value)
+                    .map(|response| response.profile)
+            },
+        )
+    }
+
+    fn remove_model_provider_credential(
+        &self,
+        request: MutationRequest<vibex_core::RemoveModelProviderCredentialRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+        let request = request.payload;
+        self.gateway_rpc(
+            vibex_core::RemoteProviderRequest::RemoveModelProviderCredential(
+                vibex_core::RemoteRemoveModelProviderCredentialRequest {
+                    auth: self.auth(),
+                    request,
+                },
+            ),
+            |value| {
+                decode::<vibex_core::RemoteModelProviderProfileResponse>(value)
+                    .map(|response| response.profile)
+            },
+        )
+    }
+
+    fn set_model_gateway_enabled(
+        &self,
+        enabled: bool,
+    ) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
+        self.gateway_rpc(
+            vibex_core::RemoteProviderRequest::SetModelGatewayEnabled(
+                vibex_core::RemoteModelGatewayEnabledRequest {
+                    auth: self.auth(),
+                    enabled,
+                },
+            ),
+            |value| {
+                decode::<vibex_core::RemoteModelGatewaySnapshotResponse>(value)
+                    .map(|response| response.snapshot)
+            },
+        )
+    }
+
     fn set_model_gateway_agent(
         &self,
         request: MutationRequest<vibex_core::GatewayAgentUpdateRequest>,

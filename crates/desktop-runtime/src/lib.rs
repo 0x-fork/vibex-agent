@@ -1586,6 +1586,88 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
             request.expected_revision,
         )?;
         service.invalidate_snapshot();
+        // Enabling or disabling must reach the listener now, not on the next
+        // runtime start: the switch is the user's control over a live service.
+        if let Err(error) = service.apply_policy().await {
+            tracing::warn!(
+                target: "vibex_model_gateway",
+                error_code = %error.code(),
+                "the gateway policy changed but the listener did not follow"
+            );
+        }
+        if let Some(base_url) = service.base_url() {
+            let catalog = provider
+                .gateway_model_catalog()
+                .map(|catalog| {
+                    catalog
+                        .into_iter()
+                        .map(|model| model.display_id())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            provider.refresh_gateway_profiles(&base_url, &catalog)?;
+        }
+        assemble_gateway_snapshot(management)
+    }
+
+    async fn add_model_provider_credential(
+        &self,
+        request: vibex_core::AddModelProviderCredentialRequest,
+    ) -> VibexResult<vibex_core::ModelProviderProfile> {
+        let management = self.management.get().ok_or_else(|| {
+            VibexError::process(
+                "desktop_management_handle_unavailable",
+                "the runtime management handle is not installed yet",
+            )
+        })?;
+        let profile = management
+            .providers()
+            .service()
+            .add_model_provider_credential(request)?;
+        management.model_gateway().invalidate_snapshot();
+        Ok(profile)
+    }
+
+    async fn remove_model_provider_credential(
+        &self,
+        request: vibex_core::RemoveModelProviderCredentialRequest,
+    ) -> VibexResult<vibex_core::ModelProviderProfile> {
+        let management = self.management.get().ok_or_else(|| {
+            VibexError::process(
+                "desktop_management_handle_unavailable",
+                "the runtime management handle is not installed yet",
+            )
+        })?;
+        let profile = management
+            .providers()
+            .service()
+            .remove_model_provider_credential(request)?;
+        management.model_gateway().invalidate_snapshot();
+        Ok(profile)
+    }
+
+    async fn set_model_gateway_enabled(
+        &self,
+        enabled: bool,
+    ) -> VibexResult<vibex_core::GatewaySnapshot> {
+        let management = self.management.get().ok_or_else(|| {
+            VibexError::process(
+                "desktop_management_handle_unavailable",
+                "the runtime management handle is not installed yet",
+            )
+        })?;
+        let service = management.model_gateway();
+        let provider = management.providers().service();
+        let mut connection = open_database(service.database_path())?;
+        apply_migrations(&mut connection)?;
+        let current = vibex_db::ModelGatewaySettingsRepository::get_or_create(&connection)?;
+        let mut next = current.clone();
+        next.policy.enabled = enabled;
+        next.revision = current.revision.saturating_add(1);
+        next.policy.validate()?;
+        vibex_db::ModelGatewaySettingsRepository::update(&connection, &next, current.revision)?;
+        service.invalidate_snapshot();
+        let _ = service.apply_policy().await;
         if let Some(base_url) = service.base_url() {
             let catalog = provider
                 .gateway_model_catalog()

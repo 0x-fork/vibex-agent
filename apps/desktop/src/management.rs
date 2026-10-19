@@ -969,6 +969,11 @@ pub struct ManagementCenter {
     gateway_limit_inputs: BTreeMap<String, GatewayLimitInputs>,
     /// A rejected limit field, shown beside the Key it belongs to.
     gateway_limits_error: Option<String>,
+    /// The key being added to one upstream, keyed by profile id.
+    gateway_key_drafts: BTreeMap<String, Entity<InputState>>,
+    /// Which upstream the add-key field belongs to.
+    gateway_key_add_target: Option<String>,
+    gateway_key_add_error: Option<String>,
     /// The catalogue's suggestion for the Model currently being edited.
     ///
     /// It is only ever a suggestion: nothing here is applied until the user
@@ -1967,6 +1972,9 @@ impl ManagementCenter {
             gateway_requests: Vec::new(),
             gateway_limit_inputs: BTreeMap::new(),
             gateway_limits_error: None,
+            gateway_key_drafts: BTreeMap::new(),
+            gateway_key_add_target: None,
+            gateway_key_add_error: None,
             model_capability_suggestion: None,
             selected_global_provider_id: None,
             profile_editor_open: false,
@@ -11398,6 +11406,42 @@ impl ManagementCenter {
         }));
     }
 
+    /// Turns automatic routing on or off.
+    ///
+    /// This is the user's control over a live service: turning it off stops the
+    /// listener, and every Agent bound to the gateway falls back to its direct
+    /// Provider.
+    fn set_gateway_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::Gateway);
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .set_model_gateway_enabled(enabled)
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(gateway) => {
+                        this.gateway = gateway;
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
     fn set_gateway_routing(
         &mut self,
         routing: vibex_core::GatewayRoutingStrategy,
@@ -11567,6 +11611,192 @@ impl ManagementCenter {
 
     /// The gateway's panel: runtime state, routing policy, upstreams, and the
     /// Agents that walk through it.
+    /// The field that adds a key to one upstream.
+    ///
+    /// The value is masked by default and the field only exists while its own
+    /// upstream is the target, so an accidental paste cannot land on the wrong
+    /// Provider.
+    fn render_gateway_add_key(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfileId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let profile_key = profile.as_str().to_string();
+        let active = self.gateway_key_add_target.as_deref() == Some(profile_key.as_str());
+        if !active {
+            return Button::new(SharedString::from(format!(
+                "management-gateway-add-key-{profile_key}"
+            )))
+            .xsmall()
+            .outline()
+            .icon(IconName::Plus)
+            .label(management_locale_text("Add key", "添加 Key", "新增 Key"))
+            .on_click(cx.listener({
+                let profile = profile.clone();
+                move |this, _, _, cx| {
+                    this.gateway_key_add_target = Some(profile.as_str().to_string());
+                    this.gateway_key_add_error = None;
+                    cx.notify();
+                }
+            }))
+            .into_any_element();
+        }
+        let input = self
+            .gateway_key_drafts
+            .entry(profile_key.clone())
+            .or_insert_with(|| {
+                cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .masked(true)
+                        .placeholder(management_locale_text("sk-…", "sk-…", "sk-…"))
+                })
+            })
+            .clone();
+        let saving = self.mutation.is_some();
+        let error = self.gateway_key_add_error.clone();
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&input).small().w_full()),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-gateway-save-key-{profile_key}"
+                        )))
+                        .xsmall()
+                        .primary()
+                        .label(management_locale_text("Save", "保存", "儲存"))
+                        .disabled(saving)
+                        .on_click(cx.listener({
+                            let profile = profile.clone();
+                            move |this, _, _, cx| this.save_gateway_key(profile.clone(), cx)
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-gateway-cancel-key-{profile_key}"
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text("Cancel", "取消", "取消"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.gateway_key_add_target = None;
+                            this.gateway_key_add_error = None;
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .children(
+                error.map(|message| div().text_xs().text_color(cx.theme().danger).child(message)),
+            )
+            .into_any_element()
+    }
+
+    /// Stores the typed key on its upstream.
+    fn save_gateway_key(
+        &mut self,
+        profile: vibex_core::ModelProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let profile_key = profile.as_str().to_string();
+        let Some(input) = self.gateway_key_drafts.get(&profile_key).cloned() else {
+            return;
+        };
+        let value = input.read(cx).value().trim().to_string();
+        if value.is_empty() {
+            self.gateway_key_add_error = Some(
+                management_locale_text("Enter an API key", "请输入 API Key", "請輸入 API Key")
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        self.gateway_key_add_error = None;
+        self.mutation = Some(ManagementMutation::Gateway);
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .add_model_provider_credential(vibex_backend::MutationRequest::new(
+                    vibex_core::AddModelProviderCredentialRequest {
+                        model_provider_profile_id: profile.clone(),
+                        display_name: None,
+                        value,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(_) => {
+                        // The draft is dropped with the field it belonged to,
+                        // so a later open starts empty rather than showing a
+                        // key that is already stored.
+                        this.gateway_key_drafts.remove(&profile_key);
+                        this.gateway_key_add_target = None;
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.gateway_key_add_error =
+                            Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    /// Removes one key from its upstream.
+    fn remove_gateway_key(
+        &mut self,
+        profile: vibex_core::ModelProviderProfileId,
+        credential: vibex_core::RequestId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::Gateway);
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .remove_model_provider_credential(vibex_backend::MutationRequest::new(
+                    vibex_core::RemoveModelProviderCredentialRequest {
+                        model_provider_profile_id: profile,
+                        credential_id: credential,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(_) => this.refresh(cx),
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
     /// The two limit fields for one Key, with its current values.
     fn render_gateway_key_limits(
         &mut self,
@@ -11733,7 +11963,33 @@ impl ManagementCenter {
                                 .child(gateway_runtime_text(status)),
                         ),
                 )
-                .child(gateway_status_badge(status, cx)),
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            v_flex().min_w_0().gap_0p5().child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "Automatic routing",
+                                        "自动调度",
+                                        "自動調度",
+                                    )),
+                            ),
+                        )
+                        .child(
+                            Switch::new("management-gateway-enabled")
+                                .small()
+                                .checked(snapshot.settings.policy.enabled)
+                                .disabled(pending)
+                                .on_click(cx.listener(|this, checked, _, cx| {
+                                    this.set_gateway_enabled(*checked, cx)
+                                })),
+                        )
+                        .child(gateway_status_badge(status, cx)),
+                ),
         );
 
         // What the service is listening on. The address is read-only on
@@ -11907,6 +12163,7 @@ impl ManagementCenter {
             .collect::<Vec<_>>();
         for upstream in &snapshot.upstreams {
             let id = upstream.model_provider_profile_id.clone();
+            let add_key = self.render_gateway_add_key(&id, window, cx);
             let mut key_rows = v_flex().w_full().gap_1();
             for key in &upstream.keys {
                 key_rows = key_rows.child(
@@ -11923,7 +12180,34 @@ impl ManagementCenter {
                                 .text_sm()
                                 .child(key.display_name.clone()),
                         )
-                        .child(gateway_key_state_badge(key, cx)),
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(gateway_key_state_badge(key, cx))
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "management-gateway-remove-key-{}-{}",
+                                        id.as_str(),
+                                        key.credential_id.as_str()
+                                    )))
+                                    .xsmall()
+                                    .ghost()
+                                    .label(management_locale_text("Remove", "移除", "移除"))
+                                    .disabled(pending)
+                                    .on_click(cx.listener({
+                                        let profile = id.clone();
+                                        let credential = key.credential_id.clone();
+                                        move |this, _, _, cx| {
+                                            this.remove_gateway_key(
+                                                profile.clone(),
+                                                credential.clone(),
+                                                cx,
+                                            )
+                                        }
+                                    })),
+                                ),
+                        ),
                 );
                 // The limits are editable here rather than read-only: a Key
                 // can be busy without being broken, and the only place a user
@@ -11976,7 +12260,8 @@ impl ManagementCenter {
                                     })),
                                 ),
                         )
-                        .child(key_rows),
+                        .child(key_rows)
+                        .child(add_key),
                 );
         }
         if snapshot.upstreams.is_empty() {
@@ -23667,6 +23952,12 @@ fn gateway_status_badge(state: &vibex_core::ModelGatewayRuntimeState, _cx: &App)
             management_locale_text("Not running", "未运行", "未執行"),
             Tag::warning(),
         ),
+        // Stepped aside is not the same as not running: the port is bound, but
+        // requests are being refused so Agents can use their direct Provider.
+        vibex_core::ModelGatewayStatus::Degraded => (
+            management_locale_text("Stepped aside", "已降级", "已降級"),
+            Tag::danger(),
+        ),
         vibex_core::ModelGatewayStatus::Disabled => (
             management_locale_text("Off", "已关闭", "已關閉"),
             Tag::secondary(),
@@ -31627,6 +31918,30 @@ mod gateway_surface_tests {
                 ..vibex_core::GatewayAccountLimits::default()
             })
         );
+    }
+
+    /// A degraded gateway is reported in words, not only in colour.
+    ///
+    /// It is also distinct from "not running": the listener is still bound, and
+    /// the user has to be able to tell the two apart to know whether restarting
+    /// or waiting is the right move.
+    #[test]
+    fn a_degraded_gateway_says_so_and_names_the_fallback() {
+        let degraded = vibex_core::ModelGatewayRuntimeState {
+            status: vibex_core::ModelGatewayStatus::Degraded,
+            port: Some(3425),
+            upstream_count: Some(1),
+            notice: Some(
+                "Repeated upstream failures: Agents have fallen back to their direct Provider configuration."
+                    .to_string(),
+            ),
+            ..vibex_core::ModelGatewayRuntimeState::default()
+        };
+        assert!(degraded.status.is_listening());
+        assert!(!degraded.status.is_routable());
+        // The address is still published, because the port is still bound.
+        assert_eq!(degraded.base_url().as_deref(), None);
+        assert!(gateway_runtime_text(&degraded).contains("direct Provider"));
     }
 
     /// A cooldown says when the Key comes back, not just that it is out.

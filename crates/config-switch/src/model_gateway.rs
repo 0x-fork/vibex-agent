@@ -754,3 +754,129 @@ mod fingerprint_tests {
         let _ = std::fs::remove_file(path);
     }
 }
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+    use vibex_core::RequestId;
+
+    fn service() -> (std::path::PathBuf, ProviderConfigService) {
+        let path = std::env::temp_dir().join(format!(
+            "vibex-gateway-credential-{}.db",
+            RequestId::new().as_str()
+        ));
+        let service = ProviderConfigService::new(&path);
+        (path, service)
+    }
+
+    fn profile_id(service: &ProviderConfigService) -> ModelProviderProfileId {
+        service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "DeepSeek".to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "endpoint-api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://api.example.invalid".to_string(),
+                    wire_protocol_id: Some(
+                        vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    ),
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: Vec::new(),
+                default_model_id: None,
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn a_key_can_be_added_and_removed_without_storing_plaintext() {
+        let (path, service) = service();
+        let provider = profile_id(&service);
+        let profile = service
+            .add_model_provider_credential(vibex_core::AddModelProviderCredentialRequest {
+                model_provider_profile_id: provider.clone(),
+                display_name: Some("Primary".to_string()),
+                value: "sk-secret-value".to_string(),
+            })
+            .unwrap();
+        assert_eq!(profile.credentials.len(), 1);
+        assert_eq!(profile.credentials[0].display_name, "Primary");
+        assert_eq!(
+            profile.credentials[0].status,
+            vibex_core::AgentCredentialStatus::Ready
+        );
+        // The row holds a reference, never the value.
+        let encoded = serde_json::to_string(&profile).unwrap();
+        assert!(
+            !encoded.contains("sk-secret-value"),
+            "the profile row carried the key value"
+        );
+
+        let credential_id = profile.credentials[0].id.clone();
+        let profile = service
+            .remove_model_provider_credential(vibex_core::RemoveModelProviderCredentialRequest {
+                model_provider_profile_id: provider.clone(),
+                credential_id,
+            })
+            .unwrap();
+        assert!(profile.credentials.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_empty_key_is_refused() {
+        let (path, service) = service();
+        let provider = profile_id(&service);
+        let error = service
+            .add_model_provider_credential(vibex_core::AddModelProviderCredentialRequest {
+                model_provider_profile_id: provider,
+                display_name: None,
+                value: "   ".to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "model_provider_credential_empty");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn removing_an_unknown_key_is_a_named_error() {
+        let (path, service) = service();
+        let provider = profile_id(&service);
+        let error = service
+            .remove_model_provider_credential(vibex_core::RemoveModelProviderCredentialRequest {
+                model_provider_profile_id: provider,
+                credential_id: RequestId::new(),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "model_provider_credential_not_found");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn each_added_key_advances_the_revision_so_bindings_restale() {
+        let (path, service) = service();
+        let provider = profile_id(&service);
+        let first = service
+            .add_model_provider_credential(vibex_core::AddModelProviderCredentialRequest {
+                model_provider_profile_id: provider.clone(),
+                display_name: None,
+                value: "sk-one".to_string(),
+            })
+            .unwrap();
+        let second = service
+            .add_model_provider_credential(vibex_core::AddModelProviderCredentialRequest {
+                model_provider_profile_id: provider,
+                display_name: None,
+                value: "sk-two".to_string(),
+            })
+            .unwrap();
+        assert!(second.revision > first.revision);
+        assert_eq!(second.credentials.len(), 2);
+        let _ = std::fs::remove_file(path);
+    }
+}

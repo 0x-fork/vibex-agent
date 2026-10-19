@@ -224,6 +224,16 @@ pub struct ModelGatewayService {
     /// Set while the service is shutting down, so an in-flight request stops
     /// instead of starting a new upstream call.
     shutting_down: RwLock<bool>,
+    /// Consecutive attempts that produced no usable upstream response.
+    ///
+    /// Reaching [`Self::DEGRADE_AFTER_FAILURES`] puts the service into
+    /// `Degraded`, which lets Agents fall back to their direct Provider
+    /// configuration instead of every request waiting out the same failure. One
+    /// success clears the count and the state.
+    consecutive_failures: AtomicU64,
+    /// When the last failure happened, so a stale count does not degrade a
+    /// gateway that has simply been idle.
+    last_failure_at_ms: AtomicU64,
 }
 
 struct ListenerHandle {
@@ -243,6 +253,14 @@ impl std::fmt::Debug for ModelGatewayService {
 }
 
 impl ModelGatewayService {
+    /// How many consecutive upstream failures degrade the gateway.
+    ///
+    /// Three is enough to tell a transient blip from a broken route, and small
+    /// enough that a user does not sit through many failing turns first.
+    pub const DEGRADE_AFTER_FAILURES: u64 = 3;
+    /// A failure this old no longer contributes to the count.
+    pub const FAILURE_MEMORY_MS: i64 = 2 * 60 * 1000;
+
     pub fn new(
         db_path: impl Into<std::path::PathBuf>,
         config: ProviderConfigService,
@@ -273,6 +291,8 @@ impl ModelGatewayService {
             listener: Mutex::new(None),
             snapshot: RwLock::new(None),
             shutting_down: RwLock::new(false),
+            consecutive_failures: AtomicU64::new(0),
+            last_failure_at_ms: AtomicU64::new(0),
         })
     }
 
@@ -407,6 +427,44 @@ impl ModelGatewayService {
         }
     }
 
+    /// Applies a settings change to the running listener.
+    ///
+    /// Turning automatic routing off must actually stop the listener, not just
+    /// flip a flag: an Agent pointing at a dead port is the honest state, and
+    /// every binding falls back to its direct Provider. Turning it back on
+    /// re-binds the persisted port.
+    pub async fn apply_policy(self: &Arc<Self>) -> GatewayResult<ModelGatewayRuntimeState> {
+        let settings = self.settings()?;
+        let running = self.runtime_state().status == ModelGatewayStatus::Running;
+        match (settings.policy.enabled, running) {
+            (false, true) => {
+                self.stop_listener().await;
+                let state = ModelGatewayRuntimeState {
+                    status: ModelGatewayStatus::Disabled,
+                    notice: Some("Automatic routing is turned off".to_string()),
+                    ..ModelGatewayRuntimeState::default()
+                };
+                self.publish(state.clone());
+                Ok(state)
+            }
+            (true, false) => self.start().await,
+            _ => {
+                self.invalidate_snapshot();
+                Ok(self.runtime_state())
+            }
+        }
+    }
+
+    /// Stops the listener but leaves the service usable, so it can be started
+    /// again without rebuilding it.
+    async fn stop_listener(&self) {
+        let handle = self.listener.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(handle) = handle {
+            handle.task.abort();
+            let _ = handle.task.await;
+        }
+    }
+
     /// Starts the listener, persisting the port that actually bound.
     ///
     /// A port collision probes upward from the persisted port and stores the
@@ -493,7 +551,60 @@ impl ModelGatewayService {
         ))
     }
 
-    fn publish(&self, state: ModelGatewayRuntimeState) {
+    /// Records one upstream success, clearing the failure count and any
+    /// degraded state.
+    pub(crate) fn note_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        self.last_failure_at_ms.store(0, Ordering::Relaxed);
+        let mut state = self.runtime_state();
+        if state.status == ModelGatewayStatus::Degraded {
+            state.status = ModelGatewayStatus::Running;
+            state.notice = None;
+            state.updated_at_ms = vibex_core::unix_timestamp_ms();
+            self.publish(state);
+        }
+    }
+
+    /// Records one failed request and degrades the gateway once the count is
+    /// reached.
+    ///
+    /// This counts *requests the caller saw fail*, not upstream attempts: one
+    /// dead upstream cools its only Key, and every later request is refused
+    /// before it can attempt anything. Counting attempts would never reach the
+    /// threshold in exactly the case that matters.
+    pub(crate) fn note_failure(&self) {
+        let now = vibex_core::unix_timestamp_ms();
+        let previous = self.last_failure_at_ms.swap(now as u64, Ordering::Relaxed) as i64;
+        // A failure older than the memory window starts a fresh count rather
+        // than adding to a tally from an unrelated outage.
+        let count = if previous != 0 && now.saturating_sub(previous) > Self::FAILURE_MEMORY_MS {
+            self.consecutive_failures.store(1, Ordering::Relaxed);
+            1
+        } else {
+            self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1
+        };
+        if count < Self::DEGRADE_AFTER_FAILURES {
+            return;
+        }
+        let mut state = self.runtime_state();
+        if state.status != ModelGatewayStatus::Running {
+            return;
+        }
+        state.status = ModelGatewayStatus::Degraded;
+        state.notice = Some(
+            "Repeated upstream failures: Agents have fallen back to their direct Provider configuration."
+                .to_string(),
+        );
+        state.updated_at_ms = now;
+        self.publish(state);
+    }
+
+    /// Whether the gateway is currently stepping aside.
+    pub fn is_degraded(&self) -> bool {
+        self.runtime_state().status == ModelGatewayStatus::Degraded
+    }
+
+    pub fn publish(&self, state: ModelGatewayRuntimeState) {
         if let Ok(mut guard) = self.runtime.write() {
             *guard = state;
         }
@@ -504,11 +615,7 @@ impl ModelGatewayService {
         if let Ok(mut shutting_down) = self.shutting_down.write() {
             *shutting_down = true;
         }
-        let handle = self.listener.lock().ok().and_then(|mut guard| guard.take());
-        if let Some(handle) = handle {
-            handle.task.abort();
-            let _ = handle.task.await;
-        }
+        self.stop_listener().await;
         let mut state = self.runtime_state();
         state.status = ModelGatewayStatus::Unavailable;
         state.port = None;
@@ -537,6 +644,12 @@ impl ModelGatewayService {
             GatewayError::MalformedRequest("the body is not valid JSON".to_string())
         })?;
         let snapshot = self.cached_snapshot()?;
+        if self.is_degraded() {
+            return Err(GatewayError::NotConfigured(
+                "the gateway stepped aside after repeated upstream failures; use the direct Provider or retry shortly"
+                    .to_string(),
+            ));
+        }
         if let Some(limit) = snapshot.settings.policy.token_limit
             && snapshot.gateway_used_tokens >= limit.tokens
         {
@@ -805,6 +918,7 @@ impl ModelGatewayService {
                 }
             };
             if response.status().is_success() {
+                self.note_success();
                 self.clear_failure(&prepared.profile_id, &candidate.credential);
                 return Ok((
                     UpstreamAttempt {
@@ -1462,6 +1576,57 @@ mod tests {
             credentials: Vec::new(),
             keys: Vec::new(),
         }
+    }
+
+    /// Three failures degrade, one success recovers.
+    ///
+    /// The transition is the whole contract: a degraded gateway must come back
+    /// without a restart, and a single good answer is the signal.
+    #[test]
+    fn the_breaker_degrades_after_three_failures_and_recovers_on_success() {
+        use std::sync::atomic::Ordering;
+        let service = ModelGatewayService::new(
+            std::env::temp_dir().join("vibex-breaker-test.db"),
+            ProviderConfigService::new(std::env::temp_dir().join("vibex-breaker-test-db.db")),
+            GatewayLimits::default(),
+        );
+        service.publish(ModelGatewayRuntimeState::running(3425, 1));
+        for _ in 0..ModelGatewayService::DEGRADE_AFTER_FAILURES {
+            service.note_failure();
+        }
+        assert!(service.is_degraded());
+        assert!(service.runtime_state().notice.is_some());
+        // The listener is still bound, so the UI can distinguish "stepped
+        // aside" from "not running".
+        assert!(service.runtime_state().status.is_listening());
+
+        service.note_success();
+        assert!(!service.is_degraded());
+        assert_eq!(service.runtime_state().status, ModelGatewayStatus::Running);
+        assert!(service.runtime_state().notice.is_none());
+        assert_eq!(service.consecutive_failures.load(Ordering::Relaxed), 0);
+    }
+
+    /// A failure from an unrelated outage starts the count over.
+    #[test]
+    fn an_old_failure_does_not_accumulate() {
+        let service = ModelGatewayService::new(
+            std::env::temp_dir().join("vibex-breaker-old.db"),
+            ProviderConfigService::new(std::env::temp_dir().join("vibex-breaker-old-db.db")),
+            GatewayLimits::default(),
+        );
+        service.publish(ModelGatewayRuntimeState::running(3425, 1));
+        service.note_failure();
+        service.note_failure();
+        service.last_failure_at_ms.store(
+            (vibex_core::unix_timestamp_ms() - ModelGatewayService::FAILURE_MEMORY_MS - 1) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        service.note_failure();
+        assert!(
+            !service.is_degraded(),
+            "a failure from an unrelated outage must not complete the count"
+        );
     }
 
     #[test]

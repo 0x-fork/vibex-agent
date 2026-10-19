@@ -374,6 +374,15 @@ pub enum ModelGatewayStatus {
     /// The service could not bind or was shut down. Agents fall back to their
     /// direct Provider configuration and the UI says so.
     Unavailable,
+    /// The listener is up but upstream calls have failed repeatedly, so the
+    /// gateway has stepped out of the way and Agents fall back to their direct
+    /// Provider configuration.
+    ///
+    /// This is distinct from `Unavailable`: the port is still bound, and the
+    /// state clears itself once an upstream answers again. Reporting it is the
+    /// whole point — a silent fallback would leave the user believing
+    /// automatic routing is still in effect.
+    Degraded,
     /// The user turned automatic routing off. The surface stays visible.
     Disabled,
 }
@@ -381,6 +390,11 @@ pub enum ModelGatewayStatus {
 impl ModelGatewayStatus {
     pub const fn is_routable(self) -> bool {
         matches!(self, Self::Running)
+    }
+
+    /// The listener is bound even though routing may be bypassed.
+    pub const fn is_listening(self) -> bool {
+        matches!(self, Self::Running | Self::Degraded)
     }
 }
 

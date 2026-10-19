@@ -1225,3 +1225,78 @@ async fn an_exhausted_minute_is_a_429_before_the_upstream_is_called() {
     service.shutdown().await;
     cleanup(path);
 }
+
+/// Three consecutive unreachable upstreams degrade the gateway, and a success
+/// brings it back.
+///
+/// A degraded gateway refuses fast with an explainable error instead of making
+/// every Agent wait out the same failure. Reporting the state is what stops a
+/// silent fallback from looking like automatic routing is still working.
+#[tokio::test]
+async fn repeated_failures_degrade_the_gateway_and_a_success_recovers_it() {
+    let path = database_path();
+    // A port nothing listens on: every attempt fails to connect.
+    let dead_url = {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}")
+    };
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &dead_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-test",
+    );
+    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+    let client = reqwest::Client::new();
+    let call = |client: reqwest::Client, url: String| async move {
+        client
+            .post(url)
+            .header(header::HOST, "127.0.0.1")
+            .json(&json!({
+                "model": "deepseek/deepseek-chat",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    };
+
+    for _ in 0..vibex_model_gateway::ModelGatewayService::DEGRADE_AFTER_FAILURES {
+        let status = call(client.clone(), format!("{gateway_url}/v1/chat/completions")).await;
+        assert!(status >= 400, "a dead upstream should fail, got {status}");
+    }
+    assert!(
+        service.is_degraded(),
+        "the gateway did not step aside after {} failures",
+        vibex_model_gateway::ModelGatewayService::DEGRADE_AFTER_FAILURES
+    );
+    assert_eq!(
+        service.runtime_state().status,
+        vibex_core::ModelGatewayStatus::Degraded
+    );
+    assert!(
+        service.runtime_state().notice.is_some(),
+        "a degraded gateway must say why"
+    );
+
+    // A degraded gateway refuses before trying an upstream at all.
+    let refused = call(client.clone(), format!("{gateway_url}/v1/chat/completions")).await;
+    assert_eq!(
+        refused, 503,
+        "a degraded gateway must refuse rather than retry"
+    );
+
+    gateway_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}

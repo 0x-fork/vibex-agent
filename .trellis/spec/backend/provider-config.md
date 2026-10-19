@@ -5045,6 +5045,23 @@ ProviderConfigService::{
     Agent's own effort vocabulary, and inventing one produces a declaration the
     Agent refuses.
   - No money field exists anywhere in the catalogue, its cache, or its DTOs.
+- **The gateway steps aside when it is the problem.** Three consecutive requests
+  that produce no upstream answer put the service into `Degraded`: the listener
+  stays bound, routing is refused with a `503` that names the fallback, and one
+  success clears both the count and the state. `Degraded` is deliberately
+  distinct from `Unavailable` — the port is alive either way, and only one of
+  them means "restart or wait". A failure older than the memory window starts the
+  count over, and the degraded refusal itself never counts, or the state could
+  never clear.
+- **The gateway's own switch reaches the listener.** Turning automatic routing
+  off stops the listener and every bound Agent falls back to its direct
+  Provider; turning it on re-binds the persisted port. A settings write that
+  only flipped a stored flag would leave a dead port Agents still point at.
+- **A Key is added and removed on the shared Provider.** The reference is
+  written first with a placeholder and the value goes through the same secret
+  store as every other credential, so plaintext never enters the profile row.
+  Removing a Key deletes its stored Secret. Either operation advances the profile
+  revision, which is what restales the bindings that project it.
 - **The gateway accepts loopback callers only, and no browser.** The `Host`
   header must name `127.0.0.1`, `localhost`, or `::1`, and any `Origin` header is
   refused; the second check is what defeats a hostile page reaching the loopback
@@ -5110,6 +5127,15 @@ ProviderConfigService::{
 - `cargo test -p vibex-db model_gateway` asserts migration 64 idempotency,
   revision compare-and-swap, window bucketing, pin expiry, ledger retention, and
   that no prompt or Key text reaches the ledger.
+- `cargo test -p vibex-model-gateway --test gateway` asserts that three
+  unreachable requests degrade the gateway, that a degraded gateway refuses with
+  `503` instead of retrying, and that the state is reported with a reason.
+- `cargo test -p vibex-model-gateway --lib` asserts the breaker's transitions
+  directly: three failures degrade, one success recovers, and an old failure does
+  not accumulate.
+- `cargo test -p vibex-config-switch credential_tests` asserts that a Key can be
+  added and removed, that the profile row never carries the value, that an empty
+  Key is refused, and that each add advances the revision.
 - `cargo test -p vibex-model-catalog` asserts exact and approximate matching, that
   adoption records provenance per field, that a hand-typed value is not
   overwritten, that `reasoning_efforts` is never suggested, that a corrupt or

@@ -1721,6 +1721,25 @@ pub struct AgentModelProviderBindingUpdateRequest {
     pub expected_revision: i64,
 }
 
+/// Adds one API key to a shared Provider Profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddModelProviderCredentialRequest {
+    pub model_provider_profile_id: ModelProviderProfileId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// The key itself. Never logged, never persisted.
+    pub value: String,
+}
+
+/// Removes one key from a shared Provider Profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveModelProviderCredentialRequest {
+    pub model_provider_profile_id: ModelProviderProfileId,
+    pub credential_id: RequestId,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderCredentialSecretMutationRequest {
     pub model_provider_profile_id: ModelProviderProfileId,

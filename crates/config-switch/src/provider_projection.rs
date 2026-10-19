@@ -986,6 +986,98 @@ impl ProviderConfigService {
         })
     }
 
+    /// Adds one API key to a shared Provider Profile.
+    ///
+    /// The reference is created first with a placeholder, then the value is
+    /// written through the same store the rest of the secrets use, so the
+    /// plaintext never enters the profile row. A failure to store the value
+    /// removes the reference again rather than leaving a Key that cannot work.
+    pub fn add_model_provider_credential(
+        &self,
+        request: vibex_core::AddModelProviderCredentialRequest,
+    ) -> VibexResult<ModelProviderProfile> {
+        let value = request.value.trim();
+        if value.is_empty() {
+            return Err(VibexError::validation(
+                "model_provider_credential_empty",
+                "an API key must not be empty",
+            ));
+        }
+        let display_name = request
+            .display_name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("Key {}", RequestId::new().as_str()));
+        let conn = self.open_connection()?;
+        let mut profile = require_model_provider(&conn, &request.model_provider_profile_id)?;
+        let credential_id = RequestId::new();
+        let lookup_key = format!("vibex-provider-secret-{}", credential_id.as_str());
+        secrets::store_provider_secret(&lookup_key, value)?;
+        let backend = secrets::provider_secret_write_backend();
+        profile.credentials.push(ModelProviderCredentialReference {
+            id: credential_id,
+            display_name,
+            status: AgentCredentialStatus::Ready,
+            credential: AgentCredential::ApiKey {
+                secret: vibex_core::ProjectionSecretReference {
+                    id: RequestId::new(),
+                    backend,
+                    setup_state: ProviderSecretSetupState::Available,
+                    lookup_key,
+                    redacted_hint: secrets::provider_secret_storage_hint(backend).to_string(),
+                    revision: 1,
+                    legacy_secret_reference_id: None,
+                },
+                target_hint: None,
+            },
+            revision: 1,
+        });
+        let expected = profile.revision;
+        profile.revision = expected.saturating_add(1);
+        profile.updated_at_ms = unix_timestamp_ms().max(profile.updated_at_ms.saturating_add(1));
+        let updated = ModelProviderProfileRepository::update(&conn, &profile, expected)?;
+        self.refresh_bindings_for_model_provider(&conn, &updated.id)?;
+        Ok(updated)
+    }
+
+    /// Removes one key from a shared Provider Profile.
+    ///
+    /// The stored Secret is deleted too: leaving it behind would keep a value
+    /// the user asked to remove. The last Key may be removed, which simply
+    /// leaves the Provider unable to answer until another is added.
+    pub fn remove_model_provider_credential(
+        &self,
+        request: vibex_core::RemoveModelProviderCredentialRequest,
+    ) -> VibexResult<ModelProviderProfile> {
+        let conn = self.open_connection()?;
+        let mut profile = require_model_provider(&conn, &request.model_provider_profile_id)?;
+        let Some(credential) = profile
+            .credentials
+            .iter()
+            .find(|credential| credential.id == request.credential_id)
+            .cloned()
+        else {
+            return Err(VibexError::validation(
+                "model_provider_credential_not_found",
+                "model provider credential was not found",
+            ));
+        };
+        if let Some(reference) = credential.credential.secret_reference()
+            && secrets::is_local_secret_backend(reference.backend)
+        {
+            let _ = secrets::delete_provider_secret(&reference.lookup_key);
+        }
+        profile
+            .credentials
+            .retain(|candidate| candidate.id != request.credential_id);
+        let expected = profile.revision;
+        profile.revision = expected.saturating_add(1);
+        profile.updated_at_ms = unix_timestamp_ms().max(profile.updated_at_ms.saturating_add(1));
+        let updated = ModelProviderProfileRepository::update(&conn, &profile, expected)?;
+        self.refresh_bindings_for_model_provider(&conn, &updated.id)?;
+        Ok(updated)
+    }
+
     pub fn mutate_provider_credential_secret(
         &self,
         request: ProviderCredentialSecretMutationRequest,
@@ -4751,10 +4843,9 @@ mod tests {
         AgentProviderProjectionOverrides, AgentRuntimeHomeStrategy, AgentRuntimeResourcePolicy,
         AgentRuntimeRouteKey, AgentRuntimeVersionIdentity, AgentVersionCompatibility,
         AgentVersionSource, ModelProviderCatalogEntry, ModelProviderEndpointKind,
-        ModelProviderProfileStatus, ProjectionEvidenceReference, ProjectionSecretReference,
-        ProviderNetworkDefaults, ProviderPermissionDefaults, ProviderSandboxDefaults,
-        ProviderSecretKind, ProviderSecretSetupState, TransportKind,
-        WIRE_PROTOCOL_OPENAI_RESPONSES,
+        ModelProviderProfileStatus, ProjectionEvidenceReference, ProviderNetworkDefaults,
+        ProviderPermissionDefaults, ProviderSandboxDefaults, ProviderSecretKind,
+        ProviderSecretSetupState, TransportKind, WIRE_PROTOCOL_OPENAI_RESPONSES,
     };
 
     use super::*;
@@ -6107,7 +6198,7 @@ mod tests {
                 display_name: "Matrix API key".to_string(),
                 status: AgentCredentialStatus::Referenced,
                 credential: AgentCredential::ApiKey {
-                    secret: ProjectionSecretReference {
+                    secret: vibex_core::ProjectionSecretReference {
                         id: credential_id,
                         backend: ProviderSecretBackend::Placeholder,
                         setup_state: ProviderSecretSetupState::Missing,
@@ -7150,7 +7241,7 @@ mod tests {
             display_name: "OpenCode API key".to_string(),
             status: AgentCredentialStatus::Referenced,
             credential: AgentCredential::ApiKey {
-                secret: ProjectionSecretReference {
+                secret: vibex_core::ProjectionSecretReference {
                     id: credential_id,
                     backend: ProviderSecretBackend::Placeholder,
                     setup_state: ProviderSecretSetupState::Missing,

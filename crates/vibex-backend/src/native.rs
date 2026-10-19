@@ -2873,10 +2873,83 @@ impl ManagementBackend for NativeBackend {
                 payload.expected_revision,
             )?;
             service.invalidate_snapshot();
+            // A listener that cannot follow the policy is reported through the
+            // runtime state, which the Config Center already renders; the write
+            // itself still succeeded.
+            let _ = service.apply_policy().await;
             provider.refresh_gateway_profiles(
                 &service.base_url().unwrap_or_default(),
                 &gateway_catalog(&provider)?,
             )?;
+            read_gateway_snapshot(&runtime).map_err(Into::into)
+        })
+    }
+
+    fn add_model_provider_credential(
+        &self,
+        request: MutationRequest<vibex_core::AddModelProviderCredentialRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            request.validate()?;
+            let profile = runtime
+                .providers()
+                .service()
+                .add_model_provider_credential(request.payload)?;
+            runtime.model_gateway().invalidate_snapshot();
+            Ok(profile)
+        })
+    }
+
+    fn remove_model_provider_credential(
+        &self,
+        request: MutationRequest<vibex_core::RemoveModelProviderCredentialRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            request.validate()?;
+            let profile = runtime
+                .providers()
+                .service()
+                .remove_model_provider_credential(request.payload)?;
+            runtime.model_gateway().invalidate_snapshot();
+            Ok(profile)
+        })
+    }
+
+    fn set_model_gateway_enabled(&self, enabled: bool) -> BackendFuture<'_, GatewaySnapshot> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let service = runtime.model_gateway();
+            let provider = runtime.providers().service();
+            let mut connection = vibex_db::open_database(service.database_path())?;
+            vibex_db::apply_migrations(&mut connection)?;
+            let current = vibex_db::ModelGatewaySettingsRepository::get_or_create(&connection)?;
+            let mut next = current.clone();
+            next.policy.enabled = enabled;
+            next.revision = current.revision.saturating_add(1);
+            next.policy.validate()?;
+            vibex_db::ModelGatewaySettingsRepository::update(&connection, &next, current.revision)?;
+            service.invalidate_snapshot();
+            let _ = service.apply_policy().await;
+            // An Agent bound to a stopped gateway must be told, and an Agent
+            // whose gateway came back must be re-pointed: the address is the
+            // same either way, so this only reports what changed.
+            if let Some(base_url) = service.base_url() {
+                let catalog = provider
+                    .gateway_model_catalog()
+                    .map(|catalog| {
+                        catalog
+                            .into_iter()
+                            .map(|model| model.display_id())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                provider.refresh_gateway_profiles(&base_url, &catalog)?;
+            }
             read_gateway_snapshot(&runtime).map_err(Into::into)
         })
     }

@@ -174,6 +174,24 @@ pub trait ManagementBackend: BackendBound {
         request: MutationRequest<GatewaySettingsUpdateRequest>,
     ) -> BackendFuture<'_, GatewaySnapshot>;
 
+    /// Adds one API key to a shared Provider.
+    fn add_model_provider_credential(
+        &self,
+        request: MutationRequest<vibex_core::AddModelProviderCredentialRequest>,
+    ) -> BackendFuture<'_, ModelProviderProfile>;
+
+    /// Removes one API key from a shared Provider.
+    fn remove_model_provider_credential(
+        &self,
+        request: MutationRequest<vibex_core::RemoveModelProviderCredentialRequest>,
+    ) -> BackendFuture<'_, ModelProviderProfile>;
+
+    /// Turns automatic routing on or off.
+    ///
+    /// Off stops the listener, so every bound Agent falls back to its direct
+    /// Provider; on re-binds the persisted port.
+    fn set_model_gateway_enabled(&self, enabled: bool) -> BackendFuture<'_, GatewaySnapshot>;
+
     /// Points one Agent at the gateway, or takes it back to a direct Provider.
     fn set_model_gateway_agent(
         &self,

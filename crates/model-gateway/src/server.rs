@@ -130,17 +130,39 @@ async fn serve(
     let prepared = match service.prepare(protocol, &headers, &body) {
         Ok(prepared) => prepared,
         Err(error) => {
-            let outcome = matches!(
+            // A routing refusal is a failed turn from the caller's point of
+            // view: the model it asked for produced no answer. Counting it is
+            // what lets a dead upstream reach the threshold even after its only
+            // Key has cooled.
+            //
+            // The degraded refusal itself is excluded: counting it would keep
+            // the gateway degraded forever with no upstream ever consulted.
+            let refuse_means_failure = matches!(
                 error,
-                GatewayError::AllKeysCooling { .. } | GatewayError::TokenCeilingReached { .. }
-            );
-            let _ = outcome;
+                GatewayError::AllKeysCooling { .. }
+                    | GatewayError::TokenCeilingReached { .. }
+                    | GatewayError::Upstream { .. }
+            ) || matches!(&error, GatewayError::NotConfigured(message)
+                    if !message.contains("stepped aside"));
+            if refuse_means_failure {
+                service.note_failure();
+            }
             return service.error_response(protocol, &error);
         }
     };
     let (attempt, key, _skipped) = match service.open_attempt(&prepared).await {
         Ok(attempt) => attempt,
-        Err(error) => return service.error_response(protocol, &error),
+        Err(error) => {
+            // A request that could not reach any upstream is what degrades the
+            // gateway; a request that never got past its own body is not.
+            if matches!(
+                error,
+                GatewayError::AllKeysCooling { .. } | GatewayError::Upstream { .. }
+            ) {
+                service.note_failure();
+            }
+            return service.error_response(protocol, &error);
+        }
     };
 
     if !prepared.stream {

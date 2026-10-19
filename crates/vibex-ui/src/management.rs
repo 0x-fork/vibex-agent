@@ -1844,6 +1844,27 @@ mod tests {
             error_future()
         }
 
+        fn add_model_provider_credential(
+            &self,
+            _request: MutationRequest<vibex_core::AddModelProviderCredentialRequest>,
+        ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+            error_future()
+        }
+
+        fn remove_model_provider_credential(
+            &self,
+            _request: MutationRequest<vibex_core::RemoveModelProviderCredentialRequest>,
+        ) -> BackendFuture<'_, vibex_core::ModelProviderProfile> {
+            error_future()
+        }
+
+        fn set_model_gateway_enabled(
+            &self,
+            _enabled: bool,
+        ) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
+            error_future()
+        }
+
         fn set_model_gateway_agent(
             &self,
             _request: MutationRequest<vibex_core::GatewayAgentUpdateRequest>,
