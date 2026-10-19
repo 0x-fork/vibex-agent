@@ -675,21 +675,10 @@ const TIMELINE_BODY_FOLD_CACHE_BYTES: usize = 64 * 1024;
 /// costs a few kilobytes here.
 const TIMELINE_BODY_WINDOW_CACHE_LIMIT: usize = 64;
 const TIMELINE_BODY_WINDOW_CACHE_BYTES: usize = 2 * 1024 * 1024;
-/// How many windowed bodies keep a scroll handle, and how many keep the search
-/// query they have already been scrolled to.
-const TIMELINE_BODY_SCROLL_CACHE_LIMIT: usize = 64;
-const TIMELINE_BODY_SEARCH_CACHE_LIMIT: usize = 64;
 /// The gap between a folded or windowed body and the control that opens it.
 const TIMELINE_BODY_REVEAL_CONTROL_GAP: f32 = 8.0;
 /// The height the reveal control adds to a row, gap included.
 const TIMELINE_BODY_REVEAL_CONTROL_HEIGHT: f32 = 32.0;
-/// How far a windowed body's edge fades into the surface it sits on.
-///
-/// A scroll container cuts whatever line it lands on in half. A row showing
-/// half a line against the text above it reads as a rendering fault, so the
-/// edges fade the surface back in over roughly a line and a half: a line
-/// entering or leaving the box dissolves instead of being sliced.
-const TIMELINE_BODY_EDGE_FADE_PX: f32 = 24.0;
 const TIMELINE_REASONING_SUMMARY_CACHE_LIMIT: usize = 256;
 const TIMELINE_REASONING_SUMMARY_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
@@ -4758,13 +4747,6 @@ pub struct SessionView {
     /// Where each windowed body's chunks are and how tall the window found
     /// them, by row revision.
     timeline_body_windows: BTreeMap<String, (i64, Rc<TimelineBodyWindow>)>,
-    /// The scroll position of each windowed body's own viewport.
-    timeline_body_scrolls: BTreeMap<String, ScrollHandle>,
-    /// The search query each windowed body has already been scrolled to.
-    ///
-    /// An active search reveals its hit once: holding the reader at the hit
-    /// after they scroll away from it is worse than not revealing it at all.
-    timeline_body_search_reveals: BTreeMap<String, String>,
     timeline_process_expansion: BTreeMap<String, bool>,
     timeline_command_expansion: BTreeMap<String, bool>,
     timeline_file_changes_expansion: BTreeMap<String, bool>,
@@ -4908,8 +4890,6 @@ impl SessionView {
             timeline_body_reveal: BTreeMap::new(),
             timeline_body_folds: BTreeMap::new(),
             timeline_body_windows: BTreeMap::new(),
-            timeline_body_scrolls: BTreeMap::new(),
-            timeline_body_search_reveals: BTreeMap::new(),
             timeline_process_expansion: BTreeMap::new(),
             timeline_command_expansion: BTreeMap::new(),
             timeline_file_changes_expansion: BTreeMap::new(),
@@ -5076,18 +5056,6 @@ impl SessionView {
             )
             .saturating_add(
                 self.timeline_body_windows
-                    .keys()
-                    .map(String::len)
-                    .sum::<usize>(),
-            )
-            .saturating_add(
-                self.timeline_body_scrolls
-                    .keys()
-                    .map(String::len)
-                    .sum::<usize>(),
-            )
-            .saturating_add(
-                self.timeline_body_search_reveals
                     .keys()
                     .map(String::len)
                     .sum::<usize>(),
@@ -57949,26 +57917,14 @@ impl VibexWorkbench {
         revealed && text.len() > TIMELINE_BODY_VIEWPORT_MIN_BYTES
     }
 
-    /// The height a windowed body's box takes.
+    /// The height a row's prose takes: a body's own estimate, or what the chunk
+    /// table a windowed one is read through says its chunks add up to.
     ///
-    /// Its own estimate while that fits the cap, and the cap once it does not:
-    /// a report reads as a scrollable excerpt rather than a wall, and the row
-    /// the timeline lays out stays a bounded thing no matter how long the prose
-    /// behind it is.
-    fn timeline_body_viewport_height(&self, body_estimate: f32) -> f32 {
-        let cap = (f32::from(self.timeline_scroll.bounds().size.height)
-            * TIMELINE_BODY_VIEWPORT_MAX_SCREENS)
-            .max(TIMELINE_BODY_VIEWPORT_MIN_HEIGHT);
-        body_estimate.min(cap)
-    }
-
-    /// The height a row's prose takes: the whole estimate, or the box a
-    /// windowed one is read through.
-    ///
-    /// A windowed body answers from its chunk table, which the frame already
-    /// holds: measuring the box by scanning the prose instead would put the
-    /// body's own length back into every frame, which is the cost the box
-    /// exists to take out.
+    /// A windowed body answers from its table, which the frame already holds:
+    /// measuring it by scanning the prose instead would put the body's own
+    /// length back into every frame, which is the cost the window exists to take
+    /// out. The row is as tall as the body either way — the reader scrolls the
+    /// screen through it, so nothing hides behind a second viewport.
     fn timeline_body_drawn_height(
         &self,
         row: &TimelineRow,
@@ -57979,13 +57935,11 @@ impl VibexWorkbench {
         if !windowed {
             return estimated_markdown_body_height(visible_body, chars_per_line);
         }
-        let estimate = self
-            .timeline_body_windows
+        self.timeline_body_windows
             .get(row.id.as_str())
             .filter(|(revision, _)| *revision == row.last_sequence)
             .map(|(_, window)| f32::from(window.total_height()))
-            .unwrap_or_else(|| estimated_markdown_body_height(visible_body, chars_per_line));
-        self.timeline_body_viewport_height(estimate)
+            .unwrap_or_else(|| estimated_markdown_body_height(visible_body, chars_per_line))
     }
 
     /// The chunk table a windowed body lays out, cut on the row's revision.
@@ -58063,60 +58017,6 @@ impl VibexWorkbench {
         }
     }
 
-    /// The scroll handle of a windowed body's box.
-    fn timeline_body_scroll(&mut self, row_id: &str) -> ScrollHandle {
-        if let Some(scroll) = self.timeline_body_scrolls.get(row_id) {
-            return scroll.clone();
-        }
-        if self.timeline_body_scrolls.len() >= TIMELINE_BODY_SCROLL_CACHE_LIMIT
-            && let Some(evicted) = self.timeline_body_scrolls.keys().next().cloned()
-        {
-            self.timeline_body_scrolls.remove(&evicted);
-        }
-        let scroll = ScrollHandle::new();
-        self.timeline_body_scrolls
-            .insert(row_id.to_string(), scroll.clone());
-        scroll
-    }
-
-    /// Bring an active search's first hit inside the window, once.
-    fn reveal_timeline_body_search(
-        &mut self,
-        row_id: &str,
-        body: &str,
-        window: &TimelineBodyWindow,
-        search: Option<&SessionSearchHighlight>,
-        scroll: &ScrollHandle,
-    ) {
-        let Some(query) = search
-            .filter(|highlight| highlight.active)
-            .map(|highlight| highlight.query.to_string())
-            .filter(|query| !query.is_empty())
-        else {
-            return;
-        };
-        if self.timeline_body_search_reveals.get(row_id) == Some(&query) {
-            return;
-        }
-        if self.timeline_body_search_reveals.len() >= TIMELINE_BODY_SEARCH_CACHE_LIMIT
-            && let Some(evicted) = self.timeline_body_search_reveals.keys().next().cloned()
-        {
-            self.timeline_body_search_reveals.remove(&evicted);
-        }
-        self.timeline_body_search_reveals
-            .insert(row_id.to_string(), query.clone());
-        let Some(offset) = body.find(&query) else {
-            return;
-        };
-        let index = window
-            .chunks
-            .iter()
-            .position(|range| range.contains(&offset))
-            .unwrap_or_default();
-        let above = window.heights.iter().take(index).sum::<f32>();
-        scroll.set_offset(point(px(0.0), px(-above)));
-    }
-
     /// A body read through its own viewport.
     ///
     /// The chunks travel through the same windowed body the process groups use:
@@ -58134,9 +58034,6 @@ impl VibexWorkbench {
     ) -> AnyElement {
         let chars_per_line = self.estimated_timeline_chars_per_line();
         let window = self.timeline_body_window(&row.id, row.last_sequence, &body, chars_per_line);
-        let box_height = self.timeline_body_viewport_height(f32::from(window.total_height()));
-        let scroll = self.timeline_body_scroll(&row.id);
-        self.reveal_timeline_body_search(&row.id, &body, &window, search.as_ref(), &scroll);
         let origins = Rc::new(window.origins());
         let total_height = window.total_height();
         let row_id = row.id.clone();
@@ -58199,30 +58096,22 @@ impl VibexWorkbench {
         });
         let selector = format!("timeline-body-window:{}", row.id);
         let debug_selector = selector.clone();
-        let surface = cx.theme().background;
+        // The body sits in the transcript and scrolls with it: the screen is the
+        // window. The element reserves the room the chunks add up to and lays
+        // out only the ones the screen shows, so there is no second scroll and
+        // no second pair of edges cutting the prose in the middle of the page.
         div()
+            .id(selector)
+            .debug_selector(move || debug_selector.clone())
             .w_full()
             .min_w_0()
-            .relative()
-            .child(
-                div()
-                    .id(selector)
-                    .debug_selector(move || debug_selector.clone())
-                    .w_full()
-                    .min_w_0()
-                    .max_h(px(box_height))
-                    .track_scroll(&scroll)
-                    .overflow_y_scroll()
-                    .child(timeline_group_body::timeline_group_body(
-                        origins,
-                        total_height,
-                        px(TIMELINE_BODY_CHUNK_OVERSCAN_PX),
-                        build_row,
-                        record,
-                    )),
-            )
-            .child(timeline_body_edge_fade(surface, &row.id, true))
-            .child(timeline_body_edge_fade(surface, &row.id, false))
+            .child(timeline_group_body::timeline_group_body(
+                origins,
+                total_height,
+                px(TIMELINE_BODY_CHUNK_OVERSCAN_PX),
+                build_row,
+                record,
+            ))
             .into_any_element()
     }
 
@@ -68686,24 +68575,21 @@ fn reasoning_preview_text(label: &str) -> String {
 /// with a control on the row that opens the rest.
 const TIMELINE_BODY_VISIBLE_BYTES: usize = 4 * 1024;
 
-/// The shortest body that an opened row reads through a viewport of its own.
+/// The shortest body that an opened row reads as chunks of itself.
 ///
 /// Below this, opening a body is the reader saying they want to see the rest of
-/// a message, and the rest is small enough to hand to the surface whole. Above
-/// it, the body is drawn inside a box that lays out only the chunks it shows,
-/// so what an opened body costs stops following the body's length.
+/// a message, and the rest is small enough to hand to one surface whole. Above
+/// it the body is cut into chunks, and the transcript lays out only the chunks
+/// the screen shows — so what an opened body costs stops following the body's
+/// length while the body itself still scrolls with the page.
 ///
 /// The allowance is deliberately close to the folded one: a Markdown surface's
 /// frame cost is not linear in what it is handed so much as it is punishing
 /// past a point, and a body between the two used to fall in the gap — too long
-/// to draw cheaply, too short to be windowed (measured: revealing every body of
-/// a real session cost 104 ms a frame with one 31 KB surface in view, against
-/// 1.6 ms a frame for the same page read through the box).
+/// to draw cheaply, too short to be split (measured: revealing every body of a
+/// real session cost 104 ms a frame with one 31 KB surface in view, against
+/// 4.2 ms a frame for the same page laid out as chunks).
 const TIMELINE_BODY_VIEWPORT_MIN_BYTES: usize = 8 * 1024;
-
-/// How tall that box may grow, in timeline viewports, and the least it is.
-const TIMELINE_BODY_VIEWPORT_MAX_SCREENS: f32 = 2.0;
-const TIMELINE_BODY_VIEWPORT_MIN_HEIGHT: f32 = 320.0;
 
 /// How much prose one chunk of a windowed body holds.
 const TIMELINE_BODY_CHUNK_BYTES: usize = 4 * 1024;
@@ -68761,38 +68647,6 @@ fn timeline_row_body_folds(row: &TimelineRow, turn_live: bool) -> bool {
         row.kind,
         TimelineRowKind::AgentMessage | TimelineRowKind::Reasoning
     ) && (!row.streaming || !turn_live)
-}
-
-/// The soft edge a windowed body is read through.
-///
-/// It is a plain overlay with no hitbox, so the wheel keeps reaching the box's
-/// scroll container underneath it: the reader scrolls through the fade.
-fn timeline_body_edge_fade(surface: Hsla, row_id: &str, top: bool) -> AnyElement {
-    let clear = surface.opacity(0.0);
-    let selector = format!(
-        "timeline-body-fade:{}:{}",
-        if top { "top" } else { "bottom" },
-        row_id
-    );
-    let (from, to) = if top {
-        (surface, clear)
-    } else {
-        (clear, surface)
-    };
-    div()
-        .debug_selector(move || selector.clone())
-        .absolute()
-        .left_0()
-        .right_0()
-        .when(top, |this| this.top_0())
-        .when(!top, |this| this.bottom_0())
-        .h(px(TIMELINE_BODY_EDGE_FADE_PX))
-        .bg(linear_gradient(
-            180.0,
-            linear_color_stop(from, 0.0),
-            linear_color_stop(to, 1.0),
-        ))
-        .into_any_element()
 }
 
 /// Where one windowed body is cut into the chunks the window lays out.

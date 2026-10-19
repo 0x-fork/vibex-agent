@@ -2595,40 +2595,25 @@ fn a_long_settled_body_is_drawn_as_its_head_until_the_reader_opens_it(cx: &mut T
                 .collect::<Vec<_>>(),
         )
     });
-    // Opening a body this long hands it to its own viewport rather than to one
-    // surface: the row is the box, and what is laid out is a chunk of the body.
-    let box_selector: &'static str =
+    // Opening a body this long splits it into chunks the transcript lays out as
+    // the screen reaches them: one surface never receives the whole body, and
+    // the row is as tall as the body so the reader scrolls the page through it.
+    let body_selector: &'static str =
         Box::leak(format!("timeline-body-window:{row_id}").into_boxed_str());
-    let box_bounds = cx
-        .debug_bounds(box_selector)
-        .expect("the opened row reads through its own box");
-    // The control clears the box, and both of the box's edges fade: a line the
-    // box cut in half must not slide under the control or into the text above.
-    let control_bounds = cx
-        .debug_bounds(control_selector)
-        .expect("the opened row keeps its control");
     assert!(
-        control_bounds.top() >= box_bounds.bottom(),
-        "the control clears the box: control {control_bounds:?} against box {box_bounds:?}"
+        cx.debug_bounds(body_selector).is_some(),
+        "the opened row is laid out in the transcript"
     );
-    for edge in ["top", "bottom"] {
-        let selector: &'static str =
-            Box::leak(format!("timeline-body-fade:{edge}:{row_id}").into_boxed_str());
-        assert!(
-            cx.debug_bounds(selector).is_some(),
-            "the {edge} edge of the box fades into the surface"
-        );
-    }
     assert!(
         !opened_surfaces.is_empty()
             && opened_surfaces
                 .iter()
                 .all(|len| *len <= TIMELINE_BODY_CHUNK_MAX_BYTES),
-        "the box lays out chunks, not the whole body: {opened_surfaces:?}"
+        "no surface receives the whole body: {opened_surfaces:?}"
     );
     assert!(
-        opened_height < full_estimate,
-        "the row is measured by the box: {opened_height} against {full_estimate}"
+        opened_height > folded_height && opened_height <= full_estimate * 1.5,
+        "the row reserves the body rather than a box: {opened_height}, folded {folded_height}, estimate {full_estimate}"
     );
 
     // Only settled prose folds: a body still arriving is the reader's live view
@@ -2709,13 +2694,13 @@ fn a_windowed_body_is_cut_on_paragraph_breaks_and_keeps_fences_whole() {
     );
 }
 
-/// A revealed long body is read through a viewport of its own.
+/// A revealed long body is laid out by the screen, not by its own length.
 ///
-/// The point of the box is what it does not lay out: the row keeps a bounded
-/// height, the timeline lays out the box, and the box builds only the chunks it
-/// shows — so an opened report costs a screenful instead of the whole report.
+/// The point of the split is what it does not lay out: the body scrolls with
+/// the transcript like any other row — one scrollbar, and whatever the screen
+/// shows is shown whole — while only the chunks the screen reaches are built.
 #[gpui::test]
-fn a_revealed_long_body_lays_out_only_the_chunks_its_box_shows(cx: &mut TestAppContext) {
+fn a_revealed_long_body_lays_out_only_the_chunks_the_screen_shows(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let session_id = VibexSessionId::parse("session_layout").unwrap();
     let long_body: String = (0..4000)
@@ -2796,7 +2781,7 @@ fn a_revealed_long_body_lays_out_only_the_chunks_its_box_shows(cx: &mut TestAppC
         let _ = draw_live_timeline_frames(&workbench, cx, 1);
     }
 
-    let (chunk_count, laid_out, laid_out_bytes, box_height, full_estimate) =
+    let (chunk_count, laid_out, laid_out_bytes, row_height, full_estimate) =
         workbench.read_with(cx, |workbench, _| {
             let (_, window) = workbench
                 .timeline_body_windows
@@ -2830,7 +2815,7 @@ fn a_revealed_long_body_lays_out_only_the_chunks_its_box_shows(cx: &mut TestAppC
     );
     assert!(
         laid_out < chunk_count / 4,
-        "only the chunks the box shows are laid out: {laid_out} of {chunk_count}"
+        "only the chunks the screen shows are laid out: {laid_out} of {chunk_count}"
     );
     assert!(
         laid_out_bytes < TIMELINE_BODY_CHUNK_MAX_BYTES * 4,
@@ -2838,24 +2823,18 @@ fn a_revealed_long_body_lays_out_only_the_chunks_its_box_shows(cx: &mut TestAppC
         long_body.len()
     );
     assert!(
-        box_height < full_estimate / 2.0,
-        "the row is measured by its box, not its prose: {box_height} against {full_estimate}"
+        row_height > full_estimate / 2.0,
+        "the row reserves the body, not a box: {row_height} against {full_estimate}"
     );
-    let box_selector: &'static str =
+    let body_selector: &'static str =
         Box::leak(format!("timeline-body-window:{row_id}").into_boxed_str());
     assert!(
-        cx.debug_bounds(box_selector).is_some(),
-        "the opened body is read through its own box"
+        cx.debug_bounds(body_selector).is_some(),
+        "the opened body is laid out in the transcript"
     );
 
-    // Scrolling the box builds the chunks it scrolls to, and only those.
-    let scroll = workbench.read_with(cx, |workbench, _| {
-        workbench
-            .timeline_body_scrolls
-            .get(&row_id)
-            .expect("the box keeps its scroll position")
-            .clone()
-    });
+    // Scrolling the transcript builds the chunks the screen reaches, and only
+    // those: the body has no scroll of its own.
     let (total_height, last_index) = workbench.read_with(cx, |workbench, _| {
         let (_, window) = workbench.timeline_body_windows.get(&row_id).unwrap();
         (
@@ -2863,7 +2842,12 @@ fn a_revealed_long_body_lays_out_only_the_chunks_its_box_shows(cx: &mut TestAppC
             window.chunks.len().saturating_sub(1),
         )
     });
-    scroll.set_offset(point(px(0.0), px(-(total_height - box_height))));
+    workbench.update(cx, |workbench, cx| {
+        workbench
+            .timeline_scroll
+            .set_offset(point(px(0.0), px(-(total_height * 0.85))));
+        cx.notify();
+    });
     for _ in 0..4 {
         cx.run_until_parked();
         let _ = draw_live_timeline_frames(&workbench, cx, 1);
@@ -2881,7 +2865,7 @@ fn a_revealed_long_body_lays_out_only_the_chunks_its_box_shows(cx: &mut TestAppC
                 .contains_key(&format!("{prefix}{last_index}")),
         )
     });
-    assert!(has_last, "the box lays out the chunk it scrolled to");
+    assert!(has_last, "the screen lays out the chunk it scrolled to");
     assert!(
         laid_out < chunk_count,
         "and still only the band it shows: {laid_out} of {chunk_count}"
