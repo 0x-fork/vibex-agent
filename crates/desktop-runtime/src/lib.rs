@@ -1387,6 +1387,21 @@ fn assemble_gateway_snapshot(
             wire_protocol_id: String::new(),
         });
     }
+    let candidates = profiles
+        .iter()
+        .filter(|profile| profile.status == vibex_core::ModelProviderProfileStatus::Enabled)
+        .map(|profile| vibex_core::GatewayUpstreamCandidate {
+            model_provider_profile_id: profile.id.clone(),
+            display_name: profile.display_name.clone(),
+            model_count: profile
+                .configured_models
+                .iter()
+                .filter(|model| model.enabled)
+                .count(),
+            key_count: profile.credentials.len(),
+            selected: settings.upstreams.contains(&profile.id),
+        })
+        .collect::<Vec<_>>();
     let mut agents = Vec::new();
     for (agent_id, _strategy, _enabled) in provider.gateway_agent_options()? {
         agents.push(vibex_core::GatewayAgentBinding {
@@ -1403,6 +1418,7 @@ fn assemble_gateway_snapshot(
         upstreams,
         models,
         agents,
+        upstream_candidates: candidates,
     })
 }
 

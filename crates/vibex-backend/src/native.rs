@@ -1179,12 +1179,28 @@ fn read_gateway_snapshot(
             agent_id: agent_id.as_str().to_string(),
         });
     }
+    let catalog = provider.list_model_provider_profiles().unwrap_or_default();
+    let upstream_candidates = catalog
+        .iter()
+        .map(|profile| vibex_core::GatewayUpstreamCandidate {
+            model_provider_profile_id: profile.id.clone(),
+            display_name: profile.display_name.clone(),
+            model_count: profile
+                .configured_models
+                .iter()
+                .filter(|model| model.enabled)
+                .count(),
+            key_count: profile.credentials.len(),
+            selected: settings.upstreams.contains(&profile.id),
+        })
+        .collect::<Vec<_>>();
     Ok(GatewaySnapshot {
         settings,
         runtime: runtime_state,
         upstreams,
         models,
         agents,
+        upstream_candidates,
     })
 }
 

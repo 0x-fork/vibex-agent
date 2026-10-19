@@ -675,6 +675,9 @@ pub struct ManagementData {
     pub devices: Vec<RemoteDeviceDetail>,
     pub audit: Vec<vibex_core::RemoteAuditRecord>,
     pub providers: Vec<vibex_core::ProviderProfileSummary>,
+    /// The local model gateway, as the authority last reported it. The
+    /// Providers page shows it as its own row above the direct Providers.
+    pub gateway: Option<vibex_core::GatewaySnapshot>,
     /// Which built-in tool panels each Agent receives, as the authority holds
     /// them.
     pub agent_tools: vibex_core::AgentToolPreferences,
@@ -9589,6 +9592,8 @@ pub enum Effect {
     },
     ListAudit,
     ListProfiles,
+    /// Read the local model gateway.
+    LoadGateway,
     SelectProfile {
         profile_id: vibex_core::ProviderProfileId,
         /// The scope this default applies to. `None` is the authority's global
@@ -9893,6 +9898,7 @@ impl Effect {
             Effect::RevokeDevice { .. } => "revoke_device",
             Effect::ListAudit => "audit",
             Effect::ListProfiles => "profiles",
+            Effect::LoadGateway => "gateway",
             Effect::SelectProfile { .. } => "select_profile",
             Effect::WriteProviderSecret { .. } => "provider_secret",
             Effect::ClearProviderSecret { .. } => "provider_secret_clear",

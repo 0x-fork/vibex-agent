@@ -1736,6 +1736,80 @@ fn version_label(agent: &vibex_core::AgentSnapshotEntry, strings: Strings) -> St
     }
 }
 
+/// The gateway's row, above the direct Providers.
+///
+/// It is a row rather than a page because it answers the same question the
+/// other rows do — which Provider serves a model — and because a reader who
+/// cannot see it cannot tell why a model they added is reachable from three
+/// Agents at once.
+fn gateway_row(data: &ManagementData, strings: Strings) -> Option<ConfigRow> {
+    let snapshot = data.gateway.as_ref()?;
+    let state = match snapshot.runtime.status {
+        vibex_core::ModelGatewayStatus::Running => strings.config_state_enabled(),
+        vibex_core::ModelGatewayStatus::Disabled => strings.config_state_disabled(),
+        _ => strings.config_state_unavailable(),
+    };
+    let cooling = snapshot.cooling_key_count();
+    let invalid = snapshot.invalid_key_count();
+    let key_summary = match (cooling, invalid) {
+        (0, 0) => format!("{} keys", snapshot.ready_key_count()),
+        (cooling, 0) => format!("{} keys · {cooling} cooling", snapshot.ready_key_count()),
+        (0, invalid) => format!("{} keys · {invalid} invalid", snapshot.ready_key_count()),
+        (cooling, invalid) => format!(
+            "{} keys · {cooling} cooling · {invalid} invalid",
+            snapshot.ready_key_count()
+        ),
+    };
+    let agents = snapshot
+        .agents
+        .iter()
+        .filter(|agent| agent.enabled)
+        .map(|agent| agent.agent_id.clone())
+        .collect::<Vec<_>>();
+    let mut row = ConfigRow::new("gateway", snapshot.settings.display_name.clone())
+        .cell(snapshot.upstreams.len().to_string())
+        .cell(key_summary)
+        .cell(state)
+        .cell(if agents.is_empty() {
+            strings.config_state_off().to_string()
+        } else {
+            agents.join(", ")
+        })
+        .chip(
+            state,
+            if snapshot.runtime.status == vibex_core::ModelGatewayStatus::Running {
+                ConfigTone::Ok
+            } else {
+                ConfigTone::Warn
+            },
+        )
+        .detail(strings.config_field_kind(), "gateway")
+        .detail(
+            "address",
+            snapshot
+                .runtime
+                .base_url()
+                .unwrap_or_else(|| "not running".to_string()),
+        )
+        .detail(
+            "routing",
+            snapshot.settings.policy.routing.label().to_string(),
+        )
+        .detail(
+            "agents",
+            if agents.is_empty() {
+                strings.config_state_off().to_string()
+            } else {
+                agents.join(", ")
+            },
+        )
+        .actions(&[ConfigAction::Toggle, ConfigAction::RefreshSnapshot]);
+    if let Some(notice) = snapshot.runtime.notice.as_deref() {
+        row = row.detail("state", notice.to_string());
+    }
+    Some(row)
+}
+
 fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
     // The authority lists profiles in its own order; the reader's arrangement
     // is a separate record, so the rows follow it when this client has read it.
@@ -1749,7 +1823,7 @@ fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
             .map(|entry| entry.order_index)
             .unwrap_or(i64::MAX)
     });
-    ordered
+    let direct = ordered
         .into_iter()
         .map(|profile| {
             let enabled = profile.status == vibex_core::ProviderProfileStatus::Enabled;
@@ -1813,7 +1887,12 @@ fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                 ConfigAction::Delete,
             ])
         })
-        .collect()
+        .collect::<Vec<_>>();
+    // The gateway leads: it is where a shared model actually comes from, and a
+    // reader scanning the page should meet it before the Providers it consumes.
+    let mut rows = gateway_row(data, strings).into_iter().collect::<Vec<_>>();
+    rows.extend(direct);
+    rows
 }
 
 fn server_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {

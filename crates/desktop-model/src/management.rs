@@ -24,6 +24,9 @@ pub enum ManagementSection {
     #[default]
     Agents,
     ModelProviders,
+    /// The local model gateway: routing policy, upstreams, and the Agents that
+    /// walk through it.
+    Gateway,
     Mcp,
     Skills,
     PromptsHooks,
@@ -34,9 +37,10 @@ pub enum ManagementSection {
 }
 
 impl ManagementSection {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Agents,
         Self::ModelProviders,
+        Self::Gateway,
         Self::Mcp,
         Self::Skills,
         Self::PromptsHooks,
@@ -50,6 +54,7 @@ impl ManagementSection {
         match self {
             Self::Agents => "agents",
             Self::ModelProviders => "model-providers",
+            Self::Gateway => "gateway",
             Self::Mcp => "mcp",
             Self::Skills => "skills",
             Self::PromptsHooks => "prompts-hooks",
@@ -64,6 +69,7 @@ impl ManagementSection {
         match self {
             Self::Agents => "Agents",
             Self::ModelProviders => "Model Providers",
+            Self::Gateway => "Gateway",
             Self::Mcp => "MCP",
             Self::Skills => "Skills",
             Self::PromptsHooks => "Prompts",

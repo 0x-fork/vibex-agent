@@ -2679,6 +2679,19 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
+        AppMessage::Gateway(result) => match result {
+            Ok(gateway) => {
+                app.management_data.gateway = Some(gateway);
+            }
+            Err(error) => {
+                // A gateway that cannot be read is not a reason to hide the
+                // Providers page: the direct Providers are still readable.
+                app.management_data.gateway = None;
+                if error.code != "remote_model_gateway_unavailable" {
+                    app.toast(Toast::danger(error.message));
+                }
+            }
+        },
         AppMessage::Profiles(result) => match result {
             Ok(profiles) => {
                 app.management_data.providers = profiles;

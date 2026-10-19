@@ -175,6 +175,7 @@ pub enum AppMessage {
     LanPairing(BackendResult<Option<Box<vibex_core::RemoteLanPairingWindowSnapshot>>>),
     Audit(BackendResult<Vec<vibex_core::RemoteAuditRecord>>),
     Profiles(BackendResult<Vec<vibex_core::ProviderProfileSummary>>),
+    Gateway(BackendResult<vibex_core::GatewaySnapshot>),
     /// One profile as the authority holds it, read for an editor.
     ProviderProfile(BackendResult<vibex_core::ProviderProfile>),
     /// One Agent's profile order, as the authority holds it.
@@ -2205,6 +2206,10 @@ impl Dispatch {
             Effect::ListProfiles => {
                 let result = self.facade.management().list_profiles().await;
                 self.send(AppMessage::Profiles(result));
+            }
+            Effect::LoadGateway => {
+                let result = self.facade.management().model_gateway_snapshot().await;
+                self.send(AppMessage::Gateway(result));
             }
             Effect::RenameProfile { profile_id, name } => {
                 let record = profile_id.as_str().to_string();

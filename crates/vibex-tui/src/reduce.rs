@@ -1268,7 +1268,7 @@ impl App {
                 },
             ],
             (_, ConfigSection::Providers) => {
-                let mut effects = vec![Effect::ListProfiles];
+                let mut effects = vec![Effect::ListProfiles, Effect::LoadGateway];
                 // The arrangement is a record of its own, read per Agent: a
                 // list that cannot say what order the reader chose would show
                 // the authority's order and call it theirs.
@@ -7742,7 +7742,7 @@ impl App {
             Page::NewSession | Page::Sessions => Outcome::effects(self.session_page_effects()),
             Page::Agent => Outcome::effects(self.refresh_timeline().into_iter().collect()),
             Page::Devices => Outcome::effects(self.device_page_effects()),
-            Page::Providers => Outcome::effects(vec![Effect::ListProfiles]),
+            Page::Providers => Outcome::effects(vec![Effect::ListProfiles, Effect::LoadGateway]),
             Page::Agents => Outcome::effects(vec![Effect::ListAgents]),
             Page::Mcp => Outcome::effects(vec![Effect::ListMcp]),
             Page::Skills => Outcome::effects(vec![Effect::ListSkills]),
@@ -7820,7 +7820,7 @@ impl App {
         match self.page {
             Page::Management => self.config_section_effects(),
             Page::Agents => vec![Effect::ListAgents],
-            Page::Providers => vec![Effect::ListProfiles],
+            Page::Providers => vec![Effect::ListProfiles, Effect::LoadGateway],
             Page::Mcp => vec![Effect::ListMcp],
             Page::Skills => vec![Effect::ListSkills],
             Page::Prompts => vec![Effect::ListPrompts],

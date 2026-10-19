@@ -4883,3 +4883,81 @@ fn a_terminal_that_asked_for_the_mouse_receives_the_click() {
         "a click beside the grid was sent into it"
     );
 }
+
+/// The gateway leads the Providers table and reports its own state.
+///
+/// A reader has to be able to tell a shared, gateway-served model from a direct
+/// Provider, and to see a cooling Key without opening anything: the row is the
+/// only place that information lives.
+#[test]
+fn the_gateway_leads_the_providers_table_and_reports_its_state() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_direct", "Direct")];
+    let upstream = vibex_core::ModelProviderProfileId::new();
+    app.management_data.gateway = Some(vibex_core::GatewaySnapshot {
+        settings: vibex_core::ModelGatewaySettings {
+            display_name: "Vibex Gateway".to_string(),
+            upstreams: vec![upstream.clone()],
+            ..vibex_core::ModelGatewaySettings::default()
+        },
+        runtime: vibex_core::ModelGatewayRuntimeState::running(3425, 1),
+        upstreams: vec![vibex_core::GatewayUpstreamSummary {
+            model_provider_profile_id: upstream,
+            display_name: "DeepSeek".to_string(),
+            model_count: 2,
+            keys: vec![
+                vibex_core::GatewayKeySummary {
+                    credential_id: vibex_core::RequestId::new(),
+                    display_name: "Primary".to_string(),
+                    state: vibex_core::GatewayKeyState::Ready,
+                    used_tokens: 0,
+                },
+                vibex_core::GatewayKeySummary {
+                    credential_id: vibex_core::RequestId::new(),
+                    display_name: "Backup".to_string(),
+                    state: vibex_core::GatewayKeyState::Cooling {
+                        kind: vibex_core::GatewayFailureKind::Rate,
+                        until_ms: Some(1),
+                    },
+                    used_tokens: 0,
+                },
+            ],
+        }],
+        models: Vec::new(),
+        agents: vec![vibex_core::GatewayAgentBinding {
+            agent_id: "codex".to_string(),
+            display_name: "codex".to_string(),
+            enabled: true,
+            unsupported: false,
+            wire_protocol_id: String::new(),
+        }],
+        upstream_candidates: Vec::new(),
+    });
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+    let strings = app.strings;
+    let rows = app.config_center.rows(&app.management_data, strings);
+    assert_eq!(rows.len(), 2, "one gateway row and one direct Provider");
+    assert_eq!(rows[0].key, "gateway");
+    assert!(
+        rows[0].cells.iter().any(|cell| cell.contains("cooling")),
+        "the gateway row must say a Key is cooling: {:?}",
+        rows[0].cells
+    );
+    assert!(
+        rows[0].cells.iter().any(|cell| cell.contains("codex")),
+        "the gateway row must name the Agents that use it: {:?}",
+        rows[0].cells
+    );
+}
+
+/// A gateway that cannot be read leaves the direct Providers readable.
+#[test]
+fn a_missing_gateway_does_not_remove_the_direct_providers() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![provider_profile("provider_direct", "Direct")];
+    app.management_data.gateway = None;
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+    let rows = app.config_center.rows(&app.management_data, app.strings);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key, "provider_direct");
+}

@@ -470,6 +470,8 @@ struct ManagementCopy {
     /// sidebar, so every locale names the record itself rather than the
     /// composer affordance it backs.
     prompts: &'static str,
+    /// The local model gateway's own tab caption.
+    gateway: &'static str,
     search_agents: &'static str,
     search_mcp: &'static str,
     search_skills: &'static str,
@@ -492,6 +494,7 @@ fn management_copy() -> ManagementCopy {
             mcp: "MCP",
             skills: "Skills",
             prompts: "Prompt",
+            gateway: "Gateway",
             search_agents: "Search Agent",
             search_mcp: "Search MCP",
             search_skills: "Search Skills",
@@ -511,6 +514,7 @@ fn management_copy() -> ManagementCopy {
             mcp: "MCP",
             skills: "Skill",
             prompts: "Prompt",
+            gateway: "网关",
             search_agents: "搜索 Agent",
             search_mcp: "搜索 MCP",
             search_skills: "搜索 Skill",
@@ -530,6 +534,7 @@ fn management_copy() -> ManagementCopy {
             mcp: "MCP",
             skills: "Skill",
             prompts: "Prompt",
+            gateway: "閘道",
             search_agents: "搜尋 Agent",
             search_mcp: "搜尋 MCP",
             search_skills: "搜尋 Skill",
@@ -560,6 +565,8 @@ struct ManagementSnapshot {
     health_summaries: Vec<vibex_core::ProviderHealthSummary>,
     capability_summaries: Vec<vibex_core::ProviderCapabilitySummary>,
     usage_summaries: Vec<vibex_core::ProviderUsageSummary>,
+    /// The local model gateway surface as the authority last reported it.
+    gateway: vibex_core::GatewaySnapshot,
     native_exports: Vec<vibex_core::ProviderNativeExportRecordSummary>,
     scheduled_runs: Vec<ScheduledTaskRun>,
     scheduled_attention: Vec<vibex_core::ScheduledTaskAttentionSummary>,
@@ -690,6 +697,7 @@ struct AgentProviderProjectionState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ManagementMutation {
+    Gateway,
     ProfileCreate,
     ProfileUpdate(String),
     ProfileDelete(String),
@@ -835,6 +843,7 @@ enum AgentAuthTerminalCompletion {
 impl ManagementMutation {
     fn key(&self) -> String {
         match self {
+            Self::Gateway => "gateway".into(),
             Self::ProfileCreate => "profile:create".into(),
             Self::ProfileUpdate(id) => format!("profile:update:{id}"),
             Self::ProfileDelete(id) => format!("profile:delete:{id}"),
@@ -938,6 +947,8 @@ pub struct ManagementCenter {
     health_summaries: Vec<vibex_core::ProviderHealthSummary>,
     capability_summaries: Vec<vibex_core::ProviderCapabilitySummary>,
     usage_summaries: Vec<vibex_core::ProviderUsageSummary>,
+    /// The local model gateway surface as the authority last reported it.
+    gateway: vibex_core::GatewaySnapshot,
     native_exports: Vec<vibex_core::ProviderNativeExportRecordSummary>,
     native_export_source: vibex_core::ProviderNativeExportSource,
     native_export_mode: vibex_core::ProviderNativeExportMode,
@@ -1924,6 +1935,7 @@ impl ManagementCenter {
             selected_scheduled_task_id: None,
             compact_sidebar_height: MANAGEMENT_COMPACT_SIDEBAR_DEFAULT_HEIGHT,
             compact_sidebar_resize_drag: None,
+            gateway: vibex_core::GatewaySnapshot::default(),
             profile_editor_open: false,
             editing_profile_id: None,
             profile_secret_configured: false,
@@ -4021,6 +4033,7 @@ impl ManagementCenter {
     ) -> bool {
         let section = match section {
             ManagementSection::ModelProviders => ManagementSection::Agents,
+            ManagementSection::Gateway => ManagementSection::Gateway,
             ManagementSection::Scheduled
             | ManagementSection::Automation
             | ManagementSection::Recovery => ManagementSection::Advanced,
@@ -4324,6 +4337,7 @@ impl ManagementCenter {
     fn apply_snapshot(&mut self, snapshot: ManagementSnapshot, cx: &mut Context<Self>) {
         self.details_ready = true;
         self.snapshot = snapshot.center;
+        self.gateway = snapshot.gateway;
         self.provider_profiles = snapshot.provider_profiles;
         self.provider_display_order = snapshot.provider_display_order;
         self.provider_display_order_drag_state = None;
@@ -10858,6 +10872,7 @@ impl ManagementCenter {
         let active = management_primary_section(self.navigation.active);
         let items = [
             (ManagementSection::Agents, copy.agents, IconName::Bot),
+            (ManagementSection::Gateway, copy.gateway, IconName::Network),
             (ManagementSection::Mcp, copy.mcp, IconName::Network),
             (ManagementSection::Skills, copy.skills, IconName::BookOpen),
             (
@@ -10898,11 +10913,634 @@ impl ManagementCenter {
             .into_any_element()
     }
 
+    /// The gateway's sidebar: what it is connected to and how it is doing.
+    ///
+    /// The list is deliberately short. A gateway is one row, not a catalogue,
+    /// and the panel beside it carries every control it has.
+    /// Applies one gateway settings change and refreshes the surface.
+    fn update_gateway_settings(
+        &mut self,
+        update: impl FnOnce(&mut vibex_core::GatewaySettingsUpdateRequest),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let snapshot = self.gateway.clone();
+        let mut request = vibex_core::GatewaySettingsUpdateRequest {
+            display_name: snapshot.settings.display_name.clone(),
+            routing: snapshot.settings.policy.routing,
+            pin: snapshot.settings.policy.pin,
+            token_limit: snapshot.settings.policy.token_limit,
+            upstreams: snapshot.settings.upstreams.clone(),
+            expected_revision: snapshot.settings.revision,
+        };
+        update(&mut request);
+        self.mutation = Some(ManagementMutation::Gateway);
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .update_model_gateway_settings(vibex_backend::MutationRequest::new(request))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(gateway) => {
+                        this.gateway = gateway;
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    fn set_gateway_routing(
+        &mut self,
+        routing: vibex_core::GatewayRoutingStrategy,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_gateway_settings(|request| request.routing = routing, cx);
+    }
+
+    fn set_gateway_pin(&mut self, pinned: bool, cx: &mut Context<Self>) {
+        self.update_gateway_settings(
+            |request| {
+                request.pin = if pinned {
+                    vibex_core::GatewayPinScope::Conversation
+                } else {
+                    vibex_core::GatewayPinScope::Off
+                }
+            },
+            cx,
+        );
+    }
+
+    fn add_gateway_upstream(
+        &mut self,
+        upstream: vibex_core::ModelProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_gateway_settings(
+            move |request| {
+                if !request.upstreams.contains(&upstream) {
+                    request.upstreams.push(upstream);
+                }
+            },
+            cx,
+        );
+    }
+
+    fn remove_gateway_upstream(
+        &mut self,
+        upstream: vibex_core::ModelProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_gateway_settings(
+            move |request| request.upstreams.retain(|existing| existing != &upstream),
+            cx,
+        );
+    }
+
+    /// Points one Agent at the gateway, or takes it back to a direct Provider.
+    fn set_gateway_agent(&mut self, agent_id: String, enabled: bool, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::Gateway);
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .set_model_gateway_agent(vibex_backend::MutationRequest::new(
+                    vibex_core::GatewayAgentUpdateRequest {
+                        agent_id: agent_id.clone(),
+                        enabled,
+                    },
+                ))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(gateway) => {
+                        this.gateway = gateway;
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    fn render_gateway_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let copy = management_copy();
+        let snapshot = &self.gateway;
+        let mut rows = v_flex().w_full().gap_2();
+        rows = rows.child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .child(management_locale_text(
+                            "Local gateway",
+                            "本地网关",
+                            "本機閘道",
+                        )),
+                )
+                .child(gateway_status_badge(&snapshot.runtime, cx)),
+        );
+        for upstream in &snapshot.upstreams {
+            rows = rows.child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .p_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_medium()
+                            .truncate()
+                            .child(upstream.display_name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "{} · {}",
+                                gateway_key_summary_text(upstream),
+                                management_locale_text("models", "个模型", "個模型")
+                            )),
+                    ),
+            );
+        }
+        if snapshot.upstreams.is_empty() {
+            rows = rows.child(compact_empty_state(
+                management_locale_text(
+                    "No upstream Providers",
+                    "还没有上游供应商",
+                    "還沒有上游供應商",
+                ),
+                management_locale_text(
+                    "Add a Provider below, then it can serve models here.",
+                    "在右侧添加供应商后，它就能在这里提供模型。",
+                    "在右側新增供應商後，它就能在這裡提供模型。",
+                ),
+                cx,
+            ));
+        }
+        v_flex()
+            .id("management-gateway-sidebar")
+            .w_full()
+            .h_full()
+            .min_w_0()
+            .gap_3()
+            .p_3()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(copy.gateway),
+            )
+            .child(rows)
+            .into_any_element()
+    }
+
+    /// The gateway's panel: runtime state, routing policy, upstreams, and the
+    /// Agents that walk through it.
+    fn render_gateway(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let snapshot = self.gateway.clone();
+        let pending = self.mutation.is_some();
+        let status = &snapshot.runtime;
+
+        let mut body = v_flex().w_full().min_w_0().gap_3();
+        body = body.child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_base()
+                                .font_semibold()
+                                .child(snapshot.settings.display_name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(gateway_runtime_text(status)),
+                        ),
+                )
+                .child(gateway_status_badge(status, cx)),
+        );
+
+        // What the service is listening on. The address is read-only on
+        // purpose: an Agent binding points at it, so editing it by hand would
+        // break every one of them.
+        let mut connection_rows = v_flex().w_full().gap_2();
+        connection_rows = connection_rows.child(stat_line(
+            management_locale_text("Address", "地址", "位址"),
+            status.base_url().unwrap_or_else(|| {
+                management_locale_text("not running", "未运行", "未執行").to_string()
+            }),
+            cx,
+        ));
+        connection_rows = connection_rows.child(stat_line(
+            management_locale_text("Upstreams", "上游供应商", "上游供應商"),
+            snapshot.upstreams.len().to_string(),
+            cx,
+        ));
+        connection_rows = connection_rows.child(stat_line(
+            management_locale_text("Keys ready", "可用 Key", "可用 Key"),
+            format!(
+                "{} / {}",
+                snapshot.ready_key_count(),
+                snapshot
+                    .upstreams
+                    .iter()
+                    .map(|upstream| upstream.keys.len())
+                    .sum::<usize>()
+            ),
+            cx,
+        ));
+        if snapshot.cooling_key_count() > 0 {
+            connection_rows = connection_rows.child(stat_line(
+                management_locale_text("Cooling down", "冷却中", "冷卻中"),
+                snapshot.cooling_key_count().to_string(),
+                cx,
+            ));
+        }
+        if snapshot.invalid_key_count() > 0 {
+            connection_rows = connection_rows.child(stat_line(
+                management_locale_text("Invalid", "已失效", "已失效"),
+                snapshot.invalid_key_count().to_string(),
+                cx,
+            ));
+        }
+        body = body.child(management_card_with_icon(
+            management_locale_text("Connection", "连接", "連線"),
+            management_locale_text(
+                "Agents point here instead of at a vendor. Vibex manages this address.",
+                "Agent 指向这里而不是厂商地址，该地址由 Vibex 管理。",
+                "Agent 指向這裡而不是廠商位址，該位址由 Vibex 管理。",
+            ),
+            "icons/vibex/server.svg",
+            connection_rows.into_any_element(),
+            cx,
+        ));
+
+        // Routing policy.
+        let mut policy_rows = v_flex().w_full().gap_2();
+        let strategies = vibex_core::GatewayRoutingStrategy::ALL;
+        let mut strategy_row = h_flex().w_full().gap_2();
+        for strategy in strategies {
+            let selected = snapshot.settings.policy.routing == strategy;
+            strategy_row = strategy_row.child(
+                Button::new(SharedString::from(format!(
+                    "management-gateway-routing-{}",
+                    strategy.id()
+                )))
+                .small()
+                .when(selected, |button| button.primary())
+                .when(!selected, |button| button.outline())
+                .label(strategy.label())
+                .disabled(pending)
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.set_gateway_routing(strategy, cx)),
+                ),
+            );
+        }
+        policy_rows = policy_rows.child(
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(management_field_label(management_locale_text(
+                    "Switching",
+                    "切换方式",
+                    "切換方式",
+                )))
+                .child(strategy_row),
+        );
+        let pinned = snapshot.settings.policy.pin == vibex_core::GatewayPinScope::Conversation;
+        policy_rows = policy_rows.child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .child(management_locale_text(
+                                    "Keep a conversation on one key",
+                                    "同一个对话尽量留在同一个 Key",
+                                    "同一個對話盡量留在同一個 Key",
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text(
+                                    "Vendors cache a prompt per account, so moving a conversation loses that cache.",
+                                    "厂商按账号缓存提示词，对话换 Key 会丢掉该缓存。",
+                                    "廠商按帳號快取提示詞，對話換 Key 會丟掉該快取。",
+                                )),
+                        ),
+                )
+                .child(
+                    Switch::new("management-gateway-pin")
+                        .small()
+                        .checked(pinned)
+                        .disabled(pending)
+                        .on_click(cx.listener(|this, checked, _, cx| {
+                            this.set_gateway_pin(*checked, cx)
+                        })),
+                ),
+        );
+        policy_rows = policy_rows.child(stat_line(
+            management_locale_text("Token limit", "token 上限", "token 上限"),
+            match snapshot.settings.policy.token_limit {
+                Some(limit) => {
+                    format!("{} tokens / {:?}", limit.tokens, limit.window).to_lowercase()
+                }
+                None => management_locale_text("not limited", "不限制", "不限制").to_string(),
+            },
+            cx,
+        ));
+        policy_rows = policy_rows.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text(
+                    "The limit is counted locally from tokens the gateway observed. It is not the vendor's own quota or balance.",
+                    "该上限由网关按本地观测到的 token 计数，不等于厂商侧的额度或余额。",
+                    "該上限由閘道按本機觀測到的 token 計數，不等於廠商側的額度或餘額。",
+                )),
+        );
+        body = body.child(management_card_with_icon(
+            management_locale_text("Automatic routing", "自动调度", "自動調度"),
+            management_locale_text(
+                "How one of an upstream's keys is chosen for each request.",
+                "每次请求如何在上游的 Key 中选择一个。",
+                "每次請求如何在上游的 Key 中選擇一個。",
+            ),
+            "icons/vibex/file-cog.svg",
+            policy_rows.into_any_element(),
+            cx,
+        ));
+
+        // Upstreams, with their keys.
+        let mut upstream_rows = v_flex().w_full().gap_2();
+        let available = snapshot
+            .upstream_candidates
+            .iter()
+            .filter(|candidate| !candidate.selected)
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>();
+        for upstream in &snapshot.upstreams {
+            let id = upstream.model_provider_profile_id.clone();
+            let mut key_rows = v_flex().w_full().gap_1();
+            for key in &upstream.keys {
+                key_rows = key_rows.child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .py_1()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .child(key.display_name.clone()),
+                        )
+                        .child(gateway_key_state_badge(key, cx)),
+                );
+            }
+            if upstream.keys.is_empty() {
+                key_rows = key_rows.child(div().text_xs().text_color(cx.theme().warning).child(
+                    management_locale_text(
+                        "No key. This upstream cannot answer a request.",
+                        "没有 Key，该上游无法发起请求。",
+                        "沒有 Key，該上游無法發起請求。",
+                    ),
+                ));
+            }
+            upstream_rows =
+                upstream_rows.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_2()
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .p_3()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_medium()
+                                        .truncate()
+                                        .child(upstream.display_name.clone()),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "management-gateway-remove-upstream-{}",
+                                        id.as_str()
+                                    )))
+                                    .xsmall()
+                                    .ghost()
+                                    .label(management_locale_text("Remove", "移除", "移除"))
+                                    .disabled(pending)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_gateway_upstream(id.clone(), cx)
+                                    })),
+                                ),
+                        )
+                        .child(key_rows),
+                );
+        }
+        if snapshot.upstreams.is_empty() {
+            upstream_rows = upstream_rows.child(compact_empty_state(
+                management_locale_text(
+                    "No upstream Providers",
+                    "还没有上游供应商",
+                    "還沒有上游供應商",
+                ),
+                management_locale_text(
+                    "An upstream is a Provider you already configured. Adding one lets every Agent use its keys.",
+                    "上游就是你已配置好的供应商，加入后所有 Agent 都能用它的 Key。",
+                    "上游就是你已設定好的供應商，加入後所有 Agent 都能用它的 Key。",
+                ),
+                cx,
+            ));
+        }
+        let mut add_row = h_flex().w_full().gap_2().flex_wrap();
+        for candidate in available {
+            let id = candidate.model_provider_profile_id.clone();
+            add_row = add_row.child(
+                Button::new(SharedString::from(format!(
+                    "management-gateway-add-upstream-{}",
+                    id.as_str()
+                )))
+                .xsmall()
+                .outline()
+                .label(candidate.display_name.clone())
+                .disabled(pending)
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.add_gateway_upstream(id.clone(), cx)),
+                ),
+            );
+        }
+        upstream_rows = upstream_rows.child(add_row);
+        body = body.child(management_card_with_icon(
+            management_locale_text("Upstream Providers", "上游供应商", "上游供應商"),
+            management_locale_text(
+                "Providers are shared: one set of keys serves every Agent below.",
+                "供应商是共享的：一套 Key 服务于下面所有 Agent。",
+                "供應商是共享的：一套 Key 服務於下面所有 Agent。",
+            ),
+            "icons/vibex/database.svg",
+            upstream_rows.into_any_element(),
+            cx,
+        ));
+
+        // Which Agents walk through it.
+        let mut agent_rows = v_flex().w_full().gap_1();
+        for agent in &snapshot.agents {
+            let agent_id = agent.agent_id.clone();
+            agent_rows = agent_rows.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(div().text_sm().truncate().child(agent.display_name.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if agent.enabled {
+                                        management_locale_text(
+                                            "Uses the gateway",
+                                            "走网关",
+                                            "走閘道",
+                                        )
+                                    } else {
+                                        management_locale_text(
+                                            "Uses its own Provider",
+                                            "使用自己的供应商",
+                                            "使用自己的供應商",
+                                        )
+                                    }),
+                            ),
+                    )
+                    .child(
+                        Switch::new(SharedString::from(format!(
+                            "management-gateway-agent-{}",
+                            agent.agent_id
+                        )))
+                        .small()
+                        .checked(agent.enabled)
+                        .disabled(pending)
+                        .on_click(cx.listener(
+                            move |this, checked, _, cx| {
+                                this.set_gateway_agent(agent_id.clone(), *checked, cx)
+                            },
+                        )),
+                    ),
+            );
+        }
+        if snapshot.agents.is_empty() {
+            agent_rows = agent_rows.child(compact_empty_state(
+                management_locale_text(
+                    "No Agent can use the gateway",
+                    "没有 Agent 能使用网关",
+                    "沒有 Agent 能使用閘道",
+                ),
+                management_locale_text(
+                    "Agents that manage their own provider cannot be routed.",
+                    "自己管理供应商的 Agent 无法接入。",
+                    "自己管理供應商的 Agent 無法接入。",
+                ),
+                cx,
+            ));
+        }
+        body = body.child(management_card_with_icon(
+            management_locale_text("Agents", "Agent", "Agent"),
+            management_locale_text(
+                "Each Agent either walks through the gateway or keeps its own Provider.",
+                "每个 Agent 要么走网关，要么保留自己的供应商。",
+                "每個 Agent 要麼走閘道，要麼保留自己的供應商。",
+            ),
+            "icons/vibex/cpu.svg",
+            agent_rows.into_any_element(),
+            cx,
+        ));
+
+        v_flex()
+            .id("management-gateway")
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .child(body)
+            .into_any_element()
+    }
+
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.navigation.active {
             ManagementSection::Agents | ManagementSection::ModelProviders => {
                 self.render_providers(window, cx)
             }
+            ManagementSection::Gateway => self.render_gateway(cx),
             ManagementSection::Mcp => self.render_mcp(cx),
             ManagementSection::Skills => self.render_skills(cx),
             ManagementSection::PromptsHooks => self.render_prompts(cx),
@@ -10920,6 +11558,7 @@ impl ManagementCenter {
     ) -> AnyElement {
         match management_primary_section(self.navigation.active) {
             ManagementSection::Agents => self.render_agents(cx),
+            ManagementSection::Gateway => self.render_gateway_sidebar(cx),
             ManagementSection::Mcp => self.render_mcp_sidebar(cx),
             ManagementSection::Skills => self.render_skills_sidebar(cx),
             ManagementSection::PromptsHooks => self.render_prompts_sidebar(cx),
@@ -14537,13 +15176,144 @@ impl ManagementCenter {
     }
 
     /// Identity: name, note, and website. Name gets the primary emphasis.
+    /// Fills the draft from a built-in preset.
+    ///
+    /// The protocol is written explicitly into `provider_options["wireApi"]`
+    /// rather than left to be inferred. The editor otherwise falls back to
+    /// "the first protocol that has a URL", which silently re-labels an
+    /// Anthropic preset as Chat Completions the next time the dialog opens.
+    fn apply_provider_preset(
+        &mut self,
+        preset_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(preset) = vibex_core::provider_preset(preset_id) else {
+            return;
+        };
+        self.profile_name.update(cx, |state, cx| {
+            state.set_value(preset.display_name.clone(), window, cx)
+        });
+        if let Some(website) = preset.website.as_deref() {
+            self.profile_website_url.update(cx, |state, cx| {
+                state.set_value(website.to_string(), window, cx)
+            });
+        }
+        let mut options = self.profile_provider_options.clone();
+        if let Some(wire_api) = preset.default_wire_api() {
+            options = with_provider_option(
+                options,
+                "wireApi",
+                Some(wire_api.wire_protocol_id().to_string()),
+            );
+            self.profile_model_edit_wire_api = Some(wire_api);
+        }
+        // A protocol-specific address is stored the way the projection reads
+        // it, so the preset's own endpoint survives a save and reopen.
+        for (protocol, url) in &preset.endpoints {
+            if let Some(wire_api) =
+                vibex_core::ProviderModelWireApi::from_wire_protocol_id(protocol)
+            {
+                options = with_provider_option(
+                    options,
+                    &wire_api.protocol_base_url_option_key(),
+                    Some(url.clone()),
+                );
+            }
+        }
+        if let Some(url) = preset
+            .default_wire_api()
+            .and_then(|wire_api| preset.endpoint_for(wire_api))
+        {
+            self.profile_base_url
+                .update(cx, |state, cx| state.set_value(url.to_string(), window, cx));
+        }
+        self.profile_provider_options = options;
+        self.rebuild_profile_protocol_base_urls(window, cx);
+        // The preset's models are added as declared entries, which is what a
+        // manual add produces too: their capabilities stay empty rather than
+        // being guessed from the id.
+        self.profile_configured_models = preset
+            .models
+            .iter()
+            .map(|model| vibex_core::ProviderConfiguredModel {
+                id: model.clone(),
+                display_name: None,
+                enabled: true,
+                wire_api: preset.default_wire_api(),
+                capabilities: Default::default(),
+            })
+            .collect();
+        self.profile_available_models = self.profile_configured_models.clone();
+        self.profile_model_selection = self
+            .profile_configured_models
+            .first()
+            .map(|model| model.id.clone());
+        if let Some(hint) = preset.key_hint.as_deref() {
+            // The hint is a placeholder, not a value: it tells the user what
+            // the vendor's keys look like without typing anything.
+            self.profile_api_key.update(cx, |state, cx| {
+                state.set_placeholder(SharedString::from(hint.to_string()), window, cx)
+            });
+        }
+        self.notice = Some(format!(
+            "{}: {}",
+            preset.display_name,
+            preset
+                .endpoint_hint
+                .clone()
+                .unwrap_or_else(|| management_locale_text(
+                    "preset applied",
+                    "已应用预设",
+                    "已套用預設",
+                )
+                .to_string())
+        ));
+        self.navigation.mark_dirty(ManagementSection::Agents, true);
+        cx.notify();
+    }
+
     fn render_profile_identity_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        // A preset is a starting point, not a mode: it only appears while a new
+        // Provider is being created, and editing an existing one never rewrites
+        // what it already holds.
+        let preset_row = (self.editing_profile_id.is_none()).then(|| {
+            let pending = self.mutation.is_some();
+            let mut row = h_flex().w_full().gap_2().flex_wrap();
+            for preset in vibex_core::provider_presets() {
+                let preset_id = preset.id.clone();
+                row = row.child(
+                    Button::new(SharedString::from(format!(
+                        "management-provider-preset-{}",
+                        preset.id
+                    )))
+                    .xsmall()
+                    .outline()
+                    .label(preset.display_name.clone())
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.apply_provider_preset(&preset_id, window, cx)
+                    })),
+                );
+            }
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(management_field_label(management_locale_text(
+                    "Start from a preset",
+                    "从预设开始",
+                    "從預設開始",
+                )))
+                .child(row)
+                .into_any_element()
+        });
         profile_editor_section(
             management_locale_text("Basics", "基本信息", "基本資訊"),
             None,
             v_flex()
                 .w_full()
                 .gap_2p5()
+                .children(preset_row)
                 .child(management_input_field_with_error(
                     management_locale_text("Provider name", "供应商名称", "供應商名稱"),
                     &self.profile_name,
@@ -20792,6 +21562,7 @@ fn management_section_body_scrolls_itself(
 fn management_primary_section(section: ManagementSection) -> ManagementSection {
     match section {
         ManagementSection::Agents | ManagementSection::ModelProviders => ManagementSection::Agents,
+        ManagementSection::Gateway => ManagementSection::Gateway,
         ManagementSection::Mcp => ManagementSection::Mcp,
         ManagementSection::Skills => ManagementSection::Skills,
         ManagementSection::PromptsHooks => ManagementSection::PromptsHooks,
@@ -21970,6 +22741,95 @@ fn management_profile_glyph(
 
 fn management_status_badge(label: String, _cx: &App) -> AnyElement {
     Tag::secondary().xsmall().child(label).into_any_element()
+}
+
+/// The gateway's lifecycle state as a badge.
+///
+/// Only a running service is quiet; every other state is something the user
+/// has to act on or at least know about, so it carries a colour.
+fn gateway_status_badge(state: &vibex_core::ModelGatewayRuntimeState, _cx: &App) -> AnyElement {
+    let (label, tag) = match state.status {
+        vibex_core::ModelGatewayStatus::Running => (
+            management_locale_text("Running", "运行中", "執行中"),
+            Tag::success(),
+        ),
+        vibex_core::ModelGatewayStatus::Starting => (
+            management_locale_text("Starting", "启动中", "啟動中"),
+            Tag::info(),
+        ),
+        vibex_core::ModelGatewayStatus::Unavailable => (
+            management_locale_text("Not running", "未运行", "未執行"),
+            Tag::warning(),
+        ),
+        vibex_core::ModelGatewayStatus::Disabled => (
+            management_locale_text("Off", "已关闭", "已關閉"),
+            Tag::secondary(),
+        ),
+    };
+    tag.xsmall().child(label).into_any_element()
+}
+
+/// One line describing why the gateway is or is not serving.
+fn gateway_runtime_text(state: &vibex_core::ModelGatewayRuntimeState) -> String {
+    if let Some(notice) = state.notice.as_deref() {
+        return notice.to_string();
+    }
+    match state.base_url() {
+        Some(url) => format!(
+            "{} {}",
+            management_locale_text("Listening on", "正在监听", "正在監聽"),
+            url
+        ),
+        None => management_locale_text(
+            "The gateway is not serving requests; Agents keep their direct Provider configuration.",
+            "网关当前未提供服务，Agent 保留自己的供应商配置。",
+            "閘道目前未提供服務，Agent 保留自己的供應商設定。",
+        )
+        .to_string(),
+    }
+}
+
+fn gateway_key_summary_text(upstream: &vibex_core::GatewayUpstreamSummary) -> String {
+    let cooling = upstream
+        .keys
+        .iter()
+        .filter(|key| matches!(key.state, vibex_core::GatewayKeyState::Cooling { .. }))
+        .count();
+    let invalid = upstream
+        .keys
+        .iter()
+        .filter(|key| key.state == vibex_core::GatewayKeyState::Invalid)
+        .count();
+    let mut parts = vec![format!("{} keys", upstream.keys.len())];
+    if cooling > 0 {
+        parts.push(format!("{cooling} cooling"));
+    }
+    if invalid > 0 {
+        parts.push(format!("{invalid} invalid"));
+    }
+    parts.join(" · ")
+}
+
+/// One Key's state, labelled so colour is never the only signal.
+fn gateway_key_state_badge(key: &vibex_core::GatewayKeySummary, _cx: &App) -> AnyElement {
+    match key.state {
+        vibex_core::GatewayKeyState::Ready => Tag::success()
+            .xsmall()
+            .child(management_locale_text("Active", "正常", "正常"))
+            .into_any_element(),
+        vibex_core::GatewayKeyState::Cooling { .. } => Tag::warning()
+            .xsmall()
+            .child(management_locale_text("Cooling down", "冷却中", "冷卻中"))
+            .into_any_element(),
+        vibex_core::GatewayKeyState::Invalid => Tag::danger()
+            .xsmall()
+            .child(management_locale_text("Invalid", "已失效", "已失效"))
+            .into_any_element(),
+        vibex_core::GatewayKeyState::Disabled => Tag::secondary()
+            .xsmall()
+            .child(management_locale_text("Off", "已停用", "已停用"))
+            .into_any_element(),
+    }
 }
 
 /// The credential state as interface language.
@@ -25445,6 +26305,7 @@ async fn load_snapshot(
         .map(|agent_id| agent_id.as_str().to_string())
         .collect();
     let profiles = bundle.profiles;
+    let gateway = bundle.model_gateway.unwrap_or_default();
     let native_import_preview = bundle.native_import_preview;
     let acp_configs = bundle
         .acp_configs
@@ -25530,6 +26391,7 @@ async fn load_snapshot(
         scheduled_audit,
         automation_runs,
         automation_steps,
+        gateway,
     })
 }
 
@@ -26678,6 +27540,13 @@ mod tests {
         assert_eq!(
             management_primary_section(ManagementSection::ModelProviders),
             ManagementSection::Agents
+        );
+        // The gateway is a primary tab of its own: it is shared state that
+        // several Agents consume, so burying it under one Agent's provider page
+        // would misrepresent who owns it.
+        assert_eq!(
+            management_primary_section(ManagementSection::Gateway),
+            ManagementSection::Gateway
         );
         assert_eq!(
             management_primary_section(ManagementSection::Mcp),
@@ -29636,5 +30505,105 @@ mod tests {
             agent_install_url(cursor),
             Some("https://docs.cursor.com/en/cli/overview")
         );
+    }
+}
+
+#[cfg(test)]
+mod gateway_surface_tests {
+    use super::*;
+
+    /// The gateway section must describe itself in the same three states a
+    /// user can be in: serving, unable to serve, and switched off. A silent
+    /// degraded state is the one outcome this surface exists to prevent.
+    #[test]
+    fn gateway_runtime_text_names_every_state() {
+        let running = vibex_core::ModelGatewayRuntimeState::running(3425, 2);
+        assert!(gateway_runtime_text(&running).contains("3425"));
+
+        let unavailable = vibex_core::ModelGatewayRuntimeState::unavailable("port is in use");
+        assert_eq!(gateway_runtime_text(&unavailable), "port is in use");
+        assert_eq!(
+            unavailable.base_url(),
+            None,
+            "a stopped gateway must not publish an address an Agent could cache"
+        );
+
+        let disabled = vibex_core::ModelGatewayRuntimeState {
+            status: vibex_core::ModelGatewayStatus::Disabled,
+            notice: Some("Automatic routing is turned off".to_string()),
+            ..vibex_core::ModelGatewayRuntimeState::default()
+        };
+        assert_eq!(
+            gateway_runtime_text(&disabled),
+            "Automatic routing is turned off"
+        );
+    }
+
+    /// A Key's badge must not rely on colour: the label distinguishes cooling
+    /// from invalid, because one recovers on its own and the other does not.
+    #[test]
+    fn gateway_key_summary_separates_cooling_from_invalid() {
+        let upstream = vibex_core::GatewayUpstreamSummary {
+            model_provider_profile_id: vibex_core::ModelProviderProfileId::new(),
+            display_name: "DeepSeek".to_string(),
+            model_count: 2,
+            keys: vec![
+                vibex_core::GatewayKeySummary {
+                    credential_id: vibex_core::RequestId::new(),
+                    display_name: "Primary".to_string(),
+                    state: vibex_core::GatewayKeyState::Ready,
+                    used_tokens: 0,
+                },
+                vibex_core::GatewayKeySummary {
+                    credential_id: vibex_core::RequestId::new(),
+                    display_name: "Backup".to_string(),
+                    state: vibex_core::GatewayKeyState::Cooling {
+                        kind: vibex_core::GatewayFailureKind::Rate,
+                        until_ms: Some(1),
+                    },
+                    used_tokens: 0,
+                },
+                vibex_core::GatewayKeySummary {
+                    credential_id: vibex_core::RequestId::new(),
+                    display_name: "Revoked".to_string(),
+                    state: vibex_core::GatewayKeyState::Invalid,
+                    used_tokens: 0,
+                },
+            ],
+        };
+        let summary = gateway_key_summary_text(&upstream);
+        assert!(summary.contains("3 keys"), "{summary}");
+        assert!(summary.contains("1 cooling"), "{summary}");
+        assert!(summary.contains("1 invalid"), "{summary}");
+    }
+
+    /// A gateway with no ready Key cannot serve anything, and the surface must
+    /// say so instead of showing a running service.
+    #[test]
+    fn a_gateway_without_a_ready_key_is_not_routable() {
+        let mut snapshot = vibex_core::GatewaySnapshot {
+            runtime: vibex_core::ModelGatewayRuntimeState::running(3425, 1),
+            ..vibex_core::GatewaySnapshot::default()
+        };
+        assert!(
+            !snapshot.is_routable(),
+            "no upstreams means nothing to route"
+        );
+        snapshot.upstreams.push(vibex_core::GatewayUpstreamSummary {
+            model_provider_profile_id: vibex_core::ModelProviderProfileId::new(),
+            display_name: "DeepSeek".to_string(),
+            model_count: 1,
+            keys: vec![vibex_core::GatewayKeySummary {
+                credential_id: vibex_core::RequestId::new(),
+                display_name: "Primary".to_string(),
+                state: vibex_core::GatewayKeyState::Cooling {
+                    kind: vibex_core::GatewayFailureKind::Credit,
+                    until_ms: Some(1),
+                },
+                used_tokens: 0,
+            }],
+        });
+        assert_eq!(snapshot.ready_key_count(), 0);
+        assert!(!snapshot.is_routable());
     }
 }

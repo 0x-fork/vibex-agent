@@ -723,6 +723,22 @@ pub struct GatewayAgentBinding {
     pub wire_protocol_id: String,
 }
 
+/// A Provider the user could add as a gateway upstream.
+///
+/// The gateway's upstream list uses the shared v2 Provider identity, while the
+/// Config Center still lists legacy Profiles. The authority resolves the two
+/// once, so a client never has to derive one id from the other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayUpstreamCandidate {
+    pub model_provider_profile_id: ModelProviderProfileId,
+    pub display_name: String,
+    pub model_count: usize,
+    pub key_count: usize,
+    /// The Provider is already an upstream.
+    pub selected: bool,
+}
+
 /// One model the gateway serves, for the Config Center's read-only list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -744,6 +760,9 @@ pub struct GatewaySnapshot {
     pub upstreams: Vec<GatewayUpstreamSummary>,
     pub models: Vec<GatewayModelSummary>,
     pub agents: Vec<GatewayAgentBinding>,
+    /// Every Provider that could become an upstream.
+    #[serde(default)]
+    pub upstream_candidates: Vec<GatewayUpstreamCandidate>,
 }
 
 impl Default for GatewaySnapshot {
@@ -754,6 +773,7 @@ impl Default for GatewaySnapshot {
             upstreams: Vec::new(),
             models: Vec::new(),
             agents: Vec::new(),
+            upstream_candidates: Vec::new(),
         }
     }
 }
