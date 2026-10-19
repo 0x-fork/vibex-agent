@@ -2557,15 +2557,26 @@ fn a_long_settled_body_is_drawn_as_its_head_until_the_reader_opens_it(cx: &mut T
         "a folded body carries the control that opens it"
     );
 
-    // The reader's click opens the rest, and the row measures the whole body.
-    // The click carries the turn so the row's measurement is the one dropped —
-    // the same pair the control itself passes.
-    let turn_id = workbench.read_with(cx, |workbench, _| {
-        workbench.conversation_turns_cache[0].id.clone()
-    });
-    workbench.update(cx, |workbench, cx| {
-        workbench.toggle_timeline_row_body(row_id.clone(), Some(turn_id.clone()), cx)
-    });
+    // The press belongs to the control: without claiming it, the same press
+    // starts a window-level text selection over the body the click opens.
+    let control_bounds = cx
+        .debug_bounds(control_selector)
+        .expect("the folded row's control is laid out");
+    cx.simulate_mouse_down(
+        control_bounds.center(),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    assert!(
+        cx.update(|_, cx| gpui_base::GlobalState::is_text_selection_suppressed(cx)),
+        "the control claims its press so the body is not selected"
+    );
+    // The reader's release opens the rest, and the row measures the whole body.
+    cx.simulate_mouse_up(
+        control_bounds.center(),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
     // The surface parses a new document in the background, so the row's
     // measurement lands after the parse rather than on the next frame.
     for _ in 0..8 {

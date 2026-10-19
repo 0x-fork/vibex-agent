@@ -58084,6 +58084,14 @@ impl VibexWorkbench {
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                // The press belongs to the control. A press that starts the
+                // window-level text selection instead resolves its anchor
+                // against the body this click is about to open, and the reader
+                // is left looking at a selection they never made.
+                gpui_base::GlobalState::suppress_text_selection(cx);
+                cx.stop_propagation();
+            })
             .child(
                 Icon::new(if revealed {
                     IconName::ChevronUp
