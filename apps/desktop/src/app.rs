@@ -68667,7 +68667,14 @@ const TIMELINE_BODY_VISIBLE_BYTES: usize = 4 * 1024;
 /// a message, and the rest is small enough to hand to the surface whole. Above
 /// it, the body is drawn inside a box that lays out only the chunks it shows,
 /// so what an opened body costs stops following the body's length.
-const TIMELINE_BODY_VIEWPORT_MIN_BYTES: usize = 32 * 1024;
+///
+/// The allowance is deliberately close to the folded one: a Markdown surface's
+/// frame cost is not linear in what it is handed so much as it is punishing
+/// past a point, and a body between the two used to fall in the gap — too long
+/// to draw cheaply, too short to be windowed (measured: revealing every body of
+/// a real session cost 104 ms a frame with one 31 KB surface in view, against
+/// 1.6 ms a frame for the same page read through the box).
+const TIMELINE_BODY_VIEWPORT_MIN_BYTES: usize = 8 * 1024;
 
 /// How tall that box may grow, in timeline viewports, and the least it is.
 const TIMELINE_BODY_VIEWPORT_MAX_SCREENS: f32 = 2.0;

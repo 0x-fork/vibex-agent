@@ -2583,23 +2583,37 @@ fn a_long_settled_body_is_drawn_as_its_head_until_the_reader_opens_it(cx: &mut T
         cx.run_until_parked();
         let _ = draw_live_timeline_frames(&workbench, cx, 1);
     }
-    let (opened_source, opened_height) = workbench.read_with(cx, |workbench, _| {
+    let (opened_height, opened_surfaces) = workbench.read_with(cx, |workbench, _| {
+        let prefix = format!("markdown-chunk:{row_id}:");
         (
+            f32::from(workbench.timeline_row_sizes[0].height),
             workbench
                 .markdown_text_states
-                .get(&format!("markdown:{row_id}"))
-                .map(|state| state.source.len()),
-            f32::from(workbench.timeline_row_sizes[0].height),
+                .iter()
+                .filter(|(id, _)| id.starts_with(&prefix))
+                .map(|(_, state)| state.source.len())
+                .collect::<Vec<_>>(),
         )
     });
-    assert_eq!(
-        opened_source,
-        Some(long_body.len()),
-        "the opened row hands the surface its whole body"
+    // Opening a body this long hands it to its own viewport rather than to one
+    // surface: the row is the box, and what is laid out is a chunk of the body.
+    assert!(
+        cx.debug_bounds(Box::leak(
+            format!("timeline-body-window:{row_id}").into_boxed_str()
+        ))
+        .is_some(),
+        "the opened row reads through its own box"
     );
     assert!(
-        opened_height > folded_height,
-        "the opened row is measured at the whole body: {opened_height} against {folded_height}"
+        !opened_surfaces.is_empty()
+            && opened_surfaces
+                .iter()
+                .all(|len| *len <= TIMELINE_BODY_CHUNK_MAX_BYTES),
+        "the box lays out chunks, not the whole body: {opened_surfaces:?}"
+    );
+    assert!(
+        opened_height < full_estimate,
+        "the row is measured by the box: {opened_height} against {full_estimate}"
     );
 
     // Only settled prose folds: a body still arriving is the reader's live view
