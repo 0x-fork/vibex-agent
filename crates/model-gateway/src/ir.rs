@@ -33,9 +33,10 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StopReason {
     /// The model reached a natural end.
+    #[default]
     EndTurn,
     /// The model hit `max_tokens`.
     MaxTokens,
@@ -185,18 +186,13 @@ pub struct ToolDefinition {
     pub strict: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ToolChoice {
+    #[default]
     Auto,
     None,
     Required,
     Named(String),
-}
-
-impl Default for ToolChoice {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 /// Sampling parameters shared by every protocol. `None` means "the client did
@@ -317,12 +313,6 @@ pub struct CanonicalResponse {
     pub parts: Vec<ContentPart>,
     pub stop: StopReason,
     pub usage: CanonicalUsage,
-}
-
-impl Default for StopReason {
-    fn default() -> Self {
-        Self::EndTurn
-    }
 }
 
 /// One thing a streaming reply said.

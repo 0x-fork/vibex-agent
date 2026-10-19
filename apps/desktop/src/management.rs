@@ -10947,7 +10947,7 @@ impl ManagementCenter {
                 .management()
                 .update_model_gateway_settings(vibex_backend::MutationRequest::new(request))
                 .await;
-            let _ = this.update(cx, |this, cx| {
+            this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
                     Ok(gateway) => {
@@ -11031,7 +11031,7 @@ impl ManagementCenter {
                     },
                 ))
                 .await;
-            let _ = this.update(cx, |this, cx| {
+            this.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
                     Ok(gateway) => {

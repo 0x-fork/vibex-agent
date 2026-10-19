@@ -752,7 +752,7 @@ pub struct GatewayModelSummary {
 }
 
 /// The whole Config Center read for the gateway.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewaySnapshot {
     pub settings: ModelGatewaySettings,
@@ -763,19 +763,6 @@ pub struct GatewaySnapshot {
     /// Every Provider that could become an upstream.
     #[serde(default)]
     pub upstream_candidates: Vec<GatewayUpstreamCandidate>,
-}
-
-impl Default for GatewaySnapshot {
-    fn default() -> Self {
-        Self {
-            settings: ModelGatewaySettings::default(),
-            runtime: ModelGatewayRuntimeState::default(),
-            upstreams: Vec::new(),
-            models: Vec::new(),
-            agents: Vec::new(),
-            upstream_candidates: Vec::new(),
-        }
-    }
 }
 
 impl GatewaySnapshot {

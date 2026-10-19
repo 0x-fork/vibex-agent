@@ -410,10 +410,10 @@ fn text_or_blocks(parts: &[ContentPart]) -> GatewayResult<Value> {
         blocks.push(json!({"type": "text", "text": text}));
     }
     for part in parts {
-        if let ContentPart::Image { source } = part {
-            if let Some(block) = image_block(source)? {
-                blocks.push(block);
-            }
+        if let ContentPart::Image { source } = part
+            && let Some(block) = image_block(source)?
+        {
+            blocks.push(block);
         }
     }
     Ok(Value::Array(blocks))
@@ -559,12 +559,11 @@ impl StreamDecoder for AnthropicDecoder {
                         // Some vendors deliver the whole input on the start
                         // block. It is treated as complete; later fragments for
                         // this call are then the vendor repeating itself.
-                        if let Some(input) = block.get("input") {
-                            if input.as_object().is_some_and(|object| !object.is_empty()) {
-                                self.tool.push_arguments(
-                                    &serde_json::to_string(input).unwrap_or_default(),
-                                );
-                            }
+                        if let Some(input) = block.get("input")
+                            && input.as_object().is_some_and(|object| !object.is_empty())
+                        {
+                            self.tool
+                                .push_arguments(&serde_json::to_string(input).unwrap_or_default());
                         }
                     }
                     "thinking" => {

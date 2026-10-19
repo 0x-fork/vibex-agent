@@ -417,9 +417,7 @@ fn gateway_profile_for(
     agent_id: &AgentId,
 ) -> VibexResult<Option<ProviderProfile>> {
     let profiles = ProviderProfileRepository::list_by_agent(conn, agent_id, true)?;
-    Ok(profiles
-        .into_iter()
-        .find(|profile| is_gateway_profile(profile)))
+    Ok(profiles.into_iter().find(is_gateway_profile))
 }
 
 /// The default Profile id an Agent is currently pointed at, resolved through

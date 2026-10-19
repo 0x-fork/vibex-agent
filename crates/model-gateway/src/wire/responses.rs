@@ -20,9 +20,9 @@ fn content_parts(content: Option<&Value>) -> GatewayResult<Vec<ContentPart>> {
         Some(Value::Array(items)) => {
             let mut parts = Vec::with_capacity(items.len());
             for item in items {
-                match string_field(&item, "type").unwrap_or_default() {
+                match string_field(item, "type").unwrap_or_default() {
                     "input_text" | "output_text" | "text" => parts.push(ContentPart::Text(
-                        string_field(&item, "text").unwrap_or_default().to_string(),
+                        string_field(item, "text").unwrap_or_default().to_string(),
                     )),
                     "input_image" => {
                         let url = string_field(item, "image_url").unwrap_or_default();
@@ -47,15 +47,15 @@ fn content_parts(content: Option<&Value>) -> GatewayResult<Vec<ContentPart>> {
                         // A Responses file reference is vendor-side state. It is
                         // modelled so a same-protocol passthrough keeps it, and
                         // refused by any translation.
-                        let file_id = string_field(&item, "file_id")
-                            .or_else(|| string_field(&item, "file_url"))
+                        let file_id = string_field(item, "file_id")
+                            .or_else(|| string_field(item, "file_url"))
                             .unwrap_or_default();
                         parts.push(ContentPart::Image {
                             source: ImageSource::VendorFileId(file_id.to_string()),
                         });
                     }
                     "refusal" => parts.push(ContentPart::Text(
-                        string_field(&item, "refusal")
+                        string_field(item, "refusal")
                             .unwrap_or_default()
                             .to_string(),
                     )),
@@ -97,10 +97,10 @@ pub fn parse_request(value: &Value) -> GatewayResult<CanonicalRequest> {
         }),
         Some(Value::Array(items)) => {
             for item in items {
-                let item_type = string_field(&item, "type").unwrap_or("message");
+                let item_type = string_field(item, "type").unwrap_or("message");
                 match item_type {
                     "message" => {
-                        let role = match string_field(&item, "role") {
+                        let role = match string_field(item, "role") {
                             Some("assistant") => Role::Assistant,
                             _ => Role::User,
                         };
@@ -114,21 +114,21 @@ pub fn parse_request(value: &Value) -> GatewayResult<CanonicalRequest> {
                     }
                     "function_call" => {
                         let call = ContentPart::ToolCall {
-                            id: string_field(&item, "call_id")
-                                .or_else(|| string_field(&item, "id"))
+                            id: string_field(item, "call_id")
+                                .or_else(|| string_field(item, "id"))
                                 .unwrap_or_default()
                                 .to_string(),
-                            name: string_field(&item, "name").unwrap_or_default().to_string(),
+                            name: string_field(item, "name").unwrap_or_default().to_string(),
                             arguments: item
                                 .get("arguments")
                                 .map(parse_arguments)
                                 .unwrap_or_else(|| Value::Object(Map::new())),
                         };
-                        if let Some(last) = messages.last_mut() {
-                            if last.role == Role::Assistant {
-                                last.parts.push(call);
-                                continue;
-                            }
+                        if let Some(last) = messages.last_mut()
+                            && last.role == Role::Assistant
+                        {
+                            last.parts.push(call);
+                            continue;
                         }
                         messages.push(CanonicalMessage {
                             role: Role::Assistant,
@@ -138,7 +138,7 @@ pub fn parse_request(value: &Value) -> GatewayResult<CanonicalRequest> {
                     "function_call_output" => messages.push(CanonicalMessage {
                         role: Role::User,
                         parts: vec![ContentPart::ToolResult {
-                            call_id: string_field(&item, "call_id")
+                            call_id: string_field(item, "call_id")
                                 .unwrap_or_default()
                                 .to_string(),
                             content: content_parts(item.get("output"))?,
@@ -555,18 +555,18 @@ impl StreamDecoder for ResponsesDecoder {
         })?;
         let event_type = string_field(&value, "type").unwrap_or_default();
         let mut events = Vec::new();
-        if event_type.starts_with("response.") {
-            if let Some(response) = value.get("response") {
-                if let Some(id) = string_field(response, "id") {
-                    self.id = id.to_string();
-                }
-                if let Some(model) = string_field(response, "model") {
-                    self.model = model.to_string();
-                }
-                if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
-                    self.usage.merge(&usage_from(usage));
-                    events.push(CanonicalEvent::Usage(self.usage.clone()));
-                }
+        if event_type.starts_with("response.")
+            && let Some(response) = value.get("response")
+        {
+            if let Some(id) = string_field(response, "id") {
+                self.id = id.to_string();
+            }
+            if let Some(model) = string_field(response, "model") {
+                self.model = model.to_string();
+            }
+            if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
+                self.usage.merge(&usage_from(usage));
+                events.push(CanonicalEvent::Usage(self.usage.clone()));
             }
         }
         if !self.started {
@@ -593,12 +593,12 @@ impl StreamDecoder for ResponsesDecoder {
             }
             "response.output_item.added" => {
                 let item = value.get("item").unwrap_or(&Value::Null);
-                if string_field(&item, "type") == Some("function_call") {
-                    let id = string_field(&item, "call_id")
-                        .or_else(|| string_field(&item, "id"))
+                if string_field(item, "type") == Some("function_call") {
+                    let id = string_field(item, "call_id")
+                        .or_else(|| string_field(item, "id"))
                         .unwrap_or_default()
                         .to_string();
-                    let name = string_field(&item, "name").unwrap_or_default().to_string();
+                    let name = string_field(item, "name").unwrap_or_default().to_string();
                     self.tool.start(&id, &name);
                     self.tool_open = true;
                     events.push(CanonicalEvent::ToolCallStart { id, name });
@@ -630,7 +630,7 @@ impl StreamDecoder for ResponsesDecoder {
             }
             "response.output_item.done" => {
                 let item = value.get("item").unwrap_or(&Value::Null);
-                if string_field(&item, "type") == Some("function_call") && self.tool_open {
+                if string_field(item, "type") == Some("function_call") && self.tool_open {
                     self.tool_open = false;
                     events.push(CanonicalEvent::ToolCallEnd {
                         id: self.tool.id().to_string(),
@@ -772,11 +772,10 @@ impl StreamEncoder for ResponsesEncoder {
                 }),
             ),
             CanonicalEvent::ReasoningDelta(text) => {
-                let output = self.frame(
+                self.frame(
                     "response.reasoning_summary_text.delta",
                     json!({"item_id": "rs_0", "output_index": self.output_index, "summary_index": 0, "delta": text}),
-                );
-                output
+                )
             }
             CanonicalEvent::ReasoningSignature(_) => String::new(),
             CanonicalEvent::ToolCallStart { id, name } => {

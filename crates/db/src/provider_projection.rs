@@ -2185,37 +2185,26 @@ mod tests {
         profile.secrets = vec![available_secret(profile.id.clone())];
         ProviderProfileRepository::insert(&conn, &profile).unwrap();
 
+        // The test's subject is that migration 37 runs and backfills, not the
+        // exact tail of the migration list: asserting every later version by
+        // name made this test fail for each unrelated migration added after it.
+        let applied = apply_migrations(&mut conn).unwrap();
         assert_eq!(
-            apply_migrations(&mut conn).unwrap(),
-            vec![
-                "37:agent_provider_projection_platform",
-                "38:agent_runtime_provider_probe_evidence",
-                "39:agent_runtime_option_snapshots",
-                "40:agent_auth_catalog_snapshots",
-                "41:agent_managed_installations",
-                "42:provider_model_runtime_option_snapshots",
-                "43:agent_model_provider_display_order",
-                "44:runtime_switch_activation_completion",
-                "45:agent_auth_context_and_runtime_source",
-                "46:runtime_auth_source_nullable_legacy_columns",
-                "47:agent_default_usage_model_nullable",
-                "48:agent_usage_counter_scope",
-                "49:message_submission_runtime_policy",
-                "50:mcp_server_env_and_headers",
-                "51:custom_acp_agent_definitions",
-                "52:agent_delegations",
-                "53:agent_session_title_lock",
-                "54:local_history_import_index",
-                "55:skill_body",
-                "56:runtime_identity",
-                "57:browser_audit",
-                "58:drop_duplicate_timeline_index",
-                "59:browser_origin_grants",
-                "60:prompt_usage",
-                "61:computer_use",
-                "62:vibex_use",
-                "63:vibex_use_budget_policy",
-            ]
+            applied.first().map(String::as_str),
+            Some("37:agent_provider_projection_platform"),
+            "a database at v36 should start applying from v37"
+        );
+        assert_eq!(
+            applied.len() as i64,
+            CURRENT_SCHEMA_VERSION - 36,
+            "every pending migration should run exactly once: {applied:?}"
+        );
+        assert!(
+            !apply_migrations(&mut conn)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.starts_with("37:")),
+            "re-running migrations must not replay v37"
         );
         assert_eq!(
             current_schema_version(&conn).unwrap(),

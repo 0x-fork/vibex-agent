@@ -19,7 +19,7 @@ fn parts(value: Option<&Value>) -> GatewayResult<Vec<ContentPart>> {
     };
     let mut parts = Vec::with_capacity(items.len());
     for item in items {
-        if let Some(text) = string_field(&item, "text") {
+        if let Some(text) = string_field(item, "text") {
             let part = if item
                 .get("thought")
                 .and_then(Value::as_bool)
@@ -27,7 +27,7 @@ fn parts(value: Option<&Value>) -> GatewayResult<Vec<ContentPart>> {
             {
                 ContentPart::Reasoning {
                     text: text.to_string(),
-                    signature: string_field(&item, "thoughtSignature").map(|signature| {
+                    signature: string_field(item, "thoughtSignature").map(|signature| {
                         crate::ir::OpaqueSignature {
                             protocol: vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI.to_string(),
                             value: signature.to_string(),
@@ -43,12 +43,10 @@ fn parts(value: Option<&Value>) -> GatewayResult<Vec<ContentPart>> {
         if let Some(inline) = item.get("inlineData") {
             parts.push(ContentPart::Image {
                 source: ImageSource::Base64 {
-                    media_type: string_field(&inline, "mimeType")
+                    media_type: string_field(inline, "mimeType")
                         .unwrap_or("image/png")
                         .to_string(),
-                    data: string_field(&inline, "data")
-                        .unwrap_or_default()
-                        .to_string(),
+                    data: string_field(inline, "data").unwrap_or_default().to_string(),
                 },
             });
             continue;
@@ -56,7 +54,7 @@ fn parts(value: Option<&Value>) -> GatewayResult<Vec<ContentPart>> {
         if let Some(file) = item.get("fileData") {
             parts.push(ContentPart::Image {
                 source: ImageSource::Url(
-                    string_field(&file, "fileUri")
+                    string_field(file, "fileUri")
                         .unwrap_or_default()
                         .to_string(),
                 ),
@@ -69,8 +67,8 @@ fn parts(value: Option<&Value>) -> GatewayResult<Vec<ContentPart>> {
                 // id keeps a later `functionResponse` paired with its call;
                 // the name is unique within one reply because Gemini rejects a
                 // duplicate tool set.
-                id: format!("call_{}", string_field(&call, "name").unwrap_or("tool")),
-                name: string_field(&call, "name").unwrap_or_default().to_string(),
+                id: format!("call_{}", string_field(call, "name").unwrap_or("tool")),
+                name: string_field(call, "name").unwrap_or_default().to_string(),
                 arguments: call
                     .get("args")
                     .cloned()
@@ -80,7 +78,7 @@ fn parts(value: Option<&Value>) -> GatewayResult<Vec<ContentPart>> {
         }
         if let Some(response) = item.get("functionResponse") {
             parts.push(ContentPart::ToolResult {
-                call_id: format!("call_{}", string_field(&response, "name").unwrap_or("tool")),
+                call_id: format!("call_{}", string_field(response, "name").unwrap_or("tool")),
                 content: vec![ContentPart::Text(
                     serde_json::to_string(response.get("response").unwrap_or(&Value::Null))
                         .unwrap_or_default(),
@@ -421,7 +419,7 @@ impl StreamDecoder for GeminiDecoder {
         if !self.started {
             self.started = true;
             if self.id.is_empty() {
-                self.id = format!("gemini_{}", &crate::wire::request_fingerprint(data));
+                self.id = format!("gemini_{}", crate::wire::request_fingerprint(data));
             }
             events.insert(
                 0,
@@ -443,7 +441,7 @@ impl StreamDecoder for GeminiDecoder {
                 .unwrap_or_default();
             for part in parts {
                 if let Some(call) = part.get("functionCall") {
-                    let name = string_field(&call, "name").unwrap_or_default().to_string();
+                    let name = string_field(call, "name").unwrap_or_default().to_string();
                     let id = format!("call_{name}");
                     self.tool.start(&id, &name);
                     self.saw_tool_call = true;
@@ -473,25 +471,25 @@ impl StreamDecoder for GeminiDecoder {
                     events.push(CanonicalEvent::TextDelta(text.to_string()));
                 }
             }
-            if let Some(reason) = string_field(candidate, "finishReason") {
-                if !self.stopped {
-                    self.stopped = true;
-                    if !self.tool.is_empty() {
-                        events.push(CanonicalEvent::ToolCallEnd {
-                            id: self.tool.id().to_string(),
-                            arguments: self.tool.arguments(),
-                        });
-                        self.tool = ToolCallAccumulator::default();
-                    }
-                    let stop = StopReason::from_gemini(reason);
-                    events.push(CanonicalEvent::Stop(
-                        if stop == StopReason::EndTurn && self.saw_tool_call {
-                            StopReason::ToolUse
-                        } else {
-                            stop
-                        },
-                    ));
+            if let Some(reason) = string_field(candidate, "finishReason")
+                && !self.stopped
+            {
+                self.stopped = true;
+                if !self.tool.is_empty() {
+                    events.push(CanonicalEvent::ToolCallEnd {
+                        id: self.tool.id().to_string(),
+                        arguments: self.tool.arguments(),
+                    });
+                    self.tool = ToolCallAccumulator::default();
                 }
+                let stop = StopReason::from_gemini(reason);
+                events.push(CanonicalEvent::Stop(
+                    if stop == StopReason::EndTurn && self.saw_tool_call {
+                        StopReason::ToolUse
+                    } else {
+                        stop
+                    },
+                ));
             }
         }
         Ok(events)
@@ -602,10 +600,10 @@ impl StreamEncoder for GeminiEncoder {
                 // does not flush the one before it.
                 self.open_tools
                     .push((name.clone(), ToolCallAccumulator::default()));
-                if !id.is_empty() {
-                    if let Some((_, accumulator)) = self.open_tools.last_mut() {
-                        accumulator.start(id, name);
-                    }
+                if !id.is_empty()
+                    && let Some((_, accumulator)) = self.open_tools.last_mut()
+                {
+                    accumulator.start(id, name);
                 }
                 String::new()
             }
@@ -620,11 +618,11 @@ impl StreamEncoder for GeminiEncoder {
                     .open_tools
                     .iter_mut()
                     .find(|(_, accumulator)| accumulator.id() == id)
+                    && accumulator.arguments() == json!({})
+                    && arguments != &json!({})
                 {
-                    if accumulator.arguments() == json!({}) && arguments != &json!({}) {
-                        accumulator
-                            .push_arguments(&serde_json::to_string(arguments).unwrap_or_default());
-                    }
+                    accumulator
+                        .push_arguments(&serde_json::to_string(arguments).unwrap_or_default());
                 }
                 String::new()
             }

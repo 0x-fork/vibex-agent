@@ -123,13 +123,13 @@ pub fn parse_request(value: &Value) -> GatewayResult<CanonicalRequest> {
             }
             "assistant" => {
                 let mut parts = Vec::new();
-                if let Some(reasoning) = string_field(message, "reasoning_content") {
-                    if !reasoning.is_empty() {
-                        parts.push(ContentPart::Reasoning {
-                            text: reasoning.to_string(),
-                            signature: None,
-                        });
-                    }
+                if let Some(reasoning) = string_field(message, "reasoning_content")
+                    && !reasoning.is_empty()
+                {
+                    parts.push(ContentPart::Reasoning {
+                        text: reasoning.to_string(),
+                        signature: None,
+                    });
                 }
                 parts.extend(parts_from_content(message.get("content"))?);
                 if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
@@ -560,13 +560,13 @@ pub fn parse_response(value: &Value) -> GatewayResult<CanonicalResponse> {
         })?;
     let message = choice.get("message").unwrap_or(&Value::Null);
     let mut parts = Vec::new();
-    if let Some(reasoning) = string_field(message, "reasoning_content") {
-        if !reasoning.is_empty() {
-            parts.push(ContentPart::Reasoning {
-                text: reasoning.to_string(),
-                signature: None,
-            });
-        }
+    if let Some(reasoning) = string_field(message, "reasoning_content")
+        && !reasoning.is_empty()
+    {
+        parts.push(ContentPart::Reasoning {
+            text: reasoning.to_string(),
+            signature: None,
+        });
     }
     parts.extend(parts_from_content(message.get("content"))?);
     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
@@ -647,15 +647,15 @@ impl StreamDecoder for ChatDecoder {
         };
         for choice in choices {
             let delta = choice.get("delta").unwrap_or(&Value::Null);
-            if let Some(reasoning) = string_field(delta, "reasoning_content") {
-                if !reasoning.is_empty() {
-                    events.push(CanonicalEvent::ReasoningDelta(reasoning.to_string()));
-                }
+            if let Some(reasoning) = string_field(delta, "reasoning_content")
+                && !reasoning.is_empty()
+            {
+                events.push(CanonicalEvent::ReasoningDelta(reasoning.to_string()));
             }
-            if let Some(text) = string_field(delta, "content") {
-                if !text.is_empty() {
-                    events.push(CanonicalEvent::TextDelta(text.to_string()));
-                }
+            if let Some(text) = string_field(delta, "content")
+                && !text.is_empty()
+            {
+                events.push(CanonicalEvent::TextDelta(text.to_string()));
             }
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in calls {
@@ -688,29 +688,29 @@ impl StreamDecoder for ChatDecoder {
                             self.tool.start("", name);
                         }
                     }
-                    if let Some(arguments) = string_field(function, "arguments") {
-                        if !arguments.is_empty() {
-                            self.tool.push_arguments(arguments);
-                            events.push(CanonicalEvent::ToolCallArgumentsDelta {
-                                id: self.tool.id().to_string(),
-                                fragment: arguments.to_string(),
-                            });
-                        }
+                    if let Some(arguments) = string_field(function, "arguments")
+                        && !arguments.is_empty()
+                    {
+                        self.tool.push_arguments(arguments);
+                        events.push(CanonicalEvent::ToolCallArgumentsDelta {
+                            id: self.tool.id().to_string(),
+                            fragment: arguments.to_string(),
+                        });
                     }
                 }
             }
-            if let Some(reason) = string_field(choice, "finish_reason") {
-                if !self.finished {
-                    if !self.tool.is_empty() {
-                        events.push(CanonicalEvent::ToolCallEnd {
-                            id: self.tool.id().to_string(),
-                            arguments: self.tool.arguments(),
-                        });
-                        self.tool = ToolCallAccumulator::default();
-                    }
-                    self.finished = true;
-                    events.push(CanonicalEvent::Stop(StopReason::from_chat(reason)));
+            if let Some(reason) = string_field(choice, "finish_reason")
+                && !self.finished
+            {
+                if !self.tool.is_empty() {
+                    events.push(CanonicalEvent::ToolCallEnd {
+                        id: self.tool.id().to_string(),
+                        arguments: self.tool.arguments(),
+                    });
+                    self.tool = ToolCallAccumulator::default();
                 }
+                self.finished = true;
+                events.push(CanonicalEvent::Stop(StopReason::from_chat(reason)));
             }
         }
         Ok(events)

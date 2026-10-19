@@ -147,16 +147,16 @@ pub fn plan_route(request: RouteRequest) -> RoutePlan {
     // would throw away the vendor's prompt cache, which is the single largest
     // cost and latency factor for a long conversation.
     let mut pinned_hit = false;
-    if let Some((profile, credential)) = pinned.as_ref() {
-        if let Some(index) = candidates.iter().position(|candidate| {
+    if let Some((profile, credential)) = pinned.as_ref()
+        && let Some(index) = candidates.iter().position(|candidate| {
             &candidate.profile == profile && &candidate.credential == credential
-        }) {
-            let candidate = &candidates[index];
-            if candidate.ready && !candidate.over_token_limit() {
-                let candidate = candidates.remove(index);
-                candidates.insert(0, candidate);
-                pinned_hit = true;
-            }
+        })
+    {
+        let candidate = &candidates[index];
+        if candidate.ready && !candidate.over_token_limit() {
+            let candidate = candidates.remove(index);
+            candidates.insert(0, candidate);
+            pinned_hit = true;
         }
     }
 

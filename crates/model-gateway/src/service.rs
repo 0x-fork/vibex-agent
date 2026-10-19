@@ -840,16 +840,7 @@ impl ModelGatewayService {
     }
 
     /// Records one finished request in the ledger and in the token window.
-    pub(crate) fn record(
-        &self,
-        prepared: &PreparedCall,
-        credential: Option<&RequestId>,
-        outcome: GatewayRequestOutcome,
-        status: Option<u16>,
-        usage: &CanonicalUsage,
-        latency_ms: Option<i64>,
-        served: Option<String>,
-    ) {
+    pub(crate) fn record(&self, prepared: &PreparedCall, outcome: &RequestOutcome) {
         let Ok(connection) = self.connection() else {
             return;
         };
@@ -858,23 +849,23 @@ impl ModelGatewayService {
             request_id: RequestId::new(),
             agent_id: prepared.agent_id.clone(),
             model_provider_profile_id: prepared.profile_id.clone(),
-            credential_id: credential.cloned(),
+            credential_id: outcome.credential.clone(),
             model_requested: prepared.requested_model.clone(),
-            model_served: served,
+            model_served: outcome.served.clone(),
             wire_in: prepared.inbound.wire_protocol_id().to_string(),
             wire_out: prepared.target.wire_protocol_id().to_string(),
-            status,
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            cached_read_tokens: usage.cached_read_tokens,
-            cached_write_tokens: usage.cached_write_tokens,
-            reasoning_tokens: usage.reasoning_tokens,
-            latency_ms,
-            outcome,
+            status: outcome.status,
+            input_tokens: outcome.usage.input_tokens,
+            output_tokens: outcome.usage.output_tokens,
+            cached_read_tokens: outcome.usage.cached_read_tokens,
+            cached_write_tokens: outcome.usage.cached_write_tokens,
+            reasoning_tokens: outcome.usage.reasoning_tokens,
+            latency_ms: outcome.latency_ms,
+            outcome: outcome.kind,
             created_at_ms: now,
         };
         let _ = ModelGatewayRequestLogRepository::insert(&connection, &log);
-        if usage.total() > 0
+        if outcome.usage.total() > 0
             && let Ok(settings) = ModelGatewaySettingsRepository::get_or_create(&connection)
             && let Some(limit) = settings.policy.token_limit
         {
@@ -882,7 +873,7 @@ impl ModelGatewayService {
                 &connection,
                 &prepared.profile_id,
                 limit.window,
-                usage.total(),
+                outcome.usage.total(),
                 now,
             );
         }
@@ -1005,6 +996,17 @@ pub struct PreparedCall {
     pub agent_id: Option<String>,
     pub conversation: Option<String>,
     pub stream: bool,
+}
+
+/// What one finished request produced, as the ledger records it.
+pub(crate) struct RequestOutcome {
+    pub kind: GatewayRequestOutcome,
+    pub credential: Option<RequestId>,
+    pub status: Option<u16>,
+    pub usage: CanonicalUsage,
+    pub latency_ms: Option<i64>,
+    /// The model the upstream said it served, when it said one.
+    pub served: Option<String>,
 }
 
 /// The credential a request authenticates with.
@@ -1332,18 +1334,20 @@ pub(crate) async fn forward(
 
     service.record(
         &prepared,
-        Some(&key.id),
-        if failed {
-            GatewayRequestOutcome::Failed
-        } else if prepared.keys.len() > 1 {
-            GatewayRequestOutcome::Failover
-        } else {
-            GatewayRequestOutcome::Ok
+        &RequestOutcome {
+            kind: if failed {
+                GatewayRequestOutcome::Failed
+            } else if prepared.keys.len() > 1 {
+                GatewayRequestOutcome::Failover
+            } else {
+                GatewayRequestOutcome::Ok
+            },
+            credential: Some(key.id.clone()),
+            status: Some(if failed { 502 } else { 200 }),
+            usage,
+            latency_ms: Some(started.elapsed().as_millis() as i64),
+            served: None,
         },
-        Some(if failed { 502 } else { 200 }),
-        &usage,
-        Some(started.elapsed().as_millis() as i64),
-        None,
     );
 }
 
@@ -1395,12 +1399,14 @@ pub(crate) async fn gather(
     }
     service.record(
         prepared,
-        Some(&key.id),
-        GatewayRequestOutcome::Ok,
-        Some(200),
-        &usage,
-        Some(started.elapsed().as_millis() as i64),
-        (!response.model.is_empty()).then(|| response.model.clone()),
+        &RequestOutcome {
+            kind: GatewayRequestOutcome::Ok,
+            credential: Some(key.id.clone()),
+            status: Some(200),
+            usage,
+            latency_ms: Some(started.elapsed().as_millis() as i64),
+            served: (!response.model.is_empty()).then(|| response.model.clone()),
+        },
     );
     Ok(rendered)
 }
