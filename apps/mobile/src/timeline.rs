@@ -26,6 +26,11 @@ impl MobileApp {
     }
 
     fn set_row_expanded(&mut self, id: String, expanded: bool, cx: &mut Context<Self>) {
+        // The reader's own tap on a row is them taking charge of the screen, the
+        // way a scroll is. Leaving the list following the live end would drag it
+        // back down as the row's height changes, lifting the row they just
+        // opened out of view — the same rule the scroll handler applies.
+        self.timeline_follow = false;
         if expanded {
             self.collapsed_timeline_rows.remove(&id);
             self.expanded_timeline_rows.insert(id.clone());

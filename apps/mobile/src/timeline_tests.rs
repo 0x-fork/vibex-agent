@@ -1151,3 +1151,46 @@ fn the_turn_header_leads_with_the_agent_mark() {
         "the header starts at the row's leading edge, not in its middle"
     );
 }
+
+/// Opening a row is the reader taking charge of the screen.
+///
+/// The list follows the live end while the Agent works. If a tap on a row left
+/// that follow in place, the row's new height would drag the list back down and
+/// lift the row the reader just opened out of view.
+#[gpui::test]
+fn opening_a_row_stops_the_list_following_the_live_end(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (app, _probe, cx) = open_timeline(
+        cx,
+        data_dir.path(),
+        vec![read(
+            "src/a-long-file.rs",
+            ToolCallStatus::Completed,
+            &"first line\n  indented line\n".repeat(120),
+        )],
+    );
+    let row_id = app.read_with(cx, |app, _| {
+        app.timeline_turns[0].process_rows[0].id.clone()
+    });
+    assert!(
+        app.read_with(cx, |app, _| app.timeline_follow),
+        "the fixture starts following the live end"
+    );
+    let header = format!("activity-header:{row_id}");
+    let before = cx
+        .debug_bounds(header.clone().leak())
+        .expect("the row's header is on screen")
+        .top();
+    app.update(cx, |app, cx| app.set_row_expanded(row_id.clone(), true, cx));
+    draw(cx);
+    let follow = app.read_with(cx, |app, _| app.timeline_follow);
+    assert!(!follow, "opening a row hands the screen to the reader");
+    let after = cx
+        .debug_bounds(header.clone().leak())
+        .expect("the row's header is still on screen")
+        .top();
+    assert!(
+        (f32::from(after) - f32::from(before)).abs() <= 2.0,
+        "and the row stays where the reader found it: {before:?} then {after:?}"
+    );
+}
