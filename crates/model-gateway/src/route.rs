@@ -500,9 +500,11 @@ pub fn conversation_key(
     {
         return Some(stable_conversation_key(agent_id, key));
     }
+    // Only headers a client may plausibly set are read. Vibex's own ACP layer
+    // already carries the session id, so the first entry is the one the runtime
+    // controls; the rest are generic names an Agent CLI may send.
     for header in [
         "x-vibex-session",
-        "x-session-affinity",
         "x-session-id",
         "session_id",
         "conversation_id",
@@ -781,7 +783,7 @@ mod tests {
     fn conversation_key_prefers_an_explicit_header() {
         let key = conversation_key(
             Some("codex"),
-            &[("X-Session-Affinity".to_string(), "session-1".to_string())],
+            &[("X-Session-Id".to_string(), "session-1".to_string())],
             &json!({"input": "hi"}),
         )
         .unwrap();
@@ -792,7 +794,7 @@ mod tests {
             key,
             conversation_key(
                 Some("claude"),
-                &[("X-Session-Affinity".to_string(), "session-1".to_string())],
+                &[("X-Session-Id".to_string(), "session-1".to_string())],
                 &json!({"input": "hi"}),
             )
             .unwrap()

@@ -4913,3 +4913,190 @@ ManagementBackend::fetch_agent_model_provider_draft_models(request)
   asserts the fetch command appears only once the request URL and the key are
   both typed.
 
+
+## Scenario: Local Model Gateway
+
+### 1. Scope / Trigger
+
+- Trigger: changing how Agents reach a Provider at request time, adding a
+  Provider preset, adding a routing strategy, or touching the gateway's tables.
+- The gateway is one loopback HTTP endpoint (`crates/model-gateway`) that serves
+  the four wire APIs an Agent already speaks and forwards each call to whichever
+  shared Provider Profile serves the requested model. `DesktopRuntime` owns its
+  lifecycle; the Provider Profile and Agent binding contracts keep owning durable
+  configuration.
+
+### 2. Signatures
+
+```rust
+// crates/core/src/model_gateway.rs
+GatewayPolicy {
+    enabled, routing: GatewayRoutingStrategy, pin: GatewayPinScope,
+    token_limit: Option<GatewayTokenLimit>, translate: GatewayTranslatePolicy,
+}
+ModelGatewaySettings { display_name, port, upstreams, policy, revision, updated_at_ms }
+GatewaySnapshot { settings, runtime, upstreams, models, agents, upstream_candidates }
+
+// crates/model-gateway
+ModelGatewayService::{new, start, shutdown, settings, read_snapshot, prepare}
+WireProtocol::{path, parse_request, render_response}
+plan_route(RouteRequest) -> RoutePlan
+classify_failure(status, body) -> GatewayFailureKind
+conversation_key(agent_id, headers, body) -> Option<String>
+
+// crates/config-switch
+ProviderConfigService::{
+    gateway_agents,
+    gateway_agent_options,
+    gateway_account_states,
+    set_gateway_agent(agent_id, enabled, base_url, model_catalog),
+    refresh_gateway_profiles(base_url, model_catalog),
+    gateway_model_catalog,
+}
+```
+
+### 3. Contracts
+
+- **One gateway, one port.** The port persists in `model_gateway_settings`. A
+  collision probes `+1..+20`, and the port that actually bound is stored. The
+  bind is never ephemeral after the first success, because an Agent's base URL
+  points at it.
+- **A gateway failure never fails startup.** The status becomes `Unavailable`,
+  the Config Center says so, and every Agent keeps its direct Provider
+  configuration. Silence is the one forbidden outcome.
+- **Routing state is request state.** Cooldowns, pool position, conversation
+  pins, and token windows never enter `ProcessSpawnConfigSnapshot`,
+  `ProviderProfile::launch_revision`, or any other process fingerprint. Replacing
+  a Key must not restart an Agent process; a test asserts this.
+- **Passthrough before translation.** When the upstream publishes an endpoint for
+  the client's own protocol, the body is forwarded unchanged and only sniffed for
+  usage. Translation runs only when the protocols differ, and a protocol the user
+  disabled in `GatewayTranslatePolicy` is refused with
+  `model_gateway_translation_disabled` rather than silently used.
+- **The intermediate representation carries what the protocols cannot share.**
+  `CanonicalRequest.system` is its own field (Anthropic and Gemini keep it
+  outside the message list). `ContentPart::Opaque` carries vendor-authored
+  reasoning back to the protocol that produced it, byte for byte.
+  `ImageSource::VendorFileId` is modelled so a same-protocol passthrough can
+  carry it, and refused with `unsupported_image_reference` by any translation.
+- **Tool calls survive a cross-protocol stream.** `CanonicalEvent::{ToolCallStart,
+  ToolCallArgumentsDelta, ToolCallEnd}` are the only shapes the encoders see, so
+  Chat's index-keyed fragments, Anthropic's `content_block` state machine,
+  Responses' `output_item` events, and Gemini's whole-object `functionCall` all
+  normalize into one accumulator and re-split on the way out.
+- **Gemini reports `finishReason: STOP` even when it called a tool.** The decoder
+  therefore records that a call was seen and reports `StopReason::ToolUse`.
+- **A failure before the first byte may fail over; a failure after it may not.**
+  `auth` never fails over at all: the credential is wrong until it is replaced.
+  An auth failure therefore sets `cooldown_reason = auth` with no expiry, while
+  every other kind gets a duration. A stream that ends without its protocol's
+  terminal event is reported as an in-stream error rather than a clean `Stop`.
+- **Cooling is per Key, not per Provider.** `model_provider_account_state` holds
+  one row per `(profile, credential_id)`; a Key's `GatewayKeyState` is what the
+  UI renders, and only `Ready` is selectable.
+- **Conversation pinning preserves the vendor's prompt cache.** The key comes from
+  `prompt_cache_key`, then an explicit session header, then a hash of the system
+  prompt, tool set, and first user message, scoped by Agent. Pins expire after
+  `GatewayConversationPin::TTL_MS` and are pruned.
+- **Upstreams are shared Profiles.** The gateway stores only their ids; the
+  Profile keeps its endpoints and Keys. Pointing an Agent at the gateway creates
+  one hidden Profile (`vibex.internal.profileRole = model_gateway`) whose address
+  and model list follow the listener. That hidden Profile never appears in an
+  Agent's provider list, and its protocol is taken from the Agent's own
+  descriptor so the existing interface validation still passes.
+- **Published model ids resolve.** `/v1/models` and the Config Center list
+  `alias/model`, where the alias is the upstream's slugified display name. Two
+  upstreams that share a display name fall back to their unique Provider Profile
+  id, because a published id the resolver would refuse is a bug.
+- **Usage is tokens only.** No `cost`, `price`, `currency`, `amount`, or `budget`
+  field exists on any gateway contract, and `ModelGatewayRequestLog` carries no
+  prompt, reply, image bytes, or Key material. It is pruned to a rolling seven
+  days.
+- **The gateway accepts loopback callers only, and no browser.** The `Host`
+  header must name `127.0.0.1`, `localhost`, or `::1`, and any `Origin` header is
+  refused; the second check is what defeats a hostile page reaching the loopback
+  port (including DNS rebinding).
+- **Presets ship with the binary.** A preset supplies addresses per wire
+  protocol, a starting model list, and the caveats its data cannot express.
+  Creating from a preset writes the protocol into `providerOptions["wireApi"]`
+  explicitly: the editor's last-resort fallback is "the first protocol that has a
+  URL", which otherwise relabels an Anthropic Provider as Chat Completions on
+  reopen.
+
+### 4. Validation & Error Matrix
+
+- No upstream serves the model -> `404 model_not_found` with up to three closest
+  configured ids.
+- Every Key for a served model is cooling or over its ceiling -> `429
+  model_gateway_keys_cooling`, and no upstream call is made.
+- A local token ceiling is crossed -> `429 model_gateway_token_ceiling_reached`;
+  requests resume when the window rolls over.
+- A translation the policy disabled is required -> `400
+  model_gateway_translation_disabled`.
+- A request carries a `file_id` image and the target is not Responses ->
+  `400 unsupported_image_reference`; the image is never silently dropped.
+- The gateway is enabled for an Agent that manages its own provider ->
+  `model_gateway_agent_unsupported`.
+- The gateway is enabled with no running listener -> `model_gateway_unavailable`.
+- Gateway settings skip or repeat a revision -> `model_gateway_settings_revision_invalid`
+  / `model_gateway_settings_revision_conflict`.
+- A non-loopback `Host` or any `Origin` -> refused before routing.
+
+### 5. Good / Base / Bad Cases
+
+- Good: one gateway with two upstreams serves `alias/model`; the first Key of the
+  answering upstream returns 429 and the request lands on its second Key, which
+  is recorded as `failover`.
+- Good: an Anthropic-speaking upstream answers a Chat-speaking Agent; frames are
+  re-encoded as `chat.completion.chunk` and the ledger records both protocols.
+- Good: a conversation pinned to one Key stays there across turns even under
+  round-robin routing.
+- Base: a Key's authentication is rejected; it becomes `Invalid`, never
+  `Cooling`, and the next Key answers.
+- Bad: resolve the model id, pick a Key, or emit a marker that changes an Agent
+  process fingerprint.
+- Bad: write a translation or preset behaviour that branches on a vendor's model
+  id to guess its capabilities.
+
+### 6. Tests Required
+
+- `cargo test -p vibex-model-gateway` covers the IR, all four decoders and
+  encoders, SSE frame boundaries, tool-call accumulation, failure classification,
+  route planning, and the loopback perimeter.
+- `cargo test -p vibex-model-gateway --test gateway` drives a real listener
+  against a mock upstream: passthrough, translation, gathering, cooling, auth
+  invalidation, the token ceiling, pinning, an unknown model, `file_id` refusal,
+  and the Origin check.
+- `cargo test -p vibex-config-switch gateway` asserts one hidden Profile per
+  Agent, that it stays out of the visible list, that the address follows the
+  listener, and that a no-op refresh does not churn the binding.
+- `cargo test -p vibex-db model_gateway` asserts migration 64 idempotency,
+  revision compare-and-swap, window bucketing, pin expiry, ledger retention, and
+  that no prompt or Key text reaches the ledger.
+- `cargo test -p vibex-desktop gateway_surface_tests` asserts every gateway state
+  is named in words and that a gateway without a ready Key is not routable.
+- `cargo test -p vibex-tui --test config_center` asserts the gateway leads the
+  Providers table with its Key and Agent summary, and that a missing gateway
+  leaves the direct Providers readable.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+// Pick a credential once and cache it on the Profile, so every request reuses it.
+profile.selected_credential = Some(pick_first_ready_key(&pool));
+save_profile(&profile)?;
+```
+
+This moves a request-time decision into durable configuration, invalidates the
+Agent's launch revision, and restarts the process on every Key change.
+
+#### Correct
+
+```rust
+let plan = plan_route(RouteRequest { candidates, strategy, rotation, pinned })?;
+let (attempt, key) = service.open_attempt(&prepared).await?;
+// The Key lives for this attempt only; the ledger records its id, never its value.
+service.record(&prepared, &RequestOutcome { credential: Some(key.id), .. });
+```

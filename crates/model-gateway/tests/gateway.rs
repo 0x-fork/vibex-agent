@@ -763,7 +763,7 @@ async fn a_conversation_stays_on_its_pinned_key() {
         let response = client
             .post(format!("{gateway_url}/v1/chat/completions"))
             .header(header::HOST, "127.0.0.1")
-            .header("x-session-affinity", "conversation-1")
+            .header("x-session-id", "conversation-1")
             .json(&json!({
                 "model": "deepseek/deepseek-chat",
                 "messages": [
