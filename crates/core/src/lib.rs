@@ -23,9 +23,11 @@ pub mod goal;
 pub mod ids;
 pub mod local_history;
 pub mod market;
+pub mod model_gateway;
 pub mod pairing_code_link;
 pub mod permission;
 pub mod provider;
+pub mod provider_presets;
 pub mod provider_projection;
 pub mod recovery;
 pub mod relay;
@@ -236,6 +238,7 @@ pub use local_history::{
     LocalHistorySessionSummary, LocalHistorySource, LocalHistoryTimelineEntry,
 };
 pub use market::*;
+pub use model_gateway::*;
 pub use pairing_code_link::{
     MAX_PAIRING_CODE_CERTIFICATE_BYTES, MAX_PAIRING_CODE_CHARS, MAX_PAIRING_CODE_LINK_BYTES,
     PAIRING_CODE_FRAGMENT_PREFIX, PAIRING_CODE_LINK_HOST, PAIRING_CODE_LINK_PREFIX,
@@ -319,6 +322,7 @@ pub use provider::{
     SkillSetProviderMatrixRequest, SkillSourceKind, SkillStatus, SkillSummary, SkillUpdateRequest,
     SkillValidateRequest, SkillValidationResult, SkillValidationStatus,
 };
+pub use provider_presets::*;
 pub use provider_projection::*;
 pub use recovery::*;
 pub use relay::{

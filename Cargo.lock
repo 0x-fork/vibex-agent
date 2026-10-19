@@ -10251,6 +10251,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibex-model-gateway"
+version = "0.1.0-rc.8"
+dependencies = [
+ "axum",
+ "base64",
+ "bytes",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "url",
+ "vibex-config-switch",
+ "vibex-core",
+ "vibex-db",
+]
+
+[[package]]
 name = "vibex-relay"
 version = "0.1.0-rc.8"
 dependencies = [

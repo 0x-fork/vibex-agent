@@ -22,6 +22,7 @@ members = [
   "crates/fs",
   "crates/git",
   "crates/gpui-tokio",
+  "crates/model-gateway",
   "crates/relay",
   "crates/remote",
   "crates/terminal",

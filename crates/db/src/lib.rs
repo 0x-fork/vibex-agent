@@ -77,6 +77,8 @@ mod vibex_use;
 pub use vibex_use::*;
 mod agent_auth_context;
 pub use agent_auth_context::*;
+mod model_gateway;
+pub use model_gateway::*;
 
 pub type DbConnection = Connection;
 
@@ -91,7 +93,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 63;
+pub const CURRENT_SCHEMA_VERSION: i64 = 64;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12425,6 +12427,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_computer_use(conn, &mut applied)?;
     apply_vibex_use(conn, &mut applied)?;
     vibex_use::budget::migrate(conn, &mut applied)?;
+    model_gateway::migrate(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -17517,6 +17520,7 @@ mod tests {
                 "61:computer_use",
                 "62:vibex_use",
                 "63:vibex_use_budget_policy",
+                "64:model_gateway",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -17664,6 +17668,7 @@ mod tests {
                 "61:computer_use",
                 "62:vibex_use",
                 "63:vibex_use_budget_policy",
+                "64:model_gateway",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -17792,6 +17797,7 @@ mod tests {
                 "61:computer_use",
                 "62:vibex_use",
                 "63:vibex_use_budget_policy",
+                "64:model_gateway",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -17958,6 +17964,7 @@ mod tests {
                 "61:computer_use",
                 "62:vibex_use",
                 "63:vibex_use_budget_policy",
+                "64:model_gateway",
             ]
         );
         assert_eq!(
@@ -19384,6 +19391,7 @@ mod tests {
                 "61:computer_use",
                 "62:vibex_use",
                 "63:vibex_use_budget_policy",
+                "64:model_gateway",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
