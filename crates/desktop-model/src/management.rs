@@ -24,6 +24,9 @@ pub enum ManagementSection {
     #[default]
     Agents,
     ModelProviders,
+    /// The global Providers page: every shared Provider Profile once, with the
+    /// Agents that bind it.
+    Providers,
     /// The local model gateway: routing policy, upstreams, and the Agents that
     /// walk through it.
     Gateway,
@@ -37,9 +40,10 @@ pub enum ManagementSection {
 }
 
 impl ManagementSection {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Agents,
         Self::ModelProviders,
+        Self::Providers,
         Self::Gateway,
         Self::Mcp,
         Self::Skills,
@@ -54,6 +58,7 @@ impl ManagementSection {
         match self {
             Self::Agents => "agents",
             Self::ModelProviders => "model-providers",
+            Self::Providers => "providers",
             Self::Gateway => "gateway",
             Self::Mcp => "mcp",
             Self::Skills => "skills",
@@ -69,6 +74,7 @@ impl ManagementSection {
         match self {
             Self::Agents => "Agents",
             Self::ModelProviders => "Model Providers",
+            Self::Providers => "Providers",
             Self::Gateway => "Gateway",
             Self::Mcp => "MCP",
             Self::Skills => "Skills",

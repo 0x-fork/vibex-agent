@@ -369,6 +369,33 @@ pub struct ModelProviderProfile {
     pub deleted_at_ms: Option<i64>,
 }
 
+impl Default for ModelProviderProfile {
+    /// An empty, disabled Provider.
+    ///
+    /// This exists so a caller — a fixture, or a page that has not loaded yet —
+    /// can name only the fields it cares about. It is never a valid record to
+    /// persist: `validate` still rejects an empty display name.
+    fn default() -> Self {
+        Self {
+            id: ModelProviderProfileId::new(),
+            legacy_provider_profile_id: None,
+            display_name: String::new(),
+            vendor_hint: None,
+            endpoints: Vec::new(),
+            proxy_policy: ModelProviderProxyPolicy::InheritSystem,
+            credentials: Vec::new(),
+            configured_models: Vec::new(),
+            default_model_id: None,
+            headers: Vec::new(),
+            status: ModelProviderProfileStatus::Disabled,
+            revision: 1,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            deleted_at_ms: None,
+        }
+    }
+}
+
 impl ModelProviderProfile {
     pub fn validate(&self) -> VibexResult<()> {
         validate_display_name(&self.display_name, "model_provider_display_name_invalid")?;
@@ -690,6 +717,38 @@ pub struct AgentModelProviderBinding {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub deleted_at_ms: Option<i64>,
+}
+
+impl Default for AgentModelProviderBinding {
+    /// An empty binding, for callers that only care about a few fields.
+    fn default() -> Self {
+        Self {
+            id: AgentModelProviderBindingId::new(),
+            legacy_provider_profile_id: None,
+            agent_id: AgentId::parse("unknown").expect("a literal Agent id is valid"),
+            runtime_profile_id: AgentRuntimeProfileId::new(),
+            model_provider_profile_id: ModelProviderProfileId::new(),
+            projection_descriptor_id: AgentProviderProjectionDescriptorId::parse(
+                "projection_unknown_runtime_v1",
+            )
+            .expect("a literal descriptor id is valid"),
+            projection_overrides: AgentProviderProjectionOverrides::default(),
+            configured_models: Vec::new(),
+            projection_fingerprint: None,
+            status: AgentModelProviderBindingStatus::Draft,
+            verification: ProjectionVerificationState {
+                state: ProjectionEvidenceState::Unverified,
+                descriptor_version: "0".to_string(),
+                source_evidence_reference: None,
+                runtime_evidence_reference: None,
+                verified_at_ms: None,
+            },
+            revision: 1,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            deleted_at_ms: None,
+        }
+    }
 }
 
 impl AgentModelProviderBinding {

@@ -1115,6 +1115,18 @@ pub async fn assemble_management_snapshot(
         .retain(|agent| vibex_core::is_user_visible_agent(&agent.id));
 
     let profiles = provider.list_profiles()?;
+    // The global Providers page reads these two lists: one Profile per shared
+    // Provider, and every Agent binding that references it.
+    let model_provider_profiles = provider.list_model_provider_profiles()?;
+    let mut agent_model_provider_bindings = Vec::new();
+    for binding in provider.list_agent_model_provider_bindings(
+        vibex_core::AgentModelProviderBindingListRequest {
+            agent_id: None,
+            model_provider_profile_id: None,
+        },
+    )? {
+        agent_model_provider_bindings.push(binding);
+    }
     let native_import_preview = provider
         .preview_native_import(vibex_core::ProviderNativeImportPreviewRequest {
             sources: vec![
@@ -1299,6 +1311,8 @@ pub async fn assemble_management_snapshot(
         agents,
         catalog,
         profiles,
+        model_provider_profiles,
+        agent_model_provider_bindings,
         native_import_preview,
         acp_configs,
         agent_details,

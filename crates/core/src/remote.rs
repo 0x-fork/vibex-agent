@@ -4290,6 +4290,16 @@ pub struct RemoteProviderManagementSnapshot {
     pub agents: Vec<AgentSnapshotEntry>,
     pub catalog: AgentCatalogListResponse,
     pub profiles: Vec<ProviderProfile>,
+    /// Every shared Provider Profile, with no Agent ownership.
+    ///
+    /// The global Providers page reads this list: a Profile appears once here
+    /// no matter how many Agents bind it. `profiles` above stays for the
+    /// compatibility window, because the Agent-scoped editor still edits it.
+    #[serde(default)]
+    pub model_provider_profiles: Vec<crate::ModelProviderProfile>,
+    /// Every Agent binding, for the "used by these Agents" reverse lookup.
+    #[serde(default)]
+    pub agent_model_provider_bindings: Vec<crate::AgentModelProviderBinding>,
     pub native_import_preview: Option<ProviderNativeImportPreview>,
     pub acp_configs: Vec<RemoteAcpProfileConfigEntry>,
     pub agent_details: Vec<RemoteManagementAgentDetail>,

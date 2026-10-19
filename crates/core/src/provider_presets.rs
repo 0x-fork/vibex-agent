@@ -172,6 +172,67 @@ impl ProviderPreset {
     }
 }
 
+impl ProviderPreset {
+    /// A draft Provider Profile this preset pre-fills.
+    ///
+    /// The result is display-shaped: it has no id worth persisting and no
+    /// Secret, and it exists so an editor can show the addresses, protocol and
+    /// models the reader would otherwise have to research. The protocol is
+    /// written into the Provider options because that is the field the
+    /// projection reads back; leaving it implicit lets an editor fall back to
+    /// "the first protocol that has a URL".
+    pub fn draft_profile(&self, agent_id: &crate::AgentId) -> crate::ProviderProfile {
+        let mut profile = crate::ProviderProfile::local_default(crate::ProviderKind::Acp);
+        profile.id = crate::ProviderProfileId::parse(format!(
+            "provider_preset_{}",
+            self.id.replace(['/', ' '], "-")
+        ))
+        .unwrap_or(profile.id);
+        profile.agent_id = agent_id.clone();
+        profile.display_name = self.display_name.clone();
+        profile.status = crate::ProviderProfileStatus::Enabled;
+        profile.base_url = self
+            .default_wire_api()
+            .and_then(|wire_api| self.endpoint_for(wire_api))
+            .map(str::to_string);
+        profile.default_model = self.models.first().cloned();
+        profile.configured_models = self
+            .models
+            .iter()
+            .map(|model| crate::ProviderConfiguredModel {
+                id: model.clone(),
+                display_name: None,
+                enabled: true,
+                wire_api: self.default_wire_api(),
+                capabilities: crate::ProviderModelCapabilities::default(),
+            })
+            .collect();
+        let mut options = crate::ProviderOptions::empty();
+        if let Some(wire_api) = self.default_wire_api() {
+            options.entries.push(crate::ProviderBindingMetadata {
+                key: "wireApi".to_string(),
+                value: wire_api.wire_protocol_id().to_string(),
+            });
+        }
+        for (protocol, url) in &self.endpoints {
+            if let Some(wire_api) = crate::ProviderModelWireApi::from_wire_protocol_id(protocol) {
+                options.entries.push(crate::ProviderBindingMetadata {
+                    key: wire_api.protocol_base_url_option_key(),
+                    value: url.clone(),
+                });
+            }
+        }
+        if let Some(website) = self.website.as_deref() {
+            options.entries.push(crate::ProviderBindingMetadata {
+                key: "websiteUrl".to_string(),
+                value: website.to_string(),
+            });
+        }
+        profile.provider_options = options;
+        profile
+    }
+}
+
 /// The first batch of built-in presets.
 pub const PROVIDER_PRESET_ANTHROPIC: &str = "anthropic";
 pub const PROVIDER_PRESET_OPENAI: &str = "openai";

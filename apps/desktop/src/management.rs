@@ -470,6 +470,8 @@ struct ManagementCopy {
     /// sidebar, so every locale names the record itself rather than the
     /// composer affordance it backs.
     prompts: &'static str,
+    /// The global Providers tab caption.
+    providers: &'static str,
     /// The local model gateway's own tab caption.
     gateway: &'static str,
     search_agents: &'static str,
@@ -494,6 +496,7 @@ fn management_copy() -> ManagementCopy {
             mcp: "MCP",
             skills: "Skills",
             prompts: "Prompt",
+            providers: "Providers",
             gateway: "Gateway",
             search_agents: "Search Agent",
             search_mcp: "Search MCP",
@@ -514,6 +517,7 @@ fn management_copy() -> ManagementCopy {
             mcp: "MCP",
             skills: "Skill",
             prompts: "Prompt",
+            providers: "供应商",
             gateway: "网关",
             search_agents: "搜索 Agent",
             search_mcp: "搜索 MCP",
@@ -534,6 +538,7 @@ fn management_copy() -> ManagementCopy {
             mcp: "MCP",
             skills: "Skill",
             prompts: "Prompt",
+            providers: "供應商",
             gateway: "閘道",
             search_agents: "搜尋 Agent",
             search_mcp: "搜尋 MCP",
@@ -556,6 +561,8 @@ fn management_copy() -> ManagementCopy {
 struct ManagementSnapshot {
     center: ProviderCenterSnapshot,
     provider_profiles: Vec<vibex_core::ProviderProfile>,
+    providers: Vec<vibex_core::ModelProviderProfile>,
+    provider_bindings: Vec<vibex_core::AgentModelProviderBinding>,
     model_provider_agent_ids: BTreeSet<String>,
     acp_configs: Vec<(String, vibex_core::AcpProviderConfig)>,
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
@@ -949,6 +956,14 @@ pub struct ManagementCenter {
     usage_summaries: Vec<vibex_core::ProviderUsageSummary>,
     /// The local model gateway surface as the authority last reported it.
     gateway: vibex_core::GatewaySnapshot,
+    /// Every shared Provider Profile, once each.
+    providers: Vec<vibex_core::ModelProviderProfile>,
+    /// Every Agent binding, for the "used by" reverse lookup.
+    provider_bindings: Vec<vibex_core::AgentModelProviderBinding>,
+    /// Which shared Provider the global Providers page has selected.
+    selected_global_provider_id: Option<String>,
+    /// The gateway's most recent requests, as the authority recorded them.
+    gateway_requests: Vec<vibex_core::GatewayRequestSummary>,
     native_exports: Vec<vibex_core::ProviderNativeExportRecordSummary>,
     native_export_source: vibex_core::ProviderNativeExportSource,
     native_export_mode: vibex_core::ProviderNativeExportMode,
@@ -1936,6 +1951,10 @@ impl ManagementCenter {
             compact_sidebar_height: MANAGEMENT_COMPACT_SIDEBAR_DEFAULT_HEIGHT,
             compact_sidebar_resize_drag: None,
             gateway: vibex_core::GatewaySnapshot::default(),
+            providers: Vec::new(),
+            provider_bindings: Vec::new(),
+            gateway_requests: Vec::new(),
+            selected_global_provider_id: None,
             profile_editor_open: false,
             editing_profile_id: None,
             profile_secret_configured: false,
@@ -4033,6 +4052,7 @@ impl ManagementCenter {
     ) -> bool {
         let section = match section {
             ManagementSection::ModelProviders => ManagementSection::Agents,
+            ManagementSection::Providers => ManagementSection::Providers,
             ManagementSection::Gateway => ManagementSection::Gateway,
             ManagementSection::Scheduled
             | ManagementSection::Automation
@@ -4215,7 +4235,11 @@ impl ManagementCenter {
         let default_scope = management_provider_default_scope(self.pairing_workspace_id.clone());
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            load_snapshot(backend, default_scope, false).await
+            let snapshot = load_snapshot(backend.clone(), default_scope, false).await;
+            // The ledger is a separate, small read: it changes per request and
+            // must not hold up the Config Center's own snapshot.
+            let requests = backend.management().model_gateway_requests().await;
+            (snapshot, requests)
         });
         self.refresh_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -4224,14 +4248,15 @@ impl ManagementCenter {
                     return;
                 }
                 this.loading = false;
-                let success = matches!(&outcome, Ok(Ok(_)));
+                let success = matches!(&outcome, Ok((Ok(_), _)));
                 match outcome {
-                    Ok(Ok(snapshot)) => {
+                    Ok((Ok(snapshot), requests)) => {
+                        this.gateway_requests = requests.unwrap_or_default();
                         this.apply_snapshot(snapshot, cx);
                         cx.notify();
                         this.start_full_refresh(cx);
                     }
-                    Ok(Err(error)) => {
+                    Ok((Err(error), _)) => {
                         this.error = Some(format!("{}: {}", error.code, error.message))
                     }
                     Err(error) => {
@@ -4338,6 +4363,8 @@ impl ManagementCenter {
         self.details_ready = true;
         self.snapshot = snapshot.center;
         self.gateway = snapshot.gateway;
+        self.providers = snapshot.providers;
+        self.provider_bindings = snapshot.provider_bindings;
         self.provider_profiles = snapshot.provider_profiles;
         self.provider_display_order = snapshot.provider_display_order;
         self.provider_display_order_drag_state = None;
@@ -10872,6 +10899,11 @@ impl ManagementCenter {
         let active = management_primary_section(self.navigation.active);
         let items = [
             (ManagementSection::Agents, copy.agents, IconName::Bot),
+            (
+                ManagementSection::Providers,
+                copy.providers,
+                IconName::Folder,
+            ),
             (ManagementSection::Gateway, copy.gateway, IconName::Network),
             (ManagementSection::Mcp, copy.mcp, IconName::Network),
             (ManagementSection::Skills, copy.skills, IconName::BookOpen),
@@ -10910,6 +10942,323 @@ impl ManagementCenter {
                     this.request_section_switch(*section, window, cx);
                 }
             }))
+            .into_any_element()
+    }
+
+    /// The shared Providers the global page lists, each with the Agents that
+    /// bind it.
+    ///
+    /// A Profile appears once here however many Agents reference it. That is
+    /// the whole point of this page: the Agent-scoped list showed the same
+    /// upstream once per Agent, which made a shared Provider look like three
+    /// separate ones.
+    fn shared_providers(&self) -> Vec<SharedProviderRow> {
+        shared_provider_rows(&self.providers, &self.provider_bindings)
+    }
+
+    /// The global Providers sidebar: one row per shared Provider.
+    fn render_provider_page_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let rows = self.shared_providers();
+        let selected = self.selected_global_provider_id.clone();
+        let mut list = v_flex().w_full().gap_1();
+        let mut first_id = None;
+        for row in &rows {
+            let id = row.profile.id.as_str().to_string();
+            if first_id.is_none() {
+                first_id = Some(id.clone());
+            }
+            let is_selected = selected.as_deref() == Some(id.as_str());
+            let key_count = row.profile.credentials.len();
+            let used = if row.agents.is_empty() {
+                management_locale_text("not used yet", "未被使用", "未被使用").to_string()
+            } else {
+                row.agents.iter().cloned().collect::<Vec<_>>().join(" · ")
+            };
+            let select_id = id.clone();
+            list = list.child(
+                v_flex()
+                    .id(SharedString::from(format!(
+                        "management-global-provider-row-{id}"
+                    )))
+                    .w_full()
+                    .min_w_0()
+                    .gap_1()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(if is_selected {
+                        cx.theme().primary
+                    } else {
+                        cx.theme().border
+                    })
+                    .p_2()
+                    .cursor_pointer()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_medium()
+                                    .child(row.profile.display_name.clone()),
+                            )
+                            .child(gateway_provider_status_badge(&row.profile, cx)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "{key_count} {} · {}",
+                                management_locale_text("keys", "个 Key", "個 Key"),
+                                used
+                            )),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected_global_provider_id = Some(select_id.clone());
+                        cx.notify();
+                    })),
+            );
+        }
+        // Keep a selection valid as Profiles come and go.
+        if selected.is_none()
+            || !rows
+                .iter()
+                .any(|row| Some(row.profile.id.as_str()) == selected.as_deref())
+        {
+            self.selected_global_provider_id = first_id;
+        }
+        v_flex()
+            .id("management-provider-page-sidebar")
+            .w_full()
+            .h_full()
+            .min_w_0()
+            .gap_3()
+            .p_3()
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(management_locale_text("Providers", "供应商", "供應商")),
+                    )
+                    .child(
+                        Button::new("management-provider-page-add")
+                            .xsmall()
+                            .outline()
+                            .icon(IconName::Plus)
+                            .tooltip(management_locale_text(
+                                "Add a Provider",
+                                "添加供应商",
+                                "新增供應商",
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_profile_creator(window, cx)
+                            })),
+                    ),
+            )
+            .child(if rows.is_empty() {
+                compact_empty_state(
+                    management_locale_text("No Providers yet", "还没有供应商", "還沒有供應商"),
+                    management_locale_text(
+                        "Add one to give your Agents a model source.",
+                        "添加后 Agent 才有可用的模型来源。",
+                        "新增後 Agent 才有可用的模型來源。",
+                    ),
+                    cx,
+                )
+            } else {
+                list.into_any_element()
+            })
+            .into_any_element()
+    }
+
+    /// The global Providers panel: what the selected Provider is, which keys it
+    /// holds, and which Agents bind it.
+    fn render_provider_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let rows = self.shared_providers();
+        let Some(row) = rows
+            .iter()
+            .find(|row| {
+                Some(row.profile.id.as_str()) == self.selected_global_provider_id.as_deref()
+            })
+            .or_else(|| rows.first())
+            .cloned()
+        else {
+            return detail_empty_state(
+                management_locale_text("No Providers yet", "还没有供应商", "還沒有供應商"),
+                management_locale_text(
+                    "Add a Provider, or point an Agent at the gateway to share one.",
+                    "添加一个供应商，或让 Agent 走网关来共享。",
+                    "新增一個供應商，或讓 Agent 走閘道來共享。",
+                ),
+                cx,
+            );
+        };
+        let profile = &row.profile;
+        let mut body = v_flex().w_full().min_w_0().gap_3();
+
+        let mut details = v_flex().w_full().gap_2();
+        details = details.child(stat_line(
+            management_locale_text("Status", "状态", "狀態"),
+            match profile.status {
+                vibex_core::ModelProviderProfileStatus::Enabled => {
+                    management_locale_text("Enabled", "已启用", "已啟用")
+                }
+                vibex_core::ModelProviderProfileStatus::Disabled => {
+                    management_locale_text("Disabled", "已停用", "已停用")
+                }
+            }
+            .to_string(),
+            cx,
+        ));
+        details = details.child(stat_line(
+            management_locale_text("Models", "模型", "模型"),
+            profile
+                .configured_models
+                .iter()
+                .filter(|model| model.enabled)
+                .count()
+                .to_string(),
+            cx,
+        ));
+        details = details.child(stat_line(
+            management_locale_text("Keys", "Key", "Key"),
+            profile.credentials.len().to_string(),
+            cx,
+        ));
+        // The address is shown, not edited: an Agent binding points at it.
+        if let Some(endpoint) = profile.primary_api_endpoint() {
+            details = details.child(stat_line(
+                management_locale_text("Endpoint", "接口地址", "介面位址"),
+                endpoint.url.clone(),
+                cx,
+            ));
+        }
+        body = body.child(management_card_dynamic(
+            profile.display_name.clone(),
+            management_locale_text(
+                "A shared Provider. Every Agent below uses the same keys.",
+                "共享的供应商。下面每个 Agent 使用同一套 Key。",
+                "共享的供應商。下面每個 Agent 使用同一套 Key。",
+            ),
+            details.into_any_element(),
+            cx,
+        ));
+
+        let mut key_rows = v_flex().w_full().gap_1();
+        for credential in &profile.credentials {
+            let state = match credential.status {
+                vibex_core::AgentCredentialStatus::Ready => Tag::success()
+                    .xsmall()
+                    .child(management_locale_text("Active", "正常", "正常"))
+                    .into_any_element(),
+                vibex_core::AgentCredentialStatus::Missing => Tag::warning()
+                    .xsmall()
+                    .child(management_locale_text(
+                        "Needs a key",
+                        "需要 Key",
+                        "需要 Key",
+                    ))
+                    .into_any_element(),
+                vibex_core::AgentCredentialStatus::Expired => Tag::danger()
+                    .xsmall()
+                    .child(management_locale_text("Expired", "已过期", "已過期"))
+                    .into_any_element(),
+                _ => Tag::secondary()
+                    .xsmall()
+                    .child(management_locale_text("Not ready", "未就绪", "未就緒"))
+                    .into_any_element(),
+            };
+            // The Key value itself never reaches this list: only its label and
+            // state, because the record carries a reference rather than a secret.
+            key_rows = key_rows.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .py_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .child(credential.display_name.clone()),
+                    )
+                    .child(state),
+            );
+        }
+        if profile.credentials.is_empty() {
+            key_rows = key_rows.child(compact_empty_state(
+                management_locale_text("No keys yet", "还没有 Key", "還沒有 Key"),
+                management_locale_text(
+                    "Add a key in the Agent that owns this Provider's connection.",
+                    "在配置该供应商连接的 Agent 页里添加 Key。",
+                    "在設定該供應商連線的 Agent 頁裡新增 Key。",
+                ),
+                cx,
+            ));
+        }
+        body = body.child(management_card_with_icon(
+            management_locale_text("Keys", "Key", "Key"),
+            management_locale_text(
+                "Every key here is shared by the Agents that bind this Provider.",
+                "这里的每个 Key 都由绑定该供应商的 Agent 共用。",
+                "這裡的每個 Key 都由綁定該供應商的 Agent 共用。",
+            ),
+            "icons/vibex/file-key.svg",
+            key_rows.into_any_element(),
+            cx,
+        ));
+
+        let mut agent_rows = v_flex().w_full().gap_1();
+        for agent_id in &row.agents {
+            agent_rows = agent_rows.child(stat_line(
+                agent_id.clone(),
+                management_locale_text("uses this Provider", "使用此供应商", "使用此供應商")
+                    .to_string(),
+                cx,
+            ));
+        }
+        if row.agents.is_empty() {
+            agent_rows = agent_rows.child(div().text_sm().text_color(cx.theme().warning).child(
+                management_locale_text(
+                    "No Agent uses this Provider yet. Point one at it from its own page.",
+                    "还没有 Agent 使用该供应商，请到 Agent 页让它接入。",
+                    "還沒有 Agent 使用該供應商，請到 Agent 頁讓它接入。",
+                ),
+            ));
+        }
+        body = body.child(management_card_with_icon(
+            management_locale_text("Used by", "被哪些 Agent 使用", "被哪些 Agent 使用"),
+            management_locale_text(
+                "Deleting this Provider would remove the model source of these Agents.",
+                "删除该供应商会让这些 Agent 失去模型来源。",
+                "刪除該供應商會讓這些 Agent 失去模型來源。",
+            ),
+            "icons/vibex/cpu.svg",
+            agent_rows.into_any_element(),
+            cx,
+        ));
+
+        v_flex()
+            .id("management-provider-page")
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .child(body)
             .into_any_element()
     }
 
@@ -11514,6 +11863,88 @@ impl ManagementCenter {
                 cx,
             ));
         }
+        // Recent requests: which upstream answered, which protocol changed,
+        // and how many tokens it took. This is the only view that explains a
+        // failover after the fact.
+        let mut request_rows = v_flex().w_full().gap_1();
+        for request in self.gateway_requests.iter().take(20) {
+            let outcome = match request.outcome {
+                vibex_core::GatewayRequestOutcome::Ok => Tag::success()
+                    .xsmall()
+                    .child(management_locale_text("ok", "成功", "成功"))
+                    .into_any_element(),
+                vibex_core::GatewayRequestOutcome::Failover => Tag::info()
+                    .xsmall()
+                    .child(management_locale_text("failover", "已切换", "已切換"))
+                    .into_any_element(),
+                vibex_core::GatewayRequestOutcome::Cooldown => Tag::warning()
+                    .xsmall()
+                    .child(management_locale_text("cooling", "冷却中", "冷卻中"))
+                    .into_any_element(),
+                _ => Tag::danger()
+                    .xsmall()
+                    .child(management_locale_text("failed", "失败", "失敗"))
+                    .into_any_element(),
+            };
+            let wire = if request.wire_in == request.wire_out {
+                management_locale_text("direct", "直通", "直通").to_string()
+            } else {
+                format!("{} → {}", request.wire_in, request.wire_out)
+            };
+            request_rows = request_rows.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .py_1()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(div().min_w_0().truncate().text_sm().child(format!(
+                                "{} · {}",
+                                request.provider_name, request.model_requested
+                            )))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{wire} · {} tokens", request.total_tokens)),
+                            ),
+                    )
+                    .child(outcome),
+            );
+        }
+        if self.gateway_requests.is_empty() {
+            request_rows = request_rows.child(compact_empty_state(
+                management_locale_text(
+                    "No requests yet",
+                    "还没有请求",
+                    "還沒有請求",
+                ),
+                management_locale_text(
+                    "Once an Agent sends a request through the gateway it appears here, without its prompt or reply.",
+                    "Agent 通过网关发出请求后会显示在这里，但不含提示词和回复正文。",
+                    "Agent 透過閘道發出請求後會顯示在這裡，但不含提示詞和回覆正文。",
+                ),
+                cx,
+            ));
+        }
+        body = body.child(management_card_with_icon(
+            management_locale_text("Recent requests", "最近请求", "最近請求"),
+            management_locale_text(
+                "Metadata only: model, route, status and tokens. Never the prompt, the reply, or a key.",
+                "仅元数据：模型、路径、状态与 token。不含提示词、回复和 Key。",
+                "僅中繼資料：模型、路徑、狀態與 token。不含提示詞、回覆和 Key。",
+            ),
+            "icons/vibex/list-checks.svg",
+            request_rows.into_any_element(),
+            cx,
+        ));
+
         body = body.child(management_card_with_icon(
             management_locale_text("Agents", "Agent", "Agent"),
             management_locale_text(
@@ -11540,6 +11971,7 @@ impl ManagementCenter {
             ManagementSection::Agents | ManagementSection::ModelProviders => {
                 self.render_providers(window, cx)
             }
+            ManagementSection::Providers => self.render_provider_page(cx),
             ManagementSection::Gateway => self.render_gateway(cx),
             ManagementSection::Mcp => self.render_mcp(cx),
             ManagementSection::Skills => self.render_skills(cx),
@@ -11558,6 +11990,7 @@ impl ManagementCenter {
     ) -> AnyElement {
         match management_primary_section(self.navigation.active) {
             ManagementSection::Agents => self.render_agents(cx),
+            ManagementSection::Providers => self.render_provider_page_sidebar(cx),
             ManagementSection::Gateway => self.render_gateway_sidebar(cx),
             ManagementSection::Mcp => self.render_mcp_sidebar(cx),
             ManagementSection::Skills => self.render_skills_sidebar(cx),
@@ -21562,6 +21995,7 @@ fn management_section_body_scrolls_itself(
 fn management_primary_section(section: ManagementSection) -> ManagementSection {
     match section {
         ManagementSection::Agents | ManagementSection::ModelProviders => ManagementSection::Agents,
+        ManagementSection::Providers => ManagementSection::Providers,
         ManagementSection::Gateway => ManagementSection::Gateway,
         ManagementSection::Mcp => ManagementSection::Mcp,
         ManagementSection::Skills => ManagementSection::Skills,
@@ -22743,6 +23177,69 @@ fn management_status_badge(label: String, _cx: &App) -> AnyElement {
     Tag::secondary().xsmall().child(label).into_any_element()
 }
 
+/// Groups shared Provider Profiles by identity and resolves the Agents that
+/// bind each one.
+///
+/// A Profile appears once regardless of how many bindings reference it, which
+/// is the property the Agent-scoped list lacked: it filtered by `agent_id`, so
+/// one upstream showed up once per Agent.
+fn shared_provider_rows(
+    profiles: &[vibex_core::ModelProviderProfile],
+    bindings: &[vibex_core::AgentModelProviderBinding],
+) -> Vec<SharedProviderRow> {
+    let mut rows = profiles
+        .iter()
+        .filter(|profile| profile.deleted_at_ms.is_none())
+        .map(|profile| {
+            let agents = bindings
+                .iter()
+                .filter(|binding| {
+                    binding.model_provider_profile_id == profile.id
+                        && binding.deleted_at_ms.is_none()
+                })
+                .map(|binding| binding.agent_id.as_str().to_string())
+                .collect::<BTreeSet<_>>();
+            SharedProviderRow {
+                profile: profile.clone(),
+                agents,
+            }
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.profile
+            .display_name
+            .to_lowercase()
+            .cmp(&right.profile.display_name.to_lowercase())
+            .then(left.profile.id.as_str().cmp(right.profile.id.as_str()))
+    });
+    rows
+}
+
+/// One row of the global Providers page.
+#[derive(Clone)]
+struct SharedProviderRow {
+    profile: vibex_core::ModelProviderProfile,
+    /// The Agents that bind this Provider.
+    agents: BTreeSet<String>,
+}
+
+/// A shared Provider's status as a badge.
+fn gateway_provider_status_badge(
+    profile: &vibex_core::ModelProviderProfile,
+    _cx: &App,
+) -> AnyElement {
+    match profile.status {
+        vibex_core::ModelProviderProfileStatus::Enabled => Tag::success()
+            .xsmall()
+            .child(management_locale_text("Enabled", "已启用", "已啟用"))
+            .into_any_element(),
+        vibex_core::ModelProviderProfileStatus::Disabled => Tag::secondary()
+            .xsmall()
+            .child(management_locale_text("Disabled", "已停用", "已停用"))
+            .into_any_element(),
+    }
+}
+
 /// The gateway's lifecycle state as a badge.
 ///
 /// Only a running service is quiet; every other state is something the user
@@ -22767,6 +23264,31 @@ fn gateway_status_badge(state: &vibex_core::ModelGatewayRuntimeState, _cx: &App)
         ),
     };
     tag.xsmall().child(label).into_any_element()
+}
+
+/// A cooldown's remaining time, in the shape the rest of the app uses.
+fn gateway_cooldown_label(until_ms: Option<i64>) -> String {
+    let cooling = management_locale_text("Cooling down", "冷却中", "冷卻中");
+    let Some(until_ms) = until_ms else {
+        return cooling.to_string();
+    };
+    let remaining_ms = until_ms.saturating_sub(vibex_core::unix_timestamp_ms());
+    if remaining_ms <= 0 {
+        return cooling.to_string();
+    }
+    let minutes = remaining_ms.saturating_add(59_999) / 60_000;
+    if minutes < 60 {
+        format!(
+            "{cooling} · {minutes}{}",
+            management_locale_text("m", " 分钟", " 分鐘")
+        )
+    } else {
+        let hours = minutes / 60;
+        format!(
+            "{cooling} · {hours}{}",
+            management_locale_text("h", " 小时", " 小時")
+        )
+    }
 }
 
 /// One line describing why the gateway is or is not serving.
@@ -22795,6 +23317,16 @@ fn gateway_key_summary_text(upstream: &vibex_core::GatewayUpstreamSummary) -> St
         .iter()
         .filter(|key| matches!(key.state, vibex_core::GatewayKeyState::Cooling { .. }))
         .count();
+    // The soonest recovery is the useful number: it is when the pool starts
+    // answering fully again.
+    let soonest_recovery = upstream
+        .keys
+        .iter()
+        .filter_map(|key| match key.state {
+            vibex_core::GatewayKeyState::Cooling { until_ms, .. } => until_ms,
+            _ => None,
+        })
+        .min();
     let invalid = upstream
         .keys
         .iter()
@@ -22802,7 +23334,25 @@ fn gateway_key_summary_text(upstream: &vibex_core::GatewayUpstreamSummary) -> St
         .count();
     let mut parts = vec![format!("{} keys", upstream.keys.len())];
     if cooling > 0 {
-        parts.push(format!("{cooling} cooling"));
+        // Keep the count, and add the soonest deadline when one is known: the
+        // reader needs both "how many" and "until when".
+        let cooling_text = format!(
+            "{cooling} {}",
+            management_locale_text("cooling", "冷却中", "冷卻中")
+        );
+        parts.push(
+            match soonest_recovery.and_then(|until_ms| {
+                let remaining = until_ms.saturating_sub(vibex_core::unix_timestamp_ms());
+                (remaining > 0).then_some(remaining)
+            }) {
+                Some(remaining_ms) => format!(
+                    "{cooling_text} · {}{}",
+                    remaining_ms.saturating_add(59_999) / 60_000,
+                    management_locale_text("m", " 分钟", " 分鐘")
+                ),
+                None => cooling_text,
+            },
+        );
     }
     if invalid > 0 {
         parts.push(format!("{invalid} invalid"));
@@ -22817,9 +23367,12 @@ fn gateway_key_state_badge(key: &vibex_core::GatewayKeySummary, _cx: &App) -> An
             .xsmall()
             .child(management_locale_text("Active", "正常", "正常"))
             .into_any_element(),
-        vibex_core::GatewayKeyState::Cooling { .. } => Tag::warning()
+        // A cooldown is the one state with a deadline, so it says when the Key
+        // comes back. "Cooling down" alone leaves the user unable to tell a
+        // 30-second rate limit from an hour-long credit problem.
+        vibex_core::GatewayKeyState::Cooling { until_ms, .. } => Tag::warning()
             .xsmall()
-            .child(management_locale_text("Cooling down", "冷却中", "冷卻中"))
+            .child(gateway_cooldown_label(until_ms))
             .into_any_element(),
         vibex_core::GatewayKeyState::Invalid => Tag::danger()
             .xsmall()
@@ -26306,6 +26859,8 @@ async fn load_snapshot(
         .collect();
     let profiles = bundle.profiles;
     let gateway = bundle.model_gateway.unwrap_or_default();
+    let shared_providers = bundle.model_provider_profiles;
+    let provider_bindings = bundle.agent_model_provider_bindings;
     let native_import_preview = bundle.native_import_preview;
     let acp_configs = bundle
         .acp_configs
@@ -26392,6 +26947,8 @@ async fn load_snapshot(
         automation_runs,
         automation_steps,
         gateway,
+        providers: shared_providers,
+        provider_bindings,
     })
 }
 
@@ -26420,6 +26977,38 @@ fn management_card(
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
     management_card_inner(title, description, None, content, cx)
+}
+
+/// A card whose title is runtime data rather than a static caption.
+fn management_card_dynamic(
+    title: String,
+    description: &'static str,
+    content: AnyElement,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_3()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.72))
+        .p_4()
+        .child(
+            v_flex()
+                .min_w_0()
+                .gap_1()
+                .child(div().text_sm().font_semibold().child(title))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(description),
+                ),
+        )
+        .child(content)
+        .into_any_element()
 }
 
 fn management_card_with_icon(
@@ -30539,6 +31128,34 @@ mod gateway_surface_tests {
         );
     }
 
+    /// A cooldown says when the Key comes back, not just that it is out.
+    ///
+    /// A 30-second rate limit and an hour-long credit problem used to read the
+    /// same, which left the user with no way to tell whether waiting would help.
+    #[test]
+    fn a_cooldown_names_its_remaining_time() {
+        let now = vibex_core::unix_timestamp_ms();
+        let in_twelve_minutes = gateway_cooldown_label(Some(now + 12 * 60 * 1000));
+        assert!(in_twelve_minutes.contains("12"), "{in_twelve_minutes}");
+        assert!(
+            in_twelve_minutes.contains("m") || in_twelve_minutes.contains('分'),
+            "{in_twelve_minutes}"
+        );
+
+        let in_two_hours = gateway_cooldown_label(Some(now + 150 * 60 * 1000));
+        assert!(in_two_hours.contains('2'), "{in_two_hours}");
+
+        // An expired or unknown deadline still says the Key is cooling.
+        assert_eq!(
+            gateway_cooldown_label(Some(now.saturating_sub(1))),
+            management_locale_text("Cooling down", "冷却中", "冷卻中")
+        );
+        assert_eq!(
+            gateway_cooldown_label(None),
+            management_locale_text("Cooling down", "冷却中", "冷卻中")
+        );
+    }
+
     /// A Key's badge must not rely on colour: the label distinguishes cooling
     /// from invalid, because one recovers on its own and the other does not.
     #[test]
@@ -30575,6 +31192,70 @@ mod gateway_surface_tests {
         assert!(summary.contains("3 keys"), "{summary}");
         assert!(summary.contains("1 cooling"), "{summary}");
         assert!(summary.contains("1 invalid"), "{summary}");
+    }
+
+    /// The global page lists a shared Provider once and names every Agent that
+    /// binds it.
+    ///
+    /// This is the acceptance criterion the Agent-scoped list could never meet:
+    /// the same upstream appeared once per Agent, so a shared Provider looked
+    /// like three of them.
+    #[test]
+    fn a_shared_provider_appears_once_with_every_agent_that_binds_it() {
+        let profile = vibex_core::ModelProviderProfile {
+            id: vibex_core::ModelProviderProfileId::new(),
+            display_name: "DeepSeek".to_string(),
+            status: vibex_core::ModelProviderProfileStatus::Enabled,
+            ..Default::default()
+        };
+        let profile_id = profile.id.clone();
+        let bindings = ["claude", "codex", "gemini"]
+            .into_iter()
+            .map(|agent_id| vibex_core::AgentModelProviderBinding {
+                model_provider_profile_id: profile_id.clone(),
+                agent_id: vibex_core::AgentId::parse(agent_id).unwrap(),
+                deleted_at_ms: None,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        let rows = shared_provider_rows(&[profile], &bindings);
+        assert_eq!(rows.len(), 1, "one shared Provider must appear once");
+        assert_eq!(
+            rows[0].agents.len(),
+            3,
+            "every binding Agent must be named: {:?}",
+            rows[0].agents
+        );
+    }
+
+    /// A soft-deleted binding no longer counts as a user of the Provider.
+    #[test]
+    fn a_deleted_binding_drops_out_of_the_used_by_list() {
+        let profile = vibex_core::ModelProviderProfile {
+            id: vibex_core::ModelProviderProfileId::new(),
+            display_name: "DeepSeek".to_string(),
+            status: vibex_core::ModelProviderProfileStatus::Enabled,
+            ..Default::default()
+        };
+        let profile_id = profile.id.clone();
+        let bindings = vec![
+            vibex_core::AgentModelProviderBinding {
+                model_provider_profile_id: profile_id.clone(),
+                agent_id: vibex_core::AgentId::parse("codex").unwrap(),
+                ..Default::default()
+            },
+            vibex_core::AgentModelProviderBinding {
+                model_provider_profile_id: profile_id,
+                agent_id: vibex_core::AgentId::parse("claude").unwrap(),
+                deleted_at_ms: Some(1),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            shared_provider_rows(&[profile], &bindings)[0].agents.len(),
+            1
+        );
     }
 
     /// A gateway with no ready Key cannot serve anything, and the surface must

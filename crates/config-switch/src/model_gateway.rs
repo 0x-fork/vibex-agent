@@ -593,3 +593,164 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 }
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use vibex_core::{
+        AgentCredential, AgentCredentialStatus, ProjectionSecretReference, RequestId,
+    };
+
+    fn service() -> (std::path::PathBuf, ProviderConfigService) {
+        let path = std::env::temp_dir().join(format!(
+            "vibex-gateway-fingerprint-{}.db",
+            RequestId::new().as_str()
+        ));
+        let service = ProviderConfigService::new(&path);
+        (path, service)
+    }
+
+    /// Creates a shared upstream with one stored Key and returns its id.
+    fn upstream(service: &ProviderConfigService, display_name: &str) -> ModelProviderProfileId {
+        let lookup_key = format!("vibex-test-secret-{}", RequestId::new().as_str());
+        crate::secrets::store_provider_secret(&lookup_key, "sk-test").unwrap();
+        service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: display_name.to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "endpoint-api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://api.example.invalid".to_string(),
+                    wire_protocol_id: Some(
+                        vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    ),
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: vec![vibex_core::ModelProviderCredentialReference {
+                    id: RequestId::new(),
+                    display_name: "Primary".to_string(),
+                    status: AgentCredentialStatus::Ready,
+                    credential: AgentCredential::ApiKey {
+                        secret: ProjectionSecretReference {
+                            id: RequestId::new(),
+                            backend: crate::secrets::provider_secret_write_backend(),
+                            setup_state: vibex_core::ProviderSecretSetupState::Available,
+                            lookup_key,
+                            redacted_hint: "stored".to_string(),
+                            revision: 1,
+                            legacy_secret_reference_id: None,
+                        },
+                        target_hint: None,
+                    },
+                    revision: 1,
+                }],
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "deepseek-chat".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities: Default::default(),
+                }],
+                default_model_id: Some("deepseek-chat".to_string()),
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap()
+            .id
+    }
+
+    /// The promise the whole gateway rests on: changing an **upstream's** Key
+    /// must not move the gateway-bound Agent's launch contract, so it does not
+    /// restart that Agent's process.
+    ///
+    /// The Agent's own Profile holds only the gateway address, so an upstream
+    /// Key rotation never reaches it. This test asserts exactly that: the
+    /// upstream's credential revision moves, the Agent Profile's launch
+    /// revision does not.
+    #[test]
+    fn rotating_an_upstream_key_does_not_move_the_agent_launch_revision() {
+        let (path, service) = service();
+        let agent_id = vibex_core::AgentId::parse("codex").unwrap();
+        let shared = upstream(&service, "DeepSeek");
+
+        // Point the Agent at the gateway.
+        let agent_profile = service
+            .set_gateway_agent(
+                &agent_id,
+                true,
+                Some("http://127.0.0.1:3425"),
+                &["deepseek/deepseek-chat".to_string()],
+            )
+            .unwrap()
+            .expect("a gateway profile");
+        let before = service
+            .get_profile(&agent_profile)
+            .unwrap()
+            .unwrap()
+            .launch_revision();
+
+        // Rotate every Key on the shared upstream, which is what a user does
+        // when a Key is exhausted.
+        let mut shared_profile = service
+            .list_model_provider_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.id == shared)
+            .unwrap();
+        for credential in &mut shared_profile.credentials {
+            credential.revision = credential.revision.saturating_add(1);
+            if let Some(reference) = credential.credential.secret_reference().cloned() {
+                let mut next = reference;
+                next.revision = next.revision.saturating_add(1);
+                // The secret value is untouched; only its reference revision
+                // moves, exactly as a Key replacement would move it.
+                credential.credential = AgentCredential::ApiKey {
+                    secret: next,
+                    target_hint: None,
+                };
+            }
+        }
+        let expected = shared_profile.revision;
+        shared_profile.revision = expected + 1;
+        service
+            .update_model_provider_profile(vibex_core::ModelProviderProfileUpdateRequest {
+                profile: shared_profile,
+                expected_revision: expected,
+            })
+            .unwrap();
+
+        let after = service
+            .get_profile(&agent_profile)
+            .unwrap()
+            .unwrap()
+            .launch_revision();
+        assert_eq!(
+            before, after,
+            "an upstream Key change moved the gateway-bound Agent's launch revision, \
+             which would restart its process"
+        );
+
+        // And the gateway address itself does move it: moving the listener port
+        // is a relaunch, which is why the port is persisted rather than re-picked.
+        service
+            .set_gateway_agent(
+                &agent_id,
+                true,
+                Some("http://127.0.0.1:3426"),
+                &["deepseek/deepseek-chat".to_string()],
+            )
+            .unwrap();
+        let moved = service
+            .get_profile(&agent_profile)
+            .unwrap()
+            .unwrap()
+            .launch_revision();
+        assert_ne!(
+            before, moved,
+            "moving the gateway's address must count as a relaunch"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+}

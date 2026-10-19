@@ -292,6 +292,16 @@ pub enum Overlay {
     /// itself, and typing a path from memory is how a session ends up in a
     /// directory nobody meant.
     WorkspacePicker { selected: usize },
+    /// The built-in Provider presets, opened before the new-Provider form.
+    ///
+    /// Choosing one pre-fills the form rather than creating anything: the
+    /// preset supplies an address, a protocol and a starting model list, and
+    /// the reader still names the Provider and supplies the key.
+    ProviderPresetPicker {
+        selected: usize,
+        /// The Agent the eventual Provider will belong to.
+        agent_id: String,
+    },
     /// A read-only detail view for one transcript block.
     BlockDetails { block: usize, scroll: usize },
     /// When the draft in the Composer should be sent.
@@ -687,6 +697,12 @@ pub struct ManagementData {
     /// install time could return a different revision, and what lands would
     /// then not be what the reader read.
     pub skill_preview: Option<Box<vibex_core::SkillMarketDocument>>,
+    /// The preset the new-Provider form was pre-filled from, until it is saved.
+    ///
+    /// It is kept so the save can write the preset's protocol explicitly: the
+    /// projection otherwise falls back to the first protocol that has a URL,
+    /// which relabels an Anthropic Provider as Chat Completions on reopen.
+    pub pending_provider_preset: Option<String>,
     /// What the last native-settings scan found.
     pub native_import: Option<vibex_core::ProviderNativeImportPreview>,
     /// The order the reader arranged the profiles in, per Agent.

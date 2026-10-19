@@ -2160,9 +2160,26 @@ impl App {
                         strings,
                     )),
                     // `n` on the Providers area has no record to open, so it
-                    // opens the blank form: a profile is the one record in the
-                    // centre the reader can make from nothing.
-                    None if key.is_none() => Some(self.provider_create_form(None, None, strings)),
+                    // opens the preset list first: a preset is the shortcut
+                    // past having to know an address, a protocol and a model id,
+                    // and the form after it is the same form either way.
+                    None if key.is_none() => {
+                        let agent_id = self
+                            .management_data
+                            .agents
+                            .first()
+                            .map(|agent| agent.id.as_str().to_string())
+                            .unwrap_or_default();
+                        if agent_id.is_empty() {
+                            Some(self.provider_create_form(None, None, strings))
+                        } else {
+                            self.overlay = Some(Overlay::ProviderPresetPicker {
+                                selected: 0,
+                                agent_id,
+                            });
+                            None
+                        }
+                    }
                     None => None,
                 }
             }
@@ -4024,10 +4041,23 @@ impl App {
                 if name.is_empty() {
                     return Err(strings.config_form_error_name());
                 }
+                // A form pre-filled from a preset writes that preset's protocol
+                // explicitly. Without this the projection falls back to the
+                // first protocol that has a URL, so an Anthropic preset comes
+                // back as Chat Completions the next time the editor opens.
+                // Read once, then clear: the preset belongs to this one form,
+                // and leaving it set would stamp its protocol onto the next
+                // Provider the reader adds from a blank form.
+                let preset = self
+                    .management_data
+                    .pending_provider_preset
+                    .take()
+                    .and_then(|id| vibex_core::provider_preset(&id));
                 // The Models the reader listed are offered as they are written:
                 // a wire protocol, a reasoning declaration and a token limit
                 // are per-Model settings, and a new profile has none of them
                 // until its Models are edited one at a time.
+                let preset_wire_api = preset.as_ref().and_then(|preset| preset.default_wire_api());
                 let configured_models = form
                     .value("models")
                     .unwrap_or_default()
@@ -4038,10 +4068,26 @@ impl App {
                         id: id.to_string(),
                         display_name: None,
                         enabled: true,
-                        wire_api: None,
+                        wire_api: preset_wire_api,
                         capabilities: vibex_core::ProviderModelCapabilities::default(),
                     })
                     .collect::<Vec<_>>();
+                // Start from the preset's options and let the form override
+                // the address, so the per-protocol URLs a multi-protocol
+                // preset carries survive.
+                let mut provider_options = preset
+                    .as_ref()
+                    .map(|preset| preset.draft_profile(&agent_id).provider_options);
+                if let Some(options) = provider_options.as_mut()
+                    && let Some(url) = form.optional("base_url")
+                    && let Some(wire_api) = preset_wire_api
+                {
+                    let key = wire_api.protocol_base_url_option_key();
+                    options.entries.retain(|entry| entry.key != key);
+                    options
+                        .entries
+                        .push(vibex_core::ProviderBindingMetadata { key, value: url });
+                }
                 Ok(ConfigMutation::CreateProviderProfile(Box::new(
                     vibex_core::AgentModelProviderProfileCreateRequest {
                         agent_id,
@@ -4072,9 +4118,11 @@ impl App {
                         permission_defaults: source
                             .as_ref()
                             .map(|source| source.permission_defaults.clone()),
-                        provider_options: source
-                            .as_ref()
-                            .map(|source| source.provider_options.clone()),
+                        provider_options: provider_options.or_else(|| {
+                            source
+                                .as_ref()
+                                .map(|source| source.provider_options.clone())
+                        }),
                         secret_references: Vec::new(),
                     },
                 )))
@@ -4501,6 +4549,58 @@ impl App {
     /// than a `perform` of an intent because the picker's own handler calls it:
     /// re-entering the overlay is how the way up used to recurse until the
     /// stack ran out.
+    /// Opens the new-Provider form pre-filled from a preset.
+    ///
+    /// The protocol is written into the form's own `wireApi` field rather than
+    /// left to be inferred, so the Provider keeps the protocol the preset
+    /// chose even after a save and reopen.
+    fn open_provider_form_from_preset(
+        &mut self,
+        agent_id: &str,
+        preset: &vibex_core::ProviderPreset,
+    ) -> Outcome {
+        let Ok(agent_id) = vibex_core::AgentId::parse(agent_id.to_string()) else {
+            return Outcome::quiet();
+        };
+        // The preset fills the form's own fields rather than a "copy" of
+        // another Profile: nothing is being duplicated, and the reader is
+        // naming a new Provider. The protocol rides in the Provider options so
+        // a save and reopen keeps the one the preset chose.
+        let mut form = self.provider_create_form(None, None, self.strings);
+        if let Some(field) = form.field_mut("name") {
+            field.value = preset.display_name.clone();
+        }
+        if let Some(field) = form.field_mut("base_url")
+            && let Some(url) = preset
+                .default_wire_api()
+                .and_then(|wire_api| preset.endpoint_for(wire_api))
+        {
+            field.value = url.to_string();
+        }
+        if let Some(field) = form.field_mut("default_model") {
+            field.value = preset.models.first().cloned().unwrap_or_default();
+        }
+        if let Some(field) = form.field_mut("models") {
+            field.value = preset.models.join("\n");
+        }
+        if let Some(field) = form.field_mut("agent") {
+            field.value = agent_id.as_str().to_string();
+        }
+        // Remember which preset pre-filled the form so the save can write its
+        // protocol explicitly instead of letting the projection infer one.
+        self.management_data.pending_provider_preset = Some(preset.id.clone());
+        self.toast(Toast::info(format!(
+            "{} · {}",
+            preset.display_name,
+            preset
+                .endpoint_hint
+                .clone()
+                .unwrap_or_else(|| preset.id.clone())
+        )));
+        self.overlay = Some(Overlay::Form { form });
+        Outcome::effects(vec![])
+    }
+
     fn workspace_browse(&mut self, path: String) -> Outcome {
         // The cursor goes back to the top with the listing it was on: a row
         // index into the directory being left would name a different directory
@@ -4878,6 +4978,41 @@ impl App {
                         row,
                         selected,
                         option,
+                    });
+                    Outcome::effects(vec![])
+                }
+                _ => Outcome::quiet(),
+            },
+            Overlay::ProviderPresetPicker { selected, agent_id } => match intent {
+                Intent::ConfirmOverlay | Intent::ApprovalApprove => {
+                    let presets = vibex_core::provider_presets();
+                    match presets.get(selected) {
+                        Some(preset) => {
+                            // The preset fills the form; it does not create
+                            // anything, because the reader still has to name
+                            // the Provider and supply a key.
+                            self.overlay = None;
+                            self.open_provider_form_from_preset(&agent_id, preset)
+                        }
+                        None => Outcome::quiet(),
+                    }
+                }
+                Intent::SelectNext => {
+                    let count = vibex_core::provider_presets().len();
+                    self.overlay = Some(Overlay::ProviderPresetPicker {
+                        selected: if count == 0 {
+                            0
+                        } else {
+                            (selected + 1) % count
+                        },
+                        agent_id: agent_id.clone(),
+                    });
+                    Outcome::effects(vec![])
+                }
+                Intent::SelectPrevious => {
+                    self.overlay = Some(Overlay::ProviderPresetPicker {
+                        selected: selected.saturating_sub(1),
+                        agent_id: agent_id.clone(),
                     });
                     Outcome::effects(vec![])
                 }

@@ -10138,6 +10138,56 @@ fn render_overlay(
             state.select(Some((*selected).min(items.len().saturating_sub(1))));
             frame.render_stateful_widget(List::new(items), content, &mut state);
         }
+        Overlay::ProviderPresetPicker { selected, .. } => {
+            let presets = vibex_core::provider_presets();
+            let chrome = modal_chrome(
+                app,
+                strings.config_preset_picker_title(),
+                ModalSizing::palette(),
+                vec![
+                    ModalHint::new("↑↓", strings.hint_nav()),
+                    ModalHint::new("Enter", strings.hint_select()),
+                    ModalHint::new("Esc", strings.close()),
+                ],
+            );
+            let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
+                return;
+            };
+            let items = presets
+                .iter()
+                .enumerate()
+                .map(|(index, preset)| {
+                    let style = if index == *selected {
+                        theme.selected()
+                    } else {
+                        theme.base()
+                    };
+                    // The second column says what the preset saves the reader
+                    // from looking up: its address, or that it needs no key.
+                    let detail = if preset.no_key {
+                        strings.config_preset_no_key().to_string()
+                    } else {
+                        preset
+                            .endpoint_hint
+                            .clone()
+                            .or_else(|| preset.website.clone())
+                            .unwrap_or_else(|| {
+                                preset
+                                    .default_wire_api()
+                                    .map(|wire_api| wire_api.wire_protocol_id().to_string())
+                                    .unwrap_or_default()
+                            })
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("{:<24}", preset.display_name), style),
+                        Span::styled(detail, Style::default().fg(theme.roles.gray)),
+                    ]))
+                })
+                .collect::<Vec<_>>();
+            let mut state = ratatui::widgets::ListState::default();
+            state.select(Some((*selected).min(items.len().saturating_sub(1))));
+            frame.render_stateful_widget(List::new(items), layout.content, &mut state);
+        }
         Overlay::WorkspacePicker { selected } => {
             let path = app
                 .workspace_browse

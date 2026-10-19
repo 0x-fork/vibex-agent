@@ -1614,9 +1614,20 @@ fn a_provider_profile_can_be_made_from_nothing() {
     app.management_data.providers = vec![];
     app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
 
+    // `n` opens the preset list first: a preset is the shortcut past knowing an
+    // address, a protocol and a model id. The form after it is the same form.
     app.perform(vibex_tui::action::Intent::ConfigEntryCreate);
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::ProviderPresetPicker { selected: 0, .. })
+        ),
+        "`n` did not open the preset list: {:?}",
+        app.overlay
+    );
+    app.perform(vibex_tui::action::Intent::ConfirmOverlay);
     let Some(Overlay::Form { form }) = app.overlay.clone() else {
-        panic!("`n` on the Providers area opened no form");
+        panic!("choosing a preset opened no form");
     };
     assert!(matches!(
         form.purpose,
@@ -1626,9 +1637,22 @@ fn a_provider_profile_can_be_made_from_nothing() {
         !form.value("agent").unwrap_or_default().is_empty(),
         "the form did not offer an Agent to belong to"
     );
-    assert_eq!(form.value("models").as_deref(), Some(""));
+    // The preset filled the address and the model list, and the protocol it
+    // chose is written into the options so a reopen cannot relabel it.
+    assert!(
+        !form.value("name").unwrap_or_default().is_empty(),
+        "the preset left the form nameless"
+    );
+    assert!(
+        !form.value("base_url").unwrap_or_default().is_empty(),
+        "the preset left the address empty"
+    );
+    assert!(
+        !form.value("models").unwrap_or_default().is_empty(),
+        "the preset left the model list empty"
+    );
 
-    // The reader names it and lists two Models.
+    // The reader renames it and lists two Models of their own.
     if let Some(Overlay::Form { form }) = app.overlay.as_mut() {
         form.field_mut("name").unwrap().value = "Work account".to_string();
         form.field_mut("base_url").unwrap().value = "https://api.example/v1".to_string();
@@ -4960,4 +4984,69 @@ fn a_missing_gateway_does_not_remove_the_direct_providers() {
     let rows = app.config_center.rows(&app.management_data, app.strings);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].key, "provider_direct");
+}
+
+/// A preset-created Provider keeps the protocol the preset chose.
+///
+/// This is the regression the two-server report called out: without an explicit
+/// `wireApi`, the projection falls back to the first protocol that has a URL,
+/// so an Anthropic preset comes back as Chat Completions the next time the
+/// editor opens.
+#[test]
+fn a_preset_created_provider_keeps_its_protocol() {
+    let mut app = loaded(140, 40);
+    app.management_data.providers = vec![];
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    app.perform(vibex_tui::action::Intent::ConfigEntryCreate);
+    // DeepSeek is not the first preset, so walk to it rather than assuming it.
+    let presets = vibex_core::provider_presets();
+    let deepseek = presets
+        .iter()
+        .position(|preset| preset.id == vibex_core::PROVIDER_PRESET_DEEPSEEK)
+        .expect("the first batch ships DeepSeek");
+    for _ in 0..deepseek {
+        app.perform(vibex_tui::action::Intent::SelectNext);
+    }
+    app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+
+    let outcome = app.perform(vibex_tui::action::Intent::ConfigFormSave);
+    let vibex_tui::app::Effect::ConfigMutation { mutation, .. } = &outcome.effects[0] else {
+        panic!("the save produced {:?}", outcome.effects);
+    };
+    let vibex_tui::app::ConfigMutation::CreateProviderProfile(request) = mutation else {
+        panic!("the save was not a creation");
+    };
+    let options = request
+        .provider_options
+        .as_ref()
+        .expect("a preset-created Provider must carry its options");
+    let wire_api = options
+        .entries
+        .iter()
+        .find(|entry| entry.key == "wireApi")
+        .map(|entry| entry.value.as_str());
+    assert_eq!(
+        wire_api,
+        Some(vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS),
+        "the preset's protocol was not written explicitly: {:?}",
+        options.entries
+    );
+    // Both of DeepSeek's addresses travel, so switching protocol later does not
+    // need the reader to look the other one up.
+    assert!(
+        options
+            .entries
+            .iter()
+            .any(|entry| entry.key.starts_with("protocolBaseUrl.")),
+        "the per-protocol addresses were dropped: {:?}",
+        options.entries
+    );
+    assert!(
+        request
+            .configured_models
+            .iter()
+            .all(|model| model.wire_api.is_some()),
+        "the preset's models lost their protocol"
+    );
 }
