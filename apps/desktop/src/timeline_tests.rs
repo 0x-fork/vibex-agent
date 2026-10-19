@@ -2620,3 +2620,234 @@ fn a_long_settled_body_is_drawn_as_its_head_until_the_reader_opens_it(cx: &mut T
         assert!(!timeline_row_body_folds(&tool), "only prose bodies fold");
     });
 }
+
+/// A windowed body's chunks are the body itself, cut on paragraph breaks.
+///
+/// A chunk is a layout unit: it has to start on a whole Markdown block so a
+/// table, a list or a fence is not cut in half, and the chunks together have to
+/// be the body exactly, or the window would show something the row does not say.
+#[test]
+fn a_windowed_body_is_cut_on_paragraph_breaks_and_keeps_fences_whole() {
+    let paragraphs: String = (0..400)
+        .map(|index| format!("paragraph {index} with enough words to wrap\n\n"))
+        .collect();
+    let chunks = timeline_body_chunks(&paragraphs);
+    assert!(chunks.len() > 1, "a long body is more than one chunk");
+    assert_eq!(chunks.first().map(|chunk| chunk.start), Some(0));
+    assert_eq!(chunks.last().map(|chunk| chunk.end), Some(paragraphs.len()));
+    for pair in chunks.windows(2) {
+        assert_eq!(pair[0].end, pair[1].start, "the chunks are adjacent");
+    }
+    for chunk in &chunks {
+        assert!(chunk.len() <= TIMELINE_BODY_CHUNK_MAX_BYTES);
+        assert!(paragraphs.is_char_boundary(chunk.start));
+        assert!(paragraphs.is_char_boundary(chunk.end));
+        assert!(
+            paragraphs[chunk.clone()].starts_with("paragraph"),
+            "a chunk opens on a whole block"
+        );
+    }
+    let rebuilt: String = chunks
+        .iter()
+        .map(|chunk| &paragraphs[chunk.clone()])
+        .collect();
+    assert_eq!(rebuilt, paragraphs, "the chunks are the body");
+
+    // A fence that fits inside the allowance travels whole.
+    let fenced = format!(
+        "intro line\n\n```rust\n{}\n```\n\nafter the fence\n",
+        "let value = 1;\n".repeat(120)
+    );
+    let chunks = timeline_body_chunks(&fenced);
+    let fences = chunks
+        .iter()
+        .filter(|chunk| fenced[chunk.start..chunk.end].matches("```").count() > 0)
+        .collect::<Vec<_>>();
+    assert_eq!(fences.len(), 1, "the fence lands inside one chunk");
+    assert_eq!(
+        fenced[fences[0].start..fences[0].end]
+            .matches("```")
+            .count(),
+        2,
+        "and it opens and closes there"
+    );
+}
+
+/// A revealed long body is read through a viewport of its own.
+///
+/// The point of the box is what it does not lay out: the row keeps a bounded
+/// height, the timeline lays out the box, and the box builds only the chunks it
+/// shows — so an opened report costs a screenful instead of the whole report.
+#[gpui::test]
+fn a_revealed_long_body_lays_out_only_the_chunks_its_box_shows(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+    let long_body: String = (0..4000)
+        .map(|index| format!("paragraph {index} of a report nobody should lay out whole\n\n"))
+        .collect();
+    assert!(long_body.len() > TIMELINE_BODY_VIEWPORT_MIN_BYTES);
+    let (view, cx) = cx.add_window_view({
+        let long_body = long_body.clone();
+        move |window, cx| {
+            let workbench = cx.new(|cx| {
+                let mut ui_state = DesktopUiStateV1::default();
+                ui_state.appearance.locale = LocaleMode::En;
+                ui_state.session.turn_preview_rail = false;
+                let mut workbench =
+                    VibexWorkbench::with_initial_state(None, ui_state, None, window, cx);
+                workbench.agent_loading = false;
+                workbench.selected_session_id = Some(session_id.clone());
+                workbench.view_session_id = Some(session_id.clone());
+                workbench.timeline.replace_authoritative(
+                    session_id.clone(),
+                    vec![
+                        live_timeline_item(
+                            1,
+                            TimelinePayload::UserMessage(UserMessagePayload {
+                                text: "first question".into(),
+                                attachments: Vec::new(),
+                                ..Default::default()
+                            }),
+                        ),
+                        live_timeline_item(
+                            2,
+                            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                                text: long_body.clone(),
+                                is_final: true,
+                            }),
+                        ),
+                        live_timeline_item(
+                            3,
+                            TimelinePayload::UserMessage(UserMessagePayload {
+                                text: "second question".into(),
+                                attachments: Vec::new(),
+                                ..Default::default()
+                            }),
+                        ),
+                        live_timeline_item(
+                            4,
+                            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                                text: "short answer".into(),
+                                is_final: true,
+                            }),
+                        ),
+                    ],
+                );
+                workbench.conversation_turns_cache_key = None;
+                workbench.rebuild_timeline_sizes();
+                workbench
+            });
+            LiveTimelineProbe { workbench }
+        }
+    });
+    let workbench = view.read_with(cx, |view, _| view.workbench.clone());
+    let (row_id, turn_id) = workbench.read_with(cx, |workbench, _| {
+        let turn = &workbench.conversation_turns_cache[0];
+        (
+            turn.conclusion_row
+                .as_ref()
+                .expect("the settled turn's answer is a row")
+                .id
+                .clone(),
+            turn.id.clone(),
+        )
+    });
+    workbench.update(cx, |workbench, cx| {
+        workbench.toggle_timeline_row_body(row_id.clone(), Some(turn_id.clone()), cx)
+    });
+    for _ in 0..6 {
+        cx.run_until_parked();
+        let _ = draw_live_timeline_frames(&workbench, cx, 1);
+    }
+
+    let (chunk_count, laid_out, laid_out_bytes, box_height, full_estimate) =
+        workbench.read_with(cx, |workbench, _| {
+            let (_, window) = workbench
+                .timeline_body_windows
+                .get(&row_id)
+                .expect("the opened body has a chunk table");
+            let prefix = format!("markdown-chunk:{row_id}:");
+            let laid_out = workbench
+                .markdown_text_states
+                .keys()
+                .filter(|key| key.starts_with(&prefix))
+                .filter_map(|key| key.rsplit(':').next()?.parse::<usize>().ok())
+                .collect::<Vec<_>>();
+            (
+                window.chunks.len(),
+                laid_out.len(),
+                laid_out
+                    .iter()
+                    .filter_map(|index| window.chunks.get(*index))
+                    .map(|chunk| chunk.len())
+                    .sum::<usize>(),
+                f32::from(workbench.timeline_row_sizes[0].height),
+                estimated_markdown_body_height(
+                    &long_body,
+                    workbench.estimated_timeline_chars_per_line(),
+                ),
+            )
+        });
+    assert!(
+        chunk_count > 8,
+        "the fixture has to need a window: {chunk_count}"
+    );
+    assert!(
+        laid_out < chunk_count / 4,
+        "only the chunks the box shows are laid out: {laid_out} of {chunk_count}"
+    );
+    assert!(
+        laid_out_bytes < TIMELINE_BODY_CHUNK_MAX_BYTES * 4,
+        "and only their text is laid out: {laid_out_bytes} bytes of {}",
+        long_body.len()
+    );
+    assert!(
+        box_height < full_estimate / 2.0,
+        "the row is measured by its box, not its prose: {box_height} against {full_estimate}"
+    );
+    let box_selector: &'static str =
+        Box::leak(format!("timeline-body-window:{row_id}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(box_selector).is_some(),
+        "the opened body is read through its own box"
+    );
+
+    // Scrolling the box builds the chunks it scrolls to, and only those.
+    let scroll = workbench.read_with(cx, |workbench, _| {
+        workbench
+            .timeline_body_scrolls
+            .get(&row_id)
+            .expect("the box keeps its scroll position")
+            .clone()
+    });
+    let (total_height, last_index) = workbench.read_with(cx, |workbench, _| {
+        let (_, window) = workbench.timeline_body_windows.get(&row_id).unwrap();
+        (
+            f32::from(window.total_height()),
+            window.chunks.len().saturating_sub(1),
+        )
+    });
+    scroll.set_offset(point(px(0.0), px(-(total_height - box_height))));
+    for _ in 0..4 {
+        cx.run_until_parked();
+        let _ = draw_live_timeline_frames(&workbench, cx, 1);
+    }
+    let (laid_out, has_last) = workbench.read_with(cx, |workbench, _| {
+        let prefix = format!("markdown-chunk:{row_id}:");
+        (
+            workbench
+                .markdown_text_states
+                .keys()
+                .filter(|key| key.starts_with(&prefix))
+                .count(),
+            workbench
+                .markdown_text_states
+                .contains_key(&format!("{prefix}{last_index}")),
+        )
+    });
+    assert!(has_last, "the box lays out the chunk it scrolled to");
+    assert!(
+        laid_out < chunk_count,
+        "and still only the band it shows: {laid_out} of {chunk_count}"
+    );
+}

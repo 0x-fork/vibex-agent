@@ -670,6 +670,15 @@ const TIMELINE_MARKDOWN_SOURCE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 /// it: one per row the reader has looked at, not one per frame.
 const TIMELINE_BODY_FOLD_CACHE_LIMIT: usize = 512;
 const TIMELINE_BODY_FOLD_CACHE_BYTES: usize = 64 * 1024;
+/// How many windowed bodies a view remembers, and the bytes their chunk
+/// tables may hold: a range and a height per chunk, so a megabyte of prose
+/// costs a few kilobytes here.
+const TIMELINE_BODY_WINDOW_CACHE_LIMIT: usize = 64;
+const TIMELINE_BODY_WINDOW_CACHE_BYTES: usize = 2 * 1024 * 1024;
+/// How many windowed bodies keep a scroll handle, and how many keep the search
+/// query they have already been scrolled to.
+const TIMELINE_BODY_SCROLL_CACHE_LIMIT: usize = 64;
+const TIMELINE_BODY_SEARCH_CACHE_LIMIT: usize = 64;
 /// The height the reveal control adds to a folded row.
 const TIMELINE_BODY_REVEAL_CONTROL_HEIGHT: f32 = 24.0;
 const TIMELINE_REASONING_SUMMARY_CACHE_LIMIT: usize = 256;
@@ -4737,6 +4746,16 @@ pub struct SessionView {
     /// screen asks for it every frame, so the row's revision is what keeps that
     /// scan off the frame path.
     timeline_body_folds: BTreeMap<String, (i64, TimelineBodyFold)>,
+    /// Where each windowed body's chunks are and how tall the window found
+    /// them, by row revision.
+    timeline_body_windows: BTreeMap<String, (i64, Rc<TimelineBodyWindow>)>,
+    /// The scroll position of each windowed body's own viewport.
+    timeline_body_scrolls: BTreeMap<String, ScrollHandle>,
+    /// The search query each windowed body has already been scrolled to.
+    ///
+    /// An active search reveals its hit once: holding the reader at the hit
+    /// after they scroll away from it is worse than not revealing it at all.
+    timeline_body_search_reveals: BTreeMap<String, String>,
     timeline_process_expansion: BTreeMap<String, bool>,
     timeline_command_expansion: BTreeMap<String, bool>,
     timeline_file_changes_expansion: BTreeMap<String, bool>,
@@ -4879,6 +4898,9 @@ impl SessionView {
             reasoning_expansion: BTreeMap::new(),
             timeline_body_reveal: BTreeMap::new(),
             timeline_body_folds: BTreeMap::new(),
+            timeline_body_windows: BTreeMap::new(),
+            timeline_body_scrolls: BTreeMap::new(),
+            timeline_body_search_reveals: BTreeMap::new(),
             timeline_process_expansion: BTreeMap::new(),
             timeline_command_expansion: BTreeMap::new(),
             timeline_file_changes_expansion: BTreeMap::new(),
@@ -4979,6 +5001,7 @@ impl SessionView {
         self.timeline_streaming_shrink_candidates.clear();
         self.timeline_markdown_sources.clear();
         self.timeline_body_folds.clear();
+        self.timeline_body_windows.clear();
         self.markdown_text_states.clear();
         self.timeline_reasoning_summaries.clear();
         self.timeline_tool_card_projections.clear();
@@ -5038,6 +5061,24 @@ impl SessionView {
             )
             .saturating_add(
                 self.timeline_body_folds
+                    .keys()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.timeline_body_windows
+                    .keys()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.timeline_body_scrolls
+                    .keys()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.timeline_body_search_reveals
                     .keys()
                     .map(String::len)
                     .sum::<usize>(),
@@ -25432,6 +25473,7 @@ impl VibexWorkbench {
         self.timeline_row_sizes = Rc::new(Vec::new());
         self.timeline_markdown_sources.clear();
         self.timeline_body_folds.clear();
+        self.timeline_body_windows.clear();
         self.markdown_text_states.clear();
         self.timeline_reasoning_summaries.clear();
         self.timeline_tool_card_projections.clear();
@@ -57889,6 +57931,304 @@ impl VibexWorkbench {
         scroll
     }
 
+    /// Whether an opened body is read through a viewport of its own.
+    ///
+    /// Opening a body is the reader saying they want the rest of it; a rest this
+    /// long cannot be laid out whole on every frame, so it is drawn inside a box
+    /// that lays out only the chunks it shows.
+    fn timeline_body_windowed(&self, text: &str, revealed: bool) -> bool {
+        revealed && text.len() > TIMELINE_BODY_VIEWPORT_MIN_BYTES
+    }
+
+    /// The height a windowed body's box takes.
+    ///
+    /// Its own estimate while that fits the cap, and the cap once it does not:
+    /// a report reads as a scrollable excerpt rather than a wall, and the row
+    /// the timeline lays out stays a bounded thing no matter how long the prose
+    /// behind it is.
+    fn timeline_body_viewport_height(&self, body_estimate: f32) -> f32 {
+        let cap = (f32::from(self.timeline_scroll.bounds().size.height)
+            * TIMELINE_BODY_VIEWPORT_MAX_SCREENS)
+            .max(TIMELINE_BODY_VIEWPORT_MIN_HEIGHT);
+        body_estimate.min(cap)
+    }
+
+    /// The height a row's prose takes: the whole estimate, or the box a
+    /// windowed one is read through.
+    ///
+    /// A windowed body answers from its chunk table, which the frame already
+    /// holds: measuring the box by scanning the prose instead would put the
+    /// body's own length back into every frame, which is the cost the box
+    /// exists to take out.
+    fn timeline_body_drawn_height(
+        &self,
+        row: &TimelineRow,
+        visible_body: &str,
+        chars_per_line: usize,
+        windowed: bool,
+    ) -> f32 {
+        if !windowed {
+            return estimated_markdown_body_height(visible_body, chars_per_line);
+        }
+        let estimate = self
+            .timeline_body_windows
+            .get(row.id.as_str())
+            .filter(|(revision, _)| *revision == row.last_sequence)
+            .map(|(_, window)| f32::from(window.total_height()))
+            .unwrap_or_else(|| estimated_markdown_body_height(visible_body, chars_per_line));
+        self.timeline_body_viewport_height(estimate)
+    }
+
+    /// The chunk table a windowed body lays out, cut on the row's revision.
+    ///
+    /// The table is the body's own ranges and one height per chunk, so it
+    /// survives every frame the body is on screen: the split runs once per
+    /// revision, and each chunk's height is estimated until the window has
+    /// shown it.
+    fn timeline_body_window(
+        &mut self,
+        row_id: &str,
+        revision: i64,
+        body: &str,
+        chars_per_line: usize,
+    ) -> Rc<TimelineBodyWindow> {
+        if let Some((cached_revision, window)) = self.timeline_body_windows.get(row_id)
+            && *cached_revision == revision
+        {
+            return window.clone();
+        }
+        let chunks = timeline_body_chunks(body);
+        let heights = chunks
+            .iter()
+            .map(|range| {
+                estimated_markdown_body_height(
+                    body.get(range.clone()).unwrap_or_default(),
+                    chars_per_line,
+                )
+            })
+            .collect();
+        let window = Rc::new(TimelineBodyWindow {
+            revision,
+            chunks,
+            heights,
+        });
+        insert_bounded_timeline_projection(
+            &mut self.timeline_body_windows,
+            row_id.to_string(),
+            revision,
+            window.clone(),
+            TIMELINE_BODY_WINDOW_CACHE_LIMIT,
+            TIMELINE_BODY_WINDOW_CACHE_BYTES,
+            |window| {
+                window.chunks.len()
+                    * (std::mem::size_of::<Range<usize>>() + std::mem::size_of::<f32>())
+            },
+        );
+        window
+    }
+
+    /// Record the heights a windowed body's window measured.
+    ///
+    /// The box's own extent follows them, so the reader scrolling on gets the
+    /// real page rather than the estimate the table started with.
+    fn record_timeline_body_heights(
+        &mut self,
+        row_id: &str,
+        revision: i64,
+        measurements: &[(usize, f32)],
+    ) {
+        let Some((cached_revision, window)) = self.timeline_body_windows.get_mut(row_id) else {
+            return;
+        };
+        if *cached_revision != revision {
+            return;
+        }
+        let window = Rc::make_mut(window);
+        for (index, height) in measurements {
+            let Some(slot) = window.heights.get_mut(*index) else {
+                continue;
+            };
+            if (*slot - *height).abs() > 0.5 {
+                *slot = *height;
+            }
+        }
+    }
+
+    /// The scroll handle of a windowed body's box.
+    fn timeline_body_scroll(&mut self, row_id: &str) -> ScrollHandle {
+        if let Some(scroll) = self.timeline_body_scrolls.get(row_id) {
+            return scroll.clone();
+        }
+        if self.timeline_body_scrolls.len() >= TIMELINE_BODY_SCROLL_CACHE_LIMIT
+            && let Some(evicted) = self.timeline_body_scrolls.keys().next().cloned()
+        {
+            self.timeline_body_scrolls.remove(&evicted);
+        }
+        let scroll = ScrollHandle::new();
+        self.timeline_body_scrolls
+            .insert(row_id.to_string(), scroll.clone());
+        scroll
+    }
+
+    /// Bring an active search's first hit inside the window, once.
+    fn reveal_timeline_body_search(
+        &mut self,
+        row_id: &str,
+        body: &str,
+        window: &TimelineBodyWindow,
+        search: Option<&SessionSearchHighlight>,
+        scroll: &ScrollHandle,
+    ) {
+        let Some(query) = search
+            .filter(|highlight| highlight.active)
+            .map(|highlight| highlight.query.to_string())
+            .filter(|query| !query.is_empty())
+        else {
+            return;
+        };
+        if self.timeline_body_search_reveals.get(row_id) == Some(&query) {
+            return;
+        }
+        if self.timeline_body_search_reveals.len() >= TIMELINE_BODY_SEARCH_CACHE_LIMIT
+            && let Some(evicted) = self.timeline_body_search_reveals.keys().next().cloned()
+        {
+            self.timeline_body_search_reveals.remove(&evicted);
+        }
+        self.timeline_body_search_reveals
+            .insert(row_id.to_string(), query.clone());
+        let Some(offset) = body.find(&query) else {
+            return;
+        };
+        let index = window
+            .chunks
+            .iter()
+            .position(|range| range.contains(&offset))
+            .unwrap_or_default();
+        let above = window.heights.iter().take(index).sum::<f32>();
+        scroll.set_offset(point(px(0.0), px(-above)));
+    }
+
+    /// A body read through its own viewport.
+    ///
+    /// The chunks travel through the same windowed body the process groups use:
+    /// it reserves the table's height and builds only the chunks the box shows,
+    /// so an opened megabyte lays out a screenful. Each chunk is a Markdown
+    /// surface of its own, which is what buys the bound — selection therefore
+    /// lives inside a chunk, and the row's copy control stays the way to take
+    /// the whole body.
+    fn render_windowed_body(
+        &mut self,
+        row: &TimelineRow,
+        body: Arc<str>,
+        search: Option<SessionSearchHighlight>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chars_per_line = self.estimated_timeline_chars_per_line();
+        let window = self.timeline_body_window(&row.id, row.last_sequence, &body, chars_per_line);
+        let box_height = self.timeline_body_viewport_height(f32::from(window.total_height()));
+        let scroll = self.timeline_body_scroll(&row.id);
+        self.reveal_timeline_body_search(&row.id, &body, &window, search.as_ref(), &scroll);
+        let origins = Rc::new(window.origins());
+        let total_height = window.total_height();
+        let row_id = row.id.clone();
+        let revision = row.last_sequence;
+        let presentation = if row.kind == TimelineRowKind::Reasoning {
+            MarkdownPresentation::Thought
+        } else {
+            MarkdownPresentation::Agent
+        };
+        let entity = cx.weak_entity();
+        let build_entity = entity.clone();
+        let build_row_id = row_id.clone();
+        let build_body = body.clone();
+        let build_search = search.clone();
+        let build_row = Box::new(move |index: usize, _window: &mut Window, cx: &mut App| {
+            build_entity
+                .update(cx, |this, cx| {
+                    let Some((cached_revision, window)) =
+                        this.timeline_body_windows.get(&build_row_id)
+                    else {
+                        return Empty.into_any_element();
+                    };
+                    if *cached_revision != revision {
+                        return Empty.into_any_element();
+                    }
+                    let source = window.source(&build_body, index);
+                    let (source, _) = timeline_markdown_source_snapshot(
+                        &mut this.timeline_markdown_sources,
+                        &format!("markdown-chunk:{build_row_id}:{index}"),
+                        source,
+                        revision,
+                        false,
+                        Instant::now(),
+                        false,
+                    );
+                    let state = this.markdown_text_state(
+                        &format!("markdown-chunk:{build_row_id}:{index}"),
+                        &source,
+                        build_search.as_ref(),
+                        false,
+                        cx,
+                    );
+                    let link_entity = build_entity.clone();
+                    markdown_text_view(&state, presentation, cx, move |url, _, window, cx| {
+                        let _ = link_entity
+                            .update(cx, |this, cx| this.open_markdown_link(url, "", window, cx));
+                    })
+                    .w_full()
+                    .min_w_0()
+                    .into_any_element()
+                })
+                .unwrap_or_else(|_| Empty.into_any_element())
+        });
+        let record_entity = entity;
+        let record_row_id = row_id.clone();
+        let record = Box::new(move |measurements: &[(usize, f32)], cx: &mut App| {
+            let _ = record_entity.update(cx, |this, _| {
+                this.record_timeline_body_heights(&record_row_id, revision, measurements);
+            });
+        });
+        let selector = format!("timeline-body-window:{}", row.id);
+        let debug_selector = selector.clone();
+        div()
+            .id(selector)
+            .debug_selector(move || debug_selector.clone())
+            .w_full()
+            .min_w_0()
+            .max_h(px(box_height))
+            .track_scroll(&scroll)
+            .overflow_y_scroll()
+            .child(timeline_group_body::timeline_group_body(
+                origins,
+                total_height,
+                px(TIMELINE_BODY_CHUNK_OVERSCAN_PX),
+                build_row,
+                record,
+            ))
+            .into_any_element()
+    }
+
+    /// Copy a row's whole body, folded or windowed.
+    ///
+    /// The surface draws what the row's shape allows; the clipboard reads the
+    /// row, so what the reader copies is what the row says.
+    fn copy_timeline_row_body(&self, row_id: &str, cx: &mut Context<Self>) {
+        let body = self
+            .conversation_turns_cache
+            .iter()
+            .flat_map(|turn| {
+                turn.user_row
+                    .iter()
+                    .chain(turn.process_rows.iter())
+                    .chain(turn.conclusion_row.iter())
+            })
+            .find(|row| row.id == row_id)
+            .map(|row| row.body.clone());
+        if let Some(body) = body {
+            cx.write_to_clipboard(ClipboardItem::new_string(body));
+        }
+    }
+
     /// Whether the reader asked for a row's whole body.
     fn timeline_row_body_revealed(&self, row_id: &str) -> bool {
         self.timeline_body_reveal
@@ -58278,15 +58618,25 @@ impl VibexWorkbench {
             }
             TimelineRowKind::AgentMessage => {
                 let (visible_body, hidden_body_bytes) = self.visible_row_body(row);
-                let mut height = estimated_markdown_body_height(visible_body, chars_per_line) + 8.0;
-                if visible_body.contains("](") {
+                // A windowed body is measured by its box, not by its prose: the
+                // box is what the timeline lays out, and the prose inside it is
+                // the box's own scrolling to do.
+                let body_windowed = self
+                    .timeline_body_windowed(visible_body, self.timeline_row_body_revealed(&row.id));
+                let mut height = self.timeline_body_drawn_height(
+                    row,
+                    visible_body,
+                    chars_per_line,
+                    body_windowed,
+                ) + 8.0;
+                if visible_body.contains("](") && !body_windowed {
                     height += 30.0;
                 }
                 if conclusion && !row.streaming {
                     // Answer metadata and hover actions share one footer row.
                     height += 36.0;
                 }
-                if hidden_body_bytes > 0 {
+                if hidden_body_bytes > 0 || body_windowed {
                     height += TIMELINE_BODY_REVEAL_CONTROL_HEIGHT;
                 }
                 height
@@ -58304,11 +58654,16 @@ impl VibexWorkbench {
                         Some(height) => height + 4.0,
                         None => {
                             let (visible, hidden) = self.visible_reasoning_body(row, remaining);
-                            let mut height = estimated_markdown_body_height(
-                                visible.unwrap_or_default(),
+                            let visible = visible.unwrap_or_default();
+                            let body_windowed = self
+                                .timeline_body_windowed(visible, self.reasoning_body_revealed(row));
+                            let mut height = self.timeline_body_drawn_height(
+                                row,
+                                visible,
                                 chars_per_line,
+                                body_windowed,
                             ) + 4.0;
-                            if hidden > 0 {
+                            if hidden > 0 || body_windowed {
                                 height += TIMELINE_BODY_REVEAL_CONTROL_HEIGHT;
                             }
                             height
@@ -59355,25 +59710,35 @@ impl VibexWorkbench {
         let body_revealed = self.timeline_row_body_revealed(&row.id);
         let (markdown_source, hidden_body_bytes) =
             self.timeline_row_body_source(row, body_revealed);
-        let body_reveal_control = (hidden_body_bytes > 0)
+        // A body past the viewport allowance is read through a box of its own:
+        // the row keeps a bounded height and only the chunks the box shows are
+        // laid out, so an opened report costs a screenful instead of itself.
+        let body_windowed = timeline_row_body_folds(row)
+            && self.timeline_body_windowed(&markdown_source, body_revealed);
+        let windowed_body = body_windowed.then(|| {
+            self.render_windowed_body(row, markdown_source.clone(), search_highlight.clone(), cx)
+        });
+        let body_reveal_control = (hidden_body_bytes > 0 || body_windowed)
             .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
-        let markdown_state = self.markdown_text_state(
-            &format!("markdown:{}", row.id),
-            &markdown_source,
-            search_highlight.as_ref(),
-            row.streaming,
-            cx,
-        );
-        let markdown_entity = cx.weak_entity();
-        let markdown_view = markdown_text_view(
-            &markdown_state,
-            MarkdownPresentation::Agent,
-            cx,
-            move |url, _, window, cx| {
-                let _ = markdown_entity
-                    .update(cx, |this, cx| this.open_markdown_link(url, "", window, cx));
-            },
-        );
+        let markdown_view = (!body_windowed).then(|| {
+            let markdown_state = self.markdown_text_state(
+                &format!("markdown:{}", row.id),
+                &markdown_source,
+                search_highlight.as_ref(),
+                row.streaming,
+                cx,
+            );
+            let markdown_entity = cx.weak_entity();
+            markdown_text_view(
+                &markdown_state,
+                MarkdownPresentation::Agent,
+                cx,
+                move |url, _, window, cx| {
+                    let _ = markdown_entity
+                        .update(cx, |this, cx| this.open_markdown_link(url, "", window, cx));
+                },
+            )
+        });
         let timestamp = conversation_conclusion
             .then(|| self.timeline_row_timestamp(row))
             .flatten();
@@ -59393,14 +59758,11 @@ impl VibexWorkbench {
             agent_answer_actions(timestamp.is_some())
                 .filter_map(|action| match action {
                     AgentAnswerAction::Copy => {
-                        // The surface draws a folded body as its head, so the
-                        // clipboard reads the row rather than the surface: what
-                        // the reader copies is what the row says.
-                        let copy_text: SharedString = if hidden_body_bytes > 0 {
-                            row.body.clone().into()
-                        } else {
-                            markdown_source.to_string().into()
-                        };
+                        // The surface draws a folded body as its head and a
+                        // windowed one a chunk at a time, so the clipboard reads
+                        // the row rather than the surface: what the reader
+                        // copies is what the row says.
+                        let copy_row_id = row.id.clone();
                         Some(
                             Button::new(format!("copy-conclusion:{}", row.id))
                                 .xsmall()
@@ -59409,11 +59771,9 @@ impl VibexWorkbench {
                                 .size(px(24.0))
                                 .icon(IconName::Copy)
                                 .tooltip(locale::text("Copy", "复制", "複製"))
-                                .on_click(move |_, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        copy_text.to_string(),
-                                    ));
-                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.copy_timeline_row_body(&copy_row_id, cx);
+                                }))
                                 .into_any_element(),
                         )
                     }
@@ -59484,9 +59844,10 @@ impl VibexWorkbench {
             .when(conversation_conclusion, |this| {
                 this.group(hover_group.clone())
             })
-            .when(!row.body.is_empty(), |this| {
-                this.child(div().w_full().min_w_0().child(markdown_view))
+            .when_some(markdown_view, |this, body| {
+                this.child(div().w_full().min_w_0().child(body))
             })
+            .when_some(windowed_body, |this, body| this.child(body))
             .when_some(body_reveal_control, |this, control| {
                 this.child(div().w_full().min_w_0().child(control))
             })
@@ -59857,9 +60218,22 @@ impl VibexWorkbench {
             // A long settled thought is drawn as its head until the reader asks
             // for the rest, so an opened row does not lay the whole thought out
             // on every frame it is on screen.
+            let body_revealed = self.reasoning_body_revealed(row);
             let (remaining_source, hidden_body_bytes) =
                 self.reasoning_row_body_source(row, remaining_source);
-            let body_reveal_control = (hidden_body_bytes > 0)
+            // The same viewport a settled message body gets: a long thought is
+            // read through a box that lays out the chunks it shows.
+            let body_windowed = self.timeline_body_windowed(
+                remaining_source.as_deref().unwrap_or_default(),
+                body_revealed,
+            );
+            let windowed_body = body_windowed.then(|| {
+                let body = remaining_source
+                    .clone()
+                    .unwrap_or_else(|| Arc::<str>::from(""));
+                self.render_windowed_body(row, body, search_highlight.clone(), cx)
+            });
+            let body_reveal_control = (hidden_body_bytes > 0 || body_windowed)
                 .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
             // The disclosure header is one short, muted line. Rendering it as a
             // second `MarkdownView` bought nothing but a second element tree,
@@ -59868,18 +60242,21 @@ impl VibexWorkbench {
             // stays plain text and only the body keeps the Markdown surface.
             let first_line = self.reasoning_first_line_text(Some(row), first_line_source, cx);
             let window = self.reasoning_window(row.streaming, remaining_source.as_deref());
-            let remaining = remaining_source.map(|source| {
-                self.reasoning_markdown_view(
-                    format!("thought:{}:remaining", row.id),
-                    source,
-                    search_highlight,
-                    cx,
-                )
-                .w_full()
-                .min_w_0()
-                .text_color(cx.theme().muted_foreground)
-                .into_any_element()
-            });
+            let remaining = match windowed_body {
+                Some(body) => Some(body),
+                None => remaining_source.map(|source| {
+                    self.reasoning_markdown_view(
+                        format!("thought:{}:remaining", row.id),
+                        source,
+                        search_highlight,
+                        cx,
+                    )
+                    .w_full()
+                    .min_w_0()
+                    .text_color(cx.theme().muted_foreground)
+                    .into_any_element()
+                }),
+            };
             return self.render_expanded_reasoning_layout(
                 row_id,
                 turn_id,
@@ -68248,6 +68625,33 @@ fn reasoning_preview_text(label: &str) -> String {
 /// with a control on the row that opens the rest.
 const TIMELINE_BODY_VISIBLE_BYTES: usize = 4 * 1024;
 
+/// The shortest body that an opened row reads through a viewport of its own.
+///
+/// Below this, opening a body is the reader saying they want to see the rest of
+/// a message, and the rest is small enough to hand to the surface whole. Above
+/// it, the body is drawn inside a box that lays out only the chunks it shows,
+/// so what an opened body costs stops following the body's length.
+const TIMELINE_BODY_VIEWPORT_MIN_BYTES: usize = 32 * 1024;
+
+/// How tall that box may grow, in timeline viewports, and the least it is.
+const TIMELINE_BODY_VIEWPORT_MAX_SCREENS: f32 = 2.0;
+const TIMELINE_BODY_VIEWPORT_MIN_HEIGHT: f32 = 320.0;
+
+/// How much prose one chunk of a windowed body holds.
+const TIMELINE_BODY_CHUNK_BYTES: usize = 4 * 1024;
+
+/// What one chunk may hold before the split stops looking for a paragraph break.
+///
+/// A fence or a paragraph that outruns this is cut where it stands; a chunk is
+/// a layout unit, not a semantic one.
+const TIMELINE_BODY_CHUNK_MAX_BYTES: usize = 16 * 1024;
+
+/// Pixels of slack the window keeps above and below the chunks it shows.
+///
+/// A chunk is a few kilobytes of prose, so this is one chunk on either side of
+/// the band at most.
+const TIMELINE_BODY_CHUNK_OVERSCAN_PX: f32 = 320.0;
+
 /// The least of that allowance a cut at a line boundary keeps.
 ///
 /// A body whose first line outruns the whole allowance is cut inside that line
@@ -68285,6 +68689,111 @@ fn timeline_row_body_folds(row: &TimelineRow) -> bool {
             row.kind,
             TimelineRowKind::AgentMessage | TimelineRowKind::Reasoning
         )
+}
+
+/// Where one windowed body is cut into the chunks the window lays out.
+///
+/// A chunk breaks at a blank line, so a table, a list or a paragraph travels
+/// inside one chunk and every chunk starts on a whole Markdown block. A fence
+/// travels whole when it fits: the split refuses to cut inside one until a
+/// chunk has run past [`TIMELINE_BODY_CHUNK_MAX_BYTES`], at which point the cut
+/// is forced and the chunk is a layout unit rather than a semantic one. The
+/// chunks are the body's own ranges: concatenating them is the body, so the
+/// window can address prose by chunk without copying it.
+fn timeline_body_chunks(body: &str) -> Vec<Range<usize>> {
+    let mut chunks = Vec::new();
+    let mut start = 0_usize;
+    let mut offset = 0_usize;
+    let mut fence: Option<String> = None;
+    let mut blank: Option<usize> = None;
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        match fence.as_deref() {
+            Some(marker) if trimmed.starts_with(marker) => fence = None,
+            Some(_) => {}
+            None => {
+                if let Some(marker) = timeline_markdown_fence(trimmed) {
+                    fence = Some(marker);
+                } else if line.trim().is_empty() {
+                    blank = Some(offset + line.len());
+                }
+            }
+        }
+        offset += line.len();
+        let held = offset - start;
+        let at_break = fence.is_none() && blank.is_some_and(|end| end > start);
+        if (held >= TIMELINE_BODY_CHUNK_BYTES && at_break) || held >= TIMELINE_BODY_CHUNK_MAX_BYTES
+        {
+            let end = match blank.filter(|end| *end > start && *end <= offset) {
+                Some(end) if held < TIMELINE_BODY_CHUNK_MAX_BYTES => end,
+                _ => offset,
+            };
+            chunks.push(start..end);
+            start = end;
+            blank = None;
+        }
+    }
+    if start < body.len() {
+        chunks.push(start..body.len());
+    }
+    if chunks.is_empty() {
+        chunks.push(0..body.len());
+    }
+    chunks
+}
+
+/// The fence marker a line opens, when it opens one.
+///
+/// CommonMark's two fences are a run of three or more backticks or tildes; the
+/// closer is a run of the same character at least as long, which
+/// [`timeline_body_chunks`] approximates by the marker's own kind and length.
+fn timeline_markdown_fence(line: &str) -> Option<String> {
+    let marker = line.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+    let run = line
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    (run >= 3).then(|| marker.to_string().repeat(run))
+}
+
+/// One windowed body's layout: where its chunks are and how tall each one is.
+#[derive(Debug, Clone, PartialEq)]
+struct TimelineBodyWindow {
+    /// The row revision the chunks were cut from.
+    revision: i64,
+    /// The body's own byte ranges, in order.
+    chunks: Vec<Range<usize>>,
+    /// The height of each chunk: measured where the window has shown it,
+    /// estimated from its text before that.
+    heights: Vec<f32>,
+}
+
+impl TimelineBodyWindow {
+    /// The heights the window lays its chunks out with, as absolute origins.
+    fn origins(&self) -> Vec<Pixels> {
+        let mut origins = Vec::with_capacity(self.heights.len());
+        let mut offset = 0.0_f32;
+        for height in &self.heights {
+            origins.push(px(offset));
+            offset += *height;
+        }
+        origins
+    }
+
+    fn total_height(&self) -> Pixels {
+        px(self.heights.iter().sum::<f32>())
+    }
+
+    /// The bytes a chunk addresses.
+    fn source<'a>(&self, body: &'a str, index: usize) -> &'a str {
+        self.chunks
+            .get(index)
+            .and_then(|range| body.get(range.clone()))
+            .unwrap_or_default()
+    }
 }
 
 /// Where a settled body is cut for the folded shape.
