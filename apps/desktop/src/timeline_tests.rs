@@ -2358,3 +2358,254 @@ fn the_process_unit_walk_is_reused_while_its_inputs_hold(cx: &mut TestAppContext
         assert!(workbench.timeline_process_units_cache.len() <= 1);
     });
 }
+
+/// A body that outruns the allowance is cut at a line boundary.
+///
+/// The head is what the Markdown surface lays out, so it has to read as whole
+/// prose rather than stopping wherever the byte allowance happened to land.
+#[test]
+fn a_body_that_outruns_the_allowance_is_cut_at_a_line_boundary() {
+    let short = "one line\n".repeat(4);
+    assert_eq!(
+        folded_body_parts(&short),
+        (short.as_str(), 0),
+        "a body that fits travels whole"
+    );
+
+    let line = "x".repeat(64);
+    let long: String = (0..400).map(|_| format!("{line}\n")).collect();
+    let (head, hidden) = folded_body_parts(&long);
+    assert!(head.len() <= TIMELINE_BODY_VISIBLE_BYTES);
+    assert!(head.len() >= TIMELINE_BODY_VISIBLE_MIN_BYTES);
+    assert!(head.ends_with('\n'), "the head ends where a line does");
+    assert!(long.starts_with(head));
+    assert_eq!(hidden, long.len() - head.len());
+
+    // One line that outruns the whole allowance is cut inside that line rather
+    // than handed over as one endless row.
+    let unbroken = "y".repeat(TIMELINE_BODY_VISIBLE_BYTES * 3);
+    let (head, hidden) = folded_body_parts(&unbroken);
+    assert_eq!(head.len(), TIMELINE_BODY_VISIBLE_BYTES);
+    assert_eq!(hidden, unbroken.len() - head.len());
+
+    // A multi-byte character on the allowance's edge is never split.
+    let cjk = "中".repeat(TIMELINE_BODY_VISIBLE_BYTES);
+    let (head, hidden) = folded_body_parts(&cjk);
+    assert!(cjk.starts_with(head));
+    assert!(head.is_char_boundary(head.len()));
+    assert_eq!(hidden, cjk.len() - head.len());
+}
+
+/// A cut is memoized by the row's revision.
+///
+/// A body on screen asks for its cut every frame, so the frame path reads the
+/// memo rather than scanning the body again — and a body that grew is a new
+/// revision, which re-cuts.
+#[gpui::test]
+fn a_body_cut_is_memoized_by_the_row_revision(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, cx) = live_tool_timeline(cx, true);
+    let body = "line\n".repeat(400);
+
+    let cut = workbench.update(cx, |workbench, _| {
+        workbench.timeline_body_fold_cut("row", 7, &body, false)
+    });
+    assert_eq!(cut, folded_body_parts(&body).0.len());
+
+    // A sentinel under the same revision is what the next call answers with,
+    // which is what proves the frame path does not rescan the body.
+    workbench.update(cx, |workbench, _| {
+        workbench.timeline_body_folds.insert(
+            "row".to_string(),
+            (
+                7,
+                TimelineBodyFold {
+                    revealed: false,
+                    cut: 11,
+                },
+            ),
+        );
+    });
+    assert_eq!(
+        workbench.update(cx, |workbench, _| workbench
+            .timeline_body_fold_cut("row", 7, &body, false)),
+        11
+    );
+
+    // A new revision is a new body, so it is cut again.
+    assert_eq!(
+        workbench.update(cx, |workbench, _| workbench
+            .timeline_body_fold_cut("row", 8, &body, false)),
+        folded_body_parts(&body).0.len()
+    );
+}
+
+/// A long settled body is drawn as its head until the reader opens it.
+///
+/// The Markdown surface lays its whole body out on every frame it is on screen,
+/// so a screenful of long answers is what turns a 60 fps timeline into a 20 fps
+/// one. A settled body that outruns the allowance therefore travels as its head,
+/// with a control on the row that pays for the rest — and the row's measurement
+/// follows the cut, or the timeline would reserve height nothing fills.
+#[gpui::test]
+fn a_long_settled_body_is_drawn_as_its_head_until_the_reader_opens_it(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+    let long_body: String = (0..400)
+        .map(|line| format!("line {line} of a settled answer\n"))
+        .collect();
+    let (view, cx) = cx.add_window_view({
+        let long_body = long_body.clone();
+        move |window, cx| {
+            let workbench = cx.new(|cx| {
+                let mut ui_state = DesktopUiStateV1::default();
+                ui_state.appearance.locale = LocaleMode::En;
+                ui_state.session.turn_preview_rail = false;
+                let mut workbench =
+                    VibexWorkbench::with_initial_state(None, ui_state, None, window, cx);
+                workbench.agent_loading = false;
+                workbench.selected_session_id = Some(session_id.clone());
+                workbench.view_session_id = Some(session_id.clone());
+                workbench.timeline.replace_authoritative(
+                    session_id.clone(),
+                    vec![
+                        live_timeline_item(
+                            1,
+                            TimelinePayload::UserMessage(UserMessagePayload {
+                                text: "first question".into(),
+                                attachments: Vec::new(),
+                                ..Default::default()
+                            }),
+                        ),
+                        live_timeline_item(
+                            2,
+                            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                                text: long_body.clone(),
+                                is_final: true,
+                            }),
+                        ),
+                        // The answer is followed by another turn, which is what
+                        // settles it: only the last turn can still be live.
+                        live_timeline_item(
+                            3,
+                            TimelinePayload::UserMessage(UserMessagePayload {
+                                text: "second question".into(),
+                                attachments: Vec::new(),
+                                ..Default::default()
+                            }),
+                        ),
+                        live_timeline_item(
+                            4,
+                            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                                text: "short answer".into(),
+                                is_final: true,
+                            }),
+                        ),
+                    ],
+                );
+                workbench.conversation_turns_cache_key = None;
+                workbench.rebuild_timeline_sizes();
+                workbench
+            });
+            LiveTimelineProbe { workbench }
+        }
+    });
+    let workbench = view.read_with(cx, |view, _| view.workbench.clone());
+    let _ = draw_live_timeline_frames(&workbench, cx, 2);
+
+    let (row_id, folded_height, full_estimate) = workbench.read_with(cx, |workbench, _| {
+        let row = workbench.conversation_turns_cache[0]
+            .conclusion_row
+            .as_ref()
+            .expect("the settled turn's answer is a row");
+        assert!(
+            !row.streaming,
+            "the fixture's long answer has to be settled for this test to mean anything"
+        );
+        (
+            row.id.clone(),
+            f32::from(workbench.timeline_row_sizes[0].height),
+            estimated_markdown_body_height(
+                &row.body,
+                workbench.estimated_timeline_chars_per_line(),
+            ),
+        )
+    });
+
+    let folded_source = folded_body_parts(&long_body).0.len();
+    let drawn = workbench.read_with(cx, |workbench, _| {
+        workbench
+            .markdown_text_states
+            .get(&format!("markdown:{row_id}"))
+            .map(|state| state.source.len())
+    });
+    assert_eq!(
+        drawn,
+        Some(folded_source),
+        "the surface lays out the head, not the whole body"
+    );
+    assert!(
+        folded_height < full_estimate,
+        "the row reserves the folded body's height, not the whole one: {folded_height} against {full_estimate}"
+    );
+    // The harness looks a selector up by `&'static str`, and this row's id is
+    // minted per run.
+    let control_selector: &'static str =
+        Box::leak(format!("timeline-body-reveal:{row_id}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(control_selector).is_some(),
+        "a folded body carries the control that opens it"
+    );
+
+    // The reader's click opens the rest, and the row measures the whole body.
+    // The click carries the turn so the row's measurement is the one dropped —
+    // the same pair the control itself passes.
+    let turn_id = workbench.read_with(cx, |workbench, _| {
+        workbench.conversation_turns_cache[0].id.clone()
+    });
+    workbench.update(cx, |workbench, cx| {
+        workbench.toggle_timeline_row_body(row_id.clone(), Some(turn_id.clone()), cx)
+    });
+    // The surface parses a new document in the background, so the row's
+    // measurement lands after the parse rather than on the next frame.
+    for _ in 0..8 {
+        cx.run_until_parked();
+        let _ = draw_live_timeline_frames(&workbench, cx, 1);
+    }
+    let (opened_source, opened_height) = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench
+                .markdown_text_states
+                .get(&format!("markdown:{row_id}"))
+                .map(|state| state.source.len()),
+            f32::from(workbench.timeline_row_sizes[0].height),
+        )
+    });
+    assert_eq!(
+        opened_source,
+        Some(long_body.len()),
+        "the opened row hands the surface its whole body"
+    );
+    assert!(
+        opened_height > folded_height,
+        "the opened row is measured at the whole body: {opened_height} against {folded_height}"
+    );
+
+    // Only settled prose folds: a body still arriving is the reader's live view
+    // of the Agent's work, and a tool card bounds itself.
+    workbench.read_with(cx, |workbench, _| {
+        let settled = workbench.conversation_turns_cache[0]
+            .conclusion_row
+            .as_ref()
+            .expect("the settled turn's answer is a row");
+        let mut streaming = settled.clone();
+        streaming.streaming = true;
+        assert!(
+            !timeline_row_body_folds(&streaming),
+            "a body still arriving is the live view"
+        );
+        let mut tool = settled.clone();
+        tool.kind = TimelineRowKind::Command;
+        assert!(!timeline_row_body_folds(&tool), "only prose bodies fold");
+    });
+}

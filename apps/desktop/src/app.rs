@@ -664,6 +664,14 @@ const AGENT_TIMELINE_OLDER_PREFETCH_SCREENS: f32 = 1.5;
 /// is therefore sized to hold one long turn rather than one screen.
 const TIMELINE_MARKDOWN_SOURCE_CACHE_LIMIT: usize = 512;
 const TIMELINE_MARKDOWN_SOURCE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+/// How many folded-body cuts a view remembers, and the bytes they may hold.
+///
+/// A cut is two integers keyed by row id, so the entry count is what bounds
+/// it: one per row the reader has looked at, not one per frame.
+const TIMELINE_BODY_FOLD_CACHE_LIMIT: usize = 512;
+const TIMELINE_BODY_FOLD_CACHE_BYTES: usize = 64 * 1024;
+/// The height the reveal control adds to a folded row.
+const TIMELINE_BODY_REVEAL_CONTROL_HEIGHT: f32 = 24.0;
 const TIMELINE_REASONING_SUMMARY_CACHE_LIMIT: usize = 256;
 const TIMELINE_REASONING_SUMMARY_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
@@ -4718,6 +4726,17 @@ pub struct SessionView {
     content_width: SessionContentWidthMode,
     collapsed_timeline_rows: BTreeSet<String>,
     reasoning_expansion: BTreeMap<String, bool>,
+    /// Rows whose settled body the reader asked to see whole.
+    ///
+    /// A long settled body is drawn as its head; this is the per-row override,
+    /// kept for the view's life like every other disclosure the reader made.
+    timeline_body_reveal: BTreeMap<String, bool>,
+    /// Where a visible settled body is cut for the folded shape, by revision.
+    ///
+    /// The cut scans the body's head — a few kilobytes at most — but a body on
+    /// screen asks for it every frame, so the row's revision is what keeps that
+    /// scan off the frame path.
+    timeline_body_folds: BTreeMap<String, (i64, TimelineBodyFold)>,
     timeline_process_expansion: BTreeMap<String, bool>,
     timeline_command_expansion: BTreeMap<String, bool>,
     timeline_file_changes_expansion: BTreeMap<String, bool>,
@@ -4858,6 +4877,8 @@ impl SessionView {
             content_width,
             collapsed_timeline_rows: BTreeSet::new(),
             reasoning_expansion: BTreeMap::new(),
+            timeline_body_reveal: BTreeMap::new(),
+            timeline_body_folds: BTreeMap::new(),
             timeline_process_expansion: BTreeMap::new(),
             timeline_command_expansion: BTreeMap::new(),
             timeline_file_changes_expansion: BTreeMap::new(),
@@ -4957,6 +4978,7 @@ impl SessionView {
         *self.conversation_turns_render_cache.borrow_mut() = Rc::new(Vec::new());
         self.timeline_streaming_shrink_candidates.clear();
         self.timeline_markdown_sources.clear();
+        self.timeline_body_folds.clear();
         self.markdown_text_states.clear();
         self.timeline_reasoning_summaries.clear();
         self.timeline_tool_card_projections.clear();
@@ -5004,6 +5026,18 @@ impl SessionView {
             )
             .saturating_add(
                 self.reasoning_expansion
+                    .keys()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.timeline_body_reveal
+                    .keys()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.timeline_body_folds
                     .keys()
                     .map(String::len)
                     .sum::<usize>(),
@@ -25397,6 +25431,7 @@ impl VibexWorkbench {
         // from the estimator because the lengths no longer match.
         self.timeline_row_sizes = Rc::new(Vec::new());
         self.timeline_markdown_sources.clear();
+        self.timeline_body_folds.clear();
         self.markdown_text_states.clear();
         self.timeline_reasoning_summaries.clear();
         self.timeline_tool_card_projections.clear();
@@ -57854,6 +57889,224 @@ impl VibexWorkbench {
         scroll
     }
 
+    /// Whether the reader asked for a row's whole body.
+    fn timeline_row_body_revealed(&self, row_id: &str) -> bool {
+        self.timeline_body_reveal
+            .get(row_id)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Whether a reasoning row's whole body is drawn.
+    ///
+    /// Opening the row by hand is that request — the click is the reader saying
+    /// they want to read the thought. A row the *preference* opened is still
+    /// folded: the preference asks for thoughts to be readable, not for every
+    /// thought to be laid out in full on every frame.
+    fn reasoning_body_revealed(&self, row: &TimelineRow) -> bool {
+        self.timeline_row_body_revealed(&row.id)
+            || self
+                .reasoning_expansion
+                .get(&row.id)
+                .copied()
+                .unwrap_or(false)
+    }
+
+    /// The body a settled row's surface draws, and the bytes the fold hides.
+    ///
+    /// The estimator's answer, uncached: a turn's sizes are rebuilt when its
+    /// shape changes rather than every frame, so this scan is not on the frame
+    /// path. The render path takes the same cut through
+    /// [`Self::timeline_row_body_source`], keyed by the row's revision.
+    fn visible_row_body<'a>(&self, row: &'a TimelineRow) -> (&'a str, usize) {
+        if !timeline_row_body_folds(row) || self.timeline_row_body_revealed(&row.id) {
+            return (row.body.as_str(), 0);
+        }
+        folded_body_parts(row.body.as_str())
+    }
+
+    /// The reasoning body a row draws after its first line, and what the fold hides.
+    fn visible_reasoning_body<'a>(
+        &self,
+        row: &TimelineRow,
+        remaining: Option<&'a str>,
+    ) -> (Option<&'a str>, usize) {
+        let Some(source) = remaining else {
+            return (None, 0);
+        };
+        if !timeline_row_body_folds(row) || self.reasoning_body_revealed(row) {
+            return (Some(source), 0);
+        }
+        let (head, hidden) = folded_body_parts(source);
+        (Some(head), hidden)
+    }
+
+    /// Where a body is cut for the folded shape, cached by the row's revision.
+    ///
+    /// The same cut serves the row's surface and its measurement, and a reader
+    /// who opens the whole body gets its whole length under the same key — the
+    /// revision is the row's, so a growing body re-cuts itself.
+    fn timeline_body_fold_cut(
+        &mut self,
+        row_id: &str,
+        revision: i64,
+        body: &str,
+        revealed: bool,
+    ) -> usize {
+        if let Some((cached_revision, fold)) = self.timeline_body_folds.get(row_id)
+            && *cached_revision == revision
+            && fold.revealed == revealed
+        {
+            return fold.cut.min(body.len());
+        }
+        let cut = folded_body_parts(body).0.len();
+        insert_bounded_timeline_projection(
+            &mut self.timeline_body_folds,
+            row_id.to_string(),
+            revision,
+            TimelineBodyFold { revealed, cut },
+            TIMELINE_BODY_FOLD_CACHE_LIMIT,
+            TIMELINE_BODY_FOLD_CACHE_BYTES,
+            |_| std::mem::size_of::<TimelineBodyFold>(),
+        );
+        cut
+    }
+
+    /// The Markdown source a row's surface draws, and the bytes the fold hides.
+    fn timeline_row_body_source(&mut self, row: &TimelineRow, revealed: bool) -> (Arc<str>, usize) {
+        let cut = if timeline_row_body_folds(row) && !revealed {
+            self.timeline_body_fold_cut(&row.id, row.last_sequence, row.body.as_str(), revealed)
+        } else {
+            row.body.len()
+        };
+        let head = row.body.get(..cut).unwrap_or(row.body.as_str());
+        let allow_throttle = self.timeline_markdown_allow_throttle(row);
+        let (source, _) = timeline_markdown_source_snapshot(
+            &mut self.timeline_markdown_sources,
+            row.id.as_str(),
+            head,
+            row.last_sequence,
+            row.streaming,
+            Instant::now(),
+            allow_throttle,
+        );
+        (source, row.body.len() - head.len())
+    }
+
+    /// The reasoning body a row's surface draws, and the bytes the fold hides.
+    ///
+    /// Routed through the Markdown source snapshot like every other body, so a
+    /// settled thought the reader opened is not copied into a fresh `Arc` on
+    /// every frame it is on screen.
+    fn reasoning_row_body_source(
+        &mut self,
+        row: &TimelineRow,
+        remaining: Option<&str>,
+    ) -> (Option<Arc<str>>, usize) {
+        let Some(source) = remaining else {
+            return (None, 0);
+        };
+        let total_bytes = source.len();
+        let revealed = self.reasoning_body_revealed(row);
+        let cut = if timeline_row_body_folds(row) && !revealed {
+            self.timeline_body_fold_cut(&row.id, row.last_sequence, source, revealed)
+        } else {
+            total_bytes
+        };
+        let head = source.get(..cut).unwrap_or(source);
+        let (source, _) = timeline_markdown_source_snapshot(
+            &mut self.timeline_markdown_sources,
+            &format!("thought:{}:remaining", row.id),
+            head,
+            row.last_sequence,
+            row.streaming,
+            Instant::now(),
+            false,
+        );
+        (Some(source), total_bytes - head.len())
+    }
+
+    /// Whether the row is the one the streaming throttle is pacing.
+    fn timeline_markdown_allow_throttle(&self, row: &TimelineRow) -> bool {
+        self.streaming_row_state.as_ref().is_some_and(|state| {
+            row.turn_id.as_deref() == Some(state.turn_id.as_str())
+                && state.row_id == row.id
+                && state.body_len == row.body.len()
+        })
+    }
+
+    /// Open or fold a settled body.
+    ///
+    /// The click changes the row's height, so the turn's measurement is
+    /// invalidated under a captured anchor — the same pair a tool card's
+    /// disclosure uses, which keeps the reader's place while the row grows or
+    /// shrinks under them.
+    fn toggle_timeline_row_body(
+        &mut self,
+        row_id: String,
+        turn_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.capture_timeline_scroll_anchor();
+        let revealed = self.timeline_row_body_revealed(&row_id);
+        self.timeline_body_reveal.insert(row_id, !revealed);
+        if let Some(turn_id) = turn_id {
+            self.invalidate_timeline_turn_measurement(&turn_id);
+        }
+        self.rebuild_timeline_sizes();
+        cx.notify();
+    }
+
+    /// The control that opens a folded body, or folds it back.
+    fn timeline_body_reveal_control(
+        &mut self,
+        row: &TimelineRow,
+        hidden_bytes: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let revealed = self.timeline_row_body_revealed(&row.id);
+        let label = if revealed {
+            self.strings().agent_show_less_message
+        } else {
+            self.strings().agent_show_full_message
+        };
+        let selector = format!("timeline-body-reveal:{}", row.id);
+        let toggle_id = row.id.clone();
+        let turn_id = row.turn_id.clone();
+        let debug_selector = selector.clone();
+        h_flex()
+            .id(selector)
+            .debug_selector(move || debug_selector.clone())
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .cursor_pointer()
+            .child(
+                Icon::new(if revealed {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(px(12.0))
+                .flex_none(),
+            )
+            .child(SharedString::from(format!(
+                "{label} · {}",
+                format_bytes(u64::try_from(hidden_bytes).unwrap_or(u64::MAX))
+            )))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // The control sits inside rows that answer a click of their own
+                // (an opened reasoning row toggles on one), so the click ends
+                // here rather than doing both things at once.
+                cx.stop_propagation();
+                this.toggle_timeline_row_body(toggle_id.clone(), turn_id.clone(), cx)
+            }))
+            .into_any_element()
+    }
+
     /// Shared body text for a markdown row.
     ///
     /// `MarkdownInput` takes an `Arc<str>`, so handing it `row.body.clone()`
@@ -57861,11 +58114,7 @@ impl VibexWorkbench {
     /// allocation also lets the markdown view settle on a pointer comparison
     /// instead of a full memcmp when nothing changed.
     fn timeline_markdown_source(&mut self, row: &TimelineRow) -> (Arc<str>, i64) {
-        let allow_throttle = self.streaming_row_state.as_ref().is_some_and(|state| {
-            row.turn_id.as_deref() == Some(state.turn_id.as_str())
-                && state.row_id == row.id
-                && state.body_len == row.body.len()
-        });
+        let allow_throttle = self.timeline_markdown_allow_throttle(row);
         timeline_markdown_source_snapshot(
             &mut self.timeline_markdown_sources,
             row.id.as_str(),
@@ -58020,13 +58269,17 @@ impl VibexWorkbench {
                 }
             }
             TimelineRowKind::AgentMessage => {
-                let mut height = estimated_markdown_body_height(&row.body, chars_per_line) + 8.0;
-                if row.body.contains("](") {
+                let (visible_body, hidden_body_bytes) = self.visible_row_body(row);
+                let mut height = estimated_markdown_body_height(visible_body, chars_per_line) + 8.0;
+                if visible_body.contains("](") {
                     height += 30.0;
                 }
                 if conclusion && !row.streaming {
                     // Answer metadata and hover actions share one footer row.
                     height += 36.0;
+                }
+                if hidden_body_bytes > 0 {
+                    height += TIMELINE_BODY_REVEAL_CONTROL_HEIGHT;
                 }
                 height
             }
@@ -58041,7 +58294,17 @@ impl VibexWorkbench {
                     let (_, remaining) = reasoning_source_parts(&row.body);
                     match self.reasoning_window(row.streaming, remaining) {
                         Some(height) => height + 4.0,
-                        None => estimated_markdown_body_height(&row.body, chars_per_line) + 4.0,
+                        None => {
+                            let (visible, hidden) = self.visible_reasoning_body(row, remaining);
+                            let mut height = estimated_markdown_body_height(
+                                visible.unwrap_or_default(),
+                                chars_per_line,
+                            ) + 4.0;
+                            if hidden > 0 {
+                                height += TIMELINE_BODY_REVEAL_CONTROL_HEIGHT;
+                            }
+                            height
+                        }
                     }
                 } else {
                     28.0
@@ -59078,7 +59341,14 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let search_highlight = self.session_search_highlight_for_rows(std::slice::from_ref(row));
-        let (markdown_source, _) = self.timeline_markdown_source(row);
+        // A settled body travels as its head until the reader asks for the
+        // rest, so the surface lays out a screenful of prose instead of a whole
+        // report. The cut belongs to the row's revision, not to the frame.
+        let body_revealed = self.timeline_row_body_revealed(&row.id);
+        let (markdown_source, hidden_body_bytes) =
+            self.timeline_row_body_source(row, body_revealed);
+        let body_reveal_control = (hidden_body_bytes > 0)
+            .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
         let markdown_state = self.markdown_text_state(
             &format!("markdown:{}", row.id),
             &markdown_source,
@@ -59115,7 +59385,14 @@ impl VibexWorkbench {
             agent_answer_actions(timestamp.is_some())
                 .filter_map(|action| match action {
                     AgentAnswerAction::Copy => {
-                        let copy_text = markdown_source.clone();
+                        // The surface draws a folded body as its head, so the
+                        // clipboard reads the row rather than the surface: what
+                        // the reader copies is what the row says.
+                        let copy_text: SharedString = if hidden_body_bytes > 0 {
+                            row.body.clone().into()
+                        } else {
+                            markdown_source.to_string().into()
+                        };
                         Some(
                             Button::new(format!("copy-conclusion:{}", row.id))
                                 .xsmall()
@@ -59201,6 +59478,9 @@ impl VibexWorkbench {
             })
             .when(!row.body.is_empty(), |this| {
                 this.child(div().w_full().min_w_0().child(markdown_view))
+            })
+            .when_some(body_reveal_control, |this, control| {
+                this.child(div().w_full().min_w_0().child(control))
             })
             .when_some(content_before_actions, |this, content| {
                 this.child(div().w_full().min_w_0().mt_2().child(content))
@@ -59402,6 +59682,10 @@ impl VibexWorkbench {
     /// `reveal` carries the spring the body below the first line travels on, so
     /// the row opens and closes exactly as a tool card does: the header answers
     /// the click at once, and the body takes the height the spring holds.
+    // The layout carries the row's identity, its header, its body and both
+    // disclosures the row answers to; they travel together because the click
+    // they serve is one gesture.
+    #[allow(clippy::too_many_arguments)]
     fn render_expanded_reasoning_layout(
         &mut self,
         row_id: String,
@@ -59409,6 +59693,7 @@ impl VibexWorkbench {
         first_line: AnyElement,
         body: ReasoningBody,
         reveal: ReasoningReveal,
+        body_reveal: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tooltip = if reveal.open {
@@ -59418,13 +59703,19 @@ impl VibexWorkbench {
         };
         let open = reveal.open;
         let toggle_id = row_id.clone();
-        render_reasoning_first_line_layout(
+        let layout = render_reasoning_first_line_layout(
             cx.theme().muted_foreground,
             first_line,
             body.remaining,
             body.window,
             reveal,
-        )
+        );
+        // The reveal control answers a click of its own inside a row whose whole
+        // shape answers the reader's click, so it carries that click and stops.
+        match body_reveal {
+            Some(control) => layout.child(control),
+            None => layout,
+        }
         .id(row_id)
         .cursor_pointer()
         .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
@@ -59494,6 +59785,7 @@ impl VibexWorkbench {
                 first_line,
                 ReasoningBody { remaining, window },
                 reveal,
+                None,
                 cx,
             );
         }
@@ -59554,17 +59846,24 @@ impl VibexWorkbench {
                 self.session_search_highlight_for_rows(std::slice::from_ref(row));
             let (markdown_source, _) = self.timeline_markdown_source(row);
             let (first_line_source, remaining_source) = reasoning_source_parts(&markdown_source);
+            // A long settled thought is drawn as its head until the reader asks
+            // for the rest, so an opened row does not lay the whole thought out
+            // on every frame it is on screen.
+            let (remaining_source, hidden_body_bytes) =
+                self.reasoning_row_body_source(row, remaining_source);
+            let body_reveal_control = (hidden_body_bytes > 0)
+                .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
             // The disclosure header is one short, muted line. Rendering it as a
             // second `MarkdownView` bought nothing but a second element tree,
             // keyed state entry, selection buffer and hitbox per reasoning row;
             // a long turn expands hundreds of rows per frame, so the header
             // stays plain text and only the body keeps the Markdown surface.
             let first_line = self.reasoning_first_line_text(Some(row), first_line_source, cx);
-            let window = self.reasoning_window(row.streaming, remaining_source);
+            let window = self.reasoning_window(row.streaming, remaining_source.as_deref());
             let remaining = remaining_source.map(|source| {
                 self.reasoning_markdown_view(
                     format!("thought:{}:remaining", row.id),
-                    Arc::<str>::from(source),
+                    source,
                     search_highlight,
                     cx,
                 )
@@ -59579,6 +59878,7 @@ impl VibexWorkbench {
                 first_line,
                 ReasoningBody { remaining, window },
                 reveal,
+                body_reveal_control,
                 cx,
             );
         }
@@ -67928,6 +68228,68 @@ fn truncate_agent_thinking_label(label: &str) -> String {
 fn reasoning_preview_text(label: &str) -> String {
     let normalized = label.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_agent_thinking_label(normalized.trim())
+}
+
+/// How much of a settled row body the timeline lays out at once.
+///
+/// A Markdown surface lays its whole body out on every frame it is on screen,
+/// and the cost follows the text rather than the row count: measured against a
+/// real session, a screenful whose bodies run to ~1.1 MB costs ~54 ms a frame
+/// and the same screenful costs ~7 ms once its long bodies are cut down to this
+/// allowance. A settled body longer than this is therefore drawn as its head,
+/// with a control on the row that opens the rest.
+const TIMELINE_BODY_VISIBLE_BYTES: usize = 4 * 1024;
+
+/// The least of that allowance a cut at a line boundary keeps.
+///
+/// A body whose first line outruns the whole allowance is cut inside that line
+/// rather than handed over as one endless row.
+const TIMELINE_BODY_VISIBLE_MIN_BYTES: usize = TIMELINE_BODY_VISIBLE_BYTES / 2;
+
+/// The head of a body that outruns the allowance, and the bytes left behind.
+///
+/// The cut lands on the last line boundary inside the allowance, so the head
+/// reads as whole prose instead of stopping mid-sentence where a paragraph
+/// break was available — falling back to the allowance itself when a single
+/// line outruns it.
+fn folded_body_parts(body: &str) -> (&str, usize) {
+    if body.len() <= TIMELINE_BODY_VISIBLE_BYTES {
+        return (body, 0);
+    }
+    let allowance = vibex_ui::markdown::utf8_prefix(body, TIMELINE_BODY_VISIBLE_BYTES);
+    let cut = allowance
+        .rfind('\n')
+        .filter(|index| *index >= TIMELINE_BODY_VISIBLE_MIN_BYTES)
+        .map_or(allowance.len(), |index| index + 1);
+    let head = allowance.get(..cut).unwrap_or(allowance);
+    (head, body.len() - head.len())
+}
+
+/// Whether a row's body is drawn folded.
+///
+/// Only prose bodies fold, and only once they have settled: a body still
+/// arriving is the reader's live view of the Agent's work, and a plan, a file
+/// diff or a tool card already bounds itself. The reader's own reveal always
+/// wins over this.
+fn timeline_row_body_folds(row: &TimelineRow) -> bool {
+    !row.streaming
+        && matches!(
+            row.kind,
+            TimelineRowKind::AgentMessage | TimelineRowKind::Reasoning
+        )
+}
+
+/// Where a settled body is cut for the folded shape.
+///
+/// The row's own revision answers it, so a visible row asks for its cut once
+/// per revision rather than once per frame — and a reader who opens the whole
+/// body gets a different cut (the whole body) under the same key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimelineBodyFold {
+    /// Whether the reader had asked for the whole body when the cut was taken.
+    revealed: bool,
+    /// How many bytes of the body the folded shape draws.
+    cut: usize,
 }
 
 fn reasoning_source_parts(source: &str) -> (&str, Option<&str>) {
@@ -95794,8 +96156,13 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the reasoning row renderer should remain inspectable");
         assert!(
-            row.contains("let window = self.reasoning_window(row.streaming, remaining_source);")
+            row.contains("let (remaining_source, hidden_body_bytes) =")
+                && row.contains("self.reasoning_row_body_source(row, remaining_source)"),
+            "a settled thought's body is folded before it is laid out"
         );
+        assert!(row.contains(
+            "let window = self.reasoning_window(row.streaming, remaining_source.as_deref());"
+        ));
         assert!(row.contains("render_expanded_reasoning_layout("));
 
         let live = source
