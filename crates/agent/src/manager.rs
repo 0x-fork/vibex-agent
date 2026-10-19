@@ -6083,6 +6083,19 @@ fn describe_runtime_route(route: &vibex_core::AgentRuntimeRouteKey) -> String {
     )
 }
 
+/// Whether one provider event is an update of a row the timeline already holds.
+///
+/// A provider narrates a thought or an operation as a run of updates, and only
+/// the newest of them describes it: the projection folds a run into a single
+/// row, and so does the compaction that folds the durable timeline once a turn
+/// settles. Appending every update instead is what makes a turn out of a
+/// paragraph — hundreds of thousands of rows for one long run, all of them rows
+/// the next reader's window has to carry before it can reach anything else.
+///
+/// Returning true here lets the append path upsert the run's newest row, which
+/// is the same row the projection would have drawn. The update still reaches
+/// the live stream, as the same sequence carrying the newest payload — the
+/// shape every client already handles as a revision of a row it holds.
 fn should_coalesce_provider_event(event: &ProviderEvent) -> bool {
     event.provider_correlation_id.is_some()
         && match &event.payload {
@@ -6091,6 +6104,11 @@ fn should_coalesce_provider_event(event: &ProviderEvent) -> bool {
                 error.code.as_str(),
                 "codex_stream_reconnecting" | "opencode_model_api_retrying"
             ),
+            // A final thought closes the run rather than extending it, so it
+            // stays a row of its own: the run it closes is still the row it
+            // reads back from.
+            TimelinePayload::Reasoning(reasoning) => !reasoning.is_final,
+            TimelinePayload::ToolCall(_) => true,
             _ => false,
         }
 }

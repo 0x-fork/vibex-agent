@@ -5654,6 +5654,13 @@ struct StreamingRowStateCache {
     turn_id: String,
     row_id: String,
     body_len: usize,
+    /// The row body's character count, when the streaming path knows it.
+    ///
+    /// The output estimate grows by characters, and a row that a coalesced run
+    /// replaces carries its whole text — so the count the previous update left
+    /// here is what saves each new one from scanning the text it replaces.
+    /// `None` means the count has to be derived from the body once.
+    body_chars: Option<usize>,
 }
 
 struct AgentStreamingCacheUpdate {
@@ -5987,6 +5994,7 @@ fn append_agent_streaming_deltas_to_cache(
         turn_id: turn_id.clone(),
         row_id: row_id.clone(),
         body_len,
+        body_chars: None,
     });
     Some(AgentStreamingCacheUpdate {
         turn_id,
@@ -6007,6 +6015,42 @@ struct AgentReasoningDeltaUpdate {
     timestamp_ms: i64,
     text: String,
     runtime_attribution: Option<String>,
+}
+
+/// Whether one reasoning revision replaces the whole run the view holds.
+///
+/// A thought's chunks are folded onto the row the run began at, so the newest
+/// text can arrive as a sequence the view already holds, carrying the run's
+/// whole accumulation. Replacing that row's body is then exactly the edit a
+/// projection would make. A run the view still holds as several rows is not
+/// that shape — each of those rows contributes its own text, and only the
+/// projection can rebuild the run from them — so the batch is left to it.
+fn reasoning_revision_replaces_the_run(
+    items: &[TimelineItem],
+    previous_end_sequence: Option<i64>,
+    events: &[TimelineLiveEvent],
+) -> bool {
+    let [event] = events else {
+        return false;
+    };
+    if previous_end_sequence != Some(event.sequence) {
+        return false;
+    }
+    let TimelinePayload::Reasoning(reasoning) = &event.item.payload else {
+        return false;
+    };
+    if reasoning.is_final {
+        return false;
+    }
+    let mut run = items.iter().rev().take_while(|item| {
+        matches!(&item.payload, TimelinePayload::Reasoning(reasoning) if !reasoning.is_final)
+    });
+    let Some(tail) = run.next() else {
+        return false;
+    };
+    run.next().is_none()
+        && tail.sequence == event.sequence
+        && tail.provider_correlation_id == event.item.provider_correlation_id
 }
 
 fn agent_reasoning_delta_updates(
@@ -6049,8 +6093,15 @@ fn append_agent_reasoning_deltas_to_cache(
     // `live_status` is only populated while the turn tail is a run of streaming
     // reasoning, which is exactly the state this append can extend.
     let live_status = last_turn.live_status.as_ref()?;
+    // A thought's chunks are folded onto the row the run began at, so the
+    // newest text can arrive as the sequence the view already holds instead of
+    // the one above it. A revision replaces the row's body — its payload is the
+    // whole accumulation, not the chunk that grew it — while a run of new
+    // sequences is appended exactly as it arrives.
+    let revision = updates.len() == 1 && previous_end_sequence == Some(first.sequence);
     if last_turn.complete
-        || previous_end_sequence.is_none_or(|end| end.saturating_add(1) != first.sequence)
+        || (!revision
+            && previous_end_sequence.is_none_or(|end| end.saturating_add(1) != first.sequence))
         || updates
             .windows(2)
             .any(|pair| pair[1].sequence != pair[0].sequence.saturating_add(1))
@@ -6059,12 +6110,17 @@ fn append_agent_reasoning_deltas_to_cache(
     }
 
     let turn_id = last_turn.id.clone();
+    let previous_sequence = if revision {
+        first.sequence
+    } else {
+        first.sequence.saturating_sub(1)
+    };
     let timeline_row = (reasoning_display_mode == ReasoningDisplayMode::Timeline)
         .then(|| {
             last_turn.process_rows.last().filter(|row| {
                 row.kind == TimelineRowKind::Reasoning
                     && row.streaming
-                    && row.last_sequence.saturating_add(1) == first.sequence
+                    && row.last_sequence == previous_sequence
                     && updates
                         .iter()
                         .all(|update| update.runtime_attribution == row.runtime_attribution)
@@ -6074,37 +6130,78 @@ fn append_agent_reasoning_deltas_to_cache(
     if reasoning_display_mode == ReasoningDisplayMode::Timeline && timeline_row.is_none() {
         return None;
     }
+    // A revision rewrites the body of the row it names, so the run that row
+    // describes has to be that row alone: a run the projection folded out of
+    // several rows has each of them contributing text, and only a projection
+    // can rebuild it from them.
+    if revision && timeline_row.is_some_and(|row| row.item_ids.len() != 1) {
+        return None;
+    }
     let row_id =
         timeline_row.map_or_else(|| format!("reasoning-live:{turn_id}"), |row| row.id.clone());
     let previous_body_len = timeline_row.map_or_else(|| live_status.len(), |row| row.body.len());
-    let output_char_delta = updates
+    // The count the previous update left beside the row is what keeps a growing
+    // thought from rescanning its own text on every chunk. A row whose state
+    // was lost is counted once here and cached again below.
+    let previous_body_chars = match (row_id.as_str(), state_cache.as_ref()) {
+        (row_id, Some(state)) if state.row_id == row_id => state.body_chars,
+        _ => None,
+    }
+    .unwrap_or_else(|| {
+        timeline_row.map_or_else(
+            || live_status.chars().count(),
+            |row| row.body.chars().count(),
+        )
+    });
+    let appended_chars = updates
         .iter()
         .map(|update| update.text.chars().count())
-        .sum();
+        .sum::<usize>();
+    let output_char_delta = if revision {
+        first
+            .text
+            .chars()
+            .count()
+            .saturating_sub(previous_body_chars)
+    } else {
+        appended_chars
+    };
 
     let turns = Rc::make_mut(cache);
     let turn = Rc::make_mut(turns.last_mut().expect("cache was checked above"));
     if let Some(live_status) = turn.live_status.as_mut() {
-        for update in updates {
-            live_status.push_str(&update.text);
+        if revision {
+            live_status.clear();
+            live_status.push_str(&first.text);
+        } else {
+            for update in updates {
+                live_status.push_str(&update.text);
+            }
         }
     }
     let mut body_len = turn.live_status.as_ref().map_or(0, String::len);
     if reasoning_display_mode == ReasoningDisplayMode::Timeline
         && let Some(row) = turn.process_rows.last_mut()
     {
-        for update in updates {
-            row.body.push_str(&update.text);
-            record_timeline_row_endpoint(&mut row.item_ids, update.item_id.clone());
-            row.last_sequence = update.sequence;
-            // The row is stamped where it last spoke, exactly as the full
-            // projection stamps it: this path exists to reach the same rows
-            // without re-projecting the timeline.
-            row.timestamp_ms = update.timestamp_ms;
+        if revision {
+            row.body.clear();
+            row.body.push_str(&first.text);
+        } else {
+            for update in updates {
+                row.body.push_str(&update.text);
+            }
         }
+        record_timeline_row_endpoint(&mut row.item_ids, first.item_id.clone());
+        row.last_sequence = first.sequence;
+        // The row is stamped where it last spoke, exactly as the full
+        // projection stamps it: this path exists to reach the same rows
+        // without re-projecting the timeline.
+        row.timestamp_ms = first.timestamp_ms;
         body_len = row.body.len();
     }
-    turn.item_count = turn.item_count.saturating_add(updates.len());
+    if !revision {
+        turn.item_count = turn.item_count.saturating_add(updates.len());
+    }
     turn.ended_at_ms = updates.last().map(|update| update.timestamp_ms);
     for row in turn
         .user_row
@@ -6118,6 +6215,11 @@ fn append_agent_reasoning_deltas_to_cache(
         turn_id: turn_id.clone(),
         row_id: row_id.clone(),
         body_len,
+        body_chars: Some(if revision {
+            first.text.chars().count()
+        } else {
+            previous_body_chars.saturating_add(appended_chars)
+        }),
     });
     Some(AgentStreamingCacheUpdate {
         turn_id,
@@ -24532,7 +24634,18 @@ impl VibexWorkbench {
         let streaming_updates = (!updates_existing_item)
             .then(|| agent_streaming_delta_updates(&events))
             .flatten();
-        let reasoning_updates = (!updates_existing_item && streaming_updates.is_none())
+        // A thought's chunks are folded onto the row the run began at, so a
+        // reasoning batch can revise the row the view already holds instead of
+        // following it. Only a run the view holds as that one row is replaced
+        // in place; a run still spread over several rows is left to the
+        // projection, which is what rebuilds a run from its own rows.
+        let reasoning_revision = reasoning_revision_replaces_the_run(
+            &self.timeline.items,
+            previous_end_sequence,
+            &events,
+        );
+        let reasoning_updates = (streaming_updates.is_none()
+            && (!updates_existing_item || reasoning_revision))
             .then(|| agent_reasoning_delta_updates(&events))
             .flatten();
         let auto_continue_refresh = timeline_batch_requires_auto_continue_refresh(&events);
@@ -24577,12 +24690,7 @@ impl VibexWorkbench {
                 }
             }
             let mut streaming_cache_update = None;
-            if updates_existing_item || optimistic_reconciled {
-                let previous = self.conversation_turns_cache.clone();
-                self.conversation_turns_cache_key = None;
-                let incoming = self.conversation_turns_cached();
-                self.invalidate_changed_timeline_content(&previous, &incoming);
-            } else if !self.view.timeline.needs_authoritative_refetch
+            if !self.view.timeline.needs_authoritative_refetch
                 && let Some(updates) = streaming_updates.as_deref()
                 && let Some(update) = with_detached_conversation_turns_render_cache(
                     &mut self.view.conversation_turns_cache,
@@ -24618,6 +24726,14 @@ impl VibexWorkbench {
                 self.conversation_turns_cache_key =
                     Some(self.current_conversation_turns_cache_key());
                 streaming_cache_update = Some(update);
+            } else if updates_existing_item || optimistic_reconciled {
+                // A batch this concrete path cannot place — a tool update
+                // replacing its own row, an edit, a reconciled optimistic
+                // message — is projected from the timeline it arrived in.
+                let previous = self.conversation_turns_cache.clone();
+                self.conversation_turns_cache_key = None;
+                let incoming = self.conversation_turns_cached();
+                self.invalidate_changed_timeline_content(&previous, &incoming);
             }
             if let Some(update) = streaming_cache_update.as_ref() {
                 self.record_agent_generation_streaming_delta(update);
@@ -25132,6 +25248,7 @@ impl VibexWorkbench {
                 turn_id: turn.id.clone(),
                 row_id: row.id.clone(),
                 body_len: row.body.len(),
+                body_chars: None,
             });
         }
 
@@ -25142,6 +25259,7 @@ impl VibexWorkbench {
                 turn_id: turn.id.clone(),
                 row_id: format!("reasoning-live:{}", turn.id),
                 body_len: body.len(),
+                body_chars: None,
             })
     }
 
@@ -25229,6 +25347,7 @@ impl VibexWorkbench {
             turn_id: update.turn_id.clone(),
             row_id: update.row_id.clone(),
             body_len: update.body_len,
+            body_chars: None,
         };
         let Some(body_len) = streaming_timeline_row_body_len(&turn, &state) else {
             return self.rebuild_timeline_sizes();
@@ -85595,6 +85714,119 @@ mod tests {
         }
     }
 
+    /// A coalesced thought arrives as a revision of the row the view holds.
+    ///
+    /// The store folds a thought's chunks onto one row, so the newest text
+    /// comes back at the sequence the run already has instead of the one above
+    /// it. The row's body is then the store's text — the whole accumulation —
+    /// and the append path must replace it rather than grow it again.
+    #[test]
+    fn a_coalesced_thought_revision_replaces_the_row_body() {
+        for mode in [
+            ReasoningDisplayMode::Timeline,
+            ReasoningDisplayMode::LatestAtBottom,
+        ] {
+            let session_id = VibexSessionId::parse("session_reasoning_revision").unwrap();
+            let question = timeline_item_with_payload(
+                &session_id,
+                1,
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "question".into(),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+            );
+            let run = timeline_item_with_payload(
+                &session_id,
+                2,
+                TimelineSource::Agent,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "one two ".into(),
+                    is_final: false,
+                }),
+            );
+            let mut timeline = TimelineModel::default();
+            timeline.replace_authoritative(session_id.clone(), vec![question.clone(), run.clone()]);
+            let projection = |items: &[TimelineItem]| {
+                timeline_conversation_turns_with_reasoning_mode(
+                    items,
+                    Some(AgentSessionState::Running),
+                    true,
+                    mode,
+                )
+                .into_iter()
+                .map(Rc::new)
+                .collect::<Vec<Rc<TimelineConversationTurn>>>()
+            };
+            let mut cache: Rc<Vec<Rc<TimelineConversationTurn>>> =
+                Rc::new(projection(&timeline.items));
+            let render_cache = Rc::new(RefCell::new(cache.clone()));
+            let active_turn_ptr = Rc::as_ptr(cache.last().expect("reasoning turn is cached"));
+
+            let revision = TimelineItem {
+                payload: TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "one two three".into(),
+                    is_final: false,
+                }),
+                ..run.clone()
+            };
+            let events = [TimelineLiveEvent {
+                session_id: session_id.clone(),
+                sequence: 2,
+                item: revision.clone(),
+            }];
+            assert!(
+                reasoning_revision_replaces_the_run(&timeline.items, Some(2), &events),
+                "the view holds the run as the one row the revision names"
+            );
+            let updates = agent_reasoning_delta_updates(&events)
+                .expect("a revised thought is a reasoning delta at the row's own sequence");
+
+            let mut state_cache = None;
+            let update =
+                with_detached_conversation_turns_render_cache(&mut cache, &render_cache, |cache| {
+                    append_agent_reasoning_deltas_to_cache(
+                        cache,
+                        &mut state_cache,
+                        mode,
+                        Some(2),
+                        &updates,
+                    )
+                })
+                .expect("a coalesced revision is applied in place");
+            assert_eq!(
+                active_turn_ptr,
+                Rc::as_ptr(cache.last().expect("revised turn stays cached")),
+                "a revision must reuse the active turn allocation"
+            );
+            assert_eq!(
+                update.body_len,
+                "one two three".len(),
+                "the row's body is the store's text, not the text grown again"
+            );
+            let turn = cache.last().expect("the revised turn stays cached");
+            assert_eq!(turn.item_count, 2, "a revision is not another item");
+            if mode == ReasoningDisplayMode::Timeline {
+                assert_eq!(
+                    turn.process_rows.last().map(|row| row.last_sequence),
+                    Some(2),
+                    "the row keeps the sequence the store folded onto"
+                );
+            } else {
+                assert_eq!(turn.live_status.as_deref(), Some("one two three"));
+            }
+
+            timeline.replace_authoritative(session_id.clone(), vec![question, revision]);
+            let expected = projection(&timeline.items);
+            assert_eq!(
+                cache.as_ref(),
+                &expected,
+                "mode {mode:?}: the revision lands where a projection would"
+            );
+        }
+    }
+
     #[test]
     fn unread_completion_tracks_only_final_messages_from_background_sessions() {
         let selected_session_id = VibexSessionId::new();
@@ -95475,6 +95707,7 @@ mod tests {
             turn_id: turn.id.clone(),
             row_id: "reasoning:stream".into(),
             body_len: "Inspecting the workspace".len(),
+            body_chars: None,
         };
         assert_eq!(
             streaming_timeline_row_body_len(&turn, &timeline_state),
@@ -95485,6 +95718,7 @@ mod tests {
             turn_id: turn.id.clone(),
             row_id: "reasoning-live:turn:stream".into(),
             body_len: "Inspecting the workspace".len(),
+            body_chars: None,
         };
         assert_eq!(
             streaming_timeline_row_body_len(&turn, &live_state),
