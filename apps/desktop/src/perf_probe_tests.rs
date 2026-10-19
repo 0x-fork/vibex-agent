@@ -1489,3 +1489,48 @@ fn probe_expanded_scroll(cx: &mut TestAppContext) {
     println!("probe fixture n={count} expand={expand} content={max_offset:.0}px");
     report(&format!("expanded scroll ({expand})"), samples, surfaces);
 }
+
+/// Probe: how the projection folds a run of message deltas.
+///
+/// A message a provider narrates as chunks must read as one body. When it does
+/// not, the transcript shows the stream's own chunk boundaries — one short line
+/// per chunk, sometimes cut mid-word — which is a projection question, not a
+/// rendering one. This prints the AgentMessage rows the fixture projects: how
+/// many there are, how long each body is, and how many items each absorbed.
+#[gpui::test]
+#[ignore = "performance probe: --ignored to run"]
+fn probe_message_delta_folding(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let Some(path) = probe_fixture() else {
+        return;
+    };
+    let items = load_items(&path);
+    let (workbench, _render_millis, cx) = build(cx, items, false);
+    workbench.read_with(cx, |workbench, _| {
+        let mut rows = Vec::new();
+        for turn in workbench.conversation_turns_cache.iter() {
+            for row in turn.process_rows.iter().chain(turn.conclusion_row.iter()) {
+                if row.kind != TimelineRowKind::AgentMessage {
+                    continue;
+                }
+                rows.push((
+                    row.body.len(),
+                    row.item_ids.len(),
+                    row.streaming,
+                    row.conclusion,
+                ));
+            }
+        }
+        let absorbed = rows.iter().map(|(_, items, _, _)| *items).sum::<usize>();
+        println!(
+            "probe message rows: {} for {} items (absorbed {absorbed})",
+            rows.len(),
+            workbench.timeline.items.len()
+        );
+        for (index, (len, items, streaming, conclusion)) in rows.iter().enumerate().take(24) {
+            println!(
+                "  row {index}: body={len} items={items} streaming={streaming} conclusion={conclusion}"
+            );
+        }
+    });
+}
