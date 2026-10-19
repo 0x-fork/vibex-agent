@@ -2842,32 +2842,278 @@ fn a_revealed_long_body_lays_out_only_the_chunks_the_screen_shows(cx: &mut TestA
             window.chunks.len().saturating_sub(1),
         )
     });
-    workbench.update(cx, |workbench, cx| {
-        workbench
-            .timeline_scroll
-            .set_offset(point(px(0.0), px(-(total_height * 0.85))));
-        cx.notify();
-    });
-    for _ in 0..4 {
-        cx.run_until_parked();
-        let _ = draw_live_timeline_frames(&workbench, cx, 1);
+    // Scroll until the end of the body is on screen. Where that is depends on
+    // the heights the chunks measure to, so the test walks to it rather than
+    // guessing a fraction of the table.
+    let mut reached = false;
+    let mut laid_out = 0;
+    let mut fraction = 0.5_f32;
+    while fraction <= 1.05 && !reached {
+        workbench.update(cx, |workbench, cx| {
+            workbench
+                .timeline_scroll
+                .set_offset(point(px(0.0), px(-(total_height * fraction))));
+            cx.notify();
+        });
+        for _ in 0..2 {
+            cx.run_until_parked();
+            let _ = draw_live_timeline_frames(&workbench, cx, 1);
+        }
+        (reached, laid_out) = workbench.read_with(cx, |workbench, _| {
+            let prefix = format!("markdown-chunk:{row_id}:");
+            (
+                workbench
+                    .markdown_text_states
+                    .contains_key(&format!("{prefix}{last_index}")),
+                workbench
+                    .markdown_text_states
+                    .keys()
+                    .filter(|key| key.starts_with(&prefix))
+                    .count(),
+            )
+        });
+        fraction += 0.1;
     }
-    let (laid_out, has_last) = workbench.read_with(cx, |workbench, _| {
+    assert!(reached, "the screen lays out the chunk it scrolled to");
+    assert!(
+        laid_out < chunk_count,
+        "and still only the band it shows: {laid_out} of {chunk_count}"
+    );
+}
+
+/// An answer that lands while its session is on screen stays open.
+///
+/// The reader is watching the turn finish: folding the answer at that instant
+/// hands them a control to press before they can read what just arrived. A turn
+/// that settles while the reader is elsewhere — every other test's shape —
+/// folds on its own, which is what the same row shows before the answer lands.
+#[gpui::test]
+fn an_answer_that_lands_on_screen_stays_open(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+    let long_answer: String = (0..400)
+        .map(|index| format!("paragraph {index} of the answer that just arrived\n\n"))
+        .collect();
+    assert!(long_answer.len() > TIMELINE_BODY_VISIBLE_BYTES);
+    let batch_session_id = session_id.clone();
+    let (view, cx) = cx.add_window_view({
+        let long_answer = long_answer.clone();
+        move |window, cx| {
+            let workbench = cx.new(|cx| {
+                let mut ui_state = DesktopUiStateV1::default();
+                ui_state.appearance.locale = LocaleMode::En;
+                ui_state.session.turn_preview_rail = false;
+                let mut workbench =
+                    VibexWorkbench::with_initial_state(None, ui_state, None, window, cx);
+                workbench.agent_loading = false;
+                workbench.selected_session_id = Some(session_id.clone());
+                workbench.view_session_id = Some(session_id.clone());
+                workbench.timeline.replace_authoritative(
+                    session_id.clone(),
+                    vec![
+                        live_timeline_item(
+                            1,
+                            TimelinePayload::UserMessage(UserMessagePayload {
+                                text: "question".into(),
+                                attachments: Vec::new(),
+                                ..Default::default()
+                            }),
+                        ),
+                        live_timeline_item(
+                            2,
+                            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                                text: long_answer.clone(),
+                                is_final: false,
+                            }),
+                        ),
+                    ],
+                );
+                workbench.upsert_session_snapshot(AgentSession {
+                    id: session_id.clone(),
+                    title: "Watched".into(),
+                    project_id: ProjectId::parse("project_probe").unwrap(),
+                    workspace_id: vibex_core::WorkspaceId::parse("workspace_probe").unwrap(),
+                    workspace_root: "/probe".into(),
+                    workspace_mode: WorkspaceMode::CurrentCheckout,
+                    agent_id: AgentId::parse("codex").unwrap(),
+                    state: AgentSessionState::Idle,
+                    safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    last_message_at_ms: 1,
+                    archived_at_ms: None,
+                    deleted_at_ms: None,
+                });
+                workbench.conversation_turns_cache_key = None;
+                workbench.rebuild_timeline_sizes();
+                workbench
+            });
+            LiveTimelineProbe { workbench }
+        }
+    });
+    let workbench = view.read_with(cx, |view, _| view.workbench.clone());
+    let _ = draw_live_timeline_frames(&workbench, cx, 2);
+    // The answer arrives, the way the live stream delivers it.
+    workbench.update(cx, |workbench, cx| {
+        workbench.apply_live_timeline_batch(
+            vec![TimelineLiveEvent {
+                session_id: batch_session_id.clone(),
+                sequence: 3,
+                item: live_timeline_item(
+                    3,
+                    TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                        text: long_answer.clone(),
+                        is_final: true,
+                    }),
+                ),
+            }],
+            cx,
+        );
+    });
+    let _ = draw_live_timeline_frames(&workbench, cx, 3);
+    let (row_id, full_body, foldable, revealed) = workbench.read_with(cx, |workbench, _| {
+        let turn = &workbench.conversation_turns_cache[0];
+        let row = turn
+            .conclusion_row
+            .as_ref()
+            .or_else(|| turn.process_rows.iter().max_by_key(|row| row.body.len()))
+            .expect("the finished turn holds its answer");
+        (
+            row.id.clone(),
+            row.body.len(),
+            workbench.row_body_folds(row),
+            workbench.timeline_row_body_revealed(&row.id),
+        )
+    });
+    assert!(
+        full_body > TIMELINE_BODY_VISIBLE_BYTES,
+        "the fixture's answer has to be long enough to fold: {full_body}"
+    );
+    assert!(
+        foldable,
+        "the answer is the kind of body that folds once its turn is done"
+    );
+    assert!(
+        revealed,
+        "the answer that landed in front of the reader is left open"
+    );
+    let (drawn, chunked) = workbench.read_with(cx, |workbench, _| {
         let prefix = format!("markdown-chunk:{row_id}:");
         (
+            workbench
+                .markdown_text_states
+                .get(&format!("markdown:{row_id}"))
+                .map(|state| state.source.len()),
             workbench
                 .markdown_text_states
                 .keys()
                 .filter(|key| key.starts_with(&prefix))
                 .count(),
-            workbench
-                .markdown_text_states
-                .contains_key(&format!("{prefix}{last_index}")),
         )
     });
-    assert!(has_last, "the screen lays out the chunk it scrolled to");
     assert!(
-        laid_out < chunk_count,
-        "and still only the band it shows: {laid_out} of {chunk_count}"
+        drawn.is_none(),
+        "the answer that landed on screen is not drawn as a folded head: {drawn:?}"
+    );
+    assert!(chunked > 0, "it is read whole, as chunks of itself");
+}
+
+/// Opening or folding a body leaves the reader's place on screen.
+///
+/// The control is under the reader's pointer, and following the bottom would
+/// grow the row upward: the text they were reading would slide out of view.
+#[gpui::test]
+fn a_body_toggle_leaves_the_screen_where_the_reader_left_it(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+    let mut items = Vec::new();
+    let mut sequence = 1_i64;
+    for turn in 0..6 {
+        items.push(live_timeline_item(
+            sequence,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+        ));
+        sequence += 1;
+        let body: String = (0..200)
+            .map(|index| {
+                format!(
+                    "answer {turn} paragraph {index} {}\n\n",
+                    "words ".repeat(20)
+                )
+            })
+            .collect();
+        items.push(live_timeline_item(
+            sequence,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: body,
+                is_final: true,
+            }),
+        ));
+        sequence += 1;
+    }
+    let (view, cx) = cx.add_window_view(move |window, cx| {
+        let workbench = cx.new(|cx| {
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            ui_state.session.turn_preview_rail = false;
+            let mut workbench =
+                VibexWorkbench::with_initial_state(None, ui_state, None, window, cx);
+            workbench.agent_loading = false;
+            workbench.selected_session_id = Some(session_id.clone());
+            workbench.view_session_id = Some(session_id.clone());
+            workbench
+                .timeline
+                .replace_authoritative(session_id.clone(), items);
+            workbench.conversation_turns_cache_key = None;
+            workbench.rebuild_timeline_sizes();
+            workbench.request_timeline_scroll_to_latest();
+            workbench
+        });
+        LiveTimelineProbe { workbench }
+    });
+    let workbench = view.read_with(cx, |view, _| view.workbench.clone());
+    let _ = draw_live_timeline_frames(&workbench, cx, 3);
+    // The reader is at the live edge when they open a body above it.
+    let (row_id, turn_id, before) = workbench.read_with(cx, |workbench, _| {
+        let turn = &workbench.conversation_turns_cache[0];
+        (
+            turn.conclusion_row
+                .as_ref()
+                .expect("the first turn's answer is a row")
+                .id
+                .clone(),
+            turn.id.clone(),
+            f32::from(workbench.timeline_scroll.offset().y),
+        )
+    });
+    assert!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .timeline_follow
+            .following_bottom),
+        "the fixture starts at the live edge"
+    );
+    workbench.update(cx, |workbench, cx| {
+        workbench.toggle_timeline_row_body(row_id.clone(), Some(turn_id.clone()), cx);
+    });
+    let _ = draw_live_timeline_frames(&workbench, cx, 3);
+    let (after, following, anchored) = workbench.read_with(cx, |workbench, _| {
+        (
+            f32::from(workbench.timeline_scroll.offset().y),
+            workbench.timeline_follow.following_bottom,
+            workbench.timeline_follow.has_anchor(),
+        )
+    });
+    assert!(
+        !following,
+        "opening a body hands the screen back to the reader"
+    );
+    assert!(anchored, "and the row they were reading is the anchor");
+    assert!(
+        (after - before).abs() <= 2.0,
+        "opening a body leaves the screen where it was: {before} then {after}"
     );
 }

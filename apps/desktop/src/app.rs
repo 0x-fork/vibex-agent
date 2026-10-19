@@ -90,6 +90,9 @@ use sha2::{Digest as _, Sha256};
 use similar::{ChangeTag, TextDiff};
 use timeline_loading::PreparedTimeline;
 #[cfg(test)]
+#[path = "perf_probe_tests.rs"]
+mod perf_probe_tests;
+#[cfg(test)]
 #[path = "team_tests.rs"]
 mod team_tests;
 #[cfg(test)]
@@ -9418,6 +9421,13 @@ pub struct VibexWorkbench {
     /// that asked for it — a thought body carries its own surface id, and one
     /// derived from the row would miss it.
     timeline_painted_markdown_surfaces: BTreeSet<String>,
+    /// How many Markdown surfaces this frame built.
+    ///
+    /// The performance probes (`perf_probe_tests`) read it: a frame's cost
+    /// follows what it lays out, so this is the number that says whether a
+    /// frame is paying for the screen or for something off it.
+    #[cfg(test)]
+    markdown_surfaces_built: usize,
     /// Unsent Composer content, one entry per session, kept outside the view
     /// cache.
     ///
@@ -10953,6 +10963,8 @@ impl VibexWorkbench {
             timeline_view: None,
             child_agent_rail_view: None,
             timeline_painted_markdown_surfaces: BTreeSet::new(),
+            #[cfg(test)]
+            markdown_surfaces_built: 0,
             composer_drafts: ComposerDraftStore::default(),
             pending_timeline_turn_measurements: BTreeMap::new(),
             pending_composer_geometries: BTreeMap::new(),
@@ -24629,8 +24641,22 @@ impl VibexWorkbench {
                 self.release_session_view_unweighed();
                 continue;
             }
+            // The answer that lands while its session is on screen is the one
+            // the reader is watching arrive; the view is borrowed here, so this
+            // is the one place its rows can be kept open by that fact.
+            let watched_final_answer = selected_session_id.as_ref() == Some(&session_id)
+                && batch.iter().any(|event| {
+                    timeline_live_event_is_well_formed(event)
+                        && matches!(
+                            &event.item.payload,
+                            TimelinePayload::AgentMessage(message) if message.is_final
+                        )
+                });
             let (changed, needs_refetch) =
                 self.apply_timeline_events_to_borrowed_view(&session_id, batch, cx);
+            if watched_final_answer {
+                self.keep_watched_turn_answer_open();
+            }
             self.release_session_view_unweighed();
             timeline_changed |= changed;
             if needs_refetch {
@@ -31547,6 +31573,10 @@ impl VibexWorkbench {
         // guessing their ids.
         self.timeline_painted_markdown_surfaces
             .insert(id.to_string());
+        #[cfg(test)]
+        {
+            self.markdown_surfaces_built += 1;
+        }
         let query = search.map(|highlight| highlight.query.clone());
         let active = search.is_some_and(|highlight| highlight.active);
         let owner = self.markdown_surface_owner();
@@ -53377,6 +53407,10 @@ impl VibexWorkbench {
         // is drawing on time. See
         // [`timeline_activity::observe_live_label_frame`].
         timeline_activity::observe_live_label_frame(window, cx);
+        #[cfg(test)]
+        {
+            self.markdown_surfaces_built = 0;
+        }
         if include_composer {
             // Elicitation forms are keyed by request id and owned by the session
             // that asked the question, so the focused view only settles its own
@@ -58174,6 +58208,34 @@ impl VibexWorkbench {
         timeline_row_body_folds(row, self.row_turn_is_live(row))
     }
 
+    /// Keep the answer of a turn that just finished on screen open.
+    ///
+    /// A turn that lands while its session is the one on screen is a turn the
+    /// reader is watching. Folding its answer at that instant hands them a
+    /// control to press before they can read what just arrived, so the answer is
+    /// left whole — with the control that folds it, for when they are done with
+    /// it. A turn that settles out of sight folds on its own, as before.
+    fn keep_watched_turn_answer_open(&mut self) {
+        let rows = {
+            let turns = self.conversation_turns_cached();
+            let Some(turn) = turns.last() else {
+                return;
+            };
+            turn.conclusion_row
+                .iter()
+                .chain(turn.process_rows.iter())
+                .filter(|row| {
+                    matches!(row.kind, TimelineRowKind::AgentMessage)
+                        && row.body.len() > TIMELINE_BODY_VISIBLE_BYTES
+                })
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>()
+        };
+        for row in rows {
+            self.timeline_body_reveal.insert(row, true);
+        }
+    }
+
     /// Whether the reader asked for a row's whole body.
     fn timeline_row_body_revealed(&self, row_id: &str) -> bool {
         self.timeline_body_reveal
@@ -58334,6 +58396,15 @@ impl VibexWorkbench {
         turn_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        // The reader asked to see more (or less) of one body. That is an
+        // instruction about the row they are on, not about the live edge:
+        // following the bottom would grow the row upward and lift the text they
+        // were reading out of view, and the anchor is not even captured while
+        // following. Leave the follow, keep the screen, and let the row change
+        // below the anchor.
+        if self.timeline_follow.following_bottom {
+            self.timeline_follow.set_following_bottom(false);
+        }
         self.capture_timeline_scroll_anchor();
         let revealed = self.timeline_row_body_revealed(&row_id);
         self.timeline_body_reveal.insert(row_id, !revealed);
@@ -58591,7 +58662,10 @@ impl VibexWorkbench {
                     // Answer metadata and hover actions share one footer row.
                     height += 36.0;
                 }
-                if hidden_body_bytes > 0 || body_windowed {
+                if hidden_body_bytes > 0
+                    || body_windowed
+                    || (self.timeline_row_body_revealed(&row.id) && self.row_body_folds(row))
+                {
                     height += TIMELINE_BODY_REVEAL_CONTROL_HEIGHT;
                 }
                 height
@@ -58618,7 +58692,10 @@ impl VibexWorkbench {
                                 chars_per_line,
                                 body_windowed,
                             ) + 4.0;
-                            if hidden > 0 || body_windowed {
+                            if hidden > 0
+                                || body_windowed
+                                || (self.reasoning_body_revealed(row) && self.row_body_folds(row))
+                            {
                                 height += TIMELINE_BODY_REVEAL_CONTROL_HEIGHT;
                             }
                             height
@@ -59666,8 +59743,11 @@ impl VibexWorkbench {
         let windowed_body = body_windowed.then(|| {
             self.render_windowed_body(row, markdown_source.clone(), search_highlight.clone(), cx)
         });
-        let body_reveal_control = (hidden_body_bytes > 0 || body_windowed)
-            .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
+        // An opened body is always collapsible again: the control is the way
+        // back even when the surface draws the whole of it.
+        let body_reveal_control =
+            (hidden_body_bytes > 0 || body_windowed || (body_revealed && self.row_body_folds(row)))
+                .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
         let markdown_view = (!body_windowed).then(|| {
             let arriving = self.row_is_arriving(row);
             let markdown_state = self.markdown_text_state(
@@ -60182,8 +60262,10 @@ impl VibexWorkbench {
                     .unwrap_or_else(|| Arc::<str>::from(""));
                 self.render_windowed_body(row, body, search_highlight.clone(), cx)
             });
-            let body_reveal_control = (hidden_body_bytes > 0 || body_windowed)
-                .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
+            let body_reveal_control = (hidden_body_bytes > 0
+                || body_windowed
+                || (body_revealed && self.row_body_folds(row)))
+            .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
             // The disclosure header is one short, muted line. Rendering it as a
             // second `MarkdownView` bought nothing but a second element tree,
             // keyed state entry, selection buffer and hitbox per reasoning row;
