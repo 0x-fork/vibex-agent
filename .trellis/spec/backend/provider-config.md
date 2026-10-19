@@ -5012,6 +5012,22 @@ ProviderConfigService::{
   field exists on any gateway contract, and `ModelGatewayRequestLog` carries no
   prompt, reply, image bytes, or Key material. It is pruned to a rolling seven
   days.
+- **The global Providers page reads the shared list.** `ManagementSnapshotPayload`
+  carries `model_provider_profiles` and `agent_model_provider_bindings` beside
+  the legacy `profiles`. The global page groups by Profile identity, so one
+  Provider appears once however many Agents bind it, and the "used by" line is
+  the bindings aggregated by `model_provider_profile_id`. The Agent-scoped list
+  stays during the compatibility window; it is what the Agent-scoped editor and
+  its drag ordering still read.
+- **Neither list is derived from the other.** The gateway's upstream picker uses
+  the v2 identity the settings store, and a client never computes one id from
+  the other; the authority resolves the pair once and publishes candidates.
+- **Concurrency and rate limits are per Key.** A lane bounds in-flight requests
+  and a rolling minute bounds request starts. A request that cannot start within
+  its own queue deadline is refused with `429` instead of waiting forever, and a
+  permit is released on drop so a cancelled request cannot leak capacity. These
+  guards bound what Vibex sends; they claim nothing about what the vendor
+  counted.
 - **The gateway accepts loopback callers only, and no browser.** The `Host`
   header must name `127.0.0.1`, `localhost`, or `::1`, and any `Origin` header is
   refused; the second check is what defeats a hostile page reaching the loopback
@@ -5041,6 +5057,10 @@ ProviderConfigService::{
 - Gateway settings skip or repeat a revision -> `model_gateway_settings_revision_invalid`
   / `model_gateway_settings_revision_conflict`.
 - A non-loopback `Host` or any `Origin` -> refused before routing.
+- A Key's queue is full, or the wait would exceed its deadline -> `429` before an
+  upstream call.
+- A Key's `max_concurrency` or `max_rpm` is zero -> `model_gateway_concurrency_invalid`
+  / `model_gateway_rpm_invalid` when the settings are validated.
 
 ### 5. Good / Base / Bad Cases
 
@@ -5074,7 +5094,20 @@ ProviderConfigService::{
   revision compare-and-swap, window bucketing, pin expiry, ledger retention, and
   that no prompt or Key text reaches the ledger.
 - `cargo test -p vibex-desktop gateway_surface_tests` asserts every gateway state
-  is named in words and that a gateway without a ready Key is not routable.
+  is named in words, that a gateway without a ready Key is not routable, that a
+  shared Provider appears once with every binding Agent named, that a deleted
+  binding drops out of that list, and that a cooldown names its remaining time.
+- `cargo test -p vibex-model-gateway limit` asserts the lane serializes, queues
+  within its bound, refuses when full or waited out, and that a minute allows
+  exactly its limit.
+- `cargo test -p vibex-model-gateway --test gateway` measures upstream overlap
+  directly: a limit of one yields a peak of one, and a companion case without a
+  limit shows the same load overlapping.
+- `cargo test -p vibex-config-switch` asserts that rotating an upstream Key
+  leaves the gateway-bound Agent's launch revision unchanged, while moving the
+  gateway's address moves it.
+- `cargo test -p vibex-tui --test config_center` asserts a preset-created
+  Provider keeps the preset's protocol and per-protocol addresses.
 - `cargo test -p vibex-tui --test config_center` asserts the gateway leads the
   Providers table with its Key and Agent summary, and that a missing gateway
   leaves the direct Providers readable.
