@@ -950,7 +950,13 @@ mod tests {
     fn every_action_kind_has_a_label() {
         // A raw `as_str()` token would be an English-only leak into the panel;
         // every kind the drawer can receive has a localized label instead.
-        for kind in [
+        //
+        // The comparison is against the translated locales, not English: several
+        // labels are spelled exactly like their token in English ("click",
+        // "scroll", "stop"), so comparing English could never tell a real
+        // translation from a fallback. What matters is that switching language
+        // changes the label away from the token.
+        let kinds = [
             ComputerActionKind::ListApps,
             ComputerActionKind::LaunchApp,
             ComputerActionKind::KillApp,
@@ -969,11 +975,30 @@ mod tests {
             ComputerActionKind::Pause,
             ComputerActionKind::Resume,
             ComputerActionKind::Unknown,
-        ] {
+        ];
+        use crate::locale::{self, ResolvedLocale};
+        use vibex_desktop_model::LocaleMode;
+
+        locale::apply_locale(LocaleMode::ZhCn);
+        for kind in kinds {
             let label = action_kind_label(kind);
             assert!(!label.is_empty(), "{kind:?} has no label");
-            assert_ne!(label, kind.as_str(), "{kind:?} fell back to its raw token");
+            assert_ne!(
+                label,
+                kind.as_str(),
+                "{kind:?} fell back to its raw token under ZhCn"
+            );
         }
+        locale::apply_locale(LocaleMode::ZhTw);
+        for kind in kinds {
+            assert_ne!(
+                action_kind_label(kind),
+                kind.as_str(),
+                "{kind:?} fell back to its raw token under ZhTw"
+            );
+        }
+        locale::apply_locale(LocaleMode::En);
+        assert_eq!(locale::current_locale(), ResolvedLocale::En);
     }
 
     #[test]
