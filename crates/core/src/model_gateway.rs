@@ -933,7 +933,96 @@ pub struct GatewaySettingsUpdateRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_limit: Option<GatewayTokenLimit>,
     pub upstreams: Vec<ModelProviderProfileId>,
+    /// Concurrency and rate limits per credential. An omitted entry leaves that
+    /// Key unlimited, and the whole map replaces the stored one.
+    #[serde(default)]
+    pub account_limits: BTreeMap<RequestId, GatewayAccountLimits>,
     pub expected_revision: i64,
+}
+
+/// The editor's question: what does the catalogue suggest for this model?
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCapabilitySuggestionRequest {
+    /// The catalogue's provider id, such as `deepseek`.
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+/// One suggested field, with how the match was made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayCapabilitySuggestion {
+    /// `contextTokens`, `outputTokens`, `reasoning`, `imageInput`, `pdfInput`,
+    /// or `temperature`.
+    pub fields: Vec<GatewayCapabilityField>,
+    /// The catalogue matched a longer id this one extends.
+    pub approximate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayCapabilityField {
+    pub field: String,
+    /// The value as the editor's own field spelling, so it can be shown without
+    /// a second mapping table.
+    pub value: String,
+}
+
+impl GatewayCapabilitySuggestion {
+    /// One suggested field's raw value.
+    pub fn field(&self, name: &str) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|entry| entry.field == name)
+            .map(|entry| entry.value.as_str())
+    }
+
+    /// A suggested numeric field.
+    pub fn number(&self, name: &str) -> Option<u32> {
+        self.field(name).and_then(|value| value.parse().ok())
+    }
+
+    /// A suggested boolean field.
+    pub fn flag(&self, name: &str) -> Option<bool> {
+        self.field(name).map(|value| value == "true")
+    }
+
+    /// Writes one suggested field into a declaration and records it as having
+    /// come from the catalogue.
+    ///
+    /// Adoption is a deliberate act on one field, so it is per field rather
+    /// than "apply everything". A field the suggestion does not carry is left
+    /// exactly as it was, and the return value says whether anything changed.
+    pub fn adopt(&self, capabilities: &mut crate::ProviderModelCapabilities, field: &str) -> bool {
+        let adopted = match field {
+            "contextTokens" => self
+                .number(field)
+                .map(|value| capabilities.context_tokens = Some(value)),
+            "outputTokens" => self
+                .number(field)
+                .map(|value| capabilities.output_tokens = Some(value)),
+            "reasoning" => self
+                .flag(field)
+                .map(|value| capabilities.reasoning = Some(value)),
+            "imageInput" => self
+                .flag(field)
+                .map(|value| capabilities.image_input = Some(value)),
+            "pdfInput" => self
+                .flag(field)
+                .map(|value| capabilities.pdf_input = Some(value)),
+            "temperature" => self
+                .flag(field)
+                .map(|value| capabilities.temperature = Some(value)),
+            _ => None,
+        };
+        if adopted.is_some() {
+            capabilities.set_source(field, crate::ModelCapabilitySource::Catalog);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Where one Provider Profile field lands in a gateway-aware editor.

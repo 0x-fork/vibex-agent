@@ -1381,6 +1381,22 @@ impl std::fmt::Display for ProviderModelReasoningEfforts {
     }
 }
 
+/// Where a declared capability value came from.
+///
+/// The runtime never infers a capability from a model id, endpoint, or vendor.
+/// A value either came from the user's own declaration or from a maintained
+/// catalogue the user explicitly adopted, and the difference survives so a
+/// projection can prefer the former.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCapabilitySource {
+    /// The user typed or confirmed it.
+    #[default]
+    Declared,
+    /// The user adopted the catalogue's suggestion for this field.
+    Catalog,
+}
+
 /// Explicitly declared per-Model runtime capabilities.
 ///
 /// Every field is tri-state. `None` means "not declared", never "unsupported":
@@ -1416,12 +1432,39 @@ pub struct ProviderModelCapabilities {
     /// answer in place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_efforts: Option<ProviderModelReasoningEfforts>,
+    /// Per-field provenance, for the values adopted from a catalogue.
+    ///
+    /// An absent entry means `Declared`, which keeps older records readable and
+    /// keeps a hand-typed value authoritative without a migration.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sources: BTreeMap<String, ModelCapabilitySource>,
 }
 
 impl ProviderModelCapabilities {
     /// True when no capability was declared, so projections emit nothing.
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// The fields a catalogue suggested and the user adopted.
+    pub fn adopted_from_catalog(&self) -> impl Iterator<Item = &str> {
+        self.sources
+            .iter()
+            .filter(|(_, source)| **source == ModelCapabilitySource::Catalog)
+            .map(|(field, _)| field.as_str())
+    }
+
+    /// Marks one field as adopted from a catalogue, or as the user's own.
+    pub fn set_source(&mut self, field: impl Into<String>, source: ModelCapabilitySource) {
+        let field = field.into();
+        match source {
+            ModelCapabilitySource::Declared => {
+                self.sources.remove(&field);
+            }
+            ModelCapabilitySource::Catalog => {
+                self.sources.insert(field, source);
+            }
+        }
     }
 }
 

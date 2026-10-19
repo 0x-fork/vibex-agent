@@ -5028,6 +5028,23 @@ ProviderConfigService::{
   permit is released on drop so a cancelled request cannot leak capacity. These
   guards bound what Vibex sends; they claim nothing about what the vendor
   counted.
+- **A catalogue value is data, not inference.** `crates/model-catalog` reads a
+  maintained table of model metadata. The Provider rule against inferring a
+  capability from a model id, endpoint, or vendor is untouched: the catalogue is
+  a second *source of data*, the same kind of statement a user makes by typing a
+  value. Three constraints follow:
+  - A value is only ever a **suggestion**. Nothing is applied until the user
+    adopts that field, and the adoption is recorded per field in
+    `ProviderModelCapabilities::sources`; an absent entry means `Declared`, so
+    older records stay authoritative without a migration.
+  - A hand-typed value always wins and loses its catalogue mark.
+  - Every failure is silent. A catalogue that cannot be fetched, parsed, stored,
+    or read yields no suggestion and changes nothing else; a stale document still
+    suggests, but its matches are marked approximate.
+  - `reasoning_efforts` is never suggested. The catalogue does not publish an
+    Agent's own effort vocabulary, and inventing one produces a declaration the
+    Agent refuses.
+  - No money field exists anywhere in the catalogue, its cache, or its DTOs.
 - **The gateway accepts loopback callers only, and no browser.** The `Host`
   header must name `127.0.0.1`, `localhost`, or `::1`, and any `Origin` header is
   refused; the second check is what defeats a hostile page reaching the loopback
@@ -5093,6 +5110,10 @@ ProviderConfigService::{
 - `cargo test -p vibex-db model_gateway` asserts migration 64 idempotency,
   revision compare-and-swap, window bucketing, pin expiry, ledger retention, and
   that no prompt or Key text reaches the ledger.
+- `cargo test -p vibex-model-catalog` asserts exact and approximate matching, that
+  adoption records provenance per field, that a hand-typed value is not
+  overwritten, that `reasoning_efforts` is never suggested, that a corrupt or
+  older-schema cache reads as missing, and that no cached field carries money.
 - `cargo test -p vibex-desktop gateway_surface_tests` asserts every gateway state
   is named in words, that a gateway without a ready Key is not routable, that a
   shared Provider appears once with every binding Agent named, that a deleted

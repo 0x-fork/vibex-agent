@@ -6912,6 +6912,7 @@ mod tests {
     fn opencode_overlay_projects_declared_model_capabilities() {
         let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
         provider.configured_models[0].capabilities = ProviderModelCapabilities {
+            sources: Default::default(),
             reasoning: Some(true),
             temperature: Some(false),
             image_input: Some(true),
@@ -6949,6 +6950,7 @@ mod tests {
     fn opencode_overlay_projects_image_input_without_pdf() {
         let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
         provider.configured_models[0].capabilities = ProviderModelCapabilities {
+            sources: Default::default(),
             image_input: Some(true),
             ..ProviderModelCapabilities::default()
         };
@@ -6972,6 +6974,7 @@ mod tests {
     fn opencode_overlay_omits_partial_token_limits() {
         let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
         provider.configured_models[0].capabilities = ProviderModelCapabilities {
+            sources: Default::default(),
             context_tokens: Some(1_000_000),
             ..ProviderModelCapabilities::default()
         };
@@ -6991,6 +6994,7 @@ mod tests {
     fn opencode_overlay_projects_explicitly_disabled_capabilities() {
         let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
         provider.configured_models[0].capabilities = ProviderModelCapabilities {
+            sources: Default::default(),
             reasoning: Some(false),
             image_input: Some(false),
             ..ProviderModelCapabilities::default()

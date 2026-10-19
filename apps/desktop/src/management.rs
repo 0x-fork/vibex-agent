@@ -964,6 +964,17 @@ pub struct ManagementCenter {
     selected_global_provider_id: Option<String>,
     /// The gateway's most recent requests, as the authority recorded them.
     gateway_requests: Vec<vibex_core::GatewayRequestSummary>,
+    /// Per-credential limit drafts, keyed by credential id. Created on demand
+    /// so a Key with no limit has no inputs at all.
+    gateway_limit_inputs: BTreeMap<String, GatewayLimitInputs>,
+    /// A rejected limit field, shown beside the Key it belongs to.
+    gateway_limits_error: Option<String>,
+    /// The catalogue's suggestion for the Model currently being edited.
+    ///
+    /// It is only ever a suggestion: nothing here is applied until the user
+    /// presses the field's own adopt control, and a failed or missing lookup
+    /// simply leaves this empty.
+    model_capability_suggestion: Option<vibex_core::GatewayCapabilitySuggestion>,
     native_exports: Vec<vibex_core::ProviderNativeExportRecordSummary>,
     native_export_source: vibex_core::ProviderNativeExportSource,
     native_export_mode: vibex_core::ProviderNativeExportMode,
@@ -1954,6 +1965,9 @@ impl ManagementCenter {
             providers: Vec::new(),
             provider_bindings: Vec::new(),
             gateway_requests: Vec::new(),
+            gateway_limit_inputs: BTreeMap::new(),
+            gateway_limits_error: None,
+            model_capability_suggestion: None,
             selected_global_provider_id: None,
             profile_editor_open: false,
             editing_profile_id: None,
@@ -5594,12 +5608,79 @@ impl ManagementCenter {
             .iter()
             .position(|model| model.id == model_id)
         {
-            Some(index) => self.load_profile_model_editor(index, window, cx),
+            Some(index) => {
+                self.load_profile_model_editor(index, window, cx);
+                self.request_model_capability_suggestion(cx);
+            }
             None => {
                 self.clear_profile_model_editor(window, cx);
                 cx.notify();
             }
         }
+    }
+
+    /// Asks the authority what the catalogue suggests for the Model in the
+    /// settings pane.
+    ///
+    /// The answer is advisory and may be absent for any reason, so a failure
+    /// clears the suggestion instead of surfacing an error: a catalogue that
+    /// cannot answer must not look like a broken editor.
+    fn request_model_capability_suggestion(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let model_id = self
+            .profile_model_edit_id
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if model_id.is_empty() {
+            self.model_capability_suggestion = None;
+            return;
+        }
+        // The catalogue is keyed by provider slug, which is what the preset id
+        // records; a hand-made Provider simply gets no suggestion.
+        let provider_id = self
+            .profile_provider_options
+            .entries
+            .iter()
+            .find(|entry| entry.key == "catalogId")
+            .map(|entry| entry.value.clone())
+            .unwrap_or_else(|| {
+                let name = self.profile_name.read(cx).value().to_lowercase();
+                name.chars()
+                    .map(|character| {
+                        if character.is_ascii_alphanumeric() {
+                            character
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect::<String>()
+                    .trim_matches('-')
+                    .to_string()
+            });
+        if provider_id.is_empty() {
+            return;
+        }
+        self.model_capability_suggestion = None;
+        let entity = cx.weak_entity();
+        self.profile_secret_task = Some(cx.spawn(async move |_, cx| {
+            let suggestion = backend
+                .management()
+                .model_capability_suggestion(vibex_core::ModelCapabilitySuggestionRequest {
+                    provider_id,
+                    model_id,
+                })
+                .await
+                .ok()
+                .flatten();
+            let _ = entity.update(cx, |this, cx| {
+                this.model_capability_suggestion = suggestion;
+                cx.notify();
+            });
+        }));
     }
 
     /// Points the settings pane's fields at the Model the pane is showing.
@@ -5617,6 +5698,7 @@ impl ManagementCenter {
 
     /// Empties the settings pane, for a selection the draft no longer holds.
     fn clear_profile_model_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.model_capability_suggestion = None;
         self.profile_model_edit_wire_api = None;
         self.profile_model_edit_reasoning_disabled = false;
         self.profile_model_edit_error = None;
@@ -11285,6 +11367,10 @@ impl ManagementCenter {
             pin: snapshot.settings.policy.pin,
             token_limit: snapshot.settings.policy.token_limit,
             upstreams: snapshot.settings.upstreams.clone(),
+            // Every unrelated edit carries the stored limits forward: the write
+            // replaces the whole map, so omitting them would silently clear a
+            // limit the user set earlier.
+            account_limits: snapshot.settings.policy.account_limits.clone(),
             expected_revision: snapshot.settings.revision,
         };
         update(&mut request);
@@ -11481,7 +11567,144 @@ impl ManagementCenter {
 
     /// The gateway's panel: runtime state, routing policy, upstreams, and the
     /// Agents that walk through it.
-    fn render_gateway(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// The two limit fields for one Key, with its current values.
+    fn render_gateway_key_limits(
+        &mut self,
+        key: &vibex_core::GatewayKeySummary,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let credential_id = key.credential_id.as_str().to_string();
+        if !self.gateway_limit_inputs.contains_key(&credential_id) {
+            let limits = key.limits.unwrap_or_default();
+            let concurrency = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(management_locale_text("unlimited", "不限", "不限"))
+                    .default_value(
+                        limits
+                            .max_concurrency
+                            .map(|value| value.to_string())
+                            .unwrap_or_default(),
+                    )
+            });
+            let rpm = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(management_locale_text("unlimited", "不限", "不限"))
+                    .default_value(
+                        limits
+                            .max_rpm
+                            .map(|value| value.to_string())
+                            .unwrap_or_default(),
+                    )
+            });
+            self.gateway_limit_inputs.insert(
+                credential_id.clone(),
+                GatewayLimitInputs { concurrency, rpm },
+            );
+        }
+        let Some(inputs) = self.gateway_limit_inputs.get(&credential_id) else {
+            return div().into_any_element();
+        };
+        let concurrency = inputs.concurrency.clone();
+        let rpm = inputs.rpm.clone();
+        let credential_for_save = key.credential_id.clone();
+        let show_error = self.gateway_limits_error.as_deref();
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .pl_3()
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(management_field_label(management_locale_text(
+                                "At once",
+                                "并发上限",
+                                "並發上限",
+                            )))
+                            .child(Input::new(&concurrency).small().w_full()),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(management_field_label(management_locale_text(
+                                "Per minute",
+                                "每分钟请求",
+                                "每分鐘請求",
+                            )))
+                            .child(Input::new(&rpm).small().w_full()),
+                    )
+                    .child(
+                        div().pt_4().child(
+                            Button::new(SharedString::from(format!(
+                                "management-gateway-limit-save-{credential_id}"
+                            )))
+                            .xsmall()
+                            .outline()
+                            .label(management_locale_text("Save", "保存", "儲存"))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.save_gateway_key_limits(credential_for_save.clone(), cx)
+                                },
+                            )),
+                        ),
+                    ),
+            )
+            .children(show_error.map(|message| {
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(message.to_string())
+            }))
+            .into_any_element()
+    }
+
+    /// Writes one Key's limits, keeping every other Key's as they are.
+    fn save_gateway_key_limits(
+        &mut self,
+        credential_id: vibex_core::RequestId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(inputs) = self.gateway_limit_inputs.get(credential_id.as_str()) else {
+            return;
+        };
+        let concurrency = parse_optional_limit(inputs.concurrency.read(cx).value().as_str());
+        let rpm = parse_optional_limit(inputs.rpm.read(cx).value().as_str());
+        let (concurrency, rpm) = match (concurrency, rpm) {
+            (Ok(concurrency), Ok(rpm)) => (concurrency, rpm),
+            (Err(message), _) | (_, Err(message)) => {
+                self.gateway_limits_error = Some(message.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let limits = vibex_core::GatewayAccountLimits {
+            max_concurrency: concurrency,
+            max_rpm: rpm,
+            ..vibex_core::GatewayAccountLimits::default()
+        };
+        self.gateway_limits_error = None;
+        self.update_gateway_settings(
+            move |request| {
+                if limits.is_configured() {
+                    request.account_limits.insert(credential_id, limits);
+                } else {
+                    request.account_limits.remove(&credential_id);
+                }
+            },
+            cx,
+        );
+    }
+
+    fn render_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let snapshot = self.gateway.clone();
         let pending = self.mutation.is_some();
         let status = &snapshot.runtime;
@@ -11702,26 +11925,10 @@ impl ManagementCenter {
                         )
                         .child(gateway_key_state_badge(key, cx)),
                 );
-                if let Some(limits) = key.limits.filter(|limits| limits.is_configured()) {
-                    let mut parts = Vec::new();
-                    if let Some(concurrency) = limits.max_concurrency {
-                        parts.push(format!(
-                            "{concurrency} {}",
-                            management_locale_text("at once", "并发", "並發")
-                        ));
-                    }
-                    if let Some(rpm) = limits.max_rpm {
-                        parts.push(format!("{rpm} RPM"));
-                    }
-                    if !parts.is_empty() {
-                        key_rows = key_rows.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(parts.join(" · ")),
-                        );
-                    }
-                }
+                // The limits are editable here rather than read-only: a Key
+                // can be busy without being broken, and the only place a user
+                // can tell the gateway so is beside the Key it applies to.
+                key_rows = key_rows.child(self.render_gateway_key_limits(key, window, cx));
             }
             if upstream.keys.is_empty() {
                 key_rows = key_rows.child(div().text_xs().text_color(cx.theme().warning).child(
@@ -11992,7 +12199,7 @@ impl ManagementCenter {
                 self.render_providers(window, cx)
             }
             ManagementSection::Providers => self.render_provider_page(cx),
-            ManagementSection::Gateway => self.render_gateway(cx),
+            ManagementSection::Gateway => self.render_gateway(window, cx),
             ManagementSection::Mcp => self.render_mcp(cx),
             ManagementSection::Skills => self.render_skills(cx),
             ManagementSection::PromptsHooks => self.render_prompts(cx),
@@ -15114,6 +15321,7 @@ impl ManagementCenter {
                     pending,
                     cx,
                 ))
+                .children(self.render_capability_suggestions(index, cx))
                 .child(management_field_hint(
                     management_locale_text(
                         "Click a value to declare it and click it again to clear it, or type any other count. Empty keeps the Agent's own default; only Agents that read a declared limit are affected.",
@@ -15127,6 +15335,165 @@ impl ManagementCenter {
         ));
 
         editor.into_any_element()
+    }
+
+    /// The catalogue's suggestions, one row per field with its own adopt
+    /// control.
+    ///
+    /// Nothing here applies by itself: a suggestion is a value the user may
+    /// take, and a field they already declared is shown with a way back to
+    /// their own value rather than being overwritten.
+    fn render_capability_suggestions(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Some(suggestion) = self.model_capability_suggestion.clone() else {
+            return Vec::new();
+        };
+        let approximate = suggestion.approximate;
+        let mut rows = Vec::new();
+        for field in suggestion.fields {
+            let label = match field.field.as_str() {
+                "contextTokens" => {
+                    management_locale_text("Context window", "上下文窗口", "上下文視窗")
+                }
+                "outputTokens" => management_locale_text("Max output", "最大输出", "最大輸出"),
+                "reasoning" => management_locale_text("Reasoning", "推理", "推理"),
+                "imageInput" => management_locale_text("Images", "图片输入", "圖片輸入"),
+                "pdfInput" => management_locale_text("PDF", "PDF 输入", "PDF 輸入"),
+                "temperature" => management_locale_text("Temperature", "温度参数", "溫度參數"),
+                _ => continue,
+            };
+            let field_key = field.field.clone();
+            let suggested = field.value.clone();
+            rows.push(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "{} · {} {}{}",
+                                label,
+                                management_locale_text("suggested", "目录建议", "目錄建議"),
+                                suggested,
+                                if approximate {
+                                    management_locale_text(
+                                        " (approximate)",
+                                        "（近似匹配）",
+                                        "（近似比對）",
+                                    )
+                                } else {
+                                    ""
+                                }
+                            )),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "provider-model-adopt-{index}-{field_key}"
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .label(if approximate {
+                            management_locale_text(
+                                "Apply (approximate)",
+                                "采用（近似匹配）",
+                                "採用（近似比對）",
+                            )
+                        } else {
+                            management_locale_text("Apply", "采用", "採用")
+                        })
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.adopt_capability_field(field_key.clone(), window, cx)
+                            },
+                        )),
+                    )
+                    .into_any_element(),
+            );
+        }
+        // A source label, so an adopted value is never mistaken for a hand-typed
+        // one later.
+        if !rows.is_empty()
+            && self
+                .profile_configured_models
+                .get(index)
+                .is_some_and(|model| model.capabilities.adopted_from_catalog().next().is_some())
+        {
+            rows.push(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Some values came from the catalogue.",
+                        "部分数值来自模型目录。",
+                        "部分數值來自模型目錄。",
+                    ))
+                    .into_any_element(),
+            );
+        }
+        rows
+    }
+
+    /// Adopts one suggested field into the Model being edited.
+    ///
+    /// The value is written into the same field the user would type into, and
+    /// its provenance is recorded so a projection can tell it from a
+    /// declaration. Clearing the field afterwards returns it to `Declared`.
+    fn adopt_capability_field(
+        &mut self,
+        field: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(suggestion) = self.model_capability_suggestion.clone() else {
+            return;
+        };
+        let Some(index) = self.selected_profile_model_index() else {
+            return;
+        };
+        let Some(model) = self.profile_configured_models.get_mut(index) else {
+            return;
+        };
+        // An explicit adoption is the user's decision on a field, so it may
+        // replace a previously adopted value; it never silently replaces a
+        // value the user typed, because the control is only offered while the
+        // field is empty.
+        // The declaration owns the mapping from a suggested field to itself, so
+        // the editor does not grow a second copy of it.
+        let mut capabilities = model.capabilities.clone();
+        if !suggestion.adopt(&mut capabilities, &field) {
+            return;
+        }
+        model.capabilities = capabilities;
+        // The visible fields follow the declaration they now hold.
+        match field.as_str() {
+            "contextTokens" => {
+                if let Some(value) = model.capabilities.context_tokens {
+                    self.profile_model_edit_context_tokens
+                        .update(cx, |state, cx| {
+                            state.set_value(value.to_string(), window, cx)
+                        });
+                }
+            }
+            "outputTokens" => {
+                if let Some(value) = model.capabilities.output_tokens {
+                    self.profile_model_edit_output_tokens
+                        .update(cx, |state, cx| {
+                            state.set_value(value.to_string(), window, cx)
+                        });
+                }
+            }
+            _ => {}
+        }
+        self.navigation.mark_dirty(ManagementSection::Agents, true);
+        cx.notify();
     }
 
     /// Checks or unchecks every picker row the current search shows.
@@ -23235,6 +23602,28 @@ fn shared_provider_rows(
     rows
 }
 
+/// The two limit fields for one Key.
+struct GatewayLimitInputs {
+    concurrency: Entity<InputState>,
+    rpm: Entity<InputState>,
+}
+
+/// Reads one optional count from a limit field.
+///
+/// An empty field means "no limit", never zero: a zero limit would forbid every
+/// request, which is not what clearing the box means.
+fn parse_optional_limit(value: &str) -> Result<Option<u32>, &'static str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    match value.parse::<u32>() {
+        Ok(count) if count > 0 => Ok(Some(count)),
+        Ok(_) => Err("must be greater than zero"),
+        Err(_) => Err("must be a whole number"),
+    }
+}
+
 /// One row of the global Providers page.
 #[derive(Clone)]
 struct SharedProviderRow {
@@ -29250,11 +29639,7 @@ mod tests {
             .expect("Model settings pane should remain inspectable");
         let editor = source
             .split_once("    fn render_profile_model_editor(")
-            .and_then(|(_, tail)| {
-                tail.split_once(
-                    "\n    /// Checks or unchecks every picker row the current search shows.",
-                )
-            })
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_capability_suggestions("))
             .map(|(body, _)| body)
             .expect("Model editor should remain inspectable");
 
@@ -31145,6 +31530,102 @@ mod gateway_surface_tests {
         assert_eq!(
             gateway_runtime_text(&disabled),
             "Automatic routing is turned off"
+        );
+    }
+
+    /// An adopted suggestion is recorded as coming from the catalogue, and a
+    /// hand-typed value is not.
+    ///
+    /// This is the rule the Provider spec states in terms of inference: a
+    /// catalogue value is data the user adopted, so it must be distinguishable
+    /// from a declaration rather than indistinguishable from one.
+    #[test]
+    fn an_adopted_value_is_marked_as_catalog_and_a_typed_one_is_not() {
+        use vibex_core::{ModelCapabilitySource, ProviderModelCapabilities};
+        let mut capabilities = ProviderModelCapabilities {
+            context_tokens: Some(128_000),
+            ..ProviderModelCapabilities::default()
+        };
+        capabilities.set_source("contextTokens", ModelCapabilitySource::Catalog);
+        assert_eq!(
+            capabilities.adopted_from_catalog().collect::<Vec<_>>(),
+            vec!["contextTokens"]
+        );
+
+        // The user edits the field: the value stays, the provenance goes.
+        capabilities.context_tokens = Some(64_000);
+        capabilities.set_source("contextTokens", ModelCapabilitySource::Declared);
+        assert!(
+            capabilities.adopted_from_catalog().next().is_none(),
+            "a hand-typed value must not still claim to be from the catalogue"
+        );
+        assert_eq!(capabilities.context_tokens, Some(64_000));
+    }
+
+    /// A catalogue value never reaches the projection without the user acting.
+    ///
+    /// An empty suggestion leaves every capability undeclared, which is what
+    /// "no catalogue" must look like: nothing invented, nothing guessed from a
+    /// model id.
+    #[test]
+    fn an_absent_suggestion_declares_nothing() {
+        let capabilities = vibex_core::ProviderModelCapabilities::default();
+        assert!(capabilities.is_empty());
+        assert!(capabilities.adopted_from_catalog().next().is_none());
+    }
+
+    /// A limit field is "no limit" when empty, never zero.
+    ///
+    /// A zero would forbid every request, which is not what clearing the box
+    /// means; and a stored zero would make a Key permanently unusable with no
+    /// visible reason.
+    #[test]
+    fn an_empty_limit_field_means_unlimited_not_zero() {
+        assert_eq!(parse_optional_limit(""), Ok(None));
+        assert_eq!(parse_optional_limit("   "), Ok(None));
+        assert_eq!(parse_optional_limit("4"), Ok(Some(4)));
+        assert_eq!(parse_optional_limit(" 60 "), Ok(Some(60)));
+        assert!(parse_optional_limit("0").is_err());
+        assert!(parse_optional_limit("-1").is_err());
+        assert!(parse_optional_limit("many").is_err());
+    }
+
+    /// Every unrelated gateway edit carries the stored limits forward.
+    ///
+    /// The settings write replaces the whole limit map, so a routing change made
+    /// from the same page must not silently clear a limit set earlier.
+    #[test]
+    fn a_settings_change_keeps_the_stored_limits() {
+        let credential = vibex_core::RequestId::new();
+        let mut limits = std::collections::BTreeMap::new();
+        limits.insert(
+            credential.clone(),
+            vibex_core::GatewayAccountLimits {
+                max_concurrency: Some(2),
+                max_rpm: Some(30),
+                ..vibex_core::GatewayAccountLimits::default()
+            },
+        );
+        let policy = vibex_core::GatewayPolicy {
+            account_limits: limits.clone(),
+            ..vibex_core::GatewayPolicy::default()
+        };
+        let request = vibex_core::GatewaySettingsUpdateRequest {
+            display_name: "Vibex Gateway".to_string(),
+            routing: vibex_core::GatewayRoutingStrategy::RoundRobin,
+            pin: vibex_core::GatewayPinScope::Conversation,
+            token_limit: None,
+            upstreams: Vec::new(),
+            account_limits: policy.account_limits.clone(),
+            expected_revision: 1,
+        };
+        assert_eq!(
+            request.account_limits.get(&credential),
+            Some(&vibex_core::GatewayAccountLimits {
+                max_concurrency: Some(2),
+                max_rpm: Some(30),
+                ..vibex_core::GatewayAccountLimits::default()
+            })
         );
     }
 

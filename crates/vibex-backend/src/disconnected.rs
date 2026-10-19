@@ -813,6 +813,13 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn model_capability_suggestion(
+        &self,
+        _request: vibex_core::ModelCapabilitySuggestionRequest,
+    ) -> BackendFuture<'_, Option<vibex_core::GatewayCapabilitySuggestion>> {
+        disconnected_future!()
+    }
+
     fn model_gateway_snapshot(&self) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
         disconnected_future!()
     }

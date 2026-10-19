@@ -32381,6 +32381,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:vibex-model-catalog@0.1.0-rc.8:1bc02d71b534700b",
+      "name": "vibex-model-catalog",
+      "version": "0.1.0-rc.8",
+      "licenses": [
+        {
+          "expression": "AGPL-3.0-or-later"
+        }
+      ],
+      "purl": "pkg:cargo/vibex-model-catalog@0.1.0-rc.8",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "path:crates/model-catalog"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "AGPL-3.0-or-later"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/vibex-ai/vibex"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:vibex-model-gateway@0.1.0-rc.8:5811db0c4b687e85",
       "name": "vibex-model-gateway",
       "version": "0.1.0-rc.8",
@@ -47154,6 +47190,7 @@
         "cargo:vibex-diagnostics@0.1.0-rc.8:f071779acd132fc6",
         "cargo:vibex-fs@0.1.0-rc.8:9fbf48bd55955db3",
         "cargo:vibex-git@0.1.0-rc.8:b6ca7a78bc73d037",
+        "cargo:vibex-model-catalog@0.1.0-rc.8:1bc02d71b534700b",
         "cargo:vibex-model-gateway@0.1.0-rc.8:5811db0c4b687e85",
         "cargo:vibex-relay@0.1.0-rc.8:0c0a0267098c7864",
         "cargo:vibex-remote@0.1.0-rc.8:b2402acf3d0333d8",
@@ -47262,6 +47299,16 @@
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
+        "cargo:vibex-core@0.1.0-rc.8:a1f32ad3e304847a"
+      ]
+    },
+    {
+      "ref": "cargo:vibex-model-catalog@0.1.0-rc.8:1bc02d71b534700b",
+      "dependsOn": [
+        "cargo:reqwest@0.13.4:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_json@1.0.150:c19b7c6f923b580a",
+        "cargo:thiserror@2.0.18:c19b7c6f923b580a",
         "cargo:vibex-core@0.1.0-rc.8:a1f32ad3e304847a"
       ]
     },

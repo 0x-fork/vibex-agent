@@ -10166,6 +10166,7 @@ dependencies = [
  "vibex-diagnostics",
  "vibex-fs",
  "vibex-git",
+ "vibex-model-catalog",
  "vibex-model-gateway",
  "vibex-relay",
  "vibex-remote",
@@ -10251,6 +10252,17 @@ dependencies = [
  "vibex-remote-client",
  "vibex-terminal-ui",
  "vibex-ui",
+]
+
+[[package]]
+name = "vibex-model-catalog"
+version = "0.1.0-rc.8"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "vibex-core",
 ]
 
 [[package]]

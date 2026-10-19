@@ -25,19 +25,20 @@ use vibex_core::{
     AutomationRunStep, AutomationRunStepListRequest, BackupCreateOutcome, BackupCreatePayload,
     BackupInspectOutcome, BackupInspectPayload, BackupRestoreOutcome, BackupRestorePayload,
     CustomAgentCreateRequest, CustomAgentDeleteRequest, DiagnosticExportOutcome,
-    DiagnosticExportPayload, GatewayAgentUpdateRequest, GatewayRequestSummary,
-    GatewaySettingsUpdateRequest, GatewaySnapshot, Hook, HookCreateRequest, HookDeleteRequest,
-    HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload,
-    McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
-    McpMarketSearchResponse, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
-    McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
-    McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
-    McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
-    McpServerValidationResult, ModelProviderProfile, ModelProviderProfileCreateRequest,
-    ModelProviderProfileUpdateRequest, Prompt, PromptCreateRequest, PromptDeleteRequest,
-    PromptUpdateRequest, PromptUsage, PromptUsageRecordRequest, PromptValidateRequest,
-    PromptValidationResult, ProviderCapabilitySummary, ProviderCredentialSecretMutationRequest,
-    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    DiagnosticExportPayload, GatewayAgentUpdateRequest, GatewayCapabilitySuggestion,
+    GatewayRequestSummary, GatewaySettingsUpdateRequest, GatewaySnapshot, Hook, HookCreateRequest,
+    HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest,
+    ManagementSnapshotPayload, McpMarketInstallRequest, McpMarketInstallResult,
+    McpMarketSearchRequest, McpMarketSearchResponse, McpServer, McpServerAgentMatrix,
+    McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
+    McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
+    McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
+    McpServerValidateRequest, McpServerValidationResult, ModelCapabilitySuggestionRequest,
+    ModelProviderProfile, ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest,
+    Prompt, PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptUsage,
+    PromptUsageRecordRequest, PromptValidateRequest, PromptValidationResult,
+    ProviderCapabilitySummary, ProviderCredentialSecretMutationRequest, ProviderHealthSummary,
+    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
     ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
@@ -153,6 +154,15 @@ pub trait ManagementBackend: BackendBound {
     ) -> BackendFuture<'_, ProviderProfileSummary>;
 
     fn list_model_provider_profiles(&self) -> BackendFuture<'_, Vec<ModelProviderProfile>>;
+
+    /// The catalogue's suggestion for one model, when a catalogue is cached.
+    ///
+    /// This never blocks on the network: a missing or stale catalogue answers
+    /// `None`, and the editor simply shows no suggestions.
+    fn model_capability_suggestion(
+        &self,
+        request: ModelCapabilitySuggestionRequest,
+    ) -> BackendFuture<'_, Option<GatewayCapabilitySuggestion>>;
 
     /// Reads the whole gateway surface: its settings, the listener state, its
     /// upstreams and Keys, and which Agents currently walk through it.

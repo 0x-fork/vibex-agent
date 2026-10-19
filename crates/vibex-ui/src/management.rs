@@ -1826,6 +1826,13 @@ mod tests {
             error_future()
         }
 
+        fn model_capability_suggestion(
+            &self,
+            _request: vibex_core::ModelCapabilitySuggestionRequest,
+        ) -> BackendFuture<'_, Option<vibex_core::GatewayCapabilitySuggestion>> {
+            error_future()
+        }
+
         fn model_gateway_snapshot(&self) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
             error_future()
         }

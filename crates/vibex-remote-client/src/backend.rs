@@ -3971,6 +3971,24 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn model_capability_suggestion(
+        &self,
+        request: vibex_core::ModelCapabilitySuggestionRequest,
+    ) -> BackendFuture<'_, Option<vibex_core::GatewayCapabilitySuggestion>> {
+        self.gateway_rpc(
+            vibex_core::RemoteProviderRequest::ModelCapabilitySuggestion(
+                vibex_core::RemoteModelCapabilitySuggestionRequest {
+                    auth: self.auth(),
+                    request,
+                },
+            ),
+            |value| {
+                decode::<vibex_core::RemoteModelCapabilitySuggestionResponse>(value)
+                    .map(|response| response.suggestion)
+            },
+        )
+    }
+
     fn model_gateway_snapshot(&self) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
         self.gateway_rpc(
             vibex_core::RemoteProviderRequest::ModelGatewaySnapshot(

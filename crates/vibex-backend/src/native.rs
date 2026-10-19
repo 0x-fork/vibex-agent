@@ -35,29 +35,29 @@ use vibex_core::{
     DiagnosticExportOutcome, DiagnosticExportPayload, FetchTimelineRequest, FileMutationRequest,
     FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
     FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GatewayAgentUpdateRequest,
-    GatewayRequestSummary, GatewaySettingsUpdateRequest, GatewaySnapshot,
-    GetMessageSubmissionRequest, GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest,
-    GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest,
-    GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult,
-    GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
-    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
-    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
-    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
-    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
-    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
-    GitWorktreeRestoreRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
-    HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload,
-    McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
-    McpMarketSearchResponse, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
-    McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
-    McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
-    McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
-    McpServerValidationResult, MessageSubmissionState, OpenWorkspaceRequest, ProjectId, Prompt,
-    PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptUsage,
-    PromptUsageRecordRequest, PromptValidateRequest, PromptValidationResult,
-    ProviderCapabilitySummary, ProviderConfiguredModel, ProviderHealthSummary,
-    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
-    ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    GatewayCapabilityField, GatewayCapabilitySuggestion, GatewayRequestSummary,
+    GatewaySettingsUpdateRequest, GatewaySnapshot, GetMessageSubmissionRequest,
+    GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitCommitRequest,
+    GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
+    GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest,
+    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
+    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
+    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
+    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
+    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, Hook, HookCreateRequest,
+    HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest,
+    ManagementSnapshotPayload, McpMarketInstallRequest, McpMarketInstallResult,
+    McpMarketSearchRequest, McpMarketSearchResponse, McpServer, McpServerAgentMatrix,
+    McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
+    McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
+    McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
+    McpServerValidateRequest, McpServerValidationResult, MessageSubmissionState,
+    ModelCapabilitySuggestionRequest, OpenWorkspaceRequest, ProjectId, Prompt, PromptCreateRequest,
+    PromptDeleteRequest, PromptUpdateRequest, PromptUsage, PromptUsageRecordRequest,
+    PromptValidateRequest, PromptValidationResult, ProviderCapabilitySummary,
+    ProviderConfiguredModel, ProviderHealthSummary, ProviderNativeExportApplyRequest,
+    ProviderNativeExportApplyResult, ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
     ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
@@ -2804,6 +2804,34 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn model_capability_suggestion(
+        &self,
+        request: ModelCapabilitySuggestionRequest,
+    ) -> BackendFuture<'_, Option<GatewayCapabilitySuggestion>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            Ok(runtime
+                .model_catalog()
+                .suggest(
+                    &request.provider_id,
+                    &request.model_id,
+                    vibex_core::unix_timestamp_ms(),
+                )
+                .map(|suggestion| GatewayCapabilitySuggestion {
+                    approximate: suggestion.source.is_approximate(),
+                    fields: suggestion
+                        .fields()
+                        .into_iter()
+                        .map(|(field, value)| GatewayCapabilityField {
+                            field: field.to_string(),
+                            value,
+                        })
+                        .collect(),
+                }))
+        })
+    }
+
     fn model_gateway_snapshot(&self) -> BackendFuture<'_, GatewaySnapshot> {
         let runtime = self.runtime.clone();
         Box::pin(async move {
@@ -2830,6 +2858,7 @@ impl ManagementBackend for NativeBackend {
             policy.routing = payload.routing;
             policy.pin = payload.pin;
             policy.token_limit = payload.token_limit;
+            policy.account_limits = payload.account_limits;
             policy.validate()?;
             let mut next = current.clone();
             next.display_name = payload.display_name;

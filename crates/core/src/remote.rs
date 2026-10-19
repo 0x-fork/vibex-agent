@@ -2319,6 +2319,7 @@ pub enum RemoteProviderOperationKind {
     TestAgentModelProviderProfile,
     FetchAgentModelProviderProfileModels,
     FetchAgentModelProviderDraftModels,
+    ModelCapabilitySuggestion,
     ModelGatewaySnapshot,
     UpdateModelGatewaySettings,
     SetModelGatewayAgent,
@@ -2779,6 +2780,19 @@ pub struct RemoteModelProviderProfileCreateRequest {
 pub struct RemoteModelProviderProfileUpdateRequest {
     pub auth: RemoteAuthProof,
     pub request: crate::ModelProviderProfileUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelCapabilitySuggestionRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::ModelCapabilitySuggestionRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelCapabilitySuggestionResponse {
+    pub suggestion: Option<crate::GatewayCapabilitySuggestion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3752,6 +3766,7 @@ pub enum RemoteProviderRequest {
     TestAgentModelProviderProfile(RemoteAgentModelProviderProfileTestRequest),
     FetchAgentModelProviderProfileModels(RemoteAgentModelProviderProfileFetchModelsRequest),
     FetchAgentModelProviderDraftModels(RemoteAgentModelProviderDraftFetchModelsRequest),
+    ModelCapabilitySuggestion(RemoteModelCapabilitySuggestionRequest),
     ModelGatewaySnapshot(RemoteModelGatewaySnapshotRequest),
     UpdateModelGatewaySettings(RemoteModelGatewaySettingsUpdateRequest),
     SetModelGatewayAgent(RemoteModelGatewayAgentUpdateRequest),
@@ -3944,6 +3959,9 @@ impl RemoteProviderRequest {
             }
             Self::FetchAgentModelProviderDraftModels(_) => {
                 RemoteProviderOperationKind::FetchAgentModelProviderDraftModels
+            }
+            Self::ModelCapabilitySuggestion(_) => {
+                RemoteProviderOperationKind::ModelCapabilitySuggestion
             }
             Self::ModelGatewaySnapshot(_) => RemoteProviderOperationKind::ModelGatewaySnapshot,
             Self::UpdateModelGatewaySettings(_) => {

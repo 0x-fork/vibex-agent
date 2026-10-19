@@ -65,6 +65,7 @@ use vibex_db::{
 };
 use vibex_desktop_model::DesktopPollingPolicy;
 use vibex_diagnostics::{DiagnosticBundleService, DiagnosticBundleServiceConfig};
+use vibex_model_catalog::CatalogCache;
 use vibex_model_gateway::{GatewayLimits as ModelGatewayLimits, ModelGatewayService};
 use vibex_remote::{
     RemoteAgentRuntimeProbeSource, RemoteAgentUsageSource, RemoteDispatcher, RemoteGateway,
@@ -1513,6 +1514,36 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
         assemble_management_snapshot(management, default_scope, refresh_agent_versions).await
     }
 
+    async fn model_capability_suggestion(
+        &self,
+        request: vibex_core::ModelCapabilitySuggestionRequest,
+    ) -> VibexResult<Option<vibex_core::GatewayCapabilitySuggestion>> {
+        let management = self.management.get().ok_or_else(|| {
+            VibexError::process(
+                "desktop_management_handle_unavailable",
+                "the runtime management handle is not installed yet",
+            )
+        })?;
+        Ok(management
+            .model_catalog()
+            .suggest(
+                &request.provider_id,
+                &request.model_id,
+                vibex_core::unix_timestamp_ms(),
+            )
+            .map(|suggestion| vibex_core::GatewayCapabilitySuggestion {
+                approximate: suggestion.source.is_approximate(),
+                fields: suggestion
+                    .fields()
+                    .into_iter()
+                    .map(|(field, value)| vibex_core::GatewayCapabilityField {
+                        field: field.to_string(),
+                        value,
+                    })
+                    .collect(),
+            }))
+    }
+
     async fn model_gateway_snapshot(&self) -> VibexResult<vibex_core::GatewaySnapshot> {
         let management = self.management.get().ok_or_else(|| {
             VibexError::process(
@@ -1542,6 +1573,7 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
         policy.routing = request.routing;
         policy.pin = request.pin;
         policy.token_limit = request.token_limit;
+        policy.account_limits = request.account_limits;
         policy.validate()?;
         let mut next = current.clone();
         next.display_name = request.display_name;
@@ -2313,6 +2345,7 @@ pub struct ManagementHandle {
     home_dir: PathBuf,
     providers: ProviderHandle,
     model_gateway: Arc<ModelGatewayService>,
+    model_catalog: Arc<CatalogCache>,
     scheduled: ScheduledHandle,
     automation: AutomationHandle,
     diagnostics: DiagnosticsHandle,
@@ -2325,6 +2358,11 @@ impl ManagementHandle {
     /// The local model gateway service.
     pub fn model_gateway(&self) -> Arc<ModelGatewayService> {
         Arc::clone(&self.model_gateway)
+    }
+
+    /// The advisory model catalogue.
+    pub fn model_catalog(&self) -> Arc<CatalogCache> {
+        Arc::clone(&self.model_catalog)
     }
 
     pub fn diagnostics_destination(&self) -> PathBuf {
@@ -2556,6 +2594,8 @@ pub struct DesktopRuntime {
     /// request-level routing state Agents never see; the durable Provider
     /// configuration stays in the Provider service.
     model_gateway: Arc<ModelGatewayService>,
+    /// The advisory model catalogue. Its absence only means "no suggestions".
+    model_catalog: Arc<CatalogCache>,
     providers: ProviderHandle,
     workspace: WorkspaceHandle,
     files: FileHandle,
@@ -3034,6 +3074,7 @@ impl DesktopRuntime {
         // writes, so it is assembled beside them. Its listener starts after the
         // runtime exists, and a bind failure degrades to direct Provider use
         // rather than blocking startup.
+        let model_catalog = Arc::new(CatalogCache::for_home(&config.home_dir));
         let model_gateway = ModelGatewayService::new(
             db_path.clone(),
             provider_config_service.clone(),
@@ -3087,6 +3128,7 @@ impl DesktopRuntime {
             browser: browser.clone(),
             computer: computer.clone(),
             model_gateway: model_gateway.clone(),
+            model_catalog: Arc::clone(&model_catalog),
             events,
             tasks: Mutex::new(Vec::new()),
             home_lock: Mutex::new(home_lock),
@@ -3162,6 +3204,31 @@ impl DesktopRuntime {
             Ok(())
         })
         .await?;
+        // The catalogue is advisory, so it is refreshed off the startup path and
+        // its failure is never reported to the user: no suggestions is a valid
+        // state that the editor already renders as "nothing to show".
+        {
+            let catalog = Arc::clone(&runtime.model_catalog);
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default();
+            let tasks = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                let now = vibex_core::unix_timestamp_ms();
+                if catalog.load(now).is_fresh() {
+                    return;
+                }
+                if let Err(error) = catalog.refresh(&client, now).await {
+                    tracing::debug!(
+                        target: "vibex_model_catalog",
+                        %error,
+                        "the model catalogue could not be refreshed; suggestions stay unavailable"
+                    );
+                }
+                drop(tasks);
+            });
+        }
         // The dev-server detector is fed by the runtime's own PTY streams, not
         // by whatever the UI happens to be showing: the terminal that printed
         // the URL may be on another tab, and a paired client is not on this
@@ -4084,6 +4151,12 @@ impl DesktopRuntime {
         Arc::clone(&self.model_gateway)
     }
 
+    /// The advisory model catalogue. A read never blocks and never fails: it
+    /// answers "no suggestion" for every reason it cannot help.
+    pub fn model_catalog(&self) -> Arc<CatalogCache> {
+        Arc::clone(&self.model_catalog)
+    }
+
     pub fn usage(&self) -> AgentUsageService {
         self.usage.clone()
     }
@@ -4251,6 +4324,7 @@ impl DesktopRuntime {
             home_dir: self.config.home_dir.clone(),
             providers: self.providers.clone(),
             model_gateway: Arc::clone(&self.model_gateway),
+            model_catalog: Arc::clone(&self.model_catalog),
             scheduled: self.scheduled.clone(),
             automation: self.automation.clone(),
             diagnostics: self.diagnostics.clone(),
