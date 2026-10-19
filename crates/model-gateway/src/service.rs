@@ -19,11 +19,11 @@ use tokio::sync::mpsc;
 
 use vibex_config_switch::{ProviderConfigService, secrets};
 use vibex_core::{
-    GatewayConversationPin, GatewayFailureKind, GatewayFailureKind as FailureKind, GatewayPinScope,
-    GatewayPolicy, GatewayRequestOutcome, GatewayTokenWindow, GatewayTokenWindowUsage,
-    ModelGatewayRequestLog, ModelGatewayRuntimeState, ModelGatewaySettings, ModelGatewayStatus,
-    ModelProviderAccountState, ModelProviderCredentialReference, ModelProviderEndpoint,
-    ModelProviderEndpointKind, ModelProviderProfileId, ModelProviderProfileStatus, RequestId,
+    GatewayConversationPin, GatewayFailureKind, GatewayPinScope, GatewayPolicy,
+    GatewayRequestOutcome, GatewayTokenWindow, GatewayTokenWindowUsage, ModelGatewayRequestLog,
+    ModelGatewayRuntimeState, ModelGatewaySettings, ModelGatewayStatus, ModelProviderAccountState,
+    ModelProviderCredentialReference, ModelProviderEndpoint, ModelProviderEndpointKind,
+    ModelProviderProfileId, ModelProviderProfileStatus, RequestId,
 };
 use vibex_db::{
     DbConnection, GatewayConversationPinRepository, GatewayTokenWindowRepository,
@@ -634,8 +634,10 @@ impl ModelGatewayService {
             candidate = match state.visibility_at(now) {
                 vibex_core::GatewayKeyState::Ready => candidate,
                 vibex_core::GatewayKeyState::Cooling { kind, .. } => candidate.cooling(kind),
-                vibex_core::GatewayKeyState::Invalid => candidate.cooling(FailureKind::Auth),
-                vibex_core::GatewayKeyState::Disabled => candidate.cooling(FailureKind::Other),
+                vibex_core::GatewayKeyState::Invalid => candidate.cooling(GatewayFailureKind::Auth),
+                vibex_core::GatewayKeyState::Disabled => {
+                    candidate.cooling(GatewayFailureKind::Other)
+                }
             };
             candidates.push((candidate, credential.clone()));
         }
@@ -745,9 +747,9 @@ impl ModelGatewayService {
                 Ok(response) => response,
                 Err(error) => {
                     let kind = if error.is_timeout() {
-                        FailureKind::Upstream
+                        GatewayFailureKind::Upstream
                     } else {
-                        FailureKind::Proxy
+                        GatewayFailureKind::Proxy
                     };
                     self.mark_failure(&prepared.profile_id, &candidate.credential, kind);
                     last_error = Some(GatewayError::Upstream {
@@ -814,7 +816,7 @@ impl ModelGatewayService {
         state.updated_at_ms = now;
         match KeyHealth::from_failure(kind, now) {
             KeyHealth::Invalid => {
-                state.cooldown_reason = Some(FailureKind::Auth);
+                state.cooldown_reason = Some(GatewayFailureKind::Auth);
                 state.cooldown_until_ms = None;
             }
             KeyHealth::Cooling { kind, until_ms } => {
@@ -877,21 +879,6 @@ impl ModelGatewayService {
                 now,
             );
         }
-    }
-
-    /// Answers one call end to end, gathering a stream when the client asked
-    /// for a single body.
-    pub async fn call(
-        &self,
-        inbound: WireProtocol,
-        headers: HeaderMap,
-        body: Vec<u8>,
-    ) -> GatewayResult<PreparedCall> {
-        let _ = headers;
-        let _ = body;
-        Err(GatewayError::Internal(format!(
-            "the {inbound:?} endpoint requires the streaming executor"
-        )))
     }
 
     /// Lists the most recent ledger rows.
