@@ -692,6 +692,40 @@ pub fn timeline_conversation_turns_with_leading_turn_start(
                     }
                 }
             }
+            // A message a provider narrates as chunks is one body to the reader.
+            //
+            // The chunks are separate durable rows: a provider gives a whole
+            // batch of them one sequence, and thinking rows interleave between
+            // them — rows a display mode may have just dropped. Folding only
+            // what was adjacent before that drop therefore still showed the
+            // stream's own boundaries: one short line per chunk, sometimes cut
+            // mid-word. The run is folded again here, over what the reader will
+            // actually see, and only when both rows are the same kind of message
+            // and the later one carries the same sequence, which is the shape a
+            // provider's own chunking leaves behind.
+            let mut coalesced: Vec<TimelineRow> = Vec::with_capacity(turn_rows.len());
+            for row in turn_rows {
+                let merges = coalesced.last().is_some_and(|previous: &TimelineRow| {
+                    previous.kind == TimelineRowKind::AgentMessage
+                        && row.kind == TimelineRowKind::AgentMessage
+                        && previous.conclusion == row.conclusion
+                        && previous.last_sequence == row.first_sequence
+                        && previous.runtime_attribution == row.runtime_attribution
+                });
+                if merges && let Some(previous) = coalesced.last_mut() {
+                    previous.body.push_str(&row.body);
+                    previous.last_sequence = row.last_sequence.max(previous.last_sequence);
+                    previous.streaming = previous.streaming || row.streaming;
+                    for index in 0..row.item_ids.len() {
+                        let item_id = row.item_ids[index].clone();
+                        record_row_item_id(&mut previous.item_ids, &item_id);
+                    }
+                    continue;
+                }
+                coalesced.push(row);
+            }
+            let turn_rows = coalesced;
+
             // The rows arrive already folded by `timeline_rows_from_refs`: a
             // run of updates for one operation is one row before any client
             // sees it, so a turn only has to order what it is given.
@@ -3001,6 +3035,65 @@ mod tests {
         assert_eq!(turns[0].process_rows.len(), 1);
         assert_eq!(turns[0].process_rows[0].kind, TimelineRowKind::Reasoning);
         assert_eq!(turns[0].process_rows[0].body, "Published reasoning");
+    }
+
+    #[test]
+    fn a_message_streamed_as_chunks_reads_as_one_body() {
+        // The shape a provider leaves behind, read back from a real session: the
+        // chunks of one message share a sequence, and thinking rows sit between
+        // them. The reading display mode drops those rows, so a fold that only
+        // looked at what was adjacent before the drop showed the stream's own
+        // boundaries — one short line per chunk.
+        let mut items = vec![
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "question".into(),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: "前半".into(),
+                    chunk_index: 0,
+                    phase: None,
+                }),
+            ),
+            item(
+                3,
+                None,
+                TimelinePayload::Reasoning(vibex_core::ReasoningPayload {
+                    text: "thinking between the chunks".into(),
+                    is_final: false,
+                }),
+            ),
+            item(
+                4,
+                None,
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: "后半".into(),
+                    chunk_index: 1,
+                    phase: None,
+                }),
+            ),
+        ];
+        // The chunks carry one sequence, as the provider's batch does.
+        items[3].sequence = 2;
+        items[3].id = TimelineItemId::parse("timeline_chunk_1").unwrap();
+
+        let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
+        let rows = &turns[0].process_rows;
+        assert_eq!(
+            rows.len(),
+            1,
+            "the chunks are one body once the hidden thought is gone: {rows:?}"
+        );
+        assert_eq!(rows[0].kind, TimelineRowKind::AgentMessage);
+        assert_eq!(rows[0].body, "前半后半");
     }
 
     #[test]
