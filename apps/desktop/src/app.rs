@@ -58229,6 +58229,44 @@ impl VibexWorkbench {
         }
     }
 
+    /// Whether the turn a row belongs to is still producing output.
+    ///
+    /// The row's own `streaming` flag says what the projection saw last, which
+    /// outlives the turn when an answer arrived as deltas and never as a final
+    /// message. Liveness belongs to the turn, so it is read from the turn.
+    fn row_turn_is_live(&self, row: &TimelineRow) -> bool {
+        row.turn_id
+            .as_deref()
+            .and_then(|turn_id| self.timeline_turn_by_id(turn_id))
+            .is_some_and(|turn| self.activity_turn_is_live(&turn))
+    }
+
+    /// Whether a row is still producing output.
+    ///
+    /// The projection's `streaming` flag is what it saw last, and it outlives
+    /// the turn whenever an answer arrived as deltas and never as a final
+    /// message. Everything that means "still arriving" — the fold, the unit
+    /// window's measured-height hold, the spinner — reads it through the turn,
+    /// because a finished row that still claims to be arriving is re-measured
+    /// on every frame it is in the view.
+    fn row_is_arriving(&self, row: &TimelineRow) -> bool {
+        row.streaming && self.row_turn_is_live(row)
+    }
+
+    /// Whether a prose row is still producing output.
+    fn prose_row_is_arriving(&self, row: &TimelineRow) -> bool {
+        self.row_is_arriving(row)
+            && matches!(
+                row.kind,
+                TimelineRowKind::AgentMessage | TimelineRowKind::Reasoning
+            )
+    }
+
+    /// Whether a row's body is drawn folded, with its turn's liveness resolved.
+    fn row_body_folds(&self, row: &TimelineRow) -> bool {
+        timeline_row_body_folds(row, self.row_turn_is_live(row))
+    }
+
     /// Whether the reader asked for a row's whole body.
     fn timeline_row_body_revealed(&self, row_id: &str) -> bool {
         self.timeline_body_reveal
@@ -58259,7 +58297,7 @@ impl VibexWorkbench {
     /// path. The render path takes the same cut through
     /// [`Self::timeline_row_body_source`], keyed by the row's revision.
     fn visible_row_body<'a>(&self, row: &'a TimelineRow) -> (&'a str, usize) {
-        if !timeline_row_body_folds(row) || self.timeline_row_body_revealed(&row.id) {
+        if !self.row_body_folds(row) || self.timeline_row_body_revealed(&row.id) {
             return (row.body.as_str(), 0);
         }
         folded_body_parts(row.body.as_str())
@@ -58274,7 +58312,7 @@ impl VibexWorkbench {
         let Some(source) = remaining else {
             return (None, 0);
         };
-        if !timeline_row_body_folds(row) || self.reasoning_body_revealed(row) {
+        if !self.row_body_folds(row) || self.reasoning_body_revealed(row) {
             return (Some(source), 0);
         }
         let (head, hidden) = folded_body_parts(source);
@@ -58314,19 +58352,20 @@ impl VibexWorkbench {
 
     /// The Markdown source a row's surface draws, and the bytes the fold hides.
     fn timeline_row_body_source(&mut self, row: &TimelineRow, revealed: bool) -> (Arc<str>, usize) {
-        let cut = if timeline_row_body_folds(row) && !revealed {
+        let cut = if self.row_body_folds(row) && !revealed {
             self.timeline_body_fold_cut(&row.id, row.last_sequence, row.body.as_str(), revealed)
         } else {
             row.body.len()
         };
         let head = row.body.get(..cut).unwrap_or(row.body.as_str());
         let allow_throttle = self.timeline_markdown_allow_throttle(row);
+        let arriving = self.row_is_arriving(row);
         let (source, _) = timeline_markdown_source_snapshot(
             &mut self.timeline_markdown_sources,
             row.id.as_str(),
             head,
             row.last_sequence,
-            row.streaming,
+            arriving,
             Instant::now(),
             allow_throttle,
         );
@@ -58348,18 +58387,19 @@ impl VibexWorkbench {
         };
         let total_bytes = source.len();
         let revealed = self.reasoning_body_revealed(row);
-        let cut = if timeline_row_body_folds(row) && !revealed {
+        let cut = if self.row_body_folds(row) && !revealed {
             self.timeline_body_fold_cut(&row.id, row.last_sequence, source, revealed)
         } else {
             total_bytes
         };
         let head = source.get(..cut).unwrap_or(source);
+        let arriving = self.row_is_arriving(row);
         let (source, _) = timeline_markdown_source_snapshot(
             &mut self.timeline_markdown_sources,
             &format!("thought:{}:remaining", row.id),
             head,
             row.last_sequence,
-            row.streaming,
+            arriving,
             Instant::now(),
             false,
         );
@@ -58463,12 +58503,13 @@ impl VibexWorkbench {
     /// instead of a full memcmp when nothing changed.
     fn timeline_markdown_source(&mut self, row: &TimelineRow) -> (Arc<str>, i64) {
         let allow_throttle = self.timeline_markdown_allow_throttle(row);
+        let arriving = self.row_is_arriving(row);
         timeline_markdown_source_snapshot(
             &mut self.timeline_markdown_sources,
             row.id.as_str(),
             row.body.as_str(),
             row.last_sequence,
-            row.streaming,
+            arriving,
             Instant::now(),
             allow_throttle,
         )
@@ -58632,7 +58673,7 @@ impl VibexWorkbench {
                 if visible_body.contains("](") && !body_windowed {
                     height += 30.0;
                 }
-                if conclusion && !row.streaming {
+                if conclusion && !self.row_is_arriving(row) {
                     // Answer metadata and hover actions share one footer row.
                     height += 36.0;
                 }
@@ -59112,23 +59153,16 @@ impl VibexWorkbench {
                 group_index += 1;
             } else {
                 let row = &turn.process_rows[row_index];
+                let arriving = self.prose_row_is_arriving(row);
                 units.push(TimelineProcessUnit {
                     rows: row_index..row_index + 1,
                     id: row.id.clone(),
                     revision: row.last_sequence,
-                    streaming: row.streaming
-                        && matches!(
-                            row.kind,
-                            TimelineRowKind::AgentMessage | TimelineRowKind::Reasoning
-                        ),
+                    streaming: arriving,
                     estimated_height: cached_timeline_process_unit_height(
                         self.timeline_process_unit_heights.get(&row.id),
                         row.last_sequence,
-                        row.streaming
-                            && matches!(
-                                row.kind,
-                                TimelineRowKind::AgentMessage | TimelineRowKind::Reasoning
-                            ),
+                        arriving,
                     )
                     .unwrap_or_else(|| self.estimated_timeline_row_height_projected(row, false)),
                     kind: TimelineProcessUnitKind::Row,
@@ -59713,7 +59747,7 @@ impl VibexWorkbench {
         // A body past the viewport allowance is read through a box of its own:
         // the row keeps a bounded height and only the chunks the box shows are
         // laid out, so an opened report costs a screenful instead of itself.
-        let body_windowed = timeline_row_body_folds(row)
+        let body_windowed = self.row_body_folds(row)
             && self.timeline_body_windowed(&markdown_source, body_revealed);
         let windowed_body = body_windowed.then(|| {
             self.render_windowed_body(row, markdown_source.clone(), search_highlight.clone(), cx)
@@ -59721,11 +59755,12 @@ impl VibexWorkbench {
         let body_reveal_control = (hidden_body_bytes > 0 || body_windowed)
             .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
         let markdown_view = (!body_windowed).then(|| {
+            let arriving = self.row_is_arriving(row);
             let markdown_state = self.markdown_text_state(
                 &format!("markdown:{}", row.id),
                 &markdown_source,
                 search_highlight.as_ref(),
-                row.streaming,
+                arriving,
                 cx,
             );
             let markdown_entity = cx.weak_entity();
@@ -60241,7 +60276,8 @@ impl VibexWorkbench {
             // a long turn expands hundreds of rows per frame, so the header
             // stays plain text and only the body keeps the Markdown surface.
             let first_line = self.reasoning_first_line_text(Some(row), first_line_source, cx);
-            let window = self.reasoning_window(row.streaming, remaining_source.as_deref());
+            let arriving = self.row_is_arriving(row);
+            let window = self.reasoning_window(arriving, remaining_source.as_deref());
             let remaining = match windowed_body {
                 Some(body) => Some(body),
                 None => remaining_source.map(|source| {
@@ -68679,16 +68715,20 @@ fn folded_body_parts(body: &str) -> (&str, usize) {
 
 /// Whether a row's body is drawn folded.
 ///
-/// Only prose bodies fold, and only once they have settled: a body still
-/// arriving is the reader's live view of the Agent's work, and a plan, a file
-/// diff or a tool card already bounds itself. The reader's own reveal always
-/// wins over this.
-fn timeline_row_body_folds(row: &TimelineRow) -> bool {
-    !row.streaming
-        && matches!(
-            row.kind,
-            TimelineRowKind::AgentMessage | TimelineRowKind::Reasoning
-        )
+/// Only prose bodies fold: a plan, a file diff or a tool card already bounds
+/// itself, and the reader's own reveal always wins over this. A body still
+/// arriving is the reader's live view of the Agent's work and is left alone —
+/// but only while its turn is live. A row keeps its `streaming` flag after the
+/// turn ends whenever the provider narrated an answer as deltas and never sent
+/// a final message, and the projection folds those deltas into one row: that
+/// row's body is the whole answer, and laying it out whole is what costs a
+/// turn's worth of prose on every frame (measured: the rows of one finished
+/// turn cost 12 ms a frame until the answer folded, 0.2 ms after).
+fn timeline_row_body_folds(row: &TimelineRow, turn_live: bool) -> bool {
+    matches!(
+        row.kind,
+        TimelineRowKind::AgentMessage | TimelineRowKind::Reasoning
+    ) && (!row.streaming || !turn_live)
 }
 
 /// Where one windowed body is cut into the chunks the window lays out.
@@ -96677,9 +96717,13 @@ mod tests {
                 && row.contains("self.reasoning_row_body_source(row, remaining_source)"),
             "a settled thought's body is folded before it is laid out"
         );
-        assert!(row.contains(
-            "let window = self.reasoning_window(row.streaming, remaining_source.as_deref());"
-        ));
+        assert!(
+            row.contains("let arriving = self.row_is_arriving(row);")
+                && row.contains(
+                    "let window = self.reasoning_window(arriving, remaining_source.as_deref());"
+                ),
+            "the window answers to the turn's liveness, not to a stale row flag"
+        );
         assert!(row.contains("render_expanded_reasoning_layout("));
 
         let live = source

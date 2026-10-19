@@ -2612,12 +2612,19 @@ fn a_long_settled_body_is_drawn_as_its_head_until_the_reader_opens_it(cx: &mut T
         let mut streaming = settled.clone();
         streaming.streaming = true;
         assert!(
-            !timeline_row_body_folds(&streaming),
+            !timeline_row_body_folds(&streaming, true),
             "a body still arriving is the live view"
+        );
+        assert!(
+            timeline_row_body_folds(&streaming, false),
+            "a row whose turn has finished folds, even when the projection left it streaming"
         );
         let mut tool = settled.clone();
         tool.kind = TimelineRowKind::Command;
-        assert!(!timeline_row_body_folds(&tool), "only prose bodies fold");
+        assert!(
+            !timeline_row_body_folds(&tool, false),
+            "only prose bodies fold"
+        );
     });
 }
 
