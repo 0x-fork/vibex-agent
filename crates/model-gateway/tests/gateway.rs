@@ -46,11 +46,42 @@ struct Recorded {
     body: Option<Value>,
 }
 
+/// How many requests the upstream saw overlapping at once.
+///
+/// This is the only honest way to test a concurrency limit: counting from the
+/// client side measures the test's own parallelism, not what left the gateway.
+#[derive(Debug, Default)]
+struct Overlap {
+    current: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+impl Overlap {
+    fn enter(&self) {
+        let now = self
+            .current
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.peak
+            .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn leave(&self) {
+        self.current
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 type Recorder = Arc<Mutex<Recorded>>;
 
 #[derive(Clone)]
 struct MockState {
     recorder: Recorder,
+    overlap: Arc<Overlap>,
     /// The status the mock answers with.
     status: u16,
     /// The SSE body the mock answers with.
@@ -65,6 +96,10 @@ async fn mock_handler(
     uri: axum::http::Uri,
     body: axum::body::Bytes,
 ) -> Response {
+    state.overlap.enter();
+    // Hold the request open long enough for a second one to overlap if the
+    // gateway really sent it.
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
     {
         let mut recorded = state.recorder.lock().await;
         recorded.path = uri.path().to_string();
@@ -86,6 +121,7 @@ async fn mock_handler(
         return response;
     }
     if let Some(body) = state.json {
+        state.overlap.leave();
         let mut response = Response::new(Body::from(body.to_string()));
         response.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -93,6 +129,7 @@ async fn mock_handler(
         );
         return response;
     }
+    state.overlap.leave();
     let mut response = Response::new(Body::from(state.stream));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -106,9 +143,20 @@ async fn mock_upstream(
     stream: String,
     json: Option<Value>,
 ) -> (String, Recorder, tokio::task::JoinHandle<()>) {
+    let (url, recorder, _overlap, task) = mock_upstream_with_overlap(status, stream, json).await;
+    (url, recorder, task)
+}
+
+async fn mock_upstream_with_overlap(
+    status: u16,
+    stream: String,
+    json: Option<Value>,
+) -> (String, Recorder, Arc<Overlap>, tokio::task::JoinHandle<()>) {
     let recorder: Recorder = Arc::new(Mutex::new(Recorded::default()));
+    let overlap = Arc::new(Overlap::default());
     let state = MockState {
         recorder: Arc::clone(&recorder),
+        overlap: Arc::clone(&overlap),
         status,
         stream,
         json,
@@ -123,7 +171,7 @@ async fn mock_upstream(
     let task = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
-    (format!("http://{address}"), recorder, task)
+    (format!("http://{address}"), recorder, overlap, task)
 }
 
 fn database_path() -> std::path::PathBuf {
@@ -970,5 +1018,210 @@ fn ledger_retention_is_seven_days() {
         ModelGatewayRequestLogRepository::prune(&connection, now).unwrap(),
         1
     );
+    cleanup(path);
+}
+
+/// A configured concurrency limit bounds what reaches the upstream.
+///
+/// The mock counts overlapping requests on its own side, which is the only
+/// honest measurement: a client-side counter would see the test's parallelism
+/// rather than what the gateway actually sent.
+#[tokio::test]
+async fn a_concurrency_limit_serializes_requests_rather_than_dropping_them() {
+    let path = database_path();
+    let (upstream_url, recorder, overlap, upstream_task) =
+        mock_upstream_with_overlap(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-test",
+    );
+    // Serialize the Key to one in-flight request.
+    let credential = {
+        let mut connection = open_database(&path).unwrap();
+        apply_migrations(&mut connection).unwrap();
+        let profile = vibex_db::ModelProviderProfileRepository::get(&connection, &upstream)
+            .unwrap()
+            .unwrap();
+        profile.credentials[0].id.clone()
+    };
+    let mut policy = GatewayPolicy::default();
+    policy.account_limits.insert(
+        credential,
+        vibex_core::GatewayAccountLimits {
+            max_concurrency: Some(1),
+            queue_wait_ms: Some(5_000),
+            ..vibex_core::GatewayAccountLimits::default()
+        },
+    );
+    point_gateway_at(&path, upstream, policy);
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let mut handles = Vec::new();
+    for _ in 0..3 {
+        let client = reqwest::Client::new();
+        let url = format!("{gateway_url}/v1/chat/completions");
+        handles.push(tokio::spawn(async move {
+            client
+                .post(url)
+                .header(header::HOST, "127.0.0.1")
+                .json(&json!({
+                    "model": "deepseek/deepseek-chat",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": true
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+    for handle in handles {
+        assert_eq!(
+            handle.await.unwrap(),
+            200,
+            "a queued request must still answer"
+        );
+    }
+    assert_eq!(
+        overlap.peak(),
+        1,
+        "the upstream saw {} requests at once under a limit of one",
+        overlap.peak()
+    );
+    // All three were served, so the limiter queued rather than refused.
+    assert_eq!(service.recent_requests(10).unwrap().len(), 3);
+    let _ = recorder;
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// Without a limit the same three requests do overlap, which proves the test
+/// above measures the limit rather than the mock's own timing.
+#[tokio::test]
+async fn without_a_limit_the_same_requests_do_overlap() {
+    let path = database_path();
+    let (upstream_url, _recorder, overlap, upstream_task) =
+        mock_upstream_with_overlap(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-test",
+    );
+    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let mut handles = Vec::new();
+    for _ in 0..3 {
+        let client = reqwest::Client::new();
+        let url = format!("{gateway_url}/v1/chat/completions");
+        handles.push(tokio::spawn(async move {
+            client
+                .post(url)
+                .header(header::HOST, "127.0.0.1")
+                .json(&json!({
+                    "model": "deepseek/deepseek-chat",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": true
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+    for handle in handles {
+        assert_eq!(handle.await.unwrap(), 200);
+    }
+    assert!(
+        overlap.peak() > 1,
+        "the mock never overlapped, so the limit test proves nothing: peak {}",
+        overlap.peak()
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// An RPM limit that a request cannot wait out is a 429 that says why.
+#[tokio::test]
+async fn an_exhausted_minute_is_a_429_before_the_upstream_is_called() {
+    let path = database_path();
+    let (upstream_url, _recorder, upstream_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-test",
+    );
+    let credential = {
+        let mut connection = open_database(&path).unwrap();
+        apply_migrations(&mut connection).unwrap();
+        let profile = vibex_db::ModelProviderProfileRepository::get(&connection, &upstream)
+            .unwrap()
+            .unwrap();
+        profile.credentials[0].id.clone()
+    };
+    let mut policy = GatewayPolicy::default();
+    policy.account_limits.insert(
+        credential,
+        vibex_core::GatewayAccountLimits {
+            max_rpm: Some(1),
+            queue_wait_ms: Some(1),
+            ..vibex_core::GatewayAccountLimits::default()
+        },
+    );
+    point_gateway_at(&path, upstream, policy);
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let client = reqwest::Client::new();
+    for turn in 0..2 {
+        let response = client
+            .post(format!("{gateway_url}/v1/chat/completions"))
+            .header(header::HOST, "127.0.0.1")
+            .json(&json!({
+                "model": "deepseek/deepseek-chat",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        if turn == 0 {
+            assert_eq!(response.status(), 200);
+            let _ = response.text().await;
+        } else {
+            assert_eq!(
+                response.status(),
+                429,
+                "the second request in a one-request minute must be refused"
+            );
+            let body: Value = response.json().await.unwrap();
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("minute"),
+                "{body}"
+            );
+        }
+    }
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
     cleanup(path);
 }

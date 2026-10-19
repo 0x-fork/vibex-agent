@@ -15,6 +15,7 @@
 //!   field. A local token ceiling is a user-set ceiling on observed tokens,
 //!   not a claim about a vendor's quota.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -188,6 +189,69 @@ impl GatewayTranslatePolicy {
     }
 }
 
+/// Concurrency and rate limits for one upstream.
+///
+/// Vendors count requests per account, so these are per Key rather than global.
+/// A Key that is already busy is not a failure: the gateway queues for it, and
+/// only answers `429` when the queue itself is full or its wait ran out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayAccountLimits {
+    /// Requests allowed in flight at once, across every model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
+    /// Requests allowed to start in any one minute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rpm: Option<u32>,
+    /// How many requests may wait for a slot. `None` means unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_limit: Option<u32>,
+    /// How long a request may wait for a slot before it is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_wait_ms: Option<u64>,
+}
+
+impl GatewayAccountLimits {
+    /// The longest a request may wait before the gateway answers `429`.
+    pub const DEFAULT_QUEUE_WAIT_MS: u64 = 30_000;
+
+    pub fn is_configured(&self) -> bool {
+        self.max_concurrency.is_some() || self.max_rpm.is_some()
+    }
+
+    pub fn validate(&self) -> VibexResult<()> {
+        if self.max_concurrency == Some(0) {
+            return Err(VibexError::validation(
+                "model_gateway_concurrency_invalid",
+                "a concurrency limit must be at least one",
+            ));
+        }
+        if self.max_rpm == Some(0) {
+            return Err(VibexError::validation(
+                "model_gateway_rpm_invalid",
+                "an RPM limit must be at least one",
+            ));
+        }
+        if self.queue_limit == Some(0) {
+            return Err(VibexError::validation(
+                "model_gateway_queue_limit_invalid",
+                "a queue limit must be at least one",
+            ));
+        }
+        if self.queue_wait_ms == Some(0) {
+            return Err(VibexError::validation(
+                "model_gateway_queue_wait_invalid",
+                "a queue wait must be at least one millisecond",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn queue_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.queue_wait_ms.unwrap_or(Self::DEFAULT_QUEUE_WAIT_MS))
+    }
+}
+
 /// Durable routing policy for the local gateway.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -199,6 +263,9 @@ pub struct GatewayPolicy {
     pub token_limit: Option<GatewayTokenLimit>,
     #[serde(default)]
     pub translate: GatewayTranslatePolicy,
+    /// Concurrency and rate limits, keyed by credential id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub account_limits: BTreeMap<RequestId, GatewayAccountLimits>,
 }
 
 impl Default for GatewayPolicy {
@@ -209,6 +276,7 @@ impl Default for GatewayPolicy {
             pin: GatewayPinScope::Conversation,
             token_limit: None,
             translate: GatewayTranslatePolicy::default(),
+            account_limits: BTreeMap::new(),
         }
     }
 }
@@ -217,6 +285,9 @@ impl GatewayPolicy {
     pub fn validate(&self) -> VibexResult<()> {
         if let Some(limit) = self.token_limit.as_ref() {
             limit.validate()?;
+        }
+        for limits in self.account_limits.values() {
+            limits.validate()?;
         }
         Ok(())
     }
@@ -820,6 +891,9 @@ pub struct GatewayKeySummary {
     pub state: GatewayKeyState,
     #[serde(default)]
     pub used_tokens: u64,
+    /// This Key's concurrency and rate limits, when it has any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<GatewayAccountLimits>,
 }
 
 /// The Config Center's request to point one Agent at the gateway.

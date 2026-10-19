@@ -21,6 +21,7 @@
 
 mod error;
 mod ir;
+mod limit;
 mod route;
 mod server;
 mod service;
@@ -33,6 +34,7 @@ pub use ir::{
     ContentPart, ImageSource, OpaqueSignature, ReasoningRequest, Role, SamplingParams, StopReason,
     ToolChoice, ToolDefinition,
 };
+pub use limit::{Limiter, Permit};
 pub use route::{
     CandidateKey, KeyHealth, ResolvedModel, RoutePlan, RouteRequest, classify_failure,
     conversation_key, plan_route, resolve_model,

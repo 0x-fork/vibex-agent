@@ -1135,6 +1135,7 @@ fn read_gateway_snapshot(
                 display_name: credential.display_name.clone(),
                 state: vibex_core::GatewayKeyState::Ready,
                 used_tokens: 0,
+                limits: settings.policy.account_limits.get(&credential.id).copied(),
             })
             .collect::<Vec<_>>();
         upstreams.push(vibex_core::GatewayUpstreamSummary {

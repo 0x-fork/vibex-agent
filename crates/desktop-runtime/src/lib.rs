@@ -1378,6 +1378,7 @@ fn assemble_gateway_snapshot(
                     display_name: credential.display_name.clone(),
                     state,
                     used_tokens: 0,
+                    limits: settings.policy.account_limits.get(&credential.id).copied(),
                 }
             })
             .collect::<Vec<_>>();

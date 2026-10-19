@@ -11702,6 +11702,26 @@ impl ManagementCenter {
                         )
                         .child(gateway_key_state_badge(key, cx)),
                 );
+                if let Some(limits) = key.limits.filter(|limits| limits.is_configured()) {
+                    let mut parts = Vec::new();
+                    if let Some(concurrency) = limits.max_concurrency {
+                        parts.push(format!(
+                            "{concurrency} {}",
+                            management_locale_text("at once", "并发", "並發")
+                        ));
+                    }
+                    if let Some(rpm) = limits.max_rpm {
+                        parts.push(format!("{rpm} RPM"));
+                    }
+                    if !parts.is_empty() {
+                        key_rows = key_rows.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(parts.join(" · ")),
+                        );
+                    }
+                }
             }
             if upstream.keys.is_empty() {
                 key_rows = key_rows.child(div().text_xs().text_color(cx.theme().warning).child(
@@ -31170,6 +31190,7 @@ mod gateway_surface_tests {
                     display_name: "Primary".to_string(),
                     state: vibex_core::GatewayKeyState::Ready,
                     used_tokens: 0,
+                    limits: None,
                 },
                 vibex_core::GatewayKeySummary {
                     credential_id: vibex_core::RequestId::new(),
@@ -31179,12 +31200,14 @@ mod gateway_surface_tests {
                         until_ms: Some(1),
                     },
                     used_tokens: 0,
+                    limits: None,
                 },
                 vibex_core::GatewayKeySummary {
                     credential_id: vibex_core::RequestId::new(),
                     display_name: "Revoked".to_string(),
                     state: vibex_core::GatewayKeyState::Invalid,
                     used_tokens: 0,
+                    limits: None,
                 },
             ],
         };
@@ -31282,6 +31305,7 @@ mod gateway_surface_tests {
                     until_ms: Some(1),
                 },
                 used_tokens: 0,
+                limits: None,
             }],
         });
         assert_eq!(snapshot.ready_key_count(), 0);

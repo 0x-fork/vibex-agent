@@ -4935,6 +4935,7 @@ fn the_gateway_leads_the_providers_table_and_reports_its_state() {
                     display_name: "Primary".to_string(),
                     state: vibex_core::GatewayKeyState::Ready,
                     used_tokens: 0,
+                    limits: None,
                 },
                 vibex_core::GatewayKeySummary {
                     credential_id: vibex_core::RequestId::new(),
@@ -4944,6 +4945,7 @@ fn the_gateway_leads_the_providers_table_and_reports_its_state() {
                         until_ms: Some(1),
                     },
                     used_tokens: 0,
+                    limits: None,
                 },
             ],
         }],

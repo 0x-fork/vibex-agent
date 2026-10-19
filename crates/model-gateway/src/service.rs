@@ -217,6 +217,8 @@ pub struct ModelGatewayService {
     limits: GatewayLimits,
     runtime: GatewayRuntime,
     rotation: AtomicU64,
+    /// Per-account concurrency and request-rate guards.
+    limiter: std::sync::Arc<crate::limit::Limiter>,
     listener: Mutex<Option<ListenerHandle>>,
     snapshot: RwLock<Option<(GatewaySnapshot, std::time::Instant)>>,
     /// Set while the service is shutting down, so an in-flight request stops
@@ -267,6 +269,7 @@ impl ModelGatewayService {
             limits,
             runtime: Arc::new(RwLock::new(ModelGatewayRuntimeState::default())),
             rotation: AtomicU64::new(0),
+            limiter: crate::limit::Limiter::new(),
             listener: Mutex::new(None),
             snapshot: RwLock::new(None),
             shutting_down: RwLock::new(false),
@@ -688,6 +691,7 @@ impl ModelGatewayService {
             agent_id,
             conversation,
             stream: request.stream,
+            limits: policy.account_limits.clone(),
         })
     }
 
@@ -729,6 +733,43 @@ impl ModelGatewayService {
                     continue;
                 }
             };
+            // Hold this account's slot for the whole attempt, and take its
+            // minute before anything leaves. A permit is released on drop, so a
+            // cancelled or failed request cannot leak capacity.
+            let limits = prepared
+                .limits
+                .get(&candidate.credential)
+                .copied()
+                .unwrap_or_default();
+            let _permit = match self
+                .limiter
+                .acquire(
+                    candidate.credential.as_str(),
+                    limits.max_concurrency,
+                    limits.queue_limit,
+                    limits.queue_wait(),
+                    std::time::Instant::now(),
+                )
+                .await
+            {
+                Ok(permit) => permit,
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            if let Err(error) = self
+                .limiter
+                .reserve_minute(
+                    candidate.credential.as_str(),
+                    limits.max_rpm,
+                    limits.queue_wait(),
+                )
+                .await
+            {
+                last_error = Some(error);
+                continue;
+            }
             let url = endpoint_url(
                 &prepared.endpoint.url,
                 prepared.target,
@@ -983,6 +1024,8 @@ pub struct PreparedCall {
     pub agent_id: Option<String>,
     pub conversation: Option<String>,
     pub stream: bool,
+    /// Per-credential concurrency and rate limits.
+    pub limits: BTreeMap<RequestId, vibex_core::GatewayAccountLimits>,
 }
 
 /// What one finished request produced, as the ledger records it.
