@@ -1826,6 +1826,34 @@ mod tests {
             error_future()
         }
 
+        fn model_gateway_snapshot(&self) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
+            error_future()
+        }
+
+        fn update_model_gateway_settings(
+            &self,
+            _request: MutationRequest<vibex_core::GatewaySettingsUpdateRequest>,
+        ) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
+            error_future()
+        }
+
+        fn set_model_gateway_agent(
+            &self,
+            _request: MutationRequest<vibex_core::GatewayAgentUpdateRequest>,
+        ) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
+            error_future()
+        }
+
+        fn model_gateway_requests(
+            &self,
+        ) -> BackendFuture<'_, Vec<vibex_core::GatewayRequestSummary>> {
+            error_future()
+        }
+
+        fn clear_model_gateway_requests(&self) -> BackendFuture<'_, usize> {
+            error_future()
+        }
+
         fn export_diagnostics(
             &self,
             _request: MutationRequest<DiagnosticExportPayload>,

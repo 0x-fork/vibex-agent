@@ -2319,6 +2319,11 @@ pub enum RemoteProviderOperationKind {
     TestAgentModelProviderProfile,
     FetchAgentModelProviderProfileModels,
     FetchAgentModelProviderDraftModels,
+    ModelGatewaySnapshot,
+    UpdateModelGatewaySettings,
+    SetModelGatewayAgent,
+    ListModelGatewayRequests,
+    ClearModelGatewayRequests,
     ListCapabilitySummaries,
     RunCapabilityProbes,
     ListMcpServers,
@@ -2774,6 +2779,56 @@ pub struct RemoteModelProviderProfileCreateRequest {
 pub struct RemoteModelProviderProfileUpdateRequest {
     pub auth: RemoteAuthProof,
     pub request: crate::ModelProviderProfileUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelGatewaySnapshotRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelGatewaySnapshotResponse {
+    pub snapshot: crate::GatewaySnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelGatewaySettingsUpdateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::GatewaySettingsUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelGatewayAgentUpdateRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::GatewayAgentUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelGatewayRequestListRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelGatewayRequestListResponse {
+    pub requests: Vec<crate::GatewayRequestSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelGatewayClearRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelGatewayClearResponse {
+    pub cleared: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3697,6 +3752,11 @@ pub enum RemoteProviderRequest {
     TestAgentModelProviderProfile(RemoteAgentModelProviderProfileTestRequest),
     FetchAgentModelProviderProfileModels(RemoteAgentModelProviderProfileFetchModelsRequest),
     FetchAgentModelProviderDraftModels(RemoteAgentModelProviderDraftFetchModelsRequest),
+    ModelGatewaySnapshot(RemoteModelGatewaySnapshotRequest),
+    UpdateModelGatewaySettings(RemoteModelGatewaySettingsUpdateRequest),
+    SetModelGatewayAgent(RemoteModelGatewayAgentUpdateRequest),
+    ListModelGatewayRequests(RemoteModelGatewayRequestListRequest),
+    ClearModelGatewayRequests(RemoteModelGatewayClearRequest),
     ListCapabilitySummaries(RemoteProviderCapabilitySummaryListRequest),
     RunCapabilityProbes(RemoteProviderRunCapabilityProbesRequest),
     ListMcpServers(RemoteProviderMcpListRequest),
@@ -3884,6 +3944,17 @@ impl RemoteProviderRequest {
             }
             Self::FetchAgentModelProviderDraftModels(_) => {
                 RemoteProviderOperationKind::FetchAgentModelProviderDraftModels
+            }
+            Self::ModelGatewaySnapshot(_) => RemoteProviderOperationKind::ModelGatewaySnapshot,
+            Self::UpdateModelGatewaySettings(_) => {
+                RemoteProviderOperationKind::UpdateModelGatewaySettings
+            }
+            Self::SetModelGatewayAgent(_) => RemoteProviderOperationKind::SetModelGatewayAgent,
+            Self::ListModelGatewayRequests(_) => {
+                RemoteProviderOperationKind::ListModelGatewayRequests
+            }
+            Self::ClearModelGatewayRequests(_) => {
+                RemoteProviderOperationKind::ClearModelGatewayRequests
             }
             Self::ListCapabilitySummaries(_) => {
                 RemoteProviderOperationKind::ListCapabilitySummaries
@@ -4237,6 +4308,11 @@ pub struct RemoteProviderManagementSnapshot {
     pub automation_graphs: Vec<AutomationGraph>,
     pub automation_runs: Vec<AutomationRun>,
     pub automation_steps: Vec<AutomationRunStep>,
+    /// The local model gateway's settings, listener state, upstreams, Keys and
+    /// Agent assignments. `None` when the authority has no gateway (a client
+    /// connected to an older runtime).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_gateway: Option<crate::GatewaySnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

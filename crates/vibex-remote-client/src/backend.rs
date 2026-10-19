@@ -3587,6 +3587,33 @@ impl TerminalBackend for WebRemoteBackend {
     }
 }
 
+impl WebRemoteBackend {
+    /// Runs one provider-class RPC and decodes its response.
+    fn gateway_rpc<T, F>(
+        &self,
+        payload: vibex_core::RemoteProviderRequest,
+        decode: F,
+    ) -> BackendFuture<'_, T>
+    where
+        T: Send + 'static,
+        F: FnOnce(serde_json::Value) -> Result<T, BackendError> + Send + 'static,
+    {
+        let this = self.clone();
+        Box::pin(async move {
+            let value = this
+                .rpc(
+                    vibex_core::RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            decode(value)
+        })
+    }
+}
+
 impl ManagementBackend for WebRemoteBackend {
     fn list_agents(&self, request: AgentListRequest) -> BackendFuture<'_, AgentListResponse> {
         let this = self.clone();
@@ -3942,6 +3969,80 @@ impl ManagementBackend for WebRemoteBackend {
                     )
                 })
         })
+    }
+
+    fn model_gateway_snapshot(&self) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
+        self.gateway_rpc(
+            vibex_core::RemoteProviderRequest::ModelGatewaySnapshot(
+                vibex_core::RemoteModelGatewaySnapshotRequest { auth: self.auth() },
+            ),
+            |value| {
+                decode::<vibex_core::RemoteModelGatewaySnapshotResponse>(value)
+                    .map(|response| response.snapshot)
+            },
+        )
+    }
+
+    fn update_model_gateway_settings(
+        &self,
+        request: MutationRequest<vibex_core::GatewaySettingsUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
+        let request = request.payload;
+        self.gateway_rpc(
+            vibex_core::RemoteProviderRequest::UpdateModelGatewaySettings(
+                vibex_core::RemoteModelGatewaySettingsUpdateRequest {
+                    auth: self.auth(),
+                    request,
+                },
+            ),
+            |value| {
+                decode::<vibex_core::RemoteModelGatewaySnapshotResponse>(value)
+                    .map(|response| response.snapshot)
+            },
+        )
+    }
+
+    fn set_model_gateway_agent(
+        &self,
+        request: MutationRequest<vibex_core::GatewayAgentUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
+        let request = request.payload;
+        self.gateway_rpc(
+            vibex_core::RemoteProviderRequest::SetModelGatewayAgent(
+                vibex_core::RemoteModelGatewayAgentUpdateRequest {
+                    auth: self.auth(),
+                    request,
+                },
+            ),
+            |value| {
+                decode::<vibex_core::RemoteModelGatewaySnapshotResponse>(value)
+                    .map(|response| response.snapshot)
+            },
+        )
+    }
+
+    fn model_gateway_requests(&self) -> BackendFuture<'_, Vec<vibex_core::GatewayRequestSummary>> {
+        self.gateway_rpc(
+            vibex_core::RemoteProviderRequest::ListModelGatewayRequests(
+                vibex_core::RemoteModelGatewayRequestListRequest { auth: self.auth() },
+            ),
+            |value| {
+                decode::<vibex_core::RemoteModelGatewayRequestListResponse>(value)
+                    .map(|response| response.requests)
+            },
+        )
+    }
+
+    fn clear_model_gateway_requests(&self) -> BackendFuture<'_, usize> {
+        self.gateway_rpc(
+            vibex_core::RemoteProviderRequest::ClearModelGatewayRequests(
+                vibex_core::RemoteModelGatewayClearRequest { auth: self.auth() },
+            ),
+            |value| {
+                decode::<vibex_core::RemoteModelGatewayClearResponse>(value)
+                    .map(|response| response.cleared)
+            },
+        )
     }
 
     fn list_model_provider_profiles(

@@ -80,10 +80,12 @@ use vibex_db::{
 pub mod computer_skill;
 mod market;
 pub mod mcp_delivery;
+mod model_gateway;
 mod native_export;
 mod native_import;
 mod native_surface;
 mod provider_projection;
+pub use model_gateway::*;
 pub use provider_projection::*;
 pub mod secrets;
 mod skill_bundle;
@@ -8229,9 +8231,11 @@ fn visible_model_provider_profiles(
 
 fn is_internal_provider_profile(conn: &vibex_db::DbConnection, profile: &ProviderProfile) -> bool {
     is_local_default_profile(&profile.id)
-        || provider_option_value(&profile.provider_options, INTERNAL_PROFILE_ROLE_OPTION_KEY)
-            .as_deref()
-            == Some(INTERNAL_AGENT_RUNTIME_PROFILE_ROLE)
+        || matches!(
+            provider_option_value(&profile.provider_options, INTERNAL_PROFILE_ROLE_OPTION_KEY)
+                .as_deref(),
+            Some(INTERNAL_AGENT_RUNTIME_PROFILE_ROLE) | Some(GATEWAY_PROFILE_ROLE)
+        )
         || is_legacy_seeded_agent_runtime_profile(conn, profile)
 }
 

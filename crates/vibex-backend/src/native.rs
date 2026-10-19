@@ -34,27 +34,29 @@ use vibex_core::{
     CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
     DiagnosticExportOutcome, DiagnosticExportPayload, FetchTimelineRequest, FileMutationRequest,
     FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
-    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
-    GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitCommitRequest,
-    GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
-    GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest,
-    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
-    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
-    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
-    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
-    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
-    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, Hook, HookCreateRequest,
-    HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest,
-    ManagementSnapshotPayload, McpMarketInstallRequest, McpMarketInstallResult,
-    McpMarketSearchRequest, McpMarketSearchResponse, McpServer, McpServerAgentMatrix,
-    McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
-    McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
-    McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
-    McpServerValidateRequest, McpServerValidationResult, MessageSubmissionState,
-    OpenWorkspaceRequest, ProjectId, Prompt, PromptCreateRequest, PromptDeleteRequest,
-    PromptUpdateRequest, PromptUsage, PromptUsageRecordRequest, PromptValidateRequest,
-    PromptValidationResult, ProviderCapabilitySummary, ProviderConfiguredModel,
-    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GatewayAgentUpdateRequest,
+    GatewayRequestSummary, GatewaySettingsUpdateRequest, GatewaySnapshot,
+    GetMessageSubmissionRequest, GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest,
+    GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest,
+    GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult,
+    GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
+    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
+    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
+    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
+    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
+    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
+    GitWorktreeRestoreRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
+    HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload,
+    McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
+    McpMarketSearchResponse, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
+    McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
+    McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
+    McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
+    McpServerValidationResult, MessageSubmissionState, OpenWorkspaceRequest, ProjectId, Prompt,
+    PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptUsage,
+    PromptUsageRecordRequest, PromptValidateRequest, PromptValidationResult,
+    ProviderCapabilitySummary, ProviderConfiguredModel, ProviderHealthSummary,
+    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
     ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
@@ -1110,6 +1112,116 @@ impl AgentBackend for NativeBackend {
 ///
 /// The stable code matches the one the Desktop's remote service answers with,
 /// so a client recognises both without a second vocabulary.
+/// Builds the gateway surface the Config Center renders.
+fn read_gateway_snapshot(
+    runtime: &vibex_desktop_runtime::DesktopRuntime,
+) -> vibex_core::VibexResult<GatewaySnapshot> {
+    let service = runtime.model_gateway();
+    let provider = runtime.providers().service();
+    let settings = service.settings().map_err(vibex_core::VibexError::from)?;
+    let runtime_state = service.runtime_state();
+    let profiles = provider.list_model_provider_profiles()?;
+    let mut upstreams = Vec::new();
+    let mut models = Vec::new();
+    for upstream_id in &settings.upstreams {
+        let Some(profile) = profiles.iter().find(|profile| &profile.id == upstream_id) else {
+            continue;
+        };
+        let keys = profile
+            .credentials
+            .iter()
+            .map(|credential| vibex_core::GatewayKeySummary {
+                credential_id: credential.id.clone(),
+                display_name: credential.display_name.clone(),
+                state: vibex_core::GatewayKeyState::Ready,
+                used_tokens: 0,
+            })
+            .collect::<Vec<_>>();
+        upstreams.push(vibex_core::GatewayUpstreamSummary {
+            model_provider_profile_id: upstream_id.clone(),
+            display_name: profile.display_name.clone(),
+            model_count: profile
+                .configured_models
+                .iter()
+                .filter(|model| model.enabled)
+                .count(),
+            keys,
+        });
+        for model in profile
+            .configured_models
+            .iter()
+            .filter(|model| model.enabled)
+        {
+            models.push(vibex_core::GatewayModelSummary {
+                model_provider_profile_id: upstream_id.clone(),
+                provider_name: profile.display_name.clone(),
+                model_id: model.id.clone(),
+                display_id: format!(
+                    "{}/{}",
+                    provider_model_alias(&profile.display_name),
+                    model.id
+                ),
+                // The gateway decides what protocol to call upstream; the
+                // published entry keeps the model's declared capability
+                // namespace empty rather than inventing one.
+                wire_protocol_id: String::new(),
+            });
+        }
+    }
+    let enabled_agents = provider.gateway_agents()?;
+    let mut agents = Vec::new();
+    for (agent_id, _strategy, _enabled) in provider.gateway_agent_options()? {
+        agents.push(vibex_core::GatewayAgentBinding {
+            display_name: agent_id.as_str().to_string(),
+            enabled: enabled_agents.contains(&agent_id),
+            unsupported: false,
+            wire_protocol_id: String::new(),
+            agent_id: agent_id.as_str().to_string(),
+        });
+    }
+    Ok(GatewaySnapshot {
+        settings,
+        runtime: runtime_state,
+        upstreams,
+        models,
+        agents,
+    })
+}
+
+/// Reads the gateway model catalogue as display ids.
+fn gateway_catalog(
+    provider: &vibex_config_switch::ProviderConfigService,
+) -> vibex_core::VibexResult<Vec<String>> {
+    Ok(provider
+        .gateway_model_catalog()?
+        .into_iter()
+        .map(|model| model.display_id())
+        .collect())
+}
+
+/// A URL-safe short name for an upstream, used in published model ids.
+fn provider_model_alias(display_name: &str) -> String {
+    let mut alias = String::with_capacity(display_name.len());
+    let mut last_dash = false;
+    for character in display_name.chars() {
+        if character.is_ascii_alphanumeric() {
+            alias.push(character.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash && !alias.is_empty() {
+            alias.push('-');
+            last_dash = true;
+        }
+    }
+    while alias.ends_with('-') {
+        alias.pop();
+    }
+    if alias.is_empty() {
+        "provider".to_string()
+    } else {
+        alias
+    }
+}
+
 fn sidebar_mutation_error(code: &'static str, message: &'static str) -> BackendError {
     BackendError::failed(code, message)
 }
@@ -2671,6 +2783,127 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .management()
                 .list_model_provider_profiles()
+                .map_err(Into::into)
+        })
+    }
+
+    fn model_gateway_snapshot(&self) -> BackendFuture<'_, GatewaySnapshot> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            read_gateway_snapshot(&runtime).map_err(Into::into)
+        })
+    }
+
+    fn update_model_gateway_settings(
+        &self,
+        request: MutationRequest<GatewaySettingsUpdateRequest>,
+    ) -> BackendFuture<'_, GatewaySnapshot> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            request.validate()?;
+            let payload = request.payload;
+            let service = runtime.model_gateway();
+            let provider = runtime.providers().service();
+            let current = vibex_db::ModelGatewaySettingsRepository::get_or_create(
+                &vibex_db::open_database(service.database_path())?,
+            )?;
+            let mut policy = current.policy.clone();
+            policy.routing = payload.routing;
+            policy.pin = payload.pin;
+            policy.token_limit = payload.token_limit;
+            policy.validate()?;
+            let mut next = current.clone();
+            next.display_name = payload.display_name;
+            next.upstreams = payload.upstreams;
+            next.policy = policy;
+            next.revision = payload.expected_revision.saturating_add(1);
+            let mut connection = vibex_db::open_database(service.database_path())?;
+            vibex_db::apply_migrations(&mut connection)?;
+            vibex_db::ModelGatewaySettingsRepository::update(
+                &connection,
+                &next,
+                payload.expected_revision,
+            )?;
+            service.invalidate_snapshot();
+            provider.refresh_gateway_profiles(
+                &service.base_url().unwrap_or_default(),
+                &gateway_catalog(&provider)?,
+            )?;
+            read_gateway_snapshot(&runtime).map_err(Into::into)
+        })
+    }
+
+    fn set_model_gateway_agent(
+        &self,
+        request: MutationRequest<GatewayAgentUpdateRequest>,
+    ) -> BackendFuture<'_, GatewaySnapshot> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            request.validate()?;
+            let payload = request.payload;
+            let service = runtime.model_gateway();
+            let provider = runtime.providers().service();
+            let agent_id = vibex_core::AgentId::parse(payload.agent_id.as_str())?;
+            let base_url = service.base_url();
+            let catalog = gateway_catalog(&provider)?;
+            provider.set_gateway_agent(
+                &agent_id,
+                payload.enabled,
+                base_url.as_deref(),
+                &catalog,
+            )?;
+            read_gateway_snapshot(&runtime).map_err(Into::into)
+        })
+    }
+
+    fn model_gateway_requests(&self) -> BackendFuture<'_, Vec<GatewayRequestSummary>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let service = runtime.model_gateway();
+            let logs = service
+                .recent_requests(50)
+                .map_err(vibex_core::VibexError::from)?;
+            let names = runtime
+                .providers()
+                .service()
+                .list_model_provider_profiles()?
+                .into_iter()
+                .map(|profile| (profile.id, profile.display_name))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            Ok(logs
+                .into_iter()
+                .map(|log| GatewayRequestSummary {
+                    total_tokens: log.total_tokens(),
+                    request_id: log.request_id,
+                    agent_id: log.agent_id,
+                    provider_name: names
+                        .get(&log.model_provider_profile_id)
+                        .cloned()
+                        .unwrap_or_else(|| log.model_provider_profile_id.as_str().to_string()),
+                    model_requested: log.model_requested,
+                    model_served: log.model_served,
+                    wire_in: log.wire_in,
+                    wire_out: log.wire_out,
+                    status: log.status,
+                    outcome: log.outcome,
+                    created_at_ms: log.created_at_ms,
+                })
+                .collect())
+        })
+    }
+
+    fn clear_model_gateway_requests(&self) -> BackendFuture<'_, usize> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .model_gateway()
+                .clear_requests()
+                .map_err(vibex_core::VibexError::from)
                 .map_err(Into::into)
         })
     }

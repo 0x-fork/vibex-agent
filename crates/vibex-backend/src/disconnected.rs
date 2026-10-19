@@ -813,6 +813,32 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn model_gateway_snapshot(&self) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
+        disconnected_future!()
+    }
+
+    fn update_model_gateway_settings(
+        &self,
+        _request: MutationRequest<vibex_core::GatewaySettingsUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
+        disconnected_future!()
+    }
+
+    fn set_model_gateway_agent(
+        &self,
+        _request: MutationRequest<vibex_core::GatewayAgentUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
+        disconnected_future!()
+    }
+
+    fn model_gateway_requests(&self) -> BackendFuture<'_, Vec<vibex_core::GatewayRequestSummary>> {
+        disconnected_future!()
+    }
+
+    fn clear_model_gateway_requests(&self) -> BackendFuture<'_, usize> {
+        disconnected_future!()
+    }
+
     fn create_model_provider_profile(
         &self,
         _request: MutationRequest<vibex_core::ModelProviderProfileCreateRequest>,

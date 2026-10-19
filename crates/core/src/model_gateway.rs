@@ -517,6 +517,15 @@ impl GatewayKeyState {
     pub const fn is_ready(self) -> bool {
         matches!(self, Self::Ready)
     }
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Cooling { .. } => "cooling",
+            Self::Invalid => "invalid",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 /// One row of the gateway's request ledger.
@@ -698,6 +707,152 @@ impl<'a> GatewayModelRef<'a> {
             },
         }
     }
+}
+
+/// One Agent's relationship to the gateway, as the Config Center shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayAgentBinding {
+    pub agent_id: String,
+    pub display_name: String,
+    /// The Agent walks through the gateway.
+    pub enabled: bool,
+    /// The Agent manages its own provider and cannot be routed.
+    pub unsupported: bool,
+    /// The protocol the Agent speaks to the gateway, for the model list.
+    pub wire_protocol_id: String,
+}
+
+/// One model the gateway serves, for the Config Center's read-only list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayModelSummary {
+    pub model_provider_profile_id: ModelProviderProfileId,
+    pub provider_name: String,
+    pub model_id: String,
+    /// The id an Agent's model picker shows.
+    pub display_id: String,
+    pub wire_protocol_id: String,
+}
+
+/// The whole Config Center read for the gateway.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewaySnapshot {
+    pub settings: ModelGatewaySettings,
+    pub runtime: ModelGatewayRuntimeState,
+    pub upstreams: Vec<GatewayUpstreamSummary>,
+    pub models: Vec<GatewayModelSummary>,
+    pub agents: Vec<GatewayAgentBinding>,
+}
+
+impl Default for GatewaySnapshot {
+    fn default() -> Self {
+        Self {
+            settings: ModelGatewaySettings::default(),
+            runtime: ModelGatewayRuntimeState::default(),
+            upstreams: Vec::new(),
+            models: Vec::new(),
+            agents: Vec::new(),
+        }
+    }
+}
+
+impl GatewaySnapshot {
+    /// The number of Keys currently selectable across every upstream.
+    pub fn ready_key_count(&self) -> usize {
+        self.upstreams
+            .iter()
+            .flat_map(|upstream| &upstream.keys)
+            .filter(|key| key.state.is_ready())
+            .count()
+    }
+
+    /// The number of Keys sitting out a cooldown.
+    pub fn cooling_key_count(&self) -> usize {
+        self.upstreams
+            .iter()
+            .flat_map(|upstream| &upstream.keys)
+            .filter(|key| matches!(key.state, GatewayKeyState::Cooling { .. }))
+            .count()
+    }
+
+    /// The number of Keys the vendor rejected outright.
+    pub fn invalid_key_count(&self) -> usize {
+        self.upstreams
+            .iter()
+            .flat_map(|upstream| &upstream.keys)
+            .filter(|key| matches!(key.state, GatewayKeyState::Invalid))
+            .count()
+    }
+
+    /// Whether the surface can actually serve a request.
+    pub fn is_routable(&self) -> bool {
+        self.runtime.status.is_routable()
+            && !self.upstreams.is_empty()
+            && self.ready_key_count() > 0
+    }
+}
+
+/// One upstream as the Config Center shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayUpstreamSummary {
+    pub model_provider_profile_id: ModelProviderProfileId,
+    pub display_name: String,
+    pub model_count: usize,
+    pub keys: Vec<GatewayKeySummary>,
+}
+
+/// One Key's visible state. The secret itself is never part of this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayKeySummary {
+    pub credential_id: RequestId,
+    pub display_name: String,
+    pub state: GatewayKeyState,
+    #[serde(default)]
+    pub used_tokens: u64,
+}
+
+/// The Config Center's request to point one Agent at the gateway.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayAgentUpdateRequest {
+    pub agent_id: String,
+    pub enabled: bool,
+}
+
+/// One request the gateway served, for the diagnostics list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayRequestSummary {
+    pub request_id: RequestId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub provider_name: String,
+    pub model_requested: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_served: Option<String>,
+    pub wire_in: String,
+    pub wire_out: String,
+    pub status: Option<u16>,
+    pub total_tokens: u64,
+    pub outcome: GatewayRequestOutcome,
+    pub created_at_ms: i64,
+}
+
+/// The settings mutation the Config Center submits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewaySettingsUpdateRequest {
+    pub display_name: String,
+    pub routing: GatewayRoutingStrategy,
+    pub pin: GatewayPinScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<GatewayTokenLimit>,
+    pub upstreams: Vec<ModelProviderProfileId>,
+    pub expected_revision: i64,
 }
 
 /// Where one Provider Profile field lands in a gateway-aware editor.

@@ -25,8 +25,9 @@ use vibex_core::{
     AutomationRunStep, AutomationRunStepListRequest, BackupCreateOutcome, BackupCreatePayload,
     BackupInspectOutcome, BackupInspectPayload, BackupRestoreOutcome, BackupRestorePayload,
     CustomAgentCreateRequest, CustomAgentDeleteRequest, DiagnosticExportOutcome,
-    DiagnosticExportPayload, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
-    HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload,
+    DiagnosticExportPayload, GatewayAgentUpdateRequest, GatewayRequestSummary,
+    GatewaySettingsUpdateRequest, GatewaySnapshot, Hook, HookCreateRequest, HookDeleteRequest,
+    HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload,
     McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
     McpMarketSearchResponse, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
     McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
@@ -152,6 +153,28 @@ pub trait ManagementBackend: BackendBound {
     ) -> BackendFuture<'_, ProviderProfileSummary>;
 
     fn list_model_provider_profiles(&self) -> BackendFuture<'_, Vec<ModelProviderProfile>>;
+
+    /// Reads the whole gateway surface: its settings, the listener state, its
+    /// upstreams and Keys, and which Agents currently walk through it.
+    fn model_gateway_snapshot(&self) -> BackendFuture<'_, GatewaySnapshot>;
+
+    /// Writes the gateway's routing policy and its upstream list.
+    fn update_model_gateway_settings(
+        &self,
+        request: MutationRequest<GatewaySettingsUpdateRequest>,
+    ) -> BackendFuture<'_, GatewaySnapshot>;
+
+    /// Points one Agent at the gateway, or takes it back to a direct Provider.
+    fn set_model_gateway_agent(
+        &self,
+        request: MutationRequest<GatewayAgentUpdateRequest>,
+    ) -> BackendFuture<'_, GatewaySnapshot>;
+
+    /// Lists the metadata-only ledger for the diagnostics view.
+    fn model_gateway_requests(&self) -> BackendFuture<'_, Vec<GatewayRequestSummary>>;
+
+    /// Clears the gateway ledger.
+    fn clear_model_gateway_requests(&self) -> BackendFuture<'_, usize>;
 
     fn create_model_provider_profile(
         &self,

@@ -65,6 +65,7 @@ use vibex_db::{
 };
 use vibex_desktop_model::DesktopPollingPolicy;
 use vibex_diagnostics::{DiagnosticBundleService, DiagnosticBundleServiceConfig};
+use vibex_model_gateway::{GatewayLimits as ModelGatewayLimits, ModelGatewayService};
 use vibex_remote::{
     RemoteAgentRuntimeProbeSource, RemoteAgentUsageSource, RemoteDispatcher, RemoteGateway,
     RemoteGatewayConfig, RemoteGatewayDeploymentMode, RemoteGatewayPeerLimits,
@@ -1316,6 +1317,92 @@ pub async fn assemble_management_snapshot(
         automation_graphs,
         automation_runs,
         automation_steps,
+        model_gateway: assemble_gateway_snapshot(management).ok(),
+    })
+}
+
+/// Reads the gateway surface for the Config Center bundle.
+///
+/// A gateway that cannot be read is reported as absent rather than failing the
+/// whole Config Center: every other section still has to open.
+fn assemble_gateway_snapshot(
+    management: &ManagementHandle,
+) -> VibexResult<vibex_core::GatewaySnapshot> {
+    let service = management.model_gateway();
+    let provider = management.providers().service();
+    let settings = service.settings().map_err(vibex_core::VibexError::from)?;
+    let runtime_state = service.runtime_state();
+    let profiles = provider.list_model_provider_profiles()?;
+    let catalog = provider.gateway_model_catalog().unwrap_or_default();
+    let enabled_agents = provider.gateway_agents()?;
+    let account_states = management
+        .providers()
+        .service()
+        .gateway_account_states()
+        .unwrap_or_default();
+    let now = vibex_core::unix_timestamp_ms();
+    let mut upstreams = Vec::new();
+    let mut models = Vec::new();
+    for upstream_id in &settings.upstreams {
+        let Some(profile) = profiles.iter().find(|profile| &profile.id == upstream_id) else {
+            continue;
+        };
+        let keys = profile
+            .credentials
+            .iter()
+            .map(|credential| {
+                let state = account_states
+                    .iter()
+                    .find(|state| {
+                        &state.model_provider_profile_id == upstream_id
+                            && state.credential_id == credential.id
+                    })
+                    .map(|state| state.visibility_at(now))
+                    .unwrap_or(vibex_core::GatewayKeyState::Ready);
+                vibex_core::GatewayKeySummary {
+                    credential_id: credential.id.clone(),
+                    display_name: credential.display_name.clone(),
+                    state,
+                    used_tokens: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+        upstreams.push(vibex_core::GatewayUpstreamSummary {
+            model_provider_profile_id: upstream_id.clone(),
+            display_name: profile.display_name.clone(),
+            model_count: profile
+                .configured_models
+                .iter()
+                .filter(|model| model.enabled)
+                .count(),
+            keys,
+        });
+    }
+    for model in catalog {
+        models.push(vibex_core::GatewayModelSummary {
+            model_provider_profile_id: model.provider.clone(),
+            provider_name: model.provider_name.clone(),
+            model_id: model.model.clone(),
+            display_id: model.display_id(),
+            wire_protocol_id: String::new(),
+        });
+    }
+    let mut agents = Vec::new();
+    for (agent_id, _strategy, _enabled) in provider.gateway_agent_options()? {
+        agents.push(vibex_core::GatewayAgentBinding {
+            agent_id: agent_id.as_str().to_string(),
+            display_name: agent_id.as_str().to_string(),
+            enabled: enabled_agents.contains(&agent_id),
+            unsupported: false,
+            wire_protocol_id: String::new(),
+        });
+    }
+    Ok(vibex_core::GatewaySnapshot {
+        settings,
+        runtime: runtime_state,
+        upstreams,
+        models,
+        agents,
     })
 }
 
@@ -1393,6 +1480,141 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
             )
         })?;
         assemble_management_snapshot(management, default_scope, refresh_agent_versions).await
+    }
+
+    async fn model_gateway_snapshot(&self) -> VibexResult<vibex_core::GatewaySnapshot> {
+        let management = self.management.get().ok_or_else(|| {
+            VibexError::process(
+                "desktop_management_handle_unavailable",
+                "the runtime management handle is not installed yet",
+            )
+        })?;
+        assemble_gateway_snapshot(management)
+    }
+
+    async fn update_model_gateway_settings(
+        &self,
+        request: vibex_core::GatewaySettingsUpdateRequest,
+    ) -> VibexResult<vibex_core::GatewaySnapshot> {
+        let management = self.management.get().ok_or_else(|| {
+            VibexError::process(
+                "desktop_management_handle_unavailable",
+                "the runtime management handle is not installed yet",
+            )
+        })?;
+        let service = management.model_gateway();
+        let provider = management.providers().service();
+        let mut connection = open_database(service.database_path())?;
+        apply_migrations(&mut connection)?;
+        let current = vibex_db::ModelGatewaySettingsRepository::get_or_create(&connection)?;
+        let mut policy = current.policy.clone();
+        policy.routing = request.routing;
+        policy.pin = request.pin;
+        policy.token_limit = request.token_limit;
+        policy.validate()?;
+        let mut next = current.clone();
+        next.display_name = request.display_name;
+        next.upstreams = request.upstreams;
+        next.policy = policy;
+        next.revision = request.expected_revision.saturating_add(1);
+        vibex_db::ModelGatewaySettingsRepository::update(
+            &connection,
+            &next,
+            request.expected_revision,
+        )?;
+        service.invalidate_snapshot();
+        if let Some(base_url) = service.base_url() {
+            let catalog = provider
+                .gateway_model_catalog()
+                .map(|catalog| {
+                    catalog
+                        .into_iter()
+                        .map(|model| model.display_id())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            provider.refresh_gateway_profiles(&base_url, &catalog)?;
+        }
+        assemble_gateway_snapshot(management)
+    }
+
+    async fn set_model_gateway_agent(
+        &self,
+        request: vibex_core::GatewayAgentUpdateRequest,
+    ) -> VibexResult<vibex_core::GatewaySnapshot> {
+        let management = self.management.get().ok_or_else(|| {
+            VibexError::process(
+                "desktop_management_handle_unavailable",
+                "the runtime management handle is not installed yet",
+            )
+        })?;
+        let service = management.model_gateway();
+        let provider = management.providers().service();
+        let agent_id = vibex_core::AgentId::parse(request.agent_id.as_str())?;
+        let base_url = service.base_url();
+        let catalog = provider
+            .gateway_model_catalog()
+            .map(|catalog| {
+                catalog
+                    .into_iter()
+                    .map(|model| model.display_id())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        provider.set_gateway_agent(&agent_id, request.enabled, base_url.as_deref(), &catalog)?;
+        assemble_gateway_snapshot(management)
+    }
+
+    async fn model_gateway_requests(&self) -> VibexResult<Vec<vibex_core::GatewayRequestSummary>> {
+        let management = self.management.get().ok_or_else(|| {
+            VibexError::process(
+                "desktop_management_handle_unavailable",
+                "the runtime management handle is not installed yet",
+            )
+        })?;
+        let logs = management
+            .model_gateway()
+            .recent_requests(50)
+            .map_err(VibexError::from)?;
+        let names = management
+            .providers()
+            .service()
+            .list_model_provider_profiles()?
+            .into_iter()
+            .map(|profile| (profile.id, profile.display_name))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        Ok(logs
+            .into_iter()
+            .map(|log| vibex_core::GatewayRequestSummary {
+                total_tokens: log.total_tokens(),
+                request_id: log.request_id,
+                agent_id: log.agent_id,
+                provider_name: names
+                    .get(&log.model_provider_profile_id)
+                    .cloned()
+                    .unwrap_or_else(|| log.model_provider_profile_id.as_str().to_string()),
+                model_requested: log.model_requested,
+                model_served: log.model_served,
+                wire_in: log.wire_in,
+                wire_out: log.wire_out,
+                status: log.status,
+                outcome: log.outcome,
+                created_at_ms: log.created_at_ms,
+            })
+            .collect())
+    }
+
+    async fn clear_model_gateway_requests(&self) -> VibexResult<usize> {
+        let management = self.management.get().ok_or_else(|| {
+            VibexError::process(
+                "desktop_management_handle_unavailable",
+                "the runtime management handle is not installed yet",
+            )
+        })?;
+        management
+            .model_gateway()
+            .clear_requests()
+            .map_err(VibexError::from)
     }
 }
 
@@ -2059,6 +2281,7 @@ pub struct RemoteHandle {
 pub struct ManagementHandle {
     home_dir: PathBuf,
     providers: ProviderHandle,
+    model_gateway: Arc<ModelGatewayService>,
     scheduled: ScheduledHandle,
     automation: AutomationHandle,
     diagnostics: DiagnosticsHandle,
@@ -2068,6 +2291,11 @@ pub struct ManagementHandle {
 }
 
 impl ManagementHandle {
+    /// The local model gateway service.
+    pub fn model_gateway(&self) -> Arc<ModelGatewayService> {
+        Arc::clone(&self.model_gateway)
+    }
+
     pub fn diagnostics_destination(&self) -> PathBuf {
         self.home_dir.join("diagnostics.json")
     }
@@ -2293,6 +2521,10 @@ pub struct DesktopRuntime {
     /// process, the CDP connection and the audit ledger all belong to the
     /// runtime; clients only subscribe.
     browser: Arc<BrowserRuntime>,
+    /// The local model gateway. It owns one loopback listener and the
+    /// request-level routing state Agents never see; the durable Provider
+    /// configuration stays in the Provider service.
+    model_gateway: Arc<ModelGatewayService>,
     providers: ProviderHandle,
     workspace: WorkspaceHandle,
     files: FileHandle,
@@ -2559,7 +2791,7 @@ impl DesktopRuntime {
             worktrees: Arc::new(WorktreeCoordinator::new(db_path.clone())),
         };
         let providers = ProviderHandle {
-            service: provider_config_service,
+            service: provider_config_service.clone(),
             runtime_probe,
             mutation_guard: ManagementMutationGuard::default(),
         };
@@ -2767,6 +2999,15 @@ impl DesktopRuntime {
             agent.clone(),
             config.computer_use_enabled,
         );
+        // The gateway reads the same Provider configuration the Config Center
+        // writes, so it is assembled beside them. Its listener starts after the
+        // runtime exists, and a bind failure degrades to direct Provider use
+        // rather than blocking startup.
+        let model_gateway = ModelGatewayService::new(
+            db_path.clone(),
+            provider_config_service.clone(),
+            ModelGatewayLimits::default(),
+        );
         let runtime = Arc::new(Self {
             config,
             app_update,
@@ -2814,6 +3055,7 @@ impl DesktopRuntime {
             polling: DesktopPollingPolicy::default(),
             browser: browser.clone(),
             computer: computer.clone(),
+            model_gateway: model_gateway.clone(),
             events,
             tasks: Mutex::new(Vec::new()),
             home_lock: Mutex::new(home_lock),
@@ -2847,6 +3089,43 @@ impl DesktopRuntime {
                     error_code = %error.code,
                     "the browser MCP endpoint could not be started; browser tools will not reach \
                      Agents"
+                ),
+            }
+            Ok(())
+        })
+        .await?;
+        // The gateway is bound after the runtime exists so a bind failure can
+        // be reported through the same handle the Config Center reads. Agents
+        // keep their direct Provider configuration when it fails, and the UI
+        // says so rather than pretending automatic routing is active.
+        startup_stage_async("model_gateway_start", async {
+            let service = Arc::clone(&runtime.model_gateway);
+            match service.start().await {
+                Ok(state) => {
+                    if let Some(base_url) = state.base_url() {
+                        let provider = runtime.providers.service();
+                        let catalog = provider
+                            .gateway_model_catalog()
+                            .map(|catalog| {
+                                catalog
+                                    .into_iter()
+                                    .map(|model| model.display_id())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        if let Err(error) = provider.refresh_gateway_profiles(&base_url, &catalog) {
+                            tracing::warn!(
+                                target: "vibex_model_gateway",
+                                error_code = %error.code,
+                                "gateway Profiles could not be refreshed after the listener started"
+                            );
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    target: "vibex_model_gateway",
+                    error_code = %error.code(),
+                    "the model gateway could not start; Agents keep their direct Provider configuration"
                 ),
             }
             Ok(())
@@ -3768,6 +4047,12 @@ impl DesktopRuntime {
         self.providers.clone()
     }
 
+    /// The local model gateway: one loopback endpoint that routes each call to
+    /// whichever shared Provider serves the requested model.
+    pub fn model_gateway(&self) -> Arc<ModelGatewayService> {
+        Arc::clone(&self.model_gateway)
+    }
+
     pub fn usage(&self) -> AgentUsageService {
         self.usage.clone()
     }
@@ -3934,6 +4219,7 @@ impl DesktopRuntime {
         ManagementHandle {
             home_dir: self.config.home_dir.clone(),
             providers: self.providers.clone(),
+            model_gateway: Arc::clone(&self.model_gateway),
             scheduled: self.scheduled.clone(),
             automation: self.automation.clone(),
             diagnostics: self.diagnostics.clone(),
@@ -4002,6 +4288,10 @@ impl DesktopRuntime {
             }
             Err(error) => record_shutdown_error(&mut first_error, error),
         }
+        // The gateway stops before the Agent runtime: a process that is still
+        // running should see its endpoint disappear rather than be handed a
+        // half-shut service.
+        self.model_gateway.shutdown().await;
         // The browser goes down next to the terminals: both own a process tree
         // that must not outlive the runtime, and both are cheap to stop
         // explicitly. `kill_on_drop` is a net, not the plan.

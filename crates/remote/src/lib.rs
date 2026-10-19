@@ -571,6 +571,27 @@ pub trait RemoteManagementSnapshotSource: Send + Sync {
         default_scope: vibex_core::ProviderProfileDefaultScope,
         refresh_agent_versions: bool,
     ) -> VibexResult<vibex_core::RemoteProviderManagementSnapshot>;
+
+    /// Reads the local model gateway's surface.
+    async fn model_gateway_snapshot(&self) -> VibexResult<vibex_core::GatewaySnapshot>;
+
+    /// Writes the gateway's routing policy and upstream list.
+    async fn update_model_gateway_settings(
+        &self,
+        request: vibex_core::GatewaySettingsUpdateRequest,
+    ) -> VibexResult<vibex_core::GatewaySnapshot>;
+
+    /// Points one Agent at the gateway, or takes it back to a direct Provider.
+    async fn set_model_gateway_agent(
+        &self,
+        request: vibex_core::GatewayAgentUpdateRequest,
+    ) -> VibexResult<vibex_core::GatewaySnapshot>;
+
+    /// Lists the gateway's metadata-only request ledger.
+    async fn model_gateway_requests(&self) -> VibexResult<Vec<vibex_core::GatewayRequestSummary>>;
+
+    /// Clears the gateway's request ledger.
+    async fn clear_model_gateway_requests(&self) -> VibexResult<usize>;
 }
 
 /// Managed-worktree lifecycle consumed by the gateway.
@@ -4354,6 +4375,98 @@ async fn dispatch_provider_request(
                 )
                 .await?;
             serde_json::to_value(vibex_core::RemoteProviderManagementSnapshotResponse { snapshot })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ModelGatewaySnapshot(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = state.management_snapshot.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "remote_model_gateway_unavailable",
+                    "the model gateway is not available on this service",
+                )
+            })?;
+            let snapshot = source.model_gateway_snapshot().await?;
+            serde_json::to_value(vibex_core::RemoteModelGatewaySnapshotResponse { snapshot })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::UpdateModelGatewaySettings(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = state.management_snapshot.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "remote_model_gateway_unavailable",
+                    "the model gateway is not available on this service",
+                )
+            })?;
+            let snapshot = source
+                .update_model_gateway_settings(request.request)
+                .await?;
+            serde_json::to_value(vibex_core::RemoteModelGatewaySnapshotResponse { snapshot })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SetModelGatewayAgent(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = state.management_snapshot.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "remote_model_gateway_unavailable",
+                    "the model gateway is not available on this service",
+                )
+            })?;
+            let snapshot = source.set_model_gateway_agent(request.request).await?;
+            serde_json::to_value(vibex_core::RemoteModelGatewaySnapshotResponse { snapshot })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ListModelGatewayRequests(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = state.management_snapshot.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "remote_model_gateway_unavailable",
+                    "the model gateway is not available on this service",
+                )
+            })?;
+            let requests = source.model_gateway_requests().await?;
+            serde_json::to_value(vibex_core::RemoteModelGatewayRequestListResponse { requests })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ClearModelGatewayRequests(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = state.management_snapshot.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "remote_model_gateway_unavailable",
+                    "the model gateway is not available on this service",
+                )
+            })?;
+            let cleared = source.clear_model_gateway_requests().await?;
+            serde_json::to_value(vibex_core::RemoteModelGatewayClearResponse { cleared })
                 .map_err(remote_payload_encode_error)
         }
         RemoteProviderRequest::MutateProviderCredentialSecret(request) => {

@@ -9896,7 +9896,9 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "vibex-browser",
+ "vibex-config-switch",
  "vibex-core",
+ "vibex-db",
  "vibex-desktop-model",
  "vibex-desktop-runtime",
 ]
@@ -10164,6 +10166,7 @@ dependencies = [
  "vibex-diagnostics",
  "vibex-fs",
  "vibex-git",
+ "vibex-model-gateway",
  "vibex-relay",
  "vibex-remote",
  "vibex-terminal",
