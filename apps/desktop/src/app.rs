@@ -679,8 +679,17 @@ const TIMELINE_BODY_WINDOW_CACHE_BYTES: usize = 2 * 1024 * 1024;
 /// query they have already been scrolled to.
 const TIMELINE_BODY_SCROLL_CACHE_LIMIT: usize = 64;
 const TIMELINE_BODY_SEARCH_CACHE_LIMIT: usize = 64;
-/// The height the reveal control adds to a folded row.
-const TIMELINE_BODY_REVEAL_CONTROL_HEIGHT: f32 = 24.0;
+/// The gap between a folded or windowed body and the control that opens it.
+const TIMELINE_BODY_REVEAL_CONTROL_GAP: f32 = 8.0;
+/// The height the reveal control adds to a row, gap included.
+const TIMELINE_BODY_REVEAL_CONTROL_HEIGHT: f32 = 32.0;
+/// How far a windowed body's edge fades into the surface it sits on.
+///
+/// A scroll container cuts whatever line it lands on in half. A row showing
+/// half a line against the text above it reads as a rendering fault, so the
+/// edges fade the surface back in over roughly a line and a half: a line
+/// entering or leaving the box dissolves instead of being sliced.
+const TIMELINE_BODY_EDGE_FADE_PX: f32 = 24.0;
 const TIMELINE_REASONING_SUMMARY_CACHE_LIMIT: usize = 256;
 const TIMELINE_REASONING_SUMMARY_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
@@ -58190,21 +58199,30 @@ impl VibexWorkbench {
         });
         let selector = format!("timeline-body-window:{}", row.id);
         let debug_selector = selector.clone();
+        let surface = cx.theme().background;
         div()
-            .id(selector)
-            .debug_selector(move || debug_selector.clone())
             .w_full()
             .min_w_0()
-            .max_h(px(box_height))
-            .track_scroll(&scroll)
-            .overflow_y_scroll()
-            .child(timeline_group_body::timeline_group_body(
-                origins,
-                total_height,
-                px(TIMELINE_BODY_CHUNK_OVERSCAN_PX),
-                build_row,
-                record,
-            ))
+            .relative()
+            .child(
+                div()
+                    .id(selector)
+                    .debug_selector(move || debug_selector.clone())
+                    .w_full()
+                    .min_w_0()
+                    .max_h(px(box_height))
+                    .track_scroll(&scroll)
+                    .overflow_y_scroll()
+                    .child(timeline_group_body::timeline_group_body(
+                        origins,
+                        total_height,
+                        px(TIMELINE_BODY_CHUNK_OVERSCAN_PX),
+                        build_row,
+                        record,
+                    )),
+            )
+            .child(timeline_body_edge_fade(surface, &row.id, true))
+            .child(timeline_body_edge_fade(surface, &row.id, false))
             .into_any_element()
     }
 
@@ -58459,6 +58477,7 @@ impl VibexWorkbench {
             .debug_selector(move || debug_selector.clone())
             .w_full()
             .min_w_0()
+            .mt(px(TIMELINE_BODY_REVEAL_CONTROL_GAP))
             .items_center()
             .gap_1()
             .text_xs()
@@ -58481,10 +58500,16 @@ impl VibexWorkbench {
                 .size(px(12.0))
                 .flex_none(),
             )
-            .child(SharedString::from(format!(
-                "{label} · {}",
-                format_bytes(u64::try_from(hidden_bytes).unwrap_or(u64::MAX))
-            )))
+            .child(SharedString::from(if hidden_bytes > 0 {
+                // The hint belongs to the folded shape: an opened body hides
+                // nothing, and "0 B" beside "Show less" is noise.
+                format!(
+                    "{label} · {}",
+                    format_bytes(u64::try_from(hidden_bytes).unwrap_or(u64::MAX))
+                )
+            } else {
+                label.to_string()
+            }))
             .on_click(cx.listener(move |this, _, _, cx| {
                 // The control sits inside rows that answer a click of their own
                 // (an opened reasoning row toggles on one), so the click ends
@@ -68736,6 +68761,38 @@ fn timeline_row_body_folds(row: &TimelineRow, turn_live: bool) -> bool {
         row.kind,
         TimelineRowKind::AgentMessage | TimelineRowKind::Reasoning
     ) && (!row.streaming || !turn_live)
+}
+
+/// The soft edge a windowed body is read through.
+///
+/// It is a plain overlay with no hitbox, so the wheel keeps reaching the box's
+/// scroll container underneath it: the reader scrolls through the fade.
+fn timeline_body_edge_fade(surface: Hsla, row_id: &str, top: bool) -> AnyElement {
+    let clear = surface.opacity(0.0);
+    let selector = format!(
+        "timeline-body-fade:{}:{}",
+        if top { "top" } else { "bottom" },
+        row_id
+    );
+    let (from, to) = if top {
+        (surface, clear)
+    } else {
+        (clear, surface)
+    };
+    div()
+        .debug_selector(move || selector.clone())
+        .absolute()
+        .left_0()
+        .right_0()
+        .when(top, |this| this.top_0())
+        .when(!top, |this| this.bottom_0())
+        .h(px(TIMELINE_BODY_EDGE_FADE_PX))
+        .bg(linear_gradient(
+            180.0,
+            linear_color_stop(from, 0.0),
+            linear_color_stop(to, 1.0),
+        ))
+        .into_any_element()
 }
 
 /// Where one windowed body is cut into the chunks the window lays out.

@@ -2597,13 +2597,28 @@ fn a_long_settled_body_is_drawn_as_its_head_until_the_reader_opens_it(cx: &mut T
     });
     // Opening a body this long hands it to its own viewport rather than to one
     // surface: the row is the box, and what is laid out is a chunk of the body.
+    let box_selector: &'static str =
+        Box::leak(format!("timeline-body-window:{row_id}").into_boxed_str());
+    let box_bounds = cx
+        .debug_bounds(box_selector)
+        .expect("the opened row reads through its own box");
+    // The control clears the box, and both of the box's edges fade: a line the
+    // box cut in half must not slide under the control or into the text above.
+    let control_bounds = cx
+        .debug_bounds(control_selector)
+        .expect("the opened row keeps its control");
     assert!(
-        cx.debug_bounds(Box::leak(
-            format!("timeline-body-window:{row_id}").into_boxed_str()
-        ))
-        .is_some(),
-        "the opened row reads through its own box"
+        control_bounds.top() >= box_bounds.bottom(),
+        "the control clears the box: control {control_bounds:?} against box {box_bounds:?}"
     );
+    for edge in ["top", "bottom"] {
+        let selector: &'static str =
+            Box::leak(format!("timeline-body-fade:{edge}:{row_id}").into_boxed_str());
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "the {edge} edge of the box fades into the surface"
+        );
+    }
     assert!(
         !opened_surfaces.is_empty()
             && opened_surfaces
