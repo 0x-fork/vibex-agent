@@ -32381,6 +32381,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:vibex-model-gateway@0.1.0-rc.8:5811db0c4b687e85",
+      "name": "vibex-model-gateway",
+      "version": "0.1.0-rc.8",
+      "licenses": [
+        {
+          "expression": "AGPL-3.0-or-later"
+        }
+      ],
+      "purl": "pkg:cargo/vibex-model-gateway@0.1.0-rc.8",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "path:crates/model-gateway"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "AGPL-3.0-or-later"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/vibex-ai/vibex"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:vibex-relay@0.1.0-rc.8:0c0a0267098c7864",
       "name": "vibex-relay",
       "version": "0.1.0-rc.8",
@@ -46924,7 +46960,9 @@
         "cargo:thiserror@2.0.18:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a",
         "cargo:vibex-browser@0.1.0-rc.8:df2965b12b4b9031",
+        "cargo:vibex-config-switch@0.1.0-rc.8:15ba9694989d1411",
         "cargo:vibex-core@0.1.0-rc.8:a1f32ad3e304847a",
+        "cargo:vibex-db@0.1.0-rc.8:b0d5d96e1f6cacc2",
         "cargo:vibex-desktop-model@0.1.0-rc.8:3eccb8226f5ee757",
         "cargo:vibex-desktop-runtime@0.1.0-rc.8:7b92bf06aa544433"
       ]
@@ -47116,6 +47154,7 @@
         "cargo:vibex-diagnostics@0.1.0-rc.8:f071779acd132fc6",
         "cargo:vibex-fs@0.1.0-rc.8:9fbf48bd55955db3",
         "cargo:vibex-git@0.1.0-rc.8:b6ca7a78bc73d037",
+        "cargo:vibex-model-gateway@0.1.0-rc.8:5811db0c4b687e85",
         "cargo:vibex-relay@0.1.0-rc.8:0c0a0267098c7864",
         "cargo:vibex-remote@0.1.0-rc.8:b2402acf3d0333d8",
         "cargo:vibex-terminal@0.1.0-rc.8:73363de7836b4dd0",
@@ -47224,6 +47263,25 @@
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
         "cargo:vibex-core@0.1.0-rc.8:a1f32ad3e304847a"
+      ]
+    },
+    {
+      "ref": "cargo:vibex-model-gateway@0.1.0-rc.8:5811db0c4b687e85",
+      "dependsOn": [
+        "cargo:axum@0.8.9:c19b7c6f923b580a",
+        "cargo:base64@0.22.1:c19b7c6f923b580a",
+        "cargo:bytes@1.12.0:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
+        "cargo:reqwest@0.13.4:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_json@1.0.150:c19b7c6f923b580a",
+        "cargo:sha2@0.10.9:c19b7c6f923b580a",
+        "cargo:tokio@1.52.3:c19b7c6f923b580a",
+        "cargo:tracing@0.1.44:c19b7c6f923b580a",
+        "cargo:url@2.5.8:c19b7c6f923b580a",
+        "cargo:vibex-config-switch@0.1.0-rc.8:15ba9694989d1411",
+        "cargo:vibex-core@0.1.0-rc.8:a1f32ad3e304847a",
+        "cargo:vibex-db@0.1.0-rc.8:b0d5d96e1f6cacc2"
       ]
     },
     {
