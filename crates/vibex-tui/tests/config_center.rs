@@ -4954,6 +4954,7 @@ fn the_gateway_leads_the_providers_table_and_reports_its_state() {
             agent_id: "codex".to_string(),
             display_name: "codex".to_string(),
             enabled: true,
+            active: true,
             unsupported: false,
             wire_protocol_id: String::new(),
         }],
@@ -4962,8 +4963,23 @@ fn the_gateway_leads_the_providers_table_and_reports_its_state() {
     app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
     let strings = app.strings;
     let rows = app.config_center.rows(&app.management_data, strings);
-    assert_eq!(rows.len(), 2, "one gateway row and one direct Provider");
+    assert_eq!(
+        rows.len(),
+        5,
+        "the gateway, its upstream, two Key rows, and one direct Provider"
+    );
     assert_eq!(rows[0].key, "gateway");
+    assert!(rows[1].key.starts_with("gateway-upstream:"));
+    assert!(rows[2].key.starts_with("gateway-key:"));
+    assert!(rows[3].key.starts_with("gateway-key:"));
+    assert_eq!(rows[4].key, "provider_direct");
+    assert!(
+        rows[2..4]
+            .iter()
+            .any(|row| row.cells.iter().any(|cell| cell.contains("cooling"))),
+        "a Key row must say it is cooling: {:?}",
+        rows[2].cells
+    );
     assert!(
         rows[0].cells.iter().any(|cell| cell.contains("cooling")),
         "the gateway row must say a Key is cooling: {:?}",
@@ -5037,6 +5053,50 @@ fn the_gateway_switch_writes_and_answers_the_press() {
         "a port the authority has not confirmed must not stay on the row: {:?}",
         after[0].detail
     );
+}
+
+/// A Key row is a write target, not decoration: switching it and preferring
+/// it both reach the gateway settings command with the row's own identity.
+#[test]
+fn a_gateway_key_row_switches_and_prefers() {
+    let mut app = loaded(140, 40);
+    let upstream = vibex_core::ModelProviderProfileId::new();
+    let credential = vibex_core::RequestId::new();
+    app.management_data.gateway = Some(vibex_core::GatewaySnapshot {
+        settings: vibex_core::ModelGatewaySettings {
+            display_name: "Vibex Gateway".to_string(),
+            upstreams: vec![upstream.clone()],
+            ..vibex_core::ModelGatewaySettings::default()
+        },
+        runtime: vibex_core::ModelGatewayRuntimeState::running(3425, 1),
+        upstreams: vec![vibex_core::GatewayUpstreamSummary {
+            model_provider_profile_id: upstream,
+            display_name: "DeepSeek".to_string(),
+            model_count: 1,
+            keys: vec![vibex_core::GatewayKeySummary {
+                credential_id: credential,
+                display_name: "Primary".to_string(),
+                state: vibex_core::GatewayKeyState::Ready,
+                used_tokens: 0,
+                limits: None,
+            }],
+        }],
+        models: Vec::new(),
+        agents: Vec::new(),
+        upstream_candidates: Vec::new(),
+    });
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+    let key = app
+        .config_center
+        .rows(&app.management_data, app.strings)
+        .into_iter()
+        .find(|row| row.key.starts_with("gateway-key:"))
+        .expect("a Key row");
+
+    app.run_config_action_by_key(&key.key, ConfigAction::Toggle);
+    assert!(app.config_center.pending.contains_key(&key.key));
+    app.run_config_action_by_key(&key.key, ConfigAction::Prefer);
+    assert!(app.config_center.pending.contains_key(&key.key));
 }
 
 /// A gateway nobody has read yet has no row to switch.

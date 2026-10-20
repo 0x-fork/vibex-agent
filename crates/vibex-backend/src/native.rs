@@ -1170,11 +1170,13 @@ fn read_gateway_snapshot(
         }
     }
     let enabled_agents = provider.gateway_agents()?;
+    let active_agents = provider.gateway_active_agents().unwrap_or_default();
     let mut agents = Vec::new();
     for (agent_id, _strategy, _enabled) in provider.gateway_agent_options()? {
         agents.push(vibex_core::GatewayAgentBinding {
             display_name: agent_id.as_str().to_string(),
             enabled: enabled_agents.contains(&agent_id),
+            active: active_agents.contains(&agent_id),
             unsupported: false,
             wire_protocol_id: String::new(),
             agent_id: agent_id.as_str().to_string(),
@@ -2948,10 +2950,14 @@ impl ManagementBackend for NativeBackend {
             // runtime state, which the Config Center already renders; the write
             // itself still succeeded.
             let _ = service.apply_policy().await;
-            provider.refresh_gateway_profiles(
-                &service.base_url().unwrap_or_default(),
-                &gateway_catalog(&provider)?,
-            )?;
+            match service.base_url() {
+                Some(base_url) => {
+                    provider.refresh_gateway_profiles(&base_url, &gateway_catalog(&provider)?)?;
+                }
+                None => {
+                    provider.deactivate_gateway_profiles()?;
+                }
+            }
             read_gateway_snapshot(&runtime).map_err(Into::into)
         })
     }
@@ -3009,17 +3015,22 @@ impl ManagementBackend for NativeBackend {
             // An Agent bound to a stopped gateway must be told, and an Agent
             // whose gateway came back must be re-pointed: the address is the
             // same either way, so this only reports what changed.
-            if let Some(base_url) = service.base_url() {
-                let catalog = provider
-                    .gateway_model_catalog()
-                    .map(|catalog| {
-                        catalog
-                            .into_iter()
-                            .map(|model| model.display_id())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                provider.refresh_gateway_profiles(&base_url, &catalog)?;
+            match service.base_url() {
+                Some(base_url) => {
+                    let catalog = provider
+                        .gateway_model_catalog()
+                        .map(|catalog| {
+                            catalog
+                                .into_iter()
+                                .map(|model| model.display_id())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    provider.refresh_gateway_profiles(&base_url, &catalog)?;
+                }
+                None => {
+                    provider.deactivate_gateway_profiles()?;
+                }
             }
             read_gateway_snapshot(&runtime).map_err(Into::into)
         })

@@ -176,6 +176,7 @@ pub enum AppMessage {
     Audit(BackendResult<Vec<vibex_core::RemoteAuditRecord>>),
     Profiles(BackendResult<Vec<vibex_core::ProviderProfileSummary>>),
     Gateway(BackendResult<vibex_core::GatewaySnapshot>),
+    GatewayRequests(BackendResult<Vec<vibex_core::GatewayRequestSummary>>),
     /// One profile as the authority holds it, read for an editor.
     ProviderProfile(BackendResult<vibex_core::ProviderProfile>),
     /// One Agent's profile order, as the authority holds it.
@@ -2211,6 +2212,10 @@ impl Dispatch {
                 let result = self.facade.management().model_gateway_snapshot().await;
                 self.send(AppMessage::Gateway(result));
             }
+            Effect::LoadGatewayRequests => {
+                let result = self.facade.management().model_gateway_requests().await;
+                self.send(AppMessage::GatewayRequests(result));
+            }
             Effect::SetGatewayEnabled { enabled } => {
                 // The answer is the snapshot that resulted, so the row is drawn
                 // from what the authority did rather than from the press: only
@@ -2232,6 +2237,100 @@ impl Dispatch {
                     }
                     Err(error) => {
                         self.failure_for("gateway_toggle", Some("gateway".to_string()), error)
+                    }
+                }
+            }
+            Effect::SetGatewayKey {
+                profile,
+                credential,
+                enabled,
+                preferred,
+            } => {
+                let snapshot = match self.facade.management().model_gateway_snapshot().await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        return self.failure_for("gateway_key", Some("gateway".to_string()), error);
+                    }
+                };
+                let settings = &snapshot.settings;
+                let request = vibex_core::GatewaySettingsUpdateRequest {
+                    display_name: settings.display_name.clone(),
+                    routing: settings.policy.routing,
+                    pin: settings.policy.pin,
+                    token_limit: settings.policy.token_limit,
+                    upstreams: settings.upstreams.clone(),
+                    account_limits: settings.policy.account_limits.clone(),
+                    translate: settings.policy.translate,
+                    account_updates: vec![vibex_core::GatewayAccountUpdate {
+                        model_provider_profile_id: profile,
+                        credential_id: credential,
+                        enabled,
+                        preferred,
+                    }],
+                    expected_revision: settings.revision,
+                };
+                match self
+                    .facade
+                    .management()
+                    .update_model_gateway_settings(vibex_backend::MutationRequest::new(request))
+                    .await
+                {
+                    Ok(snapshot) => {
+                        self.send(AppMessage::Gateway(Ok(snapshot)));
+                        self.ok_with(
+                            "gateway_key",
+                            Some("gateway".to_string()),
+                            crate::app::MutationOutcome::Plain,
+                        )
+                    }
+                    Err(error) => {
+                        self.failure_for("gateway_key", Some("gateway".to_string()), error)
+                    }
+                }
+            }
+            Effect::SetGatewayPolicy {
+                routing,
+                pin,
+                token_limit,
+            } => {
+                let snapshot = match self.facade.management().model_gateway_snapshot().await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        return self.failure_for(
+                            "gateway_policy",
+                            Some("gateway".to_string()),
+                            error,
+                        );
+                    }
+                };
+                let settings = &snapshot.settings;
+                let request = vibex_core::GatewaySettingsUpdateRequest {
+                    display_name: settings.display_name.clone(),
+                    routing: routing.unwrap_or(settings.policy.routing),
+                    pin: pin.unwrap_or(settings.policy.pin),
+                    token_limit: token_limit.unwrap_or(settings.policy.token_limit),
+                    upstreams: settings.upstreams.clone(),
+                    account_limits: settings.policy.account_limits.clone(),
+                    translate: settings.policy.translate,
+                    account_updates: Vec::new(),
+                    expected_revision: settings.revision,
+                };
+                match self
+                    .facade
+                    .management()
+                    .update_model_gateway_settings(vibex_backend::MutationRequest::new(request))
+                    .await
+                {
+                    Ok(snapshot) => {
+                        self.send(AppMessage::Gateway(Ok(snapshot)));
+                        self.ok_with(
+                            "gateway_policy",
+                            Some("gateway".to_string()),
+                            crate::app::MutationOutcome::Plain,
+                        )
+                    }
+                    Err(error) => {
+                        self.failure_for("gateway_policy", Some("gateway".to_string()), error)
                     }
                 }
             }

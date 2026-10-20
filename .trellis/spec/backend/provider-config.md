@@ -4973,6 +4973,16 @@ ProviderConfigService::{
   usage. Translation runs only when the protocols differ, and a protocol the user
   disabled in `GatewayTranslatePolicy` is refused with
   `model_gateway_translation_disabled` rather than silently used.
+- **A translated non-streaming call is read from the upstream as a stream.**
+  The gateway asks the upstream for `stream: true`, gathers the SSE frames, and
+  renders one JSON body for the client. An upstream that ignores the flag and
+  answers a whole body is accepted too, so "only supports streaming" and "only
+  supports whole bodies" both work without a capability flag.
+- **Anthropic cache breakpoints survive passthrough, not translation.** The IR
+  has no breakpoint field; a same-protocol call keeps `cache_control` because
+  the body is forwarded byte for byte, while a cross-protocol call drops it.
+  This is a documented limitation, not a silent promise that the prompt cache
+  survived.
 - **The intermediate representation carries what the protocols cannot share.**
   `CanonicalRequest.system` is its own field (Anthropic and Gemini keep it
   outside the message list). `ContentPart::Opaque` carries vendor-authored
@@ -4987,10 +4997,12 @@ ProviderConfigService::{
 - **Gemini reports `finishReason: STOP` even when it called a tool.** The decoder
   therefore records that a call was seen and reports `StopReason::ToolUse`.
 - **A failure before the first byte may fail over; a failure after it may not.**
-  `auth` never fails over at all: the credential is wrong until it is replaced.
-  An auth failure therefore sets `cooldown_reason = auth` with no expiry, while
-  every other kind gets a duration. A stream that ends without its protocol's
-  terminal event is reported as an in-stream error rather than a clean `Stop`.
+  An `auth` failure marks that Key `Invalid` with no expiry, because the
+  credential is wrong until it is replaced, but the *request* still tries the
+  next Key: a rejected Key in a pool must not fail a request another Key can
+  serve. Every other kind gets a cooldown duration. A stream that ends without
+  its protocol's terminal event is reported as an in-stream error rather than a
+  clean `Stop`.
 - **Cooling is per Key, not per Provider.** `model_provider_account_state` holds
   one row per `(profile, credential_id)`; a Key's `GatewayKeyState` is what the
   UI renders, and only `Ready` is selectable.
@@ -5012,13 +5024,16 @@ ProviderConfigService::{
   field exists on any gateway contract, and `ModelGatewayRequestLog` carries no
   prompt, reply, image bytes, or Key material. It is pruned to a rolling seven
   days.
-- **The global Providers page reads the shared list.** `ManagementSnapshotPayload`
-  carries `model_provider_profiles` and `agent_model_provider_bindings` beside
-  the legacy `profiles`. The global page groups by Profile identity, so one
-  Provider appears once however many Agents bind it, and the "used by" line is
-  the bindings aggregated by `model_provider_profile_id`. The Agent-scoped list
-  stays during the compatibility window; it is what the Agent-scoped editor and
-  its drag ordering still read.
+- **The global Providers page reads and writes the shared list.**
+  `ManagementSnapshotPayload` carries `model_provider_profiles` and
+  `agent_model_provider_bindings` beside the legacy `profiles`. The global page
+  groups by Profile identity, so one Provider appears once however many Agents
+  bind it, and the "used by" line is the bindings aggregated by
+  `model_provider_profile_id`. Its detail pane edits the v2 record directly:
+  the display name and status go through `update_model_provider_profile`, and a
+  Key is added, replaced, or removed through the v2 credential endpoints. The
+  Agent-scoped list stays during the compatibility window; it is what the
+  Agent-scoped editor and its drag ordering still read.
 - **Neither list is derived from the other.** The gateway's upstream picker uses
   the v2 identity the settings store, and a client never computes one id from
   the other; the authority resolves the pair once and publishes candidates.
@@ -5120,10 +5135,15 @@ ProviderConfigService::{
   them means "restart or wait". A failure older than the memory window starts the
   count over, and the degraded refusal itself never counts, or the state could
   never clear.
-- **The gateway's own switch reaches the listener.** Turning automatic routing
-  off stops the listener and every bound Agent falls back to its direct
-  Provider; turning it on re-binds the persisted port. A settings write that
-  only flipped a stored flag would leave a dead port Agents still point at.
+- **The gateway's own switch reaches the listener and the bindings.** Turning
+  automatic routing off stops the listener and removes every hidden gateway
+  Profile, so each bound Agent really falls back to its direct Provider instead
+  of pointing at a dead port. The *choice* of Agents survives in
+  `model_gateway_agents`: a later start re-creates the Profiles for the same
+  Agents without asking again. A start failure publishes `Unavailable` rather
+  than leaving the surface at `Starting`, and a failed start removes the
+  Profiles for the same reason. `GatewayAgentBinding.enabled` is the durable
+  choice; `active` says whether the Profile currently exists.
 - **A Key is added and removed on the shared Provider.** The reference is
   written first with a placeholder and the value goes through the same secret
   store as every other credential, so plaintext never enters the profile row.
@@ -5186,13 +5206,16 @@ ProviderConfigService::{
   chosen. "Custom provider" sits at the foot of the list and resets the draft the
   way a fresh dialog does, so a preset that was looked at and left behind cannot
   leave its addresses in a form the user asked to start empty.
-- **The TUI's Providers table offers exactly one write on the gateway: its
-  switch.** The gateway row advertises `Toggle` and the table honours it; a
-  direct Provider row is chosen, not switched, so no Provider row advertises the
-  verb. The press flips the row's state before the authority answers, like every
-  other switch in that table, and the address is dropped with the state because
-  only the authority knows which port comes back. Upstream and Key management
-  stay on the desktop, which is the source of interaction truth.
+- **The TUI's Providers table mirrors the gateway's hierarchy.** The gateway
+  row is followed by one row per upstream (`├`) and one per Key (`│ ├`), so the
+  reader can see which account is cooling without opening the desktop. A Key
+  row offers `Toggle` and `Prefer`; the gateway row offers `Switching`,
+  `Prefer` (conversation pin), `Token limit`, and `Recent requests`. The token
+  ceiling is a prompt because a character grid has no room for a combined
+  number-and-window control; an empty answer removes the ceiling. The request
+  ledger is a read-only text view with the model, route, tokens, and skipped
+  Keys. Key creation, replacement, and removal stay on the desktop, which owns
+  the masked input and the confirmation dialogs.
 - **The composer's model menu leads with the model the user already chose.** The
   remembered selections — most-recent-last, already capped — break ties inside a
   group after stars; a search term outranks both, so recency never displaces a

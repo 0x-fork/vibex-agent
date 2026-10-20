@@ -1418,12 +1418,14 @@ fn assemble_gateway_snapshot(
             selected: settings.upstreams.contains(&profile.id),
         })
         .collect::<Vec<_>>();
+    let active_agents = provider.gateway_active_agents().unwrap_or_default();
     let mut agents = Vec::new();
     for (agent_id, _strategy, _enabled) in provider.gateway_agent_options()? {
         agents.push(vibex_core::GatewayAgentBinding {
             agent_id: agent_id.as_str().to_string(),
             display_name: agent_id.as_str().to_string(),
             enabled: enabled_agents.contains(&agent_id),
+            active: active_agents.contains(&agent_id),
             unsupported: false,
             wire_protocol_id: String::new(),
         });
@@ -1663,17 +1665,25 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
                 "the gateway policy changed but the listener did not follow"
             );
         }
-        if let Some(base_url) = service.base_url() {
-            let catalog = provider
-                .gateway_model_catalog()
-                .map(|catalog| {
-                    catalog
-                        .into_iter()
-                        .map(|model| model.display_id())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            provider.refresh_gateway_profiles(&base_url, &catalog)?;
+        match service.base_url() {
+            Some(base_url) => {
+                let catalog = provider
+                    .gateway_model_catalog()
+                    .map(|catalog| {
+                        catalog
+                            .into_iter()
+                            .map(|model| model.display_id())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                provider.refresh_gateway_profiles(&base_url, &catalog)?;
+            }
+            None => {
+                // A stopped listener cannot serve its hidden Profiles. Removing
+                // them is what actually returns every bound Agent to its direct
+                // Provider; the durable gateway-Agent choice stays in the DB.
+                provider.deactivate_gateway_profiles()?;
+            }
         }
         assemble_gateway_snapshot(management)
     }
@@ -1736,17 +1746,25 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
         vibex_db::ModelGatewaySettingsRepository::update(&connection, &next, current.revision)?;
         service.invalidate_snapshot();
         let _ = service.apply_policy().await;
-        if let Some(base_url) = service.base_url() {
-            let catalog = provider
-                .gateway_model_catalog()
-                .map(|catalog| {
-                    catalog
-                        .into_iter()
-                        .map(|model| model.display_id())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            provider.refresh_gateway_profiles(&base_url, &catalog)?;
+        match service.base_url() {
+            Some(base_url) => {
+                let catalog = provider
+                    .gateway_model_catalog()
+                    .map(|catalog| {
+                        catalog
+                            .into_iter()
+                            .map(|model| model.display_id())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                provider.refresh_gateway_profiles(&base_url, &catalog)?;
+            }
+            None => {
+                // A stopped listener cannot serve its hidden Profiles. Removing
+                // them is what actually returns every bound Agent to its direct
+                // Provider; the durable gateway-Agent choice stays in the DB.
+                provider.deactivate_gateway_profiles()?;
+            }
         }
         assemble_gateway_snapshot(management)
     }
@@ -3307,31 +3325,56 @@ impl DesktopRuntime {
             let service = Arc::clone(&runtime.model_gateway);
             match service.start().await {
                 Ok(state) => {
-                    if let Some(base_url) = state.base_url() {
-                        let provider = runtime.providers.service();
-                        let catalog = provider
-                            .gateway_model_catalog()
-                            .map(|catalog| {
-                                catalog
-                                    .into_iter()
-                                    .map(|model| model.display_id())
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default();
-                        if let Err(error) = provider.refresh_gateway_profiles(&base_url, &catalog) {
-                            tracing::warn!(
-                                target: "vibex_model_gateway",
-                                error_code = %error.code,
-                                "gateway Profiles could not be refreshed after the listener started"
-                            );
+                    let provider = runtime.providers.service();
+                    match state.base_url() {
+                        Some(base_url) => {
+                            let catalog = provider
+                                .gateway_model_catalog()
+                                .map(|catalog| {
+                                    catalog
+                                        .into_iter()
+                                        .map(|model| model.display_id())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            if let Err(error) =
+                                provider.refresh_gateway_profiles(&base_url, &catalog)
+                            {
+                                tracing::warn!(
+                                    target: "vibex_model_gateway",
+                                    error_code = %error.code,
+                                    "gateway Profiles could not be refreshed after the listener started"
+                                );
+                            }
+                        }
+                        None => {
+                            // Enabled but unusable (no upstreams, for example):
+                            // a Profile pointing at a listener that never bound
+                            // is worse than no Profile at all.
+                            if let Err(error) = provider.deactivate_gateway_profiles() {
+                                tracing::warn!(
+                                    target: "vibex_model_gateway",
+                                    error_code = %error.code,
+                                    "the gateway Profiles could not be removed after a failed start"
+                                );
+                            }
                         }
                     }
                 }
-                Err(error) => tracing::warn!(
-                    target: "vibex_model_gateway",
-                    error_code = %error.code(),
-                    "the model gateway could not start; Agents keep their direct Provider configuration"
-                ),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "vibex_model_gateway",
+                        error_code = %error.code(),
+                        "the model gateway could not start; Agents go back to their direct Provider"
+                    );
+                    if let Err(error) = runtime.providers.service().deactivate_gateway_profiles() {
+                        tracing::warn!(
+                            target: "vibex_model_gateway",
+                            error_code = %error.code,
+                            "the gateway Profiles could not be removed after the listener failed"
+                        );
+                    }
+                }
             }
             Ok(())
         })

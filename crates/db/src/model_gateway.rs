@@ -13,7 +13,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use vibex_core::{
-    GatewayConversationPin, GatewayFailureKind, GatewayRequestOutcome, GatewayRouteTrace,
+    AgentId, GatewayConversationPin, GatewayFailureKind, GatewayRequestOutcome, GatewayRouteTrace,
     GatewayTokenWindow, GatewayTokenWindowUsage, ModelGatewayRequestLog, ModelGatewaySettings,
     ModelProviderAccountState, ModelProviderProfileId, RequestId, VibexError, VibexResult,
     unix_timestamp_ms,
@@ -187,6 +187,77 @@ impl ModelGatewaySettingsRepository {
         .map_err(storage_err(
             "model_gateway_port_store_failed",
             "failed to persist the gateway port",
+        ))?;
+        Ok(())
+    }
+}
+
+/// Which Agents the user has switched to the gateway.
+///
+/// This is the *desired* set, not the currently projected one. When the listener
+/// is down its hidden Profiles are removed so the Agents fall back to a direct
+/// Provider; the rows here survive, so bringing the listener back re-points the
+/// same Agents without asking the user again.
+pub struct ModelGatewayAgentRepository;
+
+impl ModelGatewayAgentRepository {
+    pub fn list(conn: &Connection) -> VibexResult<Vec<AgentId>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT agent_id
+                FROM model_gateway_agents
+                WHERE enabled = 1
+                ORDER BY agent_id
+                ",
+            )
+            .map_err(storage_err(
+                "model_gateway_agent_list_failed",
+                "failed to list the gateway Agents",
+            ))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage_err(
+                "model_gateway_agent_list_failed",
+                "failed to list the gateway Agents",
+            ))?;
+        let mut agents = Vec::new();
+        for row in rows {
+            let value = row.map_err(storage_err(
+                "model_gateway_agent_list_failed",
+                "failed to list the gateway Agents",
+            ))?;
+            agents.push(AgentId::parse(value)?);
+        }
+        Ok(agents)
+    }
+
+    pub fn set(conn: &Connection, agent_id: &AgentId, enabled: bool) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO model_gateway_agents (agent_id, enabled, updated_at_ms)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                updated_at_ms = excluded.updated_at_ms
+            ",
+            params![agent_id.as_str(), i64::from(enabled), unix_timestamp_ms()],
+        )
+        .map_err(storage_err(
+            "model_gateway_agent_write_failed",
+            "failed to remember the gateway Agent",
+        ))?;
+        Ok(())
+    }
+
+    pub fn remove(conn: &Connection, agent_id: &AgentId) -> VibexResult<()> {
+        conn.execute(
+            "DELETE FROM model_gateway_agents WHERE agent_id = ?1",
+            params![agent_id.as_str()],
+        )
+        .map_err(storage_err(
+            "model_gateway_agent_write_failed",
+            "failed to forget the gateway Agent",
         ))?;
         Ok(())
     }
@@ -846,6 +917,64 @@ pub(crate) fn migrate_route_trace(
     Ok(())
 }
 
+/// Records the Agents that have been switched to the gateway.
+///
+/// The list used to be derivable from the hidden Profiles alone, which made
+/// turning the gateway off lose the user's choice. It is now durable, so a
+/// listener that is down can remove the Profiles (Agents fall back to direct)
+/// without forgetting which Agents should walk through the gateway once it is
+/// back.
+pub(crate) fn migrate_gateway_agents(
+    conn: &mut DbConnection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 66;
+    const NAME: &str = "model_gateway_agents";
+    if crate::migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS model_gateway_agents (
+            agent_id TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            updated_at_ms INTEGER NOT NULL
+        );
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to create the gateway Agent table",
+    ))?;
+    // Adopt the hidden Profiles that already exist, so an upgrade keeps every
+    // Agent the user had pointed at the gateway.
+    conn.execute(
+        "
+        INSERT OR IGNORE INTO model_gateway_agents (agent_id, enabled, updated_at_ms)
+        SELECT json_extract(entry.value, '$.value'), 1, ?1
+        FROM provider_profiles profile, json_each(profile.provider_options_json, '$.entries') entry
+        WHERE profile.deleted_at_ms IS NULL
+          AND json_extract(entry.value, '$.key') = 'vibex.internal.profileRole'
+          AND json_extract(entry.value, '$.value') = 'model_gateway'
+        ",
+        params![unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to adopt the existing gateway Agents",
+    ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the gateway Agent migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
 fn encode_upstreams(upstreams: &[ModelProviderProfileId]) -> VibexResult<String> {
     let values = upstreams
         .iter()
@@ -924,14 +1053,15 @@ mod tests {
     #[test]
     fn migration_64_creates_gateway_tables_and_is_idempotent() {
         let (path, mut conn) = database();
-        assert_eq!(crate::current_schema_version(&conn).unwrap(), 65);
+        assert_eq!(crate::current_schema_version(&conn).unwrap(), 66);
         assert!(crate::migration_applied(&conn, 64).unwrap());
         assert!(crate::migration_applied(&conn, 65).unwrap());
+        assert!(crate::migration_applied(&conn, 66).unwrap());
         let applied = apply_migrations(&mut conn).unwrap();
         assert!(
-            !applied
-                .iter()
-                .any(|entry| entry.starts_with("64:") || entry.starts_with("65:")),
+            !applied.iter().any(|entry| entry.starts_with("64:")
+                || entry.starts_with("65:")
+                || entry.starts_with("66:")),
             "re-applying migrations must not re-run the gateway migrations"
         );
         let settings = ModelGatewaySettingsRepository::get_or_create(&conn).unwrap();

@@ -10053,16 +10053,27 @@ fn render_overlay(
             let Some(layout) = render_modal(frame, area, &chrome, theme, app) else {
                 return;
             };
-            let masked = matches!(field, crate::app::PromptField::ProviderSecret);
+            let masked = matches!(field, crate::app::PromptField::ProviderSecret)
+                && !app.reveal_provider_secret;
             let shown = if masked {
                 "•".repeat(value.chars().count())
             } else {
                 value.clone()
             };
             let mut lines = vec![Line::from(Span::styled(shown, theme.base()))];
-            if masked {
+            if matches!(field, crate::app::PromptField::ProviderSecret) {
+                if masked {
+                    lines.push(Line::from(Span::styled(
+                        strings.management_secret_write_only(),
+                        theme.muted(),
+                    )));
+                }
                 lines.push(Line::from(Span::styled(
-                    strings.management_secret_write_only(),
+                    if masked {
+                        strings.management_secret_reveal_hint()
+                    } else {
+                        strings.management_secret_hide_hint()
+                    },
                     theme.muted(),
                 )));
             }

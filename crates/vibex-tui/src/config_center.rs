@@ -241,6 +241,15 @@ pub enum ConfigAction {
     Logout,
     /// Make a model provider profile the active one.
     Activate,
+    /// Make one of a Provider's Keys the one the router tries first, or pin
+    /// the gateway's conversations to one.
+    Prefer,
+    /// Cycle the gateway's routing strategy.
+    Routing,
+    /// Edit the gateway's local token ceiling.
+    TokenLimit,
+    /// Read the recent requests the gateway served.
+    Requests,
     /// Write a new credential for a profile.
     Secret,
     /// Forget the credential a profile holds.
@@ -292,6 +301,10 @@ impl ConfigAction {
             Self::Auth => strings.config_action_sign_in(),
             Self::Logout => strings.config_action_sign_out(),
             Self::Activate => strings.config_action_activate(),
+            Self::Prefer => strings.config_action_prefer(),
+            Self::Routing => strings.config_action_routing(),
+            Self::TokenLimit => strings.config_action_token_limit(),
+            Self::Requests => strings.config_action_requests(),
             Self::Secret => strings.config_action_secret(),
             Self::ClearSecret => strings.config_action_clear_secret(),
             Self::Test => strings.config_action_test(),
@@ -1767,7 +1780,7 @@ fn gateway_row(data: &ManagementData, strings: Strings) -> Option<ConfigRow> {
     let agents = snapshot
         .agents
         .iter()
-        .filter(|agent| agent.enabled)
+        .filter(|agent| agent.active)
         .map(|agent| agent.agent_id.clone())
         .collect::<Vec<_>>();
     let mut row = ConfigRow::new("gateway", snapshot.settings.display_name.clone())
@@ -1807,11 +1820,121 @@ fn gateway_row(data: &ManagementData, strings: Strings) -> Option<ConfigRow> {
                 agents.join(", ")
             },
         )
-        .actions(&[ConfigAction::Toggle, ConfigAction::RefreshSnapshot]);
+        .actions(&[
+            ConfigAction::Toggle,
+            ConfigAction::Routing,
+            ConfigAction::Prefer,
+            ConfigAction::TokenLimit,
+            ConfigAction::Requests,
+            ConfigAction::RefreshSnapshot,
+        ]);
     if let Some(notice) = snapshot.runtime.notice.as_deref() {
         row = row.detail("state", notice.to_string());
     }
     Some(row)
+}
+
+/// The upstream and Key rows under the gateway.
+///
+/// The table has no nested widget, so the hierarchy is drawn as prefixed rows:
+/// an upstream is `├` and each of its Keys is `│ ├`. They stay in the same
+/// table because the reader is answering the same question at every level —
+/// which Key serves this model — and a separate page would hide the parent.
+fn gateway_child_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
+    let Some(snapshot) = data.gateway.as_ref() else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for upstream in &snapshot.upstreams {
+        let total = upstream.keys.len();
+        let cooling = upstream
+            .keys
+            .iter()
+            .filter(|key| matches!(key.state, vibex_core::GatewayKeyState::Cooling { .. }))
+            .count();
+        let invalid = upstream
+            .keys
+            .iter()
+            .filter(|key| key.state == vibex_core::GatewayKeyState::Invalid)
+            .count();
+        let state = match (cooling, invalid) {
+            (0, 0) => strings.config_state_ready().to_string(),
+            (cooling, 0) => format!("{cooling} cooling"),
+            (0, invalid) => format!("{invalid} invalid"),
+            (cooling, invalid) => format!("{cooling} cooling · {invalid} invalid"),
+        };
+        rows.push(
+            ConfigRow::new(
+                format!(
+                    "gateway-upstream:{}",
+                    upstream.model_provider_profile_id.as_str()
+                ),
+                format!("  ├ {}", upstream.display_name),
+            )
+            .cell("1")
+            .cell(total.to_string())
+            .cell(state.clone())
+            .cell(String::new())
+            .chip(
+                &state,
+                if invalid > 0 {
+                    ConfigTone::Bad
+                } else if cooling > 0 || total == 0 {
+                    ConfigTone::Warn
+                } else {
+                    ConfigTone::Ok
+                },
+            )
+            .detail(
+                strings.config_field_id(),
+                upstream.model_provider_profile_id.as_str(),
+            )
+            .detail(
+                strings.config_field_models(),
+                upstream.model_count.to_string(),
+            )
+            .detail(strings.config_col_keys(), total.to_string())
+            .actions(&[ConfigAction::RefreshSnapshot]),
+        );
+        for key in &upstream.keys {
+            let (state, tone) = match key.state {
+                vibex_core::GatewayKeyState::Ready => {
+                    (strings.config_state_ready().to_string(), ConfigTone::Ok)
+                }
+                vibex_core::GatewayKeyState::Cooling { .. } => {
+                    ("cooling".to_string(), ConfigTone::Warn)
+                }
+                vibex_core::GatewayKeyState::Invalid => {
+                    (strings.config_state_invalid().to_string(), ConfigTone::Bad)
+                }
+                vibex_core::GatewayKeyState::Disabled => {
+                    (strings.config_state_off().to_string(), ConfigTone::Muted)
+                }
+            };
+            rows.push(
+                ConfigRow::new(
+                    format!(
+                        "gateway-key:{}:{}",
+                        upstream.model_provider_profile_id.as_str(),
+                        key.credential_id.as_str()
+                    ),
+                    format!("  │  ├ {}", key.display_name),
+                )
+                .cell(String::new())
+                .cell("1")
+                .cell(state.clone())
+                .cell(String::new())
+                .chip(&state, tone)
+                .enabled(key.state != vibex_core::GatewayKeyState::Disabled)
+                .detail(strings.config_field_id(), key.credential_id.as_str())
+                .detail(strings.config_field_kind(), "Key")
+                .detail(strings.config_col_state(), state.clone())
+                .detail(strings.config_field_models(), key.used_tokens.to_string())
+                .actions(&[ConfigAction::Toggle, ConfigAction::Prefer]),
+            );
+        }
+    }
+    rows
 }
 
 fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
@@ -1907,6 +2030,7 @@ fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
     // The gateway leads: it is where a shared model actually comes from, and a
     // reader scanning the page should meet it before the Providers it consumes.
     let mut rows = gateway_row(data, strings).into_iter().collect::<Vec<_>>();
+    rows.extend(gateway_child_rows(data, strings));
     rows.extend(direct);
     rows
 }

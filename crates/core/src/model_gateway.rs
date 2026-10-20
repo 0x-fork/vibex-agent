@@ -522,8 +522,12 @@ impl GatewayFailureKind {
     }
 
     /// Whether another Key should be tried for the same request.
+    ///
+    /// A rejected Key is marked invalid, but the request may still succeed on
+    /// a different Key: that is the whole point of a pool. Only a reply that
+    /// has already reached the client ends the attempt loop.
     pub const fn should_fail_over(self) -> bool {
-        !matches!(self, Self::Auth)
+        true
     }
 }
 
@@ -871,8 +875,17 @@ impl<'a> GatewayModelRef<'a> {
 pub struct GatewayAgentBinding {
     pub agent_id: String,
     pub display_name: String,
-    /// The Agent walks through the gateway.
+    /// The user wants the Agent to walk through the gateway.
+    ///
+    /// This survives a stopped listener. The Agent is only actually projected
+    /// onto the gateway while [`Self::active`] is true.
     pub enabled: bool,
+    /// The Agent is currently pointed at the gateway.
+    ///
+    /// When the listener is down the hidden Profile is removed so the Agent
+    /// falls back to a direct Provider; the user's choice stays in `enabled`.
+    #[serde(default)]
+    pub active: bool,
     /// The Agent manages its own provider and cannot be routed.
     pub unsupported: bool,
     /// The protocol the Agent speaks to the gateway, for the model list.
@@ -1680,7 +1693,8 @@ mod tests {
             Some(30 * 60 * 1000)
         );
         assert_eq!(GatewayFailureKind::Auth.cooldown_ms(), None);
-        assert!(!GatewayFailureKind::Auth.should_fail_over());
+        // An auth failure invalidates this Key, but the next one may work.
+        assert!(GatewayFailureKind::Auth.should_fail_over());
         assert!(GatewayFailureKind::Rate.should_fail_over());
         assert_eq!(
             GatewayKeyHealth::from_failure(GatewayFailureKind::Auth, 5),

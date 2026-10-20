@@ -2692,6 +2692,63 @@ fn apply_message(app: &mut App, worker: &Worker, message: AppMessage) -> Backend
                 }
             }
         },
+        AppMessage::GatewayRequests(result) => match result {
+            Ok(requests) => {
+                let mut body = String::new();
+                if requests.is_empty() {
+                    body.push_str(app.strings.config_requests_empty());
+                    body.push('\n');
+                }
+                for request in requests.iter().take(100) {
+                    body.push_str(&format!(
+                        "{}  {}  {} -> {}\n",
+                        request.request_id.as_str(),
+                        request.outcome.id(),
+                        request.model_requested,
+                        request.model_served.as_deref().unwrap_or("-"),
+                    ));
+                    body.push_str(&format!(
+                        "  {} · {} → {} · {} tok ({} in / {} out / {} cached) · {} ms\n",
+                        request.provider_name,
+                        request.wire_in,
+                        request.wire_out,
+                        request.total_tokens,
+                        request.input_tokens,
+                        request.output_tokens,
+                        request.cached_read_tokens,
+                        request.latency_ms.unwrap_or_default(),
+                    ));
+                    if let Some(key) = request.credential_name.as_deref() {
+                        body.push_str(&format!("  key: {key}\n"));
+                    }
+                    if let Some(route) = request.route.as_ref() {
+                        if route.skipped_cooling > 0 || route.skipped_over_limit > 0 {
+                            body.push_str(&format!(
+                                "  skipped: {} cooling, {} over limit\n",
+                                route.skipped_cooling, route.skipped_over_limit
+                            ));
+                        }
+                        for attempt in &route.failed_attempts {
+                            body.push_str(&format!(
+                                "  tried {}: {}\n",
+                                attempt
+                                    .credential_name
+                                    .as_deref()
+                                    .unwrap_or(attempt.credential_id.as_str()),
+                                attempt.failure.id()
+                            ));
+                        }
+                    }
+                    body.push('\n');
+                }
+                app.overlay = Some(Overlay::TextView {
+                    title: app.strings.config_action_requests().to_string(),
+                    body,
+                    scroll: 0,
+                });
+            }
+            Err(error) => app.toast(Toast::danger(error.message)),
+        },
         AppMessage::Profiles(result) => match result {
             Ok(profiles) => {
                 app.management_data.providers = profiles;

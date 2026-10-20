@@ -20,8 +20,8 @@ use vibex_core::{
     ProviderSecretReferenceCreateRequest, ProviderSecretSetupState, VibexError, VibexResult,
 };
 use vibex_db::{
-    AgentDefaultModelProviderProfileRepository, ModelProviderProfileRepository,
-    ProviderProfileRepository,
+    AgentDefaultModelProviderProfileRepository, ModelGatewayAgentRepository,
+    ModelProviderProfileRepository, ProviderProfileRepository,
 };
 
 use crate::{ProviderConfigService, provider_option_value};
@@ -39,8 +39,24 @@ pub const GATEWAY_AGENT_OPTION_KEY: &str = "vibex.internal.gatewayAgent";
 pub const GATEWAY_LOCAL_KEY_HINT: &str = "managed by Vibex";
 
 impl ProviderConfigService {
-    /// The Agents currently configured to walk through the gateway.
+    /// The Agents the user has switched to the gateway.
+    ///
+    /// The answer is the durable choice, not the current projection: while the
+    /// listener is down the hidden Profiles are removed so the Agents go back
+    /// to a direct Provider, but these rows stay so a working listener restores
+    /// them without asking again.
     pub fn gateway_agents(&self) -> VibexResult<BTreeSet<AgentId>> {
+        let conn = self.open_connection()?;
+        Ok(ModelGatewayAgentRepository::list(&conn)?
+            .into_iter()
+            .collect())
+    }
+
+    /// The Agents currently pointed at the gateway's address.
+    ///
+    /// A configured Agent whose Profile has been removed is *paused*, not
+    /// active: its requests use the direct Provider until the listener returns.
+    pub fn gateway_active_agents(&self) -> VibexResult<BTreeSet<AgentId>> {
         let conn = self.open_connection()?;
         let profiles = ProviderProfileRepository::list_all(&conn)?;
         let mut agents = BTreeSet::new();
@@ -99,15 +115,17 @@ impl ProviderConfigService {
             )
             .with_diagnostic("agentId", agent_id.as_str()));
         }
-        let conn = self.open_connection()?;
-        let existing = gateway_profile_for(&conn, agent_id)?;
         if !enabled {
+            let conn = self.open_connection()?;
+            let existing = gateway_profile_for(&conn, agent_id)?;
+            drop(conn);
             if let Some(profile) = existing {
-                drop(conn);
                 self.delete_profile(vibex_core::ProviderProfileDeleteRequest {
                     provider_profile_id: profile.id,
                 })?;
             }
+            let conn = self.open_connection()?;
+            ModelGatewayAgentRepository::remove(&conn, agent_id)?;
             return Ok(None);
         }
         let base_url = base_url
@@ -119,29 +137,86 @@ impl ProviderConfigService {
                     "the gateway is not running, so no Agent can be pointed at it",
                 )
             })?;
+        if gateway_wire_api_for(agent_id).is_none() {
+            return Err(VibexError::validation(
+                "model_gateway_agent_unsupported",
+                "this Agent speaks a wire protocol the gateway does not serve",
+            )
+            .with_diagnostic("agentId", agent_id.as_str()));
+        }
+        let (profile_id, _) = self.ensure_gateway_profile(agent_id, base_url, model_catalog)?;
+        let conn = self.open_connection()?;
+        ModelGatewayAgentRepository::set(&conn, agent_id, true)?;
+        Ok(Some(profile_id))
+    }
+
+    /// Removes every hidden gateway Profile while keeping the durable choice.
+    ///
+    /// This is what a stopped listener has to do: an Agent whose Profile still
+    /// points at a dead loopback port cannot fall back, so the Profile goes
+    /// away and the Agent returns to its direct default. `gateway_agents()`
+    /// still remembers the Agent, so a later start re-creates the Profile.
+    pub fn deactivate_gateway_profiles(&self) -> VibexResult<Vec<AgentId>> {
+        let agents = self.gateway_agents()?;
+        let mut deactivated = Vec::new();
+        for agent_id in agents {
+            let conn = self.open_connection()?;
+            let Some(profile) = gateway_profile_for(&conn, &agent_id)? else {
+                continue;
+            };
+            drop(conn);
+            self.delete_profile(vibex_core::ProviderProfileDeleteRequest {
+                provider_profile_id: profile.id,
+            })?;
+            deactivated.push(agent_id);
+        }
+        Ok(deactivated)
+    }
+
+    /// Creates or refreshes one hidden gateway Profile.
+    ///
+    /// Returns whether the Profile's projected content changed. A no-op leaves
+    /// the revision alone, which is what keeps a snapshot refresh from
+    /// restaling every Agent merely because it ran.
+    fn ensure_gateway_profile(
+        &self,
+        agent_id: &AgentId,
+        base_url: &str,
+        model_catalog: &[String],
+    ) -> VibexResult<(ProviderProfileId, bool)> {
         let models = gateway_models(agent_id, model_catalog);
+        let conn = self.open_connection()?;
+        let existing = gateway_profile_for(&conn, agent_id)?;
         match existing {
             Some(profile) => {
+                let unchanged = profile.base_url.as_deref() == Some(base_url)
+                    && profile.configured_models == models
+                    && profile.status == ProviderProfileStatus::Enabled;
                 let profile_id = profile.id.clone();
                 drop(conn);
-                self.update_profile(vibex_core::ProviderProfileUpdateRequest {
-                    provider_profile_id: profile_id.clone(),
-                    display_name: Some(gateway_display_name()),
-                    status: Some(ProviderProfileStatus::Enabled),
-                    account_alias: None,
-                    base_url: Some(base_url.to_string()),
-                    default_model: models.first().map(|model| model.id.clone()),
-                    small_model: None,
-                    large_model: None,
-                    configured_models: Some(models),
-                    reasoning_effort: None,
-                    sandbox_defaults: None,
-                    network_defaults: None,
-                    permission_defaults: None,
-                    provider_options: Some(gateway_provider_options(agent_id, profile_id.as_str())),
-                })?;
+                if !unchanged {
+                    self.update_profile(vibex_core::ProviderProfileUpdateRequest {
+                        provider_profile_id: profile_id.clone(),
+                        display_name: Some(gateway_display_name()),
+                        status: Some(ProviderProfileStatus::Enabled),
+                        account_alias: None,
+                        base_url: Some(base_url.to_string()),
+                        default_model: models.first().map(|model| model.id.clone()),
+                        small_model: None,
+                        large_model: None,
+                        configured_models: Some(models),
+                        reasoning_effort: None,
+                        sandbox_defaults: None,
+                        network_defaults: None,
+                        permission_defaults: None,
+                        provider_options: Some(gateway_provider_options(
+                            agent_id,
+                            profile_id.as_str(),
+                        )),
+                    })?;
+                }
                 self.set_gateway_default(agent_id, &profile_id)?;
-                Ok(Some(profile_id))
+                Ok((profile_id, !unchanged))
             }
             None => {
                 drop(conn);
@@ -169,7 +244,6 @@ impl ProviderConfigService {
                         redacted_hint: GATEWAY_LOCAL_KEY_HINT.to_string(),
                     }],
                 })?;
-                let options = gateway_provider_options(agent_id, created.id.as_str());
                 let profile_id = created.id.clone();
                 self.update_profile(vibex_core::ProviderProfileUpdateRequest {
                     provider_profile_id: profile_id.clone(),
@@ -185,10 +259,10 @@ impl ProviderConfigService {
                     sandbox_defaults: None,
                     network_defaults: None,
                     permission_defaults: None,
-                    provider_options: Some(options),
+                    provider_options: Some(gateway_provider_options(agent_id, profile_id.as_str())),
                 })?;
                 self.set_gateway_default(agent_id, &profile_id)?;
-                Ok(Some(profile_id))
+                Ok((profile_id, true))
             }
         }
     }
@@ -205,35 +279,10 @@ impl ProviderConfigService {
         let agents = self.gateway_agents()?;
         let mut refreshed = Vec::new();
         for agent_id in agents {
-            let conn = self.open_connection()?;
-            let Some(profile) = gateway_profile_for(&conn, &agent_id)? else {
-                continue;
-            };
-            let models = gateway_models(&agent_id, model_catalog);
-            let unchanged = profile.base_url.as_deref() == Some(base_url)
-                && profile.configured_models == models;
-            if unchanged {
-                continue;
+            let (_, changed) = self.ensure_gateway_profile(&agent_id, base_url, model_catalog)?;
+            if changed {
+                refreshed.push(agent_id);
             }
-            let profile_id = profile.id.clone();
-            drop(conn);
-            self.update_profile(vibex_core::ProviderProfileUpdateRequest {
-                provider_profile_id: profile_id,
-                display_name: Some(gateway_display_name()),
-                status: None,
-                account_alias: None,
-                base_url: Some(base_url.to_string()),
-                default_model: models.first().map(|model| model.id.clone()),
-                small_model: None,
-                large_model: None,
-                configured_models: Some(models.clone()),
-                reasoning_effort: None,
-                sandbox_defaults: None,
-                network_defaults: None,
-                permission_defaults: None,
-                provider_options: None,
-            })?;
-            refreshed.push(agent_id);
         }
         Ok(refreshed)
     }
@@ -355,6 +404,18 @@ fn gateway_wire_api_for(agent_id: &AgentId) -> Option<ProviderModelWireApi> {
         .flat_map(|descriptor| descriptor.model_interfaces.iter())
         .filter_map(|interface| {
             ProviderModelWireApi::from_wire_protocol_id(&interface.wire_protocol_id)
+        })
+        // The gateway serves exactly four inbound protocols. An Agent whose
+        // only interface is Mistral, Bedrock, or Vertex cannot be pointed at
+        // it: the address would accept a request shape it does not serve.
+        .filter(|wire_api| {
+            matches!(
+                wire_api,
+                ProviderModelWireApi::OpenaiResponses
+                    | ProviderModelWireApi::OpenaiChatCompletions
+                    | ProviderModelWireApi::AnthropicMessages
+                    | ProviderModelWireApi::GoogleGenerativeAi
+            )
         })
         .collect::<Vec<_>>();
     [
@@ -618,6 +679,46 @@ mod tests {
             .set_gateway_agent(&agent_id, false, None, &[])
             .unwrap();
         assert!(!service.gateway_agents().unwrap().contains(&agent_id));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_stopped_gateway_removes_profiles_but_remembers_the_agents() {
+        let (path, service) = service();
+        let agent_id = agent("codex");
+        service
+            .set_gateway_agent(
+                &agent_id,
+                true,
+                Some("http://127.0.0.1:3425"),
+                &["deepseek/deepseek-chat".to_string()],
+            )
+            .unwrap();
+        let conn = test_connection(&path).unwrap();
+        assert!(default_profile_for(&conn, &agent_id).unwrap().is_some());
+        drop(conn);
+
+        let deactivated = service.deactivate_gateway_profiles().unwrap();
+        assert_eq!(deactivated, vec![agent_id.clone()]);
+        // The durable choice survives, so bringing the listener back needs no
+        // second decision from the user.
+        assert!(service.gateway_agents().unwrap().contains(&agent_id));
+        assert!(service.gateway_active_agents().unwrap().is_empty());
+        let conn = test_connection(&path).unwrap();
+        assert_eq!(default_profile_for(&conn, &agent_id).unwrap(), None);
+        drop(conn);
+
+        service
+            .refresh_gateway_profiles(
+                "http://127.0.0.1:3426",
+                &["deepseek/deepseek-chat".to_string()],
+            )
+            .unwrap();
+        assert!(service.gateway_active_agents().unwrap().contains(&agent_id));
+        let conn = test_connection(&path).unwrap();
+        let default = default_profile_for(&conn, &agent_id).unwrap().unwrap();
+        let profile = service.get_profile(&default).unwrap().unwrap();
+        assert_eq!(profile.base_url.as_deref(), Some("http://127.0.0.1:3426"));
         let _ = std::fs::remove_file(path);
     }
 

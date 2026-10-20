@@ -125,6 +125,7 @@ pub fn build_upstream_request(
     protocol: WireProtocol,
     request: &CanonicalRequest,
     model: &str,
+    stream: bool,
 ) -> GatewayResult<Value> {
     if request.has_vendor_file_image() {
         return Err(GatewayError::UnsupportedImageReference);
@@ -137,10 +138,11 @@ pub fn build_upstream_request(
     };
     if let Some(object) = value.as_object_mut() {
         object.insert("model".to_string(), Value::String(model.to_string()));
-        // A streamed call is the gateway's only upstream shape when the client
-        // asked for a stream. A translated non-streaming call is still read as
-        // a stream so its token counts are observed, then rendered whole.
-        object.insert("stream".to_string(), Value::Bool(request.stream));
+        // A translated call is always read from the upstream as a stream: the
+        // gateway needs the terminal usage frame and cannot know whether the
+        // upstream supports a whole-body reply. The caller still gets one JSON
+        // body when it did not ask for a stream.
+        object.insert("stream".to_string(), Value::Bool(stream));
     }
     Ok(value)
 }

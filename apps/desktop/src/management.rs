@@ -994,6 +994,11 @@ pub struct ManagementCenter {
     /// Which upstream the add-key field belongs to.
     gateway_key_add_target: Option<String>,
     gateway_key_add_error: Option<String>,
+    /// The shared Provider whose display name is being edited.
+    shared_provider_name_editing: bool,
+    shared_provider_name_target: Option<String>,
+    shared_provider_name_input: Option<Entity<InputState>>,
+    shared_provider_name_error: Option<String>,
     /// The preset the editor's draft started from, until it is saved.
     ///
     /// It is kept beside the draft rather than inside it because a preset is a
@@ -2041,6 +2046,10 @@ impl ManagementCenter {
             gateway_key_drafts: BTreeMap::new(),
             gateway_key_add_target: None,
             gateway_key_add_error: None,
+            shared_provider_name_editing: false,
+            shared_provider_name_target: None,
+            shared_provider_name_input: None,
+            shared_provider_name_error: None,
             provider_preset_draft: None,
             provider_preset_region: None,
             provider_preset_picker: false,
@@ -4713,6 +4722,63 @@ impl ManagementCenter {
     }
 
     fn open_profile_creator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The editor is still Agent-scoped: the projection descriptor is what
+        // says whether a Key field exists and what a model catalogue means for
+        // this Agent. Opening it from the global Providers page must therefore
+        // borrow a configurable Agent rather than fall through to the empty
+        // "unsupported runtime" surface.
+        // A new Provider has no legacy profile, so a selection left over from
+        // the previous edit must not decide which projection descriptor the
+        // form borrows.
+        self.selected_provider_profile_id = None;
+        // A configurable Agent is only usable here when its descriptor actually
+        // carries the Key field and a Model catalogue. A leftover selection of
+        // an Agent-managed provider (Cursor, Devin, ...) has a capability too,
+        // but it is the wrong one: it would hide both the Key field and the
+        // Model panes.
+        let current_ready = self
+            .projection_editor
+            .shows(vibex_core::AgentProjectionFormControl::ApiKey)
+            && self
+                .projection_editor
+                .shows(vibex_core::AgentProjectionFormControl::Model);
+        if self.selected_agent_id.is_none() || !current_ready {
+            let configurable = vibex_core::model_provider_configurable_agent_ids().ok();
+            let chosen = self
+                .projection_states
+                .iter()
+                .filter(|state| {
+                    configurable
+                        .as_ref()
+                        .is_none_or(|ids| ids.iter().any(|id| id.as_str() == state.agent_id))
+                })
+                .find(|state| {
+                    state
+                        .capability
+                        .form_controls
+                        .contains(&vibex_core::AgentProjectionFormControl::ApiKey)
+                        && state
+                            .capability
+                            .form_controls
+                            .contains(&vibex_core::AgentProjectionFormControl::Model)
+                })
+                .map(|state| state.agent_id.clone())
+                .or_else(|| {
+                    self.snapshot
+                        .agents
+                        .iter()
+                        .find(|agent| {
+                            configurable.as_ref().is_none_or(|ids| {
+                                ids.iter().any(|id| id.as_str() == agent.id.as_str())
+                            })
+                        })
+                        .map(|agent| agent.id.as_str().to_string())
+                });
+            if let Some(agent_id) = chosen {
+                self.selected_agent_id = Some(agent_id);
+            }
+        }
+        self.sync_projection_editor();
         self.provider_preset_draft = None;
         self.provider_preset_region = None;
         // Every new Provider starts by choosing; even "none of these" is a
@@ -11318,7 +11384,7 @@ impl ManagementCenter {
         let gateway_agents = gateway
             .agents
             .iter()
-            .filter(|agent| agent.enabled)
+            .filter(|agent| agent.active)
             .map(|agent| {
                 // The binding carries the id; the Agent catalogue carries the
                 // name the reader knows. Fall back to the id so a newly added
@@ -11565,122 +11631,8 @@ impl ManagementCenter {
         };
         let profile = &row.profile;
         let mut body = v_flex().w_full().min_w_0().gap_3();
-
-        let mut details = v_flex().w_full().gap_2();
-        details = details.child(stat_line(
-            management_locale_text("Status", "状态", "狀態"),
-            match profile.status {
-                vibex_core::ModelProviderProfileStatus::Enabled => {
-                    management_locale_text("Enabled", "已启用", "已啟用")
-                }
-                vibex_core::ModelProviderProfileStatus::Disabled => {
-                    management_locale_text("Disabled", "已停用", "已停用")
-                }
-            }
-            .to_string(),
-            cx,
-        ));
-        details = details.child(stat_line(
-            management_locale_text("Models", "模型", "模型"),
-            profile
-                .configured_models
-                .iter()
-                .filter(|model| model.enabled)
-                .count()
-                .to_string(),
-            cx,
-        ));
-        details = details.child(stat_line(
-            management_locale_text("Keys", "Key", "Key"),
-            profile.credentials.len().to_string(),
-            cx,
-        ));
-        // The address is shown, not edited: an Agent binding points at it.
-        if let Some(endpoint) = profile.primary_api_endpoint() {
-            details = details.child(stat_line(
-                management_locale_text("Endpoint", "接口地址", "介面位址"),
-                endpoint.url.clone(),
-                cx,
-            ));
-        }
-        body = body.child(management_card_dynamic(
-            profile.display_name.clone(),
-            management_locale_text(
-                "A shared Provider. Every Agent below uses the same keys.",
-                "共享的供应商。下面每个 Agent 使用同一套 Key。",
-                "共享的供應商。下面每個 Agent 使用同一套 Key。",
-            ),
-            details.into_any_element(),
-            cx,
-        ));
-
-        let mut key_rows = v_flex().w_full().gap_1();
-        for credential in &profile.credentials {
-            let state = match credential.status {
-                vibex_core::AgentCredentialStatus::Ready => Tag::success()
-                    .xsmall()
-                    .child(management_locale_text("Active", "正常", "正常"))
-                    .into_any_element(),
-                vibex_core::AgentCredentialStatus::Missing => Tag::warning()
-                    .xsmall()
-                    .child(management_locale_text(
-                        "Needs a key",
-                        "需要 Key",
-                        "需要 Key",
-                    ))
-                    .into_any_element(),
-                vibex_core::AgentCredentialStatus::Expired => Tag::danger()
-                    .xsmall()
-                    .child(management_locale_text("Expired", "已过期", "已過期"))
-                    .into_any_element(),
-                _ => Tag::secondary()
-                    .xsmall()
-                    .child(management_locale_text("Not ready", "未就绪", "未就緒"))
-                    .into_any_element(),
-            };
-            // The Key value itself never reaches this list: only its label and
-            // state, because the record carries a reference rather than a secret.
-            key_rows = key_rows.child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .py_2()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .child(credential.display_name.clone()),
-                    )
-                    .child(state),
-            );
-        }
-        if profile.credentials.is_empty() {
-            key_rows = key_rows.child(compact_empty_state(
-                management_locale_text("No keys yet", "还没有 Key", "還沒有 Key"),
-                management_locale_text(
-                    "Add a key in the Agent that owns this Provider's connection.",
-                    "在配置该供应商连接的 Agent 页里添加 Key。",
-                    "在設定該供應商連線的 Agent 頁裡新增 Key。",
-                ),
-                cx,
-            ));
-        }
-        body = body.child(management_card_with_icon(
-            management_locale_text("Keys", "Key", "Key"),
-            management_locale_text(
-                "Every key here is shared by the Agents that bind this Provider.",
-                "这里的每个 Key 都由绑定该供应商的 Agent 共用。",
-                "這裡的每個 Key 都由綁定該供應商的 Agent 共用。",
-            ),
-            "icons/vibex/file-key.svg",
-            key_rows.into_any_element(),
-            cx,
-        ));
+        body = body.child(self.render_shared_provider_header(profile, window, cx));
+        body = body.child(self.render_shared_provider_keys(profile, window, cx));
 
         let mut agent_rows = v_flex().w_full().gap_1();
         for agent_id in &row.agents {
@@ -11719,6 +11671,321 @@ impl ManagementCenter {
             .gap_3()
             .child(body)
             .into_any_element()
+    }
+
+    /// One shared Provider's header: name, status, and the facts that decide
+    /// whether it can serve a request.
+    fn render_shared_provider_header(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let editing = self.shared_provider_name_editing
+            && self.shared_provider_name_target.as_deref() == Some(profile.id.as_str());
+        let name_input = if editing {
+            Some(
+                self.shared_provider_name_input
+                    .get_or_insert_with(|| {
+                        cx.new(|cx| {
+                            InputState::new(window, cx).default_value(profile.display_name.clone())
+                        })
+                    })
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let name_row = if let Some(input) = name_input {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&input).small().w_full()),
+                )
+                .child(
+                    Button::new("management-shared-provider-name-save")
+                        .xsmall()
+                        .primary()
+                        .label(management_locale_text("Save", "保存", "儲存"))
+                        .disabled(pending)
+                        .on_click(cx.listener({
+                            let profile_id = profile.id.clone();
+                            move |this, _, _, cx| {
+                                this.save_shared_provider_name(profile_id.clone(), cx)
+                            }
+                        })),
+                )
+                .child(
+                    Button::new("management-shared-provider-name-cancel")
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text("Cancel", "取消", "取消"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.shared_provider_name_editing = false;
+                            this.shared_provider_name_target = None;
+                            this.shared_provider_name_error = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element()
+        } else {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_1()
+                .child(div().text_sm().child(management_locale_text(
+                    "Display name",
+                    "显示名",
+                    "顯示名",
+                )))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_sm()
+                        .font_medium()
+                        .child(profile.display_name.clone()),
+                )
+                .child(
+                    Button::new("management-shared-provider-name-edit")
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                        .tooltip(management_locale_text("Rename", "重命名", "重新命名"))
+                        .accessibility_label(management_locale_text("Rename", "重命名", "重新命名"))
+                        .disabled(pending)
+                        .on_click(cx.listener({
+                            let profile = profile.clone();
+                            move |this, _, window, cx| {
+                                this.open_shared_provider_name_editor(&profile, window, cx)
+                            }
+                        })),
+                )
+                .into_any_element()
+        };
+        let name_error = editing
+            .then(|| self.shared_provider_name_error.clone())
+            .flatten();
+
+        let enabled = profile.status == vibex_core::ModelProviderProfileStatus::Enabled;
+        let mut details = v_flex().w_full().gap_2();
+        details = details.child(v_flex().w_full().gap_1().child(name_row).children(
+            name_error.map(|message| div().text_xs().text_color(cx.theme().danger).child(message)),
+        ));
+        details = details.child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .child(management_locale_text("Status", "状态", "狀態")),
+                )
+                .child(
+                    Switch::new("management-shared-provider-enabled")
+                        .small()
+                        .checked(enabled)
+                        .disabled(pending)
+                        .on_click(cx.listener({
+                            let profile_id = profile.id.clone();
+                            move |this, checked, _, cx| {
+                                this.set_shared_provider_enabled(profile_id.clone(), *checked, cx)
+                            }
+                        })),
+                ),
+        );
+        details = details.child(stat_line(
+            management_locale_text("Models", "模型", "模型"),
+            profile
+                .configured_models
+                .iter()
+                .filter(|model| model.enabled)
+                .count()
+                .to_string(),
+            cx,
+        ));
+        details = details.child(stat_line(
+            management_locale_text("Keys", "Key", "Key"),
+            profile.credentials.len().to_string(),
+            cx,
+        ));
+        if let Some(endpoint) = profile.primary_api_endpoint() {
+            details = details.child(stat_line(
+                management_locale_text("Endpoint", "接口地址", "介面位址"),
+                endpoint.url.clone(),
+                cx,
+            ));
+        }
+        management_card_dynamic(
+            profile.display_name.clone(),
+            management_locale_text(
+                "A shared Provider. Every Agent below uses the same keys.",
+                "共享的供应商。下面每个 Agent 使用同一套 Key。",
+                "共享的供應商。下面每個 Agent 使用同一套 Key。",
+            ),
+            details.into_any_element(),
+            cx,
+        )
+    }
+
+    /// One shared Provider's keys, editable through the v2 credential API.
+    fn render_shared_provider_keys(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let count = profile.credentials.len();
+        let mut key_rows = v_flex().w_full().gap_1();
+        for credential in &profile.credentials {
+            let state = match credential.status {
+                vibex_core::AgentCredentialStatus::Ready => Tag::success()
+                    .xsmall()
+                    .child(management_locale_text("Active", "正常", "正常"))
+                    .into_any_element(),
+                vibex_core::AgentCredentialStatus::Missing => Tag::warning()
+                    .xsmall()
+                    .child(management_locale_text(
+                        "Needs a key",
+                        "需要 Key",
+                        "需要 Key",
+                    ))
+                    .into_any_element(),
+                vibex_core::AgentCredentialStatus::Expired => Tag::danger()
+                    .xsmall()
+                    .child(management_locale_text("Expired", "已过期", "已過期"))
+                    .into_any_element(),
+                _ => Tag::secondary()
+                    .xsmall()
+                    .child(management_locale_text("Not ready", "未就绪", "未就緒"))
+                    .into_any_element(),
+            };
+            let replace_open = self.gateway_key_replace_target.as_ref().is_some_and(
+                |(target_profile, credential_id)| {
+                    target_profile == &profile.id && credential_id == &credential.id
+                },
+            );
+            key_rows = key_rows.child(
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .py_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .child(credential.display_name.clone()),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(state)
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "management-shared-provider-replace-key-{}",
+                                    credential.id.as_str()
+                                )))
+                                .xsmall()
+                                .ghost()
+                                .label(if replace_open {
+                                    management_locale_text("Cancel", "取消", "取消")
+                                } else {
+                                    management_locale_text("Replace key", "更换 Key", "更換 Key")
+                                })
+                                .disabled(pending)
+                                .on_click(cx.listener({
+                                    let profile_id = profile.id.clone();
+                                    let credential_id = credential.id.clone();
+                                    move |this, _, _, cx| {
+                                        if replace_open {
+                                            this.gateway_key_replace_target = None;
+                                            this.gateway_key_replace_input = None;
+                                            this.gateway_key_replace_error = None;
+                                        } else {
+                                            this.gateway_key_replace_target =
+                                                Some((profile_id.clone(), credential_id.clone()));
+                                            this.gateway_key_replace_input = None;
+                                            this.gateway_key_replace_error = None;
+                                        }
+                                        cx.notify();
+                                    }
+                                })),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "management-shared-provider-remove-key-{}",
+                                    credential.id.as_str()
+                                )))
+                                .xsmall()
+                                .ghost()
+                                .label(management_locale_text("Remove", "移除", "移除"))
+                                .disabled(pending)
+                                .on_click(cx.listener({
+                                    let profile_id = profile.id.clone();
+                                    let credential_id = credential.id.clone();
+                                    move |this, _, window, cx| {
+                                        this.confirm_remove_provider_key(
+                                            profile_id.clone(),
+                                            credential_id.clone(),
+                                            count,
+                                            window,
+                                            cx,
+                                        )
+                                    }
+                                })),
+                            ),
+                    ),
+            );
+            key_rows = key_rows.child(self.render_gateway_key_replace(
+                &profile.id,
+                &credential.id,
+                window,
+                cx,
+            ));
+        }
+        if profile.credentials.is_empty() {
+            key_rows = key_rows.child(compact_empty_state(
+                management_locale_text("No keys yet", "还没有 Key", "還沒有 Key"),
+                management_locale_text(
+                    "Add a key here; every Agent bound to this Provider uses it.",
+                    "在这里添加 Key，绑定该供应商的每个 Agent 都会使用它。",
+                    "在這裡新增 Key，綁定該供應商的每個 Agent 都會使用它。",
+                ),
+                cx,
+            ));
+        }
+        key_rows = key_rows.child(self.render_gateway_add_key(&profile.id, window, cx));
+        management_card_with_icon(
+            management_locale_text("Keys", "Key", "Key"),
+            management_locale_text(
+                "Every key here is shared by the Agents that bind this Provider.",
+                "这里的每个 Key 都由绑定该供应商的 Agent 共用。",
+                "這裡的每個 Key 都由綁定該供應商的 Agent 共用。",
+            ),
+            "icons/vibex/file-key.svg",
+            key_rows.into_any_element(),
+            cx,
+        )
     }
 
     /// The gateway's sidebar: what it is connected to and how it is doing.
@@ -11971,6 +12238,137 @@ impl ManagementCenter {
                 cx.notify();
             }
         }
+    }
+
+    /// Opens the selected shared Provider's name in place.
+    fn open_shared_provider_name_editor(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = profile.display_name.clone();
+        self.shared_provider_name_input =
+            Some(cx.new(|cx| InputState::new(window, cx).default_value(value)));
+        self.shared_provider_name_editing = true;
+        self.shared_provider_name_target = Some(profile.id.as_str().to_string());
+        self.shared_provider_name_error = None;
+        cx.notify();
+    }
+
+    fn save_shared_provider_name(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.shared_provider_name_input.clone() else {
+            return;
+        };
+        let name = input.read(cx).value().trim().to_string();
+        if name.is_empty() || name.chars().count() > 160 {
+            self.shared_provider_name_error = Some(
+                management_locale_text(
+                    "Enter a name of at most 160 characters",
+                    "请输入不超过 160 个字符的名称",
+                    "請輸入不超過 160 個字元的名稱",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(mut profile) = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        profile.display_name = name;
+        self.shared_provider_name_editing = false;
+        self.shared_provider_name_target = None;
+        self.shared_provider_name_error = None;
+        self.update_shared_provider(
+            profile,
+            management_locale_text("Provider renamed", "供应商已重命名", "供應商已重新命名"),
+            cx,
+        );
+    }
+
+    fn set_shared_provider_enabled(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut profile) = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        profile.status = if enabled {
+            vibex_core::ModelProviderProfileStatus::Enabled
+        } else {
+            vibex_core::ModelProviderProfileStatus::Disabled
+        };
+        let message = if enabled {
+            management_locale_text("Provider enabled", "供应商已启用", "供應商已啟用")
+        } else {
+            management_locale_text("Provider disabled", "供应商已停用", "供應商已停用")
+        };
+        self.update_shared_provider(profile, message, cx);
+    }
+
+    /// Writes one shared Provider through the v2 contract.
+    ///
+    /// Editing a shared Provider from the global page must not fall back to a
+    /// v1 Agent-scoped Profile: the whole point of the page is that the record
+    /// is shared, and only the v2 update carries the revision the authority
+    /// checks.
+    fn update_shared_provider(
+        &mut self,
+        profile: vibex_core::ModelProviderProfile,
+        message: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let expected_revision = profile.revision;
+        self.mutation = Some(ManagementMutation::Gateway);
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .update_model_provider_profile(vibex_backend::MutationRequest::new(
+                    vibex_core::ModelProviderProfileUpdateRequest {
+                        profile,
+                        expected_revision,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(_) => {
+                        this.notice = Some(message.to_string());
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
     }
 
     /// Writes the token ceiling the draft describes.
@@ -12661,6 +13059,22 @@ impl ManagementCenter {
             .find(|upstream| upstream.model_provider_profile_id == profile)
             .map(|upstream| upstream.keys.len())
             .unwrap_or(0);
+        self.confirm_remove_provider_key(profile, credential, remaining, window, cx);
+    }
+
+    /// Asks before removing a shared Provider's last Key.
+    ///
+    /// The same rule covers a gateway upstream and a Provider edited from the
+    /// global page: every other Key is reversible by adding one back, while the
+    /// last one leaves the Provider unable to answer at all.
+    fn confirm_remove_provider_key(
+        &mut self,
+        profile: vibex_core::ModelProviderProfileId,
+        credential: vibex_core::RequestId,
+        remaining: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if remaining > 1 {
             self.remove_gateway_key(profile, credential, cx);
             return;
@@ -12813,7 +13227,7 @@ impl ManagementCenter {
     fn render_gateway_key_replace(
         &mut self,
         profile: &vibex_core::ModelProviderProfileId,
-        key: &vibex_core::GatewayKeySummary,
+        credential_id: &vibex_core::RequestId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -12821,7 +13235,7 @@ impl ManagementCenter {
             self.gateway_key_replace_target
                 .as_ref()
                 .is_some_and(|(target_profile, credential)| {
-                    target_profile == profile && credential == &key.credential_id
+                    target_profile == profile && credential == credential_id
                 });
         if !active {
             return div().into_any_element();
@@ -12838,7 +13252,7 @@ impl ManagementCenter {
             .clone();
         let pending = self.mutation.is_some();
         let profile = profile.clone();
-        let credential = key.credential_id.clone();
+        let credential = credential_id.clone();
         let error = self.gateway_key_replace_error.clone();
         v_flex()
             .w_full()
@@ -12857,7 +13271,7 @@ impl ManagementCenter {
                     .child(
                         Button::new(SharedString::from(format!(
                             "management-gateway-replace-save-{}",
-                            key.credential_id.as_str()
+                            credential_id.as_str()
                         )))
                         .xsmall()
                         .primary()
@@ -12870,7 +13284,7 @@ impl ManagementCenter {
                     .child(
                         Button::new(SharedString::from(format!(
                             "management-gateway-replace-cancel-{}",
-                            key.credential_id.as_str()
+                            credential_id.as_str()
                         )))
                         .xsmall()
                         .ghost()
@@ -13262,6 +13676,7 @@ impl ManagementCenter {
                 .child(
                     v_flex()
                         .min_w_0()
+                        .flex_1()
                         .gap_1()
                         .child(
                             div()
@@ -13653,7 +14068,12 @@ impl ManagementCenter {
                 // can be busy without being broken, and the only place a user
                 // can tell the gateway so is beside the Key it applies to.
                 key_rows = key_rows.child(self.render_gateway_key_limits(key, window, cx));
-                key_rows = key_rows.child(self.render_gateway_key_replace(&id, key, window, cx));
+                key_rows = key_rows.child(self.render_gateway_key_replace(
+                    &id,
+                    &key.credential_id,
+                    window,
+                    cx,
+                ));
             }
             if upstream.keys.is_empty() {
                 key_rows = key_rows.child(div().text_xs().text_color(cx.theme().warning).child(
@@ -13845,11 +14265,17 @@ impl ManagementCenter {
                                     .text_color(cx.theme().muted_foreground)
                                     .child(if switching {
                                         management_locale_text("Switching…", "切换中…", "切換中…")
-                                    } else if agent.enabled {
+                                    } else if agent.enabled && agent.active {
                                         management_locale_text(
                                             "Uses the gateway",
                                             "走网关",
                                             "走閘道",
+                                        )
+                                    } else if agent.enabled {
+                                        management_locale_text(
+                                            "Paused: the gateway is not running",
+                                            "已暂停：网关未运行",
+                                            "已暫停：閘道未執行",
                                         )
                                     } else {
                                         management_locale_text(
@@ -26476,12 +26902,12 @@ fn agent_gateway_mode(
 ) -> Option<AgentGatewayMode> {
     match binding {
         Some(binding) if binding.enabled => Some(AgentGatewayMode {
-            tone: if routable {
+            tone: if routable && binding.active {
                 AgentGatewayModeTone::Normal
             } else {
                 AgentGatewayModeTone::Warning
             },
-            text: if routable {
+            text: if routable && binding.active {
                 match locale {
                     ResolvedLocale::En => format!("Current mode: gateway ({gateway_name})"),
                     ResolvedLocale::ZhCn => format!("当前模式：走网关（{gateway_name}）"),
@@ -35426,6 +35852,43 @@ mod gateway_surface_tests {
     /// A fetch applies the preset it was started from, and a vendor list that
     /// cannot be read still leaves the plan's models in the picker; the ledger
     /// asks before it deletes, because clearing it cannot be undone.
+    /// The global page is a writer, not a read-only summary.
+    #[test]
+    fn the_global_provider_page_writes_through_v2_contracts() {
+        let source = include_str!("management.rs");
+        let keys = source
+            .split_once("    fn render_shared_provider_keys(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The gateway's sidebar"))
+            .map(|(body, _)| body)
+            .expect("the shared Provider key editor should remain inspectable");
+        assert!(keys.contains("render_gateway_add_key"));
+        assert!(keys.contains("render_gateway_key_replace"));
+        assert!(keys.contains("confirm_remove_provider_key"));
+
+        let update = source
+            .split_once("    fn update_shared_provider(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Writes the token ceiling"))
+            .map(|(body, _)| body)
+            .expect("the v2 write should remain inspectable");
+        assert!(update.contains("update_model_provider_profile"));
+        assert!(update.contains("ModelProviderProfileUpdateRequest"));
+    }
+
+    /// Creating from the global page must borrow a real projection descriptor,
+    /// or the form loses both the Key field and the Model panes.
+    #[test]
+    fn creating_a_provider_from_the_global_page_borrows_a_configurable_agent() {
+        let source = include_str!("management.rs");
+        let opening = source
+            .split_once("    fn open_profile_creator(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn open_profile_editor("))
+            .map(|(body, _)| body)
+            .expect("the creator should remain inspectable");
+        assert!(opening.contains("self.selected_provider_profile_id = None;"));
+        assert!(opening.contains("AgentProjectionFormControl::ApiKey"));
+        assert!(opening.contains("self.sync_projection_editor();"));
+    }
+
     #[test]
     fn the_preset_and_ledger_paths_are_wired_to_their_surfaces() {
         let source = include_str!("management.rs");
@@ -35641,6 +36104,7 @@ mod gateway_surface_tests {
             agent_id: "claude".to_string(),
             display_name: "Claude Code".to_string(),
             enabled,
+            active: enabled,
             unsupported: false,
             wire_protocol_id: String::new(),
         };

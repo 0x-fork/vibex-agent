@@ -472,6 +472,20 @@ impl ModelGatewayService {
     /// result, so the next start does not move again and Agents keep the same
     /// base URL.
     pub async fn start(self: &Arc<Self>) -> GatewayResult<ModelGatewayRuntimeState> {
+        let result = self.start_inner().await;
+        if let Err(error) = &result {
+            // Every start failure is a terminal state for this attempt. Without
+            // this, a settings or snapshot read that failed before the bind
+            // would leave the Config Center saying "starting" forever.
+            let current = self.runtime_state();
+            if current.status == ModelGatewayStatus::Starting {
+                self.publish(ModelGatewayRuntimeState::unavailable(error.message()));
+            }
+        }
+        result
+    }
+
+    async fn start_inner(self: &Arc<Self>) -> GatewayResult<ModelGatewayRuntimeState> {
         if let Ok(mut shutting_down) = self.shutting_down.write() {
             *shutting_down = false;
         }
@@ -494,7 +508,16 @@ impl ModelGatewayService {
             return Ok(state);
         }
 
-        let listener = self.bind(settings.port).await?;
+        let listener = match self.bind(settings.port).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                // A bind failure is a terminal state, not a pending one: the
+                // Config Center must stop saying "starting" and tell the user
+                // that Agents are on their direct Provider.
+                self.publish(ModelGatewayRuntimeState::unavailable(error.message()));
+                return Err(error);
+            }
+        };
         let port = listener
             .local_addr()
             .map_err(|_| GatewayError::Internal("the gateway listener has no address".to_string()))?
@@ -796,7 +819,8 @@ impl ModelGatewayService {
             })
             .collect::<Vec<_>>();
 
-        let body = build_upstream_request(target, &request, &requested_model)?;
+        let upstream_stream = request.stream || !passthrough;
+        let body = build_upstream_request(target, &request, &requested_model, upstream_stream)?;
         Ok(PreparedCall {
             inbound,
             profile_id,
@@ -1588,25 +1612,39 @@ pub(crate) async fn gather(
         let usage = parsed.usage.clone();
         (parsed, usage)
     } else {
-        let mut sniffer = UsageSniffer::new(target);
-        let mut buffer = SseBuffer::default();
-        let mut accumulator = ReplyAccumulator::default();
-        let mut decoded = decoder(target);
-        for (_, data) in buffer.push(&bytes) {
-            if data.trim() == "[DONE]" {
-                continue;
+        // A translated request asks the upstream for a stream, but an upstream
+        // that only speaks whole bodies may ignore the flag. Accept both
+        // shapes rather than turning a valid answer into an empty one.
+        if bytes
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+            == Some(b'{')
+        {
+            let parsed = parse_reply(target, &bytes).unwrap_or_default();
+            let usage = parsed.usage.clone();
+            (parsed, usage)
+        } else {
+            let mut sniffer = UsageSniffer::new(target);
+            let mut buffer = SseBuffer::default();
+            let mut accumulator = ReplyAccumulator::default();
+            let mut decoded = decoder(target);
+            for (_, data) in buffer.push(&bytes) {
+                if data.trim() == "[DONE]" {
+                    continue;
+                }
+                for event in decoded.decode(&data).unwrap_or_default() {
+                    accumulator.apply(&event);
+                }
             }
-            for event in decoded.decode(&data).unwrap_or_default() {
-                accumulator.apply(&event);
+            sniffer.observe(&buffer.finish());
+            if sniffer.usage().total() > 0 {
+                accumulator.apply(&CanonicalEvent::Usage(sniffer.usage()));
             }
+            let parsed = accumulator.finish();
+            let usage = parsed.usage.clone();
+            (parsed, usage)
         }
-        sniffer.observe(&buffer.finish());
-        if sniffer.usage().total() > 0 {
-            accumulator.apply(&CanonicalEvent::Usage(sniffer.usage()));
-        }
-        let parsed = accumulator.finish();
-        let usage = parsed.usage.clone();
-        (parsed, usage)
     };
     let rendered = render_response(prepared.inbound, &response)?;
     if let Some(conversation) = prepared.conversation.as_deref() {

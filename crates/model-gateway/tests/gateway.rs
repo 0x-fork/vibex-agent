@@ -166,13 +166,22 @@ async fn mock_upstream_refusing(
     refused_authorization: &str,
     stream: String,
 ) -> (String, Recorder, tokio::task::JoinHandle<()>) {
+    mock_upstream_refusing_with_status(refused_authorization, 429, stream).await
+}
+
+async fn mock_upstream_refusing_with_status(
+    refused_authorization: &str,
+    status: u16,
+    stream: String,
+) -> (String, Recorder, tokio::task::JoinHandle<()>) {
     let (url, recorder, _overlap, task) =
-        mock_upstream_with_refusal(refused_authorization, stream).await;
+        mock_upstream_with_refusal(refused_authorization, status, stream).await;
     (url, recorder, task)
 }
 
 async fn mock_upstream_with_refusal(
     refused_authorization: &str,
+    refusal_status: u16,
     stream: String,
 ) -> (String, Recorder, Arc<Overlap>, tokio::task::JoinHandle<()>) {
     let recorder: Recorder = Arc::new(Mutex::new(Recorded::default()));
@@ -183,7 +192,7 @@ async fn mock_upstream_with_refusal(
         status: 200,
         stream,
         json: None,
-        refuse: Some((refused_authorization.to_string(), 429)),
+        refuse: Some((refused_authorization.to_string(), refusal_status)),
     };
     let router = Router::new()
         .route("/{*path}", post(mock_handler))
@@ -527,6 +536,50 @@ async fn a_non_streaming_client_gets_one_body() {
 }
 
 #[tokio::test]
+async fn a_translated_non_streaming_client_gets_a_whole_body() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) =
+        mock_upstream(200, anthropic_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    // Anthropic-only upstream: the Chat request must be translated, and the
+    // client asked for one JSON body, so the gateway has to gather the stream.
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::AnthropicMessages,
+        &["claude"],
+        "sk-test",
+    );
+    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": "deepseek/claude",
+            "messages": [{"role": "user", "content": "say hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "hi");
+    assert_eq!(body["usage"]["prompt_tokens"], 9);
+    assert_eq!(
+        recorder.lock().await.body.as_ref().unwrap()["stream"],
+        true,
+        "a translated non-streaming call is read from the upstream as a stream"
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+#[tokio::test]
 async fn an_invalid_key_is_marked_and_the_next_key_answers() {
     let path = database_path();
     let (upstream_url, recorder, upstream_task) = mock_upstream(200, chat_stream(), None).await;
@@ -712,6 +765,58 @@ async fn an_authentication_failure_cools_the_key_until_it_is_replaced() {
     // An auth failure has no duration: the Key never recovers on its own.
     assert!(states[0].cooldown_until_ms.is_none());
     assert!(!states[0].is_ready_at(vibex_core::unix_timestamp_ms()));
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+#[tokio::test]
+async fn an_authentication_failure_fails_over_to_the_next_key() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) =
+        mock_upstream_refusing_with_status("Bearer sk-revoked", 401, chat_stream()).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-revoked",
+    );
+    config
+        .add_model_provider_credential(vibex_core::AddModelProviderCredentialRequest {
+            model_provider_profile_id: upstream.clone(),
+            display_name: Some("Backup".to_string()),
+            value: "sk-good".to_string(),
+        })
+        .unwrap();
+    point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": "deepseek/deepseek-chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.text().await.unwrap();
+    assert_eq!(
+        recorder.lock().await.authorization.as_deref(),
+        Some("Bearer sk-good"),
+        "a rejected Key must not end the request while another Key can answer"
+    );
+    let logs = service.recent_requests(10).unwrap();
+    let trace = logs[0].route.as_ref().expect("the route is recorded");
+    assert_eq!(trace.failed_attempts.len(), 1);
+    assert_eq!(trace.failed_attempts[0].failure, GatewayFailureKind::Auth);
 
     gateway_task.abort();
     upstream_task.abort();

@@ -93,7 +93,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 65;
+pub const CURRENT_SCHEMA_VERSION: i64 = 66;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12429,6 +12429,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     vibex_use::budget::migrate(conn, &mut applied)?;
     model_gateway::migrate(conn, &mut applied)?;
     model_gateway::migrate_route_trace(conn, &mut applied)?;
+    model_gateway::migrate_gateway_agents(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -17523,6 +17524,7 @@ mod tests {
                 "63:vibex_use_budget_policy",
                 "64:model_gateway",
                 "65:model_gateway_route_trace",
+                "66:model_gateway_agents",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -17672,6 +17674,7 @@ mod tests {
                 "63:vibex_use_budget_policy",
                 "64:model_gateway",
                 "65:model_gateway_route_trace",
+                "66:model_gateway_agents",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -17802,6 +17805,7 @@ mod tests {
                 "63:vibex_use_budget_policy",
                 "64:model_gateway",
                 "65:model_gateway_route_trace",
+                "66:model_gateway_agents",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -17970,6 +17974,7 @@ mod tests {
                 "63:vibex_use_budget_policy",
                 "64:model_gateway",
                 "65:model_gateway_route_trace",
+                "66:model_gateway_agents",
             ]
         );
         assert_eq!(
@@ -19398,6 +19403,7 @@ mod tests {
                 "63:vibex_use_budget_policy",
                 "64:model_gateway",
                 "65:model_gateway_route_trace",
+                "66:model_gateway_agents",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

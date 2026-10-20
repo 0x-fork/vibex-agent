@@ -90,6 +90,23 @@ impl App {
     }
 
     fn perform_intent(&mut self, intent: Intent) -> Outcome {
+        // `ctrl+r` is the universal refresh key; inside the Key prompt it is
+        // the one way a terminal can reveal what it is about to store.
+        if matches!(intent, Intent::Refresh | Intent::ReloadManagement)
+            && matches!(
+                self.overlay,
+                Some(Overlay::Prompt {
+                    field: PromptField::ProviderSecret,
+                    ..
+                })
+            )
+        {
+            self.reveal_provider_secret = !self.reveal_provider_secret;
+            return Outcome {
+                effects: Vec::new(),
+                dirty: true,
+            };
+        }
         // An overlay swallows most intents; the overlay's own intents and the
         // global escape hatches still apply.
         if self.overlay.is_some() {
@@ -1811,6 +1828,104 @@ impl App {
             // Provider is chosen rather than switched, so this arm is the row
             // it names and nothing else: the verbs a Provider row advertises do
             // not include Toggle.
+            (ConfigSection::Providers, ConfigAction::Toggle) if key.starts_with("gateway-key:") => {
+                let Some((profile, credential, enabled, _)) = self.gateway_key_target(key) else {
+                    return Outcome::quiet();
+                };
+                self.begin_toggle(
+                    key,
+                    !enabled,
+                    Effect::SetGatewayKey {
+                        profile,
+                        credential,
+                        enabled: Some(!enabled),
+                        preferred: None,
+                    },
+                )
+            }
+            (ConfigSection::Providers, ConfigAction::Prefer) if key.starts_with("gateway-key:") => {
+                let Some((profile, credential, _, preferred)) = self.gateway_key_target(key) else {
+                    return Outcome::quiet();
+                };
+                let subject = self.config_row_subject(key);
+                self.begin_record_work(
+                    key.to_string(),
+                    subject,
+                    crate::config_center::ConfigVerb::Activate,
+                    vec![Effect::SetGatewayKey {
+                        profile,
+                        credential,
+                        enabled: None,
+                        preferred: Some(!preferred),
+                    }],
+                )
+            }
+            (ConfigSection::Providers, ConfigAction::Routing) if key == "gateway" => {
+                let Some(snapshot) = self.management_data.gateway.as_ref() else {
+                    return Outcome::quiet();
+                };
+                let strategies = vibex_core::GatewayRoutingStrategy::ALL;
+                let current = snapshot.settings.policy.routing;
+                let next = strategies
+                    .iter()
+                    .position(|strategy| *strategy == current)
+                    .map(|index| strategies[(index + 1) % strategies.len()])
+                    .unwrap_or(vibex_core::GatewayRoutingStrategy::Ordered);
+                self.begin_record_work(
+                    "gateway".to_string(),
+                    self.config_row_subject("gateway"),
+                    crate::config_center::ConfigVerb::Activate,
+                    vec![Effect::SetGatewayPolicy {
+                        routing: Some(next),
+                        pin: None,
+                        token_limit: None,
+                    }],
+                )
+            }
+            (ConfigSection::Providers, ConfigAction::Prefer) if key == "gateway" => {
+                let Some(snapshot) = self.management_data.gateway.as_ref() else {
+                    return Outcome::quiet();
+                };
+                let pin =
+                    if snapshot.settings.policy.pin == vibex_core::GatewayPinScope::Conversation {
+                        vibex_core::GatewayPinScope::Off
+                    } else {
+                        vibex_core::GatewayPinScope::Conversation
+                    };
+                self.begin_record_work(
+                    "gateway".to_string(),
+                    self.config_row_subject("gateway"),
+                    crate::config_center::ConfigVerb::Activate,
+                    vec![Effect::SetGatewayPolicy {
+                        routing: None,
+                        pin: Some(pin),
+                        token_limit: None,
+                    }],
+                )
+            }
+            (ConfigSection::Providers, ConfigAction::Requests) if key == "gateway" => self
+                .begin_record_work(
+                    "gateway".to_string(),
+                    self.config_row_subject("gateway"),
+                    crate::config_center::ConfigVerb::RefreshSnapshot,
+                    vec![Effect::LoadGatewayRequests],
+                ),
+            (ConfigSection::Providers, ConfigAction::TokenLimit) if key == "gateway" => {
+                let value = self
+                    .management_data
+                    .gateway
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.settings.policy.token_limit)
+                    .map(|limit| limit.tokens.to_string())
+                    .unwrap_or_default();
+                self.overlay = Some(Overlay::Prompt {
+                    title: self.strings.config_action_token_limit().to_string(),
+                    field: PromptField::GatewayTokenLimit,
+                    value,
+                    target: Some("gateway".to_string()),
+                });
+                Outcome::effects(vec![])
+            }
             (ConfigSection::Providers, ConfigAction::Toggle) if key == "gateway" => {
                 let Some(snapshot) = self.management_data.gateway.as_ref() else {
                     return Outcome::quiet();
@@ -1878,6 +1993,7 @@ impl App {
                 // The profile the key is for travels with the prompt: the list
                 // can be re-read while the reader is typing, and the row the
                 // cursor then points at is not the row they pressed.
+                self.reveal_provider_secret = false;
                 self.overlay = Some(Overlay::Prompt {
                     title: self.strings.config_action_secret().to_string(),
                     field: PromptField::ProviderSecret,
@@ -2045,6 +2161,42 @@ impl App {
             .iter()
             .find(|agent| agent.id.as_str() == key)
             .map(|agent| agent.id.clone())
+    }
+
+    /// The (profile, credential, enabled, preferred) a gateway Key row names.
+    fn gateway_key_target(
+        &self,
+        key: &str,
+    ) -> Option<(
+        vibex_core::ModelProviderProfileId,
+        vibex_core::RequestId,
+        bool,
+        bool,
+    )> {
+        let rest = key.strip_prefix("gateway-key:")?;
+        let (profile, credential) = rest.split_once(':')?;
+        let profile = vibex_core::ModelProviderProfileId::parse(profile).ok()?;
+        let credential = vibex_core::RequestId::parse(credential).ok()?;
+        let snapshot = self.management_data.gateway.as_ref()?;
+        let preferred = snapshot
+            .settings
+            .policy
+            .preferred_keys
+            .get(&profile)
+            .is_some_and(|preferred| preferred == &credential);
+        let key = snapshot
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.model_provider_profile_id == profile)?
+            .keys
+            .iter()
+            .find(|key| key.credential_id == credential)?;
+        Some((
+            profile,
+            credential,
+            key.state != vibex_core::GatewayKeyState::Disabled,
+            preferred,
+        ))
     }
 
     fn provider_id(&self, key: &str) -> Option<vibex_core::ProviderProfileId> {
@@ -5436,6 +5588,41 @@ impl App {
                     profile_id,
                     secret: value,
                 }])
+            }
+            PromptField::GatewayTokenLimit => {
+                let window = self
+                    .management_data
+                    .gateway
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.settings.policy.token_limit)
+                    .map(|limit| limit.window)
+                    .unwrap_or(vibex_core::GatewayTokenWindow::Day);
+                let digits = trimmed.replace(['_', ','], "");
+                let limit = if digits.is_empty() {
+                    None
+                } else {
+                    match digits.parse::<u64>() {
+                        Ok(tokens) if tokens > 0 => {
+                            Some(vibex_core::GatewayTokenLimit { window, tokens })
+                        }
+                        _ => {
+                            self.toast(Toast::warning(
+                                self.strings.config_form_error_tokens().to_string(),
+                            ));
+                            return Outcome::quiet();
+                        }
+                    }
+                };
+                self.begin_record_work(
+                    "gateway".to_string(),
+                    self.config_row_subject("gateway"),
+                    crate::config_center::ConfigVerb::Save,
+                    vec![Effect::SetGatewayPolicy {
+                        routing: None,
+                        pin: None,
+                        token_limit: Some(limit),
+                    }],
+                )
             }
             PromptField::ProviderEndpoint => {
                 let index = self.selection_for(Scope::Providers);

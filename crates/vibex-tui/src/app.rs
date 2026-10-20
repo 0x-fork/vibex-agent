@@ -418,6 +418,8 @@ pub enum PromptField {
     WorkspacePath,
     ProviderSecret,
     ProviderEndpoint,
+    /// The gateway's local token ceiling, in tokens.
+    GatewayTokenLimit,
     McpServerName,
     SkillName,
     PromptName,
@@ -1141,6 +1143,11 @@ pub struct App {
     /// back through: the order pages were opened in, not a fixed hierarchy.
     pub page_history: Vec<PageVisit>,
     pub overlay: Option<Overlay>,
+    /// Whether the Key prompt is showing the secret instead of masking it.
+    ///
+    /// Revealing is a view state, not a property of the value: it resets every
+    /// time the prompt opens, and never reaches the authority.
+    pub reveal_provider_secret: bool,
     /// A sign-in terminal the authority opened and this client attached to.
     ///
     /// A terminal method runs the Agent's own login flow in a PTY the authority
@@ -2050,6 +2057,7 @@ impl App {
             focus: Focus::Main,
             page_history: Vec::new(),
             overlay: None,
+            reveal_provider_secret: false,
             auth_terminal: None,
             toast: None,
             quit_armed: 0,
@@ -9632,6 +9640,8 @@ pub enum Effect {
     ListProfiles,
     /// Read the local model gateway.
     LoadGateway,
+    /// Read the gateway's recent request ledger.
+    LoadGatewayRequests,
     SelectProfile {
         profile_id: vibex_core::ProviderProfileId,
         /// The scope this default applies to. `None` is the authority's global
@@ -9662,6 +9672,19 @@ pub enum Effect {
     /// their own configuration.
     SetGatewayEnabled {
         enabled: bool,
+    },
+    /// Turn one upstream Key off or on, or make it the preferred one.
+    SetGatewayKey {
+        profile: vibex_core::ModelProviderProfileId,
+        credential: vibex_core::RequestId,
+        enabled: Option<bool>,
+        preferred: Option<bool>,
+    },
+    /// Change one part of the gateway policy, carrying the rest forward.
+    SetGatewayPolicy {
+        routing: Option<vibex_core::GatewayRoutingStrategy>,
+        pin: Option<vibex_core::GatewayPinScope>,
+        token_limit: Option<Option<vibex_core::GatewayTokenLimit>>,
     },
     ListAgents,
     InstallAgent {
@@ -9947,6 +9970,9 @@ impl Effect {
             Effect::ListProfiles => "profiles",
             Effect::LoadGateway => "gateway",
             Effect::SetGatewayEnabled { .. } => "gateway_toggle",
+            Effect::SetGatewayKey { .. } => "gateway_key",
+            Effect::SetGatewayPolicy { .. } => "gateway_policy",
+            Effect::LoadGatewayRequests => "gateway_requests",
             Effect::SelectProfile { .. } => "select_profile",
             Effect::WriteProviderSecret { .. } => "provider_secret",
             Effect::ClearProviderSecret { .. } => "provider_secret_clear",
