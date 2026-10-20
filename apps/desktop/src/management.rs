@@ -11337,6 +11337,20 @@ impl ManagementCenter {
         } else {
             gateway_agents
         };
+        let gateway_summary = if gateway.upstreams.is_empty() {
+            management_locale_text("No upstream Providers", "没有上游供应商", "沒有上游供應商")
+                .to_string()
+        } else {
+            format!(
+                "{} · {gateway_used}",
+                gateway_overall_key_summary(gateway, locale)
+            )
+        };
+        let gateway_summary_color = if gateway.upstreams.is_empty() {
+            cx.theme().warning
+        } else {
+            cx.theme().muted_foreground
+        };
         list = list.child(
             v_flex()
                 .id("management-global-provider-row-gateway")
@@ -11392,11 +11406,8 @@ impl ManagementCenter {
                 .child(
                     div()
                         .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "{} · {gateway_used}",
-                            gateway_overall_key_summary(gateway, locale)
-                        )),
+                        .text_color(gateway_summary_color)
+                        .child(gateway_summary),
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());

@@ -5027,8 +5027,10 @@ ProviderConfigService::{
   Gateway item, and a stored `gateway` cursor resolves to `Providers`. The
   Providers list draws the gateway first, with a `●` marker (direct Providers
   use `○`), its automatic-routing state, the aggregate Key summary, and the
-  Agents bound to it. Selecting that row renders the gateway's detail in the
-  same right pane as any other Provider; the old separate sidebar is gone.
+  Agents bound to it. An empty upstream list is said in warning colour rather
+  than shown as `0 keys`, because it is the reason the row cannot route.
+  Selecting that row renders the gateway's detail in the same right pane as any
+  other Provider; the old separate sidebar is gone.
 - **The token ceiling is set where its window is.** The gateway detail edits the
   count and the window (day/week/month) as one pair, because a count without a
   window is not a ceiling. An empty field is refused, not read as zero; removing
