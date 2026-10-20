@@ -8515,6 +8515,71 @@ mod tests {
         }
     }
 
+    /// The Config Center aggregates bindings across Agents, so the service
+    /// exposes a deliberate "all" read. The filtered one keeps refusing an
+    /// unfiltered request, which is what made the missing filter a real bug
+    /// instead of a silent table scan.
+    #[test]
+    fn the_global_but_not_the_filtered_binding_read_answers_without_a_filter() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        for agent_id in ["claude", "codex"] {
+            service
+                .update_agent_config(AgentUpdateConfigRequest {
+                    agent_id: AgentId::parse(agent_id).unwrap(),
+                    added: Some(true),
+                    enabled: Some(true),
+                    label_override: None,
+                    description_override: None,
+                    order_index: None,
+                    command: None,
+                    env: None,
+                    params: None,
+                })
+                .unwrap();
+        }
+
+        let error = service
+            .list_agent_model_provider_bindings(vibex_core::AgentModelProviderBindingListRequest {
+                agent_id: None,
+                model_provider_profile_id: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "agent_model_provider_binding_filter_missing");
+
+        let all = service
+            .list_all_agent_model_provider_bindings()
+            .expect("the global read must answer without a filter");
+        // Each enabled Agent seeds its own runtime binding, so the aggregate
+        // must hold at least what the per-Agent reads return between them.
+        let mut per_agent = Vec::new();
+        for agent_id in ["claude", "codex"] {
+            per_agent.extend(
+                service
+                    .list_agent_model_provider_bindings(
+                        vibex_core::AgentModelProviderBindingListRequest {
+                            agent_id: Some(AgentId::parse(agent_id).unwrap()),
+                            model_provider_profile_id: None,
+                        },
+                    )
+                    .unwrap(),
+            );
+        }
+        assert!(
+            all.len() >= per_agent.len(),
+            "the global read ({} rows) must cover every per-Agent row ({} rows)",
+            all.len(),
+            per_agent.len()
+        );
+        for agent_id in ["claude", "codex"] {
+            assert!(
+                all.iter()
+                    .any(|binding| binding.agent_id.as_str() == agent_id),
+                "{agent_id} must appear in the aggregate"
+            );
+        }
+    }
+
     #[test]
     fn agent_definitions_and_acp_presets_stay_synchronized() {
         let definition_presets = builtin_agent_definitions()

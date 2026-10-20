@@ -179,6 +179,13 @@ impl ProviderManagementFacade {
         self.service.list_agent_model_provider_bindings(request)
     }
 
+    /// Every binding, for the Config Center's cross-Agent aggregation.
+    pub fn list_all_agent_model_provider_bindings(
+        &self,
+    ) -> VibexResult<Vec<vibex_core::AgentModelProviderBinding>> {
+        self.service.list_all_agent_model_provider_bindings()
+    }
+
     pub fn create_agent_model_provider_binding(
         &self,
         request: vibex_core::AgentModelProviderBindingCreateRequest,

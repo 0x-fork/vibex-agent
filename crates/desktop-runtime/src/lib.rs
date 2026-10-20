@@ -1118,16 +1118,12 @@ pub async fn assemble_management_snapshot(
     let profiles = provider.list_profiles()?;
     // The global Providers page reads these two lists: one Profile per shared
     // Provider, and every Agent binding that references it.
+    //
+    // This is one read of the whole table, not one read per Agent. The same
+    // rows are then grouped in memory for the per-Agent details below, so the
+    // bundle costs one binding query instead of one per configured Agent.
     let model_provider_profiles = provider.list_model_provider_profiles()?;
-    let mut agent_model_provider_bindings = Vec::new();
-    for binding in provider.list_agent_model_provider_bindings(
-        vibex_core::AgentModelProviderBindingListRequest {
-            agent_id: None,
-            model_provider_profile_id: None,
-        },
-    )? {
-        agent_model_provider_bindings.push(binding);
-    }
+    let agent_model_provider_bindings = provider.list_all_agent_model_provider_bindings()?;
     let native_import_preview = provider
         .preview_native_import(vibex_core::ProviderNativeImportPreviewRequest {
             sources: vec![
@@ -1166,12 +1162,13 @@ pub async fn assemble_management_snapshot(
             },
         )?;
         let runtime_profiles = provider.list_agent_runtime_profiles(&agent.id)?;
-        let bindings = provider.list_agent_model_provider_bindings(
-            vibex_core::AgentModelProviderBindingListRequest {
-                agent_id: Some(agent.id.clone()),
-                model_provider_profile_id: None,
-            },
-        )?;
+        // The bundle already read every binding once; grouping here keeps the
+        // Agent's own list in the same shape the filtered lookup returned.
+        let bindings = agent_model_provider_bindings
+            .iter()
+            .filter(|binding| binding.agent_id == agent.id)
+            .cloned()
+            .collect::<Vec<_>>();
 
         let mut projections = Vec::new();
         for runtime_profile in &runtime_profiles {
@@ -1442,6 +1439,8 @@ fn assemble_gateway_snapshot(
 
 #[cfg(test)]
 mod management_snapshot_tests {
+    use super::*;
+
     /// The Config Center depends on detected Agent versions being refreshed
     /// before capability state is read, and that ordering now lives here rather
     /// than in the desktop loader.
@@ -1463,6 +1462,51 @@ mod management_snapshot_tests {
             refresh < agent_list,
             "versioned Agent identity must be refreshed before capability state is loaded"
         );
+    }
+
+    /// The bundle has to assemble against a home that has no Providers yet.
+    ///
+    /// This is the regression guard rather than a source check: the assembly
+    /// used to ask for bindings with neither an Agent nor a Provider, and that
+    /// request is refused, so the whole Config Center came back as an error and
+    /// the desktop fell back to default snapshots — a gateway stuck on
+    /// "starting" and an empty Providers list.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn management_snapshot_assembles_on_a_home_with_no_providers() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = DesktopRuntimeConfig::isolated_test(directory.path());
+        let runtime = DesktopRuntime::start(config).await.unwrap();
+
+        let snapshot = assemble_management_snapshot(
+            &runtime.management(),
+            vibex_core::ProviderProfileDefaultScope {
+                kind: vibex_core::ProviderDefaultScopeKind::Global,
+                project_id: None,
+                workspace_id: None,
+            },
+            false,
+        )
+        .await
+        .expect("the Config Center bundle must assemble without any Providers");
+
+        // The runtime seeds a local Agent profile on first boot, so the point
+        // is not "nothing exists" but "whatever exists is reported": the
+        // unfiltered binding read used to fail the whole bundle even here.
+        assert!(
+            !snapshot.model_provider_profiles.is_empty(),
+            "the seeded Provider must be reported, not dropped with the bundle"
+        );
+        // An absent gateway would make the desktop fall back to a default
+        // snapshot, which is what disguised the failure as "starting".
+        let gateway = snapshot
+            .model_gateway
+            .expect("the bundle must report the gateway, not leave it absent");
+        assert!(
+            gateway.runtime.status != vibex_core::ModelGatewayStatus::Starting,
+            "a gateway that never started must report a terminal state, not Starting"
+        );
+
+        runtime.shutdown().await.unwrap();
     }
 }
 

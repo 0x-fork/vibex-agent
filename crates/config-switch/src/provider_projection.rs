@@ -748,6 +748,21 @@ impl ProviderConfigService {
         }
     }
 
+    /// Every binding, for a reader that aggregates across Agents.
+    ///
+    /// The Config Center's global Providers page answers "which Agents use this
+    /// Provider", which is the inverse of both indexed lookups above. It is a
+    /// separate entry point rather than an unfiltered call to
+    /// [`Self::list_agent_model_provider_bindings`]: that one refuses a request
+    /// naming neither an Agent nor a Provider, so a missing filter stays a
+    /// caller bug instead of becoming a silent table scan.
+    pub fn list_all_agent_model_provider_bindings(
+        &self,
+    ) -> VibexResult<Vec<AgentModelProviderBinding>> {
+        let conn = self.open_connection()?;
+        AgentModelProviderBindingRepository::list_all(&conn)
+    }
+
     pub fn create_agent_model_provider_binding(
         &self,
         request: AgentModelProviderBindingCreateRequest,

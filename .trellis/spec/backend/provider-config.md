@@ -5037,6 +5037,22 @@ ProviderConfigService::{
 - **Neither list is derived from the other.** The gateway's upstream picker uses
   the v2 identity the settings store, and a client never computes one id from
   the other; the authority resolves the pair once and publishes candidates.
+- **The cross-Agent binding read is its own entry point.** The "used by" line
+  needs the inverse of both indexed lookups, so
+  `list_all_agent_model_provider_bindings()` exists beside
+  `list_agent_model_provider_bindings()`. The filtered one still refuses a
+  request that names neither an Agent nor a Provider: a caller that forgets a
+  filter gets `agent_model_provider_binding_filter_missing` rather than a
+  silent table scan. The bundle reads the whole table once and groups it in
+  memory, so per-Agent details cost no extra query and cannot drift from the
+  aggregate the page draws. An unfiltered call to the filtered method used to
+  fail the entire `ManagementSnapshotPayload`, which surfaced as a gateway
+  stuck on `Starting` and an empty Providers list.
+- **An unreported gateway is not a starting one.** A bundle assembled without a
+  gateway (an older authority, or a read that did not run) is reported as
+  `Unavailable` with a notice, never left at `GatewaySnapshot::default()`. The
+  default's `Starting` claims a boot is under way, so defaulting to it hides a
+  failed read behind a state that looks like it will resolve itself.
 - **The gateway is the pinned row of the Providers page.** It is not a
   top-level section: `ManagementSection::ALL` omits it, the navigation has no
   Gateway item, and a stored `gateway` cursor resolves to `Providers`. The

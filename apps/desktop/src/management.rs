@@ -30810,6 +30810,30 @@ async fn load_agent_snapshot(backend: BackendFacade) -> VibexResult<Vec<AgentSna
         .collect())
 }
 
+/// The gateway surface a reading client shows when the authority reported none.
+///
+/// An older authority, or a bundle assembled before the gateway existed, omits
+/// the field entirely. That is "unknown", and unknown has to read as "not
+/// serving": the default snapshot's `Starting` would claim a boot is under way
+/// and hide the fact that nothing is coming.
+fn unreported_gateway_snapshot() -> vibex_core::GatewaySnapshot {
+    vibex_core::GatewaySnapshot {
+        runtime: vibex_core::ModelGatewayRuntimeState {
+            status: vibex_core::ModelGatewayStatus::Unavailable,
+            notice: Some(
+                management_locale_text(
+                    "The gateway state could not be read. Agents keep their direct Provider configuration.",
+                    "没能读到网关状态，Agent 保留自己的供应商配置。",
+                    "沒能讀到閘道狀態，Agent 保留自己的供應商設定。",
+                )
+                .to_string(),
+            ),
+            ..vibex_core::ModelGatewayRuntimeState::default()
+        },
+        ..vibex_core::GatewaySnapshot::default()
+    }
+}
+
 async fn load_snapshot(
     backend: BackendFacade,
     default_scope: vibex_core::ProviderProfileDefaultScope,
@@ -30836,7 +30860,14 @@ async fn load_snapshot(
         .map(|agent_id| agent_id.as_str().to_string())
         .collect();
     let profiles = bundle.profiles;
-    let gateway = bundle.model_gateway.unwrap_or_default();
+    // An authority that does not report the gateway is not a gateway that is
+    // starting. `GatewaySnapshot::default()` says `Starting`, so defaulting to
+    // it made a failed read look like a boot in progress — the row sat on
+    // "starting" forever, with no upstreams and no address. Unknown is
+    // reported as "not running" instead, which is the truth Agents act on.
+    let gateway = bundle
+        .model_gateway
+        .unwrap_or_else(unreported_gateway_snapshot);
     let shared_providers = bundle.model_provider_profiles;
     let provider_bindings = bundle.agent_model_provider_bindings;
     let native_import_preview = bundle.native_import_preview;
@@ -34904,6 +34935,29 @@ mod tests {
             load_snapshot.contains(".management_snapshot("),
             "Config Center snapshot must read the aggregated authority bundle"
         );
+    }
+
+    /// A gateway the authority did not report must not claim to be starting.
+    ///
+    /// This is the shape the whole bug took on screen: a bundle that failed to
+    /// assemble left the row on "starting" forever, with no upstreams and no
+    /// address, so nothing about it invited a second look.
+    #[test]
+    fn an_unreported_gateway_reads_as_not_running_rather_than_starting() {
+        let snapshot = unreported_gateway_snapshot();
+        assert_eq!(
+            snapshot.runtime.status,
+            vibex_core::ModelGatewayStatus::Unavailable
+        );
+        assert!(
+            snapshot.runtime.notice.is_some(),
+            "the surface has to say why there is no address"
+        );
+        assert!(
+            !snapshot.runtime.status.is_routable(),
+            "an unknown gateway must never claim to be routable"
+        );
+        assert!(snapshot.runtime.base_url().is_none());
     }
 
     #[test]

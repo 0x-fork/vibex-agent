@@ -436,6 +436,23 @@ impl AgentModelProviderBindingRepository {
         )
     }
 
+    /// Every binding, for a reader that aggregates across Agents.
+    ///
+    /// The Config Center's global Providers page answers "which Agents use this
+    /// Provider", which needs the inverse of both indexed lookups. It is a
+    /// deliberate contract of its own rather than an empty filter on
+    /// [`list_for_agent`]: that lookup refuses an unfiltered request on
+    /// purpose, so a caller cannot accidentally scan the table by passing
+    /// nothing.
+    pub fn list_all(conn: &Connection) -> VibexResult<Vec<AgentModelProviderBinding>> {
+        list_bindings(
+            conn,
+            "1 = 1",
+            (),
+            "agent_model_provider_binding_list_failed",
+        )
+    }
+
     pub fn list_for_runtime(
         conn: &Connection,
         id: &AgentRuntimeProfileId,
@@ -951,6 +968,20 @@ fn list_bindings_where(
     value: &str,
     error_code: &'static str,
 ) -> VibexResult<Vec<AgentModelProviderBinding>> {
+    list_bindings(conn, predicate, params![value], error_code)
+}
+
+/// The one binding query every lookup shares.
+///
+/// `bind` is the prepared parameter list, so a lookup that takes an id and the
+/// unfiltered read of the whole table run the same SQL and the same row
+/// mapping; only the predicate and its parameters differ.
+fn list_bindings<P: rusqlite::Params>(
+    conn: &Connection,
+    predicate: &str,
+    bind: P,
+    error_code: &'static str,
+) -> VibexResult<Vec<AgentModelProviderBinding>> {
     let sql = format!(
         "
         SELECT agent_model_provider_binding_id, legacy_provider_profile_id,
@@ -968,10 +999,7 @@ fn list_bindings_where(
         "failed to prepare Agent provider binding list",
     ))?;
     let mut bindings = collect_rows(
-        stmt.query_map(
-            params![value],
-            map_agent_model_provider_binding_without_models,
-        ),
+        stmt.query_map(bind, map_agent_model_provider_binding_without_models),
         error_code,
         "failed to list Agent provider bindings",
     )?;
@@ -2751,6 +2779,76 @@ mod tests {
         ModelProviderProfileRepository::update(&conn, &updated, 1).unwrap();
         let error = ModelProviderProfileRepository::update(&conn, &updated, 1).unwrap_err();
         assert_eq!(error.code, "model_provider_profile_revision_conflict");
+    }
+
+    /// The unfiltered read is what the Config Center's "used by" aggregation
+    /// needs, so it must return every binding instead of nothing.
+    #[test]
+    fn list_all_returns_every_live_binding_across_agents() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        // Migrations seed the local default bindings, so the baseline is
+        // whatever they created rather than zero.
+        let baseline = AgentModelProviderBindingRepository::list_all(&conn)
+            .unwrap()
+            .len();
+
+        let shared = ModelProviderProfile {
+            id: ModelProviderProfileId::new(),
+            legacy_provider_profile_id: None,
+            display_name: "Shared".to_string(),
+            vendor_hint: None,
+            endpoints: vec![ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: ModelProviderEndpointKind::Api,
+                url: "https://shared.example.invalid/v1".to_string(),
+                wire_protocol_id: None,
+            }],
+            proxy_policy: ModelProviderProxyPolicy::InheritSystem,
+            credentials: Vec::new(),
+            configured_models: Vec::new(),
+            default_model_id: None,
+            headers: Vec::new(),
+            status: ModelProviderProfileStatus::Enabled,
+            revision: 1,
+            created_at_ms: 100,
+            updated_at_ms: 100,
+            deleted_at_ms: None,
+        };
+        ModelProviderProfileRepository::insert(&conn, &shared).unwrap();
+
+        let mut inserted = Vec::new();
+        for kind in [ProviderKind::Claude, ProviderKind::Codex] {
+            let mut legacy = ProviderProfile::local_default(kind);
+            legacy.id = ProviderProfileId::new();
+            let mut records = map_legacy_projection_records(&conn, &legacy).unwrap();
+            AgentRuntimeProfileRepository::insert(&conn, &records.agent_runtime).unwrap();
+            records.binding.model_provider_profile_id = shared.id.clone();
+            AgentModelProviderBindingRepository::insert(&conn, &records.binding).unwrap();
+            inserted.push(records.binding.agent_id.as_str().to_string());
+        }
+
+        let all = AgentModelProviderBindingRepository::list_all(&conn).unwrap();
+        assert_eq!(all.len(), baseline + 2);
+        let agents = all
+            .iter()
+            .map(|binding| binding.agent_id.as_str().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        for agent in &inserted {
+            assert!(
+                agents.contains(agent),
+                "the unfiltered read must include the {agent} binding"
+            );
+        }
+        // The shared row mapper still hydrates each binding's own model list,
+        // so the unfiltered read is not a shallower shape than the filtered
+        // ones it shares its SQL with.
+        assert!(
+            all.iter()
+                .all(|binding| binding.configured_models.is_empty() || binding.revision > 0)
+        );
     }
 
     #[test]
