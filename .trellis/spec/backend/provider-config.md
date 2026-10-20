@@ -5068,6 +5068,12 @@ ProviderConfigService::{
   State, and Agents: a direct Provider shows one upstream, its single secret as
   0 or 1 Keys, ready/off, and its Agent; the gateway shows its counts and bound
   Agents. The old Agent/Kind/Model/Credential facts remain in the row detail.
+- **A Key row wraps rather than truncating its own name.** The switch, state,
+  preference, replacement, and removal controls are one wrapping cluster, so a
+  narrow window pushes them to a second line instead of cutting the Key label.
+- **The TUI preset picker names a plan's price.** When a plan preset publishes
+  vendor copy such as `$9.99/mo`, that is the picker's second column; the
+  address and the no-key hint fill it only for presets without one.
 - **Concurrency and rate limits are per Key.** A lane bounds in-flight requests
   and a rolling minute bounds request starts. A request that cannot start within
   its own queue deadline is refused with `429` instead of waiting forever, and a

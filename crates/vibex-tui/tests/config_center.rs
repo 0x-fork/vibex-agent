@@ -5083,6 +5083,22 @@ fn a_missing_gateway_does_not_remove_the_direct_providers() {
     assert_eq!(rows[0].key, "provider_direct");
 }
 
+/// A plan preset shows the price its vendor publishes in the picker.
+///
+/// The price is static vendor copy, not a computed amount; the TUI has no
+/// other place to put it before the plan is chosen.
+#[test]
+fn a_plan_preset_shows_its_price_in_the_picker() {
+    let source = include_str!("../src/view.rs");
+    let picker = source
+        .split_once("Overlay::ProviderPresetPicker { selected, .. } => {")
+        .and_then(|(_, tail)| tail.split_once("Overlay::WorkspacePicker { selected }"))
+        .map(|(body, _)| body)
+        .expect("the preset picker should remain inspectable");
+    assert!(picker.contains("preset.plan_note.as_deref()"));
+    assert!(picker.contains("detail = if let Some(note)"));
+}
+
 /// A preset-created Provider keeps the protocol the preset chose.
 ///
 /// This is the regression the two-server report called out: without an explicit

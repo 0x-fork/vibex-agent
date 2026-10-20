@@ -13344,6 +13344,7 @@ impl ManagementCenter {
                 key_rows = key_rows.child(
                     h_flex()
                         .w_full()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
                         .gap_2()
@@ -35511,6 +35512,8 @@ mod gateway_surface_tests {
         assert!(row.contains("gateway_key_state_badge(key, cx)"));
         assert!(row.contains("management-gateway-key-enabled-"));
         assert!(row.contains("management-gateway-prefer-key-"));
+        // The controls wrap instead of pushing the name off a narrow row.
+        assert!(row.contains(".flex_wrap()"));
     }
 
     /// One ledger row, built the way the authority reports it.

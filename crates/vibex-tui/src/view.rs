@@ -10151,8 +10151,11 @@ fn render_overlay(
                         theme.base()
                     };
                     // The second column says what the preset saves the reader
-                    // from looking up: its address, or that it needs no key.
-                    let detail = if preset.no_key {
+                    // from looking up: a plan's price, its address, or that it
+                    // needs no key.
+                    let detail = if let Some(note) = preset.plan_note.as_deref() {
+                        note.to_string()
+                    } else if preset.no_key {
                         strings.config_preset_no_key().to_string()
                     } else {
                         preset
