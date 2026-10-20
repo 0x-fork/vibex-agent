@@ -107,12 +107,12 @@ fs2 = "0.4.3"
 gpui = { package = "gpui-pre", version = "=0.3.9" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 gpui_tokio = { package = "gpui-tokio", path = "crates/gpui-tokio" }
-gpui-component = "0.7.3"
-gpui-fps = "0.7.3"
-gpui-kit-assets = "0.7.3"
+gpui-component = "0.8.0"
+gpui-fps = "0.8.0"
+gpui-kit-assets = "0.8.0"
 # The kit's motion layer, which `Plot::hover` implementations sample. Same
 # version the component crate already resolves, so the graph keeps one copy.
-gpui-base = "0.7.3"
+gpui-base = "0.8.0"
 image = { version = "=0.25.10", default-features = false }
 tray-icon = { version = "0.24.2", default-features = false }
 # The Markdown parser the component text view renders with. The clients read

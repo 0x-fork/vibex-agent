@@ -10241,15 +10241,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-base@0.7.3:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-base@0.8.0:c19b7c6f923b580a",
       "name": "gpui-base",
-      "version": "0.7.3",
+      "version": "0.8.0",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-base@0.7.3",
+      "purl": "pkg:cargo/gpui-base@0.8.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10277,15 +10277,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-component@0.7.3:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-component@0.8.0:c19b7c6f923b580a",
       "name": "gpui-component",
-      "version": "0.7.3",
+      "version": "0.8.0",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-component@0.7.3",
+      "purl": "pkg:cargo/gpui-component@0.8.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10313,15 +10313,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-component-macros@0.7.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-component-macros@0.8.0:c19b7c6f923b580a",
       "name": "gpui-component-macros",
-      "version": "0.7.1",
+      "version": "0.8.0",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-component-macros@0.7.1",
+      "purl": "pkg:cargo/gpui-component-macros@0.8.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10343,21 +10343,21 @@
       "externalReferences": [
         {
           "type": "distribution",
-          "url": "https://crates.io/crates/gpui-component-macros/0.7.1"
+          "url": "https://crates.io/crates/gpui-component-macros/0.8.0"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-fast@0.1.7:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-fast@0.1.10:c19b7c6f923b580a",
       "name": "gpui-fast",
-      "version": "0.1.7",
+      "version": "0.1.10",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-fast@0.1.7",
+      "purl": "pkg:cargo/gpui-fast@0.1.10",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10385,15 +10385,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-fast-macros@0.1.7:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-fast-macros@0.1.10:c19b7c6f923b580a",
       "name": "gpui-fast-macros",
-      "version": "0.1.7",
+      "version": "0.1.10",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-fast-macros@0.1.7",
+      "purl": "pkg:cargo/gpui-fast-macros@0.1.10",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10421,15 +10421,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-fps@0.7.3:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-fps@0.8.0:c19b7c6f923b580a",
       "name": "gpui-fps",
-      "version": "0.7.3",
+      "version": "0.8.0",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-fps@0.7.3",
+      "purl": "pkg:cargo/gpui-fps@0.8.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10457,15 +10457,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-kit-assets@0.7.3:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-kit-assets@0.8.0:c19b7c6f923b580a",
       "name": "gpui-kit-assets",
-      "version": "0.7.3",
+      "version": "0.8.0",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-kit-assets@0.7.3",
+      "purl": "pkg:cargo/gpui-kit-assets@0.8.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -41917,7 +41917,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-base@0.7.3:c19b7c6f923b580a",
+      "ref": "cargo:gpui-base@0.8.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:aho-corasick@1.1.4:c19b7c6f923b580a",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
@@ -41926,7 +41926,7 @@
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:data-url@0.3.2:c19b7c6f923b580a",
         "cargo:futures@0.3.34:c19b7c6f923b580a",
-        "cargo:gpui-fast@0.1.7:c19b7c6f923b580a",
+        "cargo:gpui-fast@0.1.10:c19b7c6f923b580a",
         "cargo:gpui-pre-macros@0.3.9:c19b7c6f923b580a",
         "cargo:gpui-pre-sum-tree@0.3.9:c19b7c6f923b580a",
         "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
@@ -41956,7 +41956,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-component-macros@0.7.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-component-macros@0.8.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:proc-macro-crate@3.5.0:c19b7c6f923b580a",
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
@@ -41965,16 +41965,16 @@
       ]
     },
     {
-      "ref": "cargo:gpui-component@0.7.3:c19b7c6f923b580a",
+      "ref": "cargo:gpui-component@0.8.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:core-text@21.0.0:c19b7c6f923b580a",
         "cargo:enum-iterator@2.3.0:c19b7c6f923b580a",
-        "cargo:gpui-base@0.7.3:c19b7c6f923b580a",
-        "cargo:gpui-component-macros@0.7.1:c19b7c6f923b580a",
-        "cargo:gpui-fast@0.1.7:c19b7c6f923b580a",
-        "cargo:gpui-kit-assets@0.7.3:c19b7c6f923b580a",
+        "cargo:gpui-base@0.8.0:c19b7c6f923b580a",
+        "cargo:gpui-component-macros@0.8.0:c19b7c6f923b580a",
+        "cargo:gpui-fast@0.1.10:c19b7c6f923b580a",
+        "cargo:gpui-kit-assets@0.8.0:c19b7c6f923b580a",
         "cargo:gpui-pre-macros@0.3.9:c19b7c6f923b580a",
         "cargo:gpui-pre-sum-tree@0.3.9:c19b7c6f923b580a",
         "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
@@ -42035,7 +42035,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-fast-macros@0.1.7:c19b7c6f923b580a",
+      "ref": "cargo:gpui-fast-macros@0.1.10:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:heck@0.5.0:c19b7c6f923b580a",
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
@@ -42044,7 +42044,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-fast@0.1.7:c19b7c6f923b580a",
+      "ref": "cargo:gpui-fast@0.1.10:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:accesskit@0.24.1:c19b7c6f923b580a",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
@@ -42060,7 +42060,7 @@
         "cargo:futures-concurrency@7.7.1:c19b7c6f923b580a",
         "cargo:futures@0.3.34:c19b7c6f923b580a",
         "cargo:getrandom@0.3.4:c19b7c6f923b580a",
-        "cargo:gpui-fast-macros@0.1.7:c19b7c6f923b580a",
+        "cargo:gpui-fast-macros@0.1.10:c19b7c6f923b580a",
         "cargo:gpui-pre-collections@0.3.9:c19b7c6f923b580a",
         "cargo:gpui-pre-http-client@0.3.9:c19b7c6f923b580a",
         "cargo:gpui-pre-refineable@0.3.9:c19b7c6f923b580a",
@@ -42110,7 +42110,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-fps@0.7.3:c19b7c6f923b580a",
+      "ref": "cargo:gpui-fps@0.8.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:core-graphics@0.24.0:c19b7c6f923b580a",
         "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
@@ -42125,7 +42125,7 @@
       ]
     },
     {
-      "ref": "cargo:gpui-kit-assets@0.7.3:c19b7c6f923b580a",
+      "ref": "cargo:gpui-kit-assets@0.8.0:c19b7c6f923b580a",
       "dependsOn": [
         "asset:gpui-kit-lucide-icons:efafb5ab9a148d12",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
@@ -47209,10 +47209,10 @@
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:embed-resource@3.0.9:c19b7c6f923b580a",
         "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
-        "cargo:gpui-base@0.7.3:c19b7c6f923b580a",
-        "cargo:gpui-component@0.7.3:c19b7c6f923b580a",
-        "cargo:gpui-fps@0.7.3:c19b7c6f923b580a",
-        "cargo:gpui-kit-assets@0.7.3:c19b7c6f923b580a",
+        "cargo:gpui-base@0.8.0:c19b7c6f923b580a",
+        "cargo:gpui-component@0.8.0:c19b7c6f923b580a",
+        "cargo:gpui-fps@0.8.0:c19b7c6f923b580a",
+        "cargo:gpui-kit-assets@0.8.0:c19b7c6f923b580a",
         "cargo:gpui-pre-platform@0.3.9:c19b7c6f923b580a",
         "cargo:gpui-pre-wgpu@0.3.9:c19b7c6f923b580a",
         "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
@@ -47464,7 +47464,7 @@
         "asset:vibex-mobile-application-icons:b690a33c976cf781",
         "asset:vibex-mobile-brand-marks:84a77e160e305979",
         "asset:vibex-mobile-native-icons:60418f3d673b6ca6",
-        "cargo:gpui-component@0.7.3:c19b7c6f923b580a",
+        "cargo:gpui-component@0.8.0:c19b7c6f923b580a",
         "cargo:gpui-pre@0.3.9:c19b7c6f923b580a",
         "cargo:markdown@1.0.0:c19b7c6f923b580a",
         "cargo:percent-encoding@2.3.2:c19b7c6f923b580a",
