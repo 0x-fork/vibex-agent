@@ -8453,10 +8453,10 @@ impl MobileWorkbench {
                                 let branches = self.git_branches.as_deref().unwrap_or_default();
                                 let (behind, ahead) = git_sync_counts(branches);
                                 tab.when(behind > 0, |tab| {
-                                    tab.child(sync_badge(behind, "↙", theme::accent_blue()))
+                                    tab.child(sync_badge(behind, "↓", theme::accent_blue()))
                                 })
                                 .when(ahead > 0, |tab| {
-                                    tab.child(sync_badge(ahead, "↗", theme::accent_success()))
+                                    tab.child(sync_badge(ahead, "↑", theme::accent_success()))
                                 })
                             })
                     })),
@@ -8683,8 +8683,10 @@ fn git_sync_counts(branches: &[GitBranchSummary]) -> (u32, u32) {
 ///
 /// Geometry and tone are the desktop's own sync badge: a plate of the count's
 /// colour at a twelfth, the count on it, and one corner small enough to read as
-/// a label rather than a button. A reader who knows what the arrow means on the
-/// desktop reads the same thing here.
+/// a label rather than a button. The arrows are the plain vertical pair the
+/// branch sheet already uses, not the desktop's diagonal one: on the platform's
+/// monospace face the diagonal arrows fall through to the emoji font and paint
+/// as a coloured glyph, while these two stay text in every face on the phone.
 fn sync_badge(count: u32, arrow: &'static str, color: gpui::Hsla) -> gpui::AnyElement {
     div()
         .h(px(18.0))
@@ -11111,6 +11113,27 @@ index 3333333..4444444 100644
             git_sync_counts(&[branch(false, true, 5, 5)]),
             (0, 0),
             "and a branch the reader is not on is not the one on screen"
+        );
+    }
+
+    /// The rail's two counts are drawn with text arrows, not emoji.
+    ///
+    /// The platform monospace face has no diagonal arrows, so `↙` and `↗`
+    /// fell through to the emoji font and the badge painted a coloured glyph
+    /// where the desktop paints a text arrow. The vertical arrows are the ones
+    /// the branch sheet already uses and no face on the phone turns them into
+    /// emoji.
+    #[test]
+    fn the_sync_badge_draws_text_arrows() {
+        let source = include_str!("workbench.rs");
+        assert!(
+            source.contains("sync_badge(behind, \"↓\"")
+                && source.contains("sync_badge(ahead, \"↑\""),
+            "the badge asks for the plain arrows"
+        );
+        assert!(
+            !source.contains("\"↙\"") && !source.contains("\"↗\""),
+            "the diagonal arrows are the emoji fallback this fix removes"
         );
     }
 }
