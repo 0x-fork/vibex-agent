@@ -25,10 +25,10 @@ vendored Android IME host.
 gpui = { package = "gpui-pre", version = "=0.3.9" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 gpui_tokio = { package = "gpui-tokio", path = "crates/gpui-tokio" }
-gpui-component = "0.7.3"
-gpui-fps = "0.7.3"
-gpui-kit-assets = "0.7.3"
-gpui-base = "0.7.3"
+gpui-component = "0.8.0"
+gpui-fps = "0.8.0"
+gpui-kit-assets = "0.8.0"
+gpui-base = "0.8.0"
 ```
 
 ```toml
@@ -56,7 +56,7 @@ pnpm check:mobile-native              native mobile crate and project contract
   not rename a fork to satisfy the version constraint.
 - `gpui-pre-mobile` resolves from its pinned Git revision; the pin moves only with
   a reviewed dependency-source change, never as a floating branch.
-- gpui-kit 0.7.3 pins `gpui-pre =0.3.9`, and Cargo cannot hold two exact pins in
+- gpui-kit 0.8.0 pins `gpui-pre =0.3.9`, and Cargo cannot hold two exact pins in
   the same `0.3` range, so the mobile platform layer must accept 0.3.9 or the
   workspace does not resolve at all. The pin is upstream `longbridge/gpui-mobile`
   at revision `9a2cf8b`, which carries both halves of that requirement: `55e7deb`
@@ -193,7 +193,7 @@ This reintroduces a renamed GPUI fork and a vendored component tree.
 ```toml
 gpui = { package = "gpui-pre", version = "=0.3.9" }
 gpui_tokio = { package = "gpui-tokio", path = "crates/gpui-tokio" }
-gpui-component = "0.7.3"
+gpui-component = "0.8.0"
 ```
 
 ## Scenario: Redistributed Native Runtime With A Bounded Package Transform
