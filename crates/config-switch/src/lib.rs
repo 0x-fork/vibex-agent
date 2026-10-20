@@ -1828,6 +1828,125 @@ impl ProviderConfigService {
         Ok(created)
     }
 
+    /// Materialises a shared Provider into a legacy Profile for one Agent.
+    ///
+    /// A shared record is Agent-neutral: it carries addresses and a model list,
+    /// and its protocol lives on each endpoint. The launch path needs the other
+    /// shape — one `ProviderProfile` owned by the Agent, with a single `base_url`,
+    /// a `wireApi` pin and an ACP config — so this is where the two meet.
+    ///
+    /// The protocol is taken from the endpoint the record publishes: a
+    /// protocol-specific address decides it, and a record with only a
+    /// provider-wide address leaves the pin unset, which the projection then
+    /// resolves from the Agent's own first supported interface.
+    fn materialize_legacy_profile_for_agent(
+        &self,
+        shared: &vibex_core::ModelProviderProfile,
+        agent_id: &AgentId,
+    ) -> VibexResult<ProviderProfile> {
+        let kind = match agent_id.as_str() {
+            "claude" => ProviderKind::Claude,
+            "codex" => ProviderKind::Codex,
+            _ => ProviderKind::Acp,
+        };
+        let protocol_endpoint = shared
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.wire_protocol_id.is_some());
+        let wire_api = protocol_endpoint
+            .and_then(|endpoint| endpoint.wire_protocol_id.as_deref())
+            .and_then(vibex_core::ProviderModelWireApi::from_wire_protocol_id);
+        let base_url = shared
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.wire_protocol_id.is_none())
+            .or_else(|| shared.endpoints.first())
+            .map(|endpoint| endpoint.url.clone());
+        let mut provider_options = vibex_core::ProviderOptions::empty();
+        if let Some(wire_api) = wire_api {
+            provider_options
+                .entries
+                .push(vibex_core::ProviderBindingMetadata {
+                    key: "wireApi".to_string(),
+                    value: wire_api.wire_protocol_id().to_string(),
+                });
+        }
+        for endpoint in &shared.endpoints {
+            let Some(protocol) = endpoint.wire_protocol_id.as_deref() else {
+                continue;
+            };
+            let Some(wire_api) = vibex_core::ProviderModelWireApi::from_wire_protocol_id(protocol)
+            else {
+                continue;
+            };
+            provider_options
+                .entries
+                .push(vibex_core::ProviderBindingMetadata {
+                    key: wire_api.protocol_base_url_option_key(),
+                    value: endpoint.url.clone(),
+                });
+        }
+        let now = unix_timestamp_ms().max(1);
+        let id = ProviderProfileId::new();
+        let models = shared
+            .configured_models
+            .iter()
+            .map(|model| ProviderConfiguredModel {
+                id: model.id.clone(),
+                display_name: model.display_name.clone(),
+                enabled: model.enabled,
+                wire_api,
+                capabilities: model.capabilities.clone(),
+            })
+            .collect::<Vec<_>>();
+        let secrets = shared
+            .credentials
+            .iter()
+            .filter_map(|credential| {
+                let reference = credential.credential.secret_reference()?;
+                Some(vibex_core::ProviderSecretReference {
+                    id: RequestId::new(),
+                    provider_profile_id: id.clone(),
+                    secret_kind: vibex_core::ProviderSecretKind::ApiKey,
+                    backend: reference.backend,
+                    setup_state: reference.setup_state,
+                    lookup_key: reference.lookup_key.clone(),
+                    display_label: credential.display_name.clone(),
+                    redacted_hint: reference.redacted_hint.clone(),
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                })
+            })
+            .collect::<Vec<_>>();
+        let profile = ProviderProfile {
+            id: id.clone(),
+            agent_id: agent_id.clone(),
+            kind,
+            display_name: shared.display_name.clone(),
+            status: match shared.status {
+                vibex_core::ModelProviderProfileStatus::Enabled => ProviderProfileStatus::Enabled,
+                vibex_core::ModelProviderProfileStatus::Disabled => ProviderProfileStatus::Disabled,
+            },
+            account_alias: None,
+            base_url,
+            default_model: shared.default_model_id.clone(),
+            small_model: None,
+            large_model: None,
+            configured_models: models,
+            reasoning_effort: None,
+            sandbox_defaults: vibex_core::ProviderSandboxDefaults::workspace_write_ask_on_risk(),
+            network_defaults: vibex_core::ProviderNetworkDefaults::local_default(),
+            permission_defaults: vibex_core::ProviderPermissionDefaults::ask_on_risk(),
+            provider_options,
+            secrets,
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+        };
+        ProviderProfileRepository::insert(&self.open_connection()?, &profile)?;
+        Ok(profile)
+    }
+
     /// Gives one Agent its own Profile for a Provider another Agent already has.
     ///
     /// This is what the global Providers page offers as "use this Provider for
@@ -1845,14 +1964,49 @@ impl ProviderConfigService {
     ) -> VibexResult<ProviderProfile> {
         require_agent_definition(&request.agent_id)?;
         let conn = self.open_connection()?;
-        let source = ProviderProfileRepository::get(&conn, &request.provider_profile_id)?
-            .ok_or_else(|| {
-                VibexError::validation(
-                    "provider_profile_not_found",
-                    "provider profile was not found",
-                )
-                .with_diagnostic("providerProfileId", request.provider_profile_id.as_str())
-            })?;
+        // A Provider created on the global page has no legacy row to copy, so the
+        // source is materialised from its shared record first. From here on the
+        // two entry points behave the same: one legacy Profile per Agent.
+        let source = match request.model_provider_profile_id.as_ref() {
+            Some(shared_id) => {
+                let shared = vibex_db::ModelProviderProfileRepository::get(&conn, shared_id)?
+                    .ok_or_else(|| {
+                        VibexError::validation(
+                            "model_provider_profile_not_found",
+                            "shared Provider was not found",
+                        )
+                        .with_diagnostic("modelProviderProfileId", shared_id.as_str())
+                    })?;
+                // The materialised row already belongs to the target Agent, so
+                // there is nothing left to copy: it is the answer itself.
+                let created =
+                    self.materialize_legacy_profile_for_agent(&shared, &request.agent_id)?;
+                self.sync_legacy_projection(&conn, &created)?;
+                if request.make_default {
+                    self.set_agent_model_provider_default(
+                        vibex_core::AgentModelProviderSetDefaultRequest {
+                            scope: vibex_core::ProviderProfileDefaultScope {
+                                kind: vibex_core::ProviderDefaultScopeKind::Global,
+                                project_id: None,
+                                workspace_id: None,
+                            },
+                            agent_id: request.agent_id.clone(),
+                            provider_profile_id: created.id.clone(),
+                        },
+                    )?;
+                }
+                self.notify_profile_saved(&created);
+                return Ok(created);
+            }
+            None => ProviderProfileRepository::get(&conn, &request.provider_profile_id)?
+                .ok_or_else(|| {
+                    VibexError::validation(
+                        "provider_profile_not_found",
+                        "provider profile was not found",
+                    )
+                    .with_diagnostic("providerProfileId", request.provider_profile_id.as_str())
+                })?,
+        };
         if source.agent_id == request.agent_id {
             return Err(VibexError::validation(
                 "agent_model_provider_binding_same_agent",

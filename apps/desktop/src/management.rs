@@ -1013,6 +1013,15 @@ pub struct ManagementCenter {
     /// the picker can show it and a second change can replace the first one's
     /// endpoints rather than only its own.
     provider_preset_region: Option<String>,
+    /// Whether the open Provider editor is creating a shared Provider rather
+    /// than an Agent-scoped one.
+    ///
+    /// A shared Provider has no `agent_id`: it is one record several Agents
+    /// bind. The editor's fields are the same, but nothing in it may depend on
+    /// an Agent — no borrowed projection, and no interface validation at save
+    /// time. That validation belongs to the moment a Provider is given to an
+    /// Agent, because only then is there an Agent whose protocol matters.
+    provider_editor_shared: bool,
     /// Whether a new Provider's dialog is still on the "which preset" step.
     ///
     /// Creating a Provider starts with the choice rather than with a blank
@@ -2055,6 +2064,7 @@ impl ManagementCenter {
             provider_preset_draft: None,
             provider_preset_region: None,
             provider_preset_picker: false,
+            provider_editor_shared: false,
             provider_preset_query,
             model_capability_suggestion: None,
             selected_global_provider_id: None,
@@ -4936,6 +4946,7 @@ impl ManagementCenter {
         self.provider_preset_draft = None;
         self.provider_preset_region = None;
         self.provider_preset_picker = false;
+        self.provider_editor_shared = false;
         self.projection_editor.draft_revision = 0;
         // The stored Secret is read back so the field can show it masked and
         // reveal it on request; until the read lands the field stays blank,
@@ -5046,7 +5057,28 @@ impl ManagementCenter {
 
     fn rebuild_profile_protocol_base_urls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.profile_protocol_base_urls.clear();
-        for wire_api in self.projection_editor.supported_wire_apis() {
+        // A shared Provider is not narrowed to one Agent's interfaces: an Agent
+        // that speaks Messages and another that speaks Chat can bind the same
+        // record, so its per-protocol addresses have to be enterable up front.
+        // The borrowed projection still decides the form controls, but not how
+        // many protocols the record may describe.
+        let wire_apis = if self.provider_editor_shared {
+            let mut all = self.projection_editor.supported_wire_apis();
+            for wire_api in [
+                vibex_core::ProviderModelWireApi::OpenaiChatCompletions,
+                vibex_core::ProviderModelWireApi::OpenaiResponses,
+                vibex_core::ProviderModelWireApi::AnthropicMessages,
+                vibex_core::ProviderModelWireApi::GoogleGenerativeAi,
+            ] {
+                if !all.contains(&wire_api) {
+                    all.push(wire_api);
+                }
+            }
+            all
+        } else {
+            self.projection_editor.supported_wire_apis()
+        };
+        for wire_api in wire_apis {
             let option_key = wire_api.protocol_base_url_option_key();
             let value = provider_option_value(&self.profile_provider_options, &option_key)
                 .unwrap_or_default()
@@ -6211,7 +6243,194 @@ impl ManagementCenter {
         });
     }
 
+    /// Writes a Provider that belongs to no Agent.
+    ///
+    /// The draft is the same one the Agent-scoped editor uses, because the
+    /// fields are the same; what changes is the record it becomes. A shared
+    /// Provider keeps its addresses and its protocol per endpoint, so one
+    /// record can serve an Agent that speaks Messages and another that speaks
+    /// Chat. The protocol is therefore not a property of the Provider at all —
+    /// it is chosen when an Agent binds it.
+    fn save_shared_provider(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            self.error = Some(
+                management_error_text(
+                    "Management runtime is not connected",
+                    "配置中心运行时未连接",
+                    "配置中心執行階段未連線",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let name = self.profile_name.read(cx).value().trim().to_string();
+        self.profile_name_error = name.is_empty().then(|| {
+            management_error_text(
+                "Provider name is required",
+                "请填写供应商名称",
+                "請填寫供應商名稱",
+            )
+            .to_string()
+        });
+        if self.profile_name_error.is_some() {
+            self.error = None;
+            cx.notify();
+            return;
+        }
+        // One endpoint per address the draft holds. The single request-URL field
+        // is the provider-wide fallback; each per-protocol override becomes its
+        // own endpoint, which is what lets a binding pick by protocol.
+        let mut endpoints = Vec::new();
+        let base_url = self.profile_base_url.read(cx).value().trim().to_string();
+        if !base_url.is_empty() {
+            endpoints.push(vibex_core::ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: vibex_core::ModelProviderEndpointKind::Api,
+                url: base_url,
+                wire_protocol_id: None,
+            });
+        }
+        for (wire_api, input) in &self.profile_protocol_base_urls {
+            let url = input.read(cx).value().trim().to_string();
+            if url.is_empty() {
+                continue;
+            }
+            endpoints.push(vibex_core::ModelProviderEndpoint {
+                id: format!("api-{}", wire_api.wire_protocol_id().replace('_', "-")),
+                kind: vibex_core::ModelProviderEndpointKind::Api,
+                url,
+                wire_protocol_id: Some(wire_api.wire_protocol_id().to_string()),
+            });
+        }
+        if endpoints.is_empty() {
+            self.error = Some(
+                management_error_text(
+                    "Enter at least one address for this Provider",
+                    "请至少填写一个接口地址",
+                    "請至少填寫一個介面位址",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let configured_models = normalized_provider_models(&self.profile_configured_models);
+        let default_model_id = configured_models
+            .iter()
+            .find(|model| model.enabled)
+            .map(|model| model.id.clone());
+        let models = configured_models
+            .iter()
+            .map(|model| vibex_core::ModelProviderCatalogEntry {
+                id: model.id.clone(),
+                display_name: model.display_name.clone(),
+                enabled: model.enabled,
+                metadata: model
+                    .wire_api
+                    .map(|wire_api| {
+                        vec![vibex_core::ProviderBindingMetadata {
+                            key: "wireApi".to_string(),
+                            value: wire_api.wire_protocol_id().to_string(),
+                        }]
+                    })
+                    .unwrap_or_default(),
+                capabilities: model.capabilities.clone(),
+            })
+            .collect::<Vec<_>>();
+        let api_key = self.profile_api_key.read(cx).value().trim().to_string();
+        let request = vibex_core::ModelProviderProfileCreateRequest {
+            display_name: name,
+            vendor_hint: None,
+            endpoints,
+            proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+            credentials: Vec::new(),
+            configured_models: models,
+            default_model_id,
+            headers: Vec::new(),
+            status: vibex_core::ModelProviderProfileStatus::Enabled,
+        };
+        let active_locale = locale::current_locale();
+        self.mutation = Some(ManagementMutation::ProfileCreate);
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let created = backend
+                .management()
+                .create_model_provider_profile(vibex_backend::MutationRequest::new(request))
+                .await;
+            let outcome = match created {
+                Ok(profile) => {
+                    // The Key is written through the v2 credential API rather
+                    // than carried on the create request, because that is the
+                    // path that also stores the Secret and advances the
+                    // revision the bindings read.
+                    if api_key.is_empty() {
+                        Ok(profile)
+                    } else {
+                        backend
+                            .management()
+                            .add_model_provider_credential(vibex_backend::MutationRequest::new(
+                                vibex_core::AddModelProviderCredentialRequest {
+                                    model_provider_profile_id: profile.id.clone(),
+                                    display_name: None,
+                                    value: api_key,
+                                },
+                            ))
+                            .await
+                            .map(|_| profile)
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(profile) => {
+                        this.notice = Some(format!(
+                            "{} · {}",
+                            management_locale_text_for(
+                                active_locale,
+                                "Provider created",
+                                "供应商已创建",
+                                "供應商已建立",
+                            ),
+                            profile.display_name
+                        ));
+                        this.selected_global_provider_id = Some(profile.id.as_str().to_string());
+                        this.profile_editor_open = false;
+                        this.editing_profile_id = None;
+                        this.provider_editor_shared = false;
+                        this.provider_preset_draft = None;
+                        this.provider_preset_region = None;
+                        this.profile_secret_clear = false;
+                        this.projection_editor.set_secret_intent(false, false);
+                        this.navigation
+                            .mark_dirty(ManagementSection::Providers, false);
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
     fn save_profile(&mut self, cx: &mut Context<Self>) {
+        // A shared Provider belongs to no Agent, so this path deliberately has
+        // no Agent to fall back on. It writes the v2 record directly, which is
+        // also why it never reaches the per-Agent interface validation: what a
+        // Provider may speak is decided by the Agent that binds it, not by the
+        // Provider itself.
+        if self.provider_editor_shared {
+            self.save_shared_provider(cx);
+            return;
+        }
         let Some(agent) = self.snapshot.agents.iter().find(|agent| {
             agent.added && self.selected_agent_id.as_deref() == Some(agent.id.as_str())
         }) else {
@@ -11603,12 +11822,26 @@ impl ManagementCenter {
                                 "新增供應商",
                             ))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_profile_creator(window, cx)
+                                this.open_shared_provider_creator(window, cx)
                             })),
                     ),
             )
             .child(list)
             .into_any_element()
+    }
+
+    /// Opens the Provider editor to create a shared record.
+    ///
+    /// A Provider created here belongs to no Agent: it is one record that
+    /// several Agents bind afterwards. That is why nothing in this path asks an
+    /// Agent which protocol it speaks — the answer depends on who binds it, and
+    /// the binding is where the answer is checked.
+    fn open_shared_provider_creator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_profile_creator(window, cx);
+        self.provider_editor_shared = true;
+        // The preset step still applies: it fills the address, the protocol and
+        // the starting model list, none of which needs an Agent.
+        cx.notify();
     }
 
     /// The global Providers panel: the pinned gateway row's detail, or one
@@ -11683,22 +11916,26 @@ impl ManagementCenter {
             .filter(|agent| !row.agents.contains(agent.id.as_str()))
             .map(|agent| (agent.id.clone(), agent.label.clone()))
             .collect::<Vec<_>>();
-        // The copy is made from the legacy Profile that owns this shared
-        // record: that is the shape carrying the protocol pin and the ACP
-        // config an Agent needs to launch. A shared Provider created outside
-        // that layer has no such row, so it offers nothing to copy.
+        // Binding needs a source: either the legacy Profile that already exists
+        // for this shared record, or the shared record itself, which the
+        // authority can materialise into one. A Provider created on this page
+        // has only the latter, and it is exactly the one that most needs the
+        // offer.
         let bind_profile = profile.legacy_provider_profile_id.clone();
-        let bindable = match &bind_profile {
-            Some(_) => bindable,
-            None => Vec::new(),
+        let bind_shared = Some(profile.id.clone());
+        let bindable = if bind_profile.is_some() || profile.legacy_provider_profile_id.is_none() {
+            bindable
+        } else {
+            Vec::new()
         };
         let bind_count = bindable.len();
         let mut bind_rows = v_flex().w_full().gap_1();
         for (agent_id, label) in bindable {
             let bind_agent = agent_id.clone();
-            let Some(bind_profile) = bind_profile.clone() else {
-                continue;
-            };
+            let bind_profile = bind_profile
+                .clone()
+                .unwrap_or_else(vibex_core::ProviderProfileId::new);
+            let bind_shared = bind_shared.clone();
             bind_rows = bind_rows.child(
                 h_flex()
                     .w_full()
@@ -11724,6 +11961,7 @@ impl ManagementCenter {
                             this.bind_provider_to_agent(
                                 bind_agent.clone(),
                                 bind_profile.clone(),
+                                bind_shared.clone(),
                                 cx,
                             )
                         })),
@@ -11778,6 +12016,7 @@ impl ManagementCenter {
         &mut self,
         agent_id: vibex_core::AgentId,
         profile_id: vibex_core::ProviderProfileId,
+        shared_id: Option<vibex_core::ModelProviderProfileId>,
         cx: &mut Context<Self>,
     ) {
         let Some(backend) = self.backend.clone() else {
@@ -11798,6 +12037,7 @@ impl ManagementCenter {
                 .bind_agent_model_provider(vibex_backend::MutationRequest::new(
                     vibex_core::AgentModelProviderBindRequest {
                         provider_profile_id: profile_id,
+                        model_provider_profile_id: shared_id,
                         agent_id: agent_id.clone(),
                         make_default: true,
                     },
@@ -18360,6 +18600,27 @@ impl ManagementCenter {
                 )
                 .into_any_element();
         }
+        // A shared Provider is not one Agent's configuration, and the dialog has
+        // to say so: the same form otherwise reads as "for the Agent I had
+        // selected", which is the shape this path exists to stop producing.
+        let shared_scope_note = self.provider_editor_shared.then(|| {
+            div()
+                .w_full()
+                .min_w_0()
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(cx.theme().info)
+                .px_2()
+                .py_1p5()
+                .text_xs()
+                .text_color(cx.theme().info)
+                .child(management_locale_text(
+                    "This Provider is shared: any Agent can use it, and each one keeps its own protocol. Nothing is tied to a single Agent.",
+                    "该供应商是共享的：任何 Agent 都能使用，各自保留自己的协议。它不绑定到某一个 Agent。",
+                    "該供應商是共用的：任何 Agent 都能使用，各自保留自己的協定。它不綁定到某一個 Agent。",
+                ))
+                .into_any_element()
+        });
         let saving = matches!(
             self.mutation,
             Some(ManagementMutation::ProfileCreate) | Some(ManagementMutation::ProfileUpdate(_))
@@ -18409,6 +18670,9 @@ impl ManagementCenter {
         };
 
         let mut body = v_flex().w_full().min_h_0().flex_1();
+        if let Some(note) = shared_scope_note {
+            body = body.child(div().w_full().flex_none().pb_2().child(note));
+        }
         if wide {
             // The band is bounded so an expanded protocol override cannot eat
             // the height the two panes need, and it scrolls on its own if it

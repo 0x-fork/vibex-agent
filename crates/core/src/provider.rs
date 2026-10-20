@@ -2013,6 +2013,14 @@ pub struct AgentModelProviderDefaultRequest {
 #[serde(rename_all = "camelCase")]
 pub struct AgentModelProviderBindRequest {
     pub provider_profile_id: ProviderProfileId,
+    /// The shared record to copy from, when the Provider was created on the
+    /// global page and has no legacy Profile of its own.
+    ///
+    /// Exactly one of the two ids is set: a Provider that predates the shared
+    /// page is addressed by its legacy id, and one created there is addressed by
+    /// its shared id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider_profile_id: Option<crate::ModelProviderProfileId>,
     pub agent_id: AgentId,
     /// Make the copy the Agent's default. Off by default, so binding a second
     /// Provider does not silently take over from the one in use.

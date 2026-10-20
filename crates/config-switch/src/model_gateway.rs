@@ -1309,6 +1309,7 @@ mod bind_to_agent_tests {
         let bound = service
             .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
                 provider_profile_id: source.id.clone(),
+                model_provider_profile_id: None,
                 agent_id: vibex_core::AgentId::parse("deepseek-harness").unwrap(),
                 make_default: false,
             })
@@ -1341,11 +1342,200 @@ mod bind_to_agent_tests {
         let error = service
             .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
                 provider_profile_id: source.id.clone(),
+                model_provider_profile_id: None,
                 agent_id: vibex_core::AgentId::parse("claude").unwrap(),
                 make_default: false,
             })
             .unwrap_err();
         assert_eq!(error.code, "agent_model_provider_binding_same_agent");
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod shared_provider_tests {
+    use super::*;
+
+    fn service() -> (std::path::PathBuf, ProviderConfigService) {
+        let path = std::env::temp_dir().join(format!(
+            "vibex-shared-provider-{}.db",
+            vibex_core::RequestId::new().as_str()
+        ));
+        let service = ProviderConfigService::new(&path);
+        (path, service)
+    }
+
+    fn endpoint(id: &str, url: &str, protocol: Option<&str>) -> vibex_core::ModelProviderEndpoint {
+        vibex_core::ModelProviderEndpoint {
+            id: id.to_string(),
+            kind: vibex_core::ModelProviderEndpointKind::Api,
+            url: url.to_string(),
+            wire_protocol_id: protocol.map(str::to_string),
+        }
+    }
+
+    /// A shared Provider is created without naming an Agent, and it carries one
+    /// address per protocol.
+    ///
+    /// This is the regression the global Providers page hit: creating there
+    /// borrowed an Agent, so a Provider whose protocol that Agent could not
+    /// speak was refused at save time with
+    /// `agent_model_interface_unsupported`, even though nothing about the
+    /// Provider itself was wrong.
+    #[test]
+    fn a_shared_provider_is_created_without_an_agent() {
+        let (path, service) = service();
+        let created = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Shared DeepSeek".to_string(),
+                vendor_hint: None,
+                endpoints: vec![
+                    endpoint("api", "https://api.deepseek.com/v1", None),
+                    endpoint(
+                        "api-anthropic",
+                        "https://api.deepseek.com/anthropic",
+                        Some(vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES),
+                    ),
+                ],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "deepseek-chat".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities: Default::default(),
+                }],
+                default_model_id: Some("deepseek-chat".to_string()),
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        // No Agent, and both protocols are addressable on the one record.
+        assert!(created.legacy_provider_profile_id.is_none());
+        assert_eq!(created.endpoints.len(), 2);
+        let protocols = created
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.wire_protocol_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            protocols,
+            vec![vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The protocol check moves to the binding, which is the first moment an
+    /// Agent exists to have the limitation.
+    #[test]
+    fn a_shared_provider_is_checked_against_the_agent_that_binds_it() {
+        let (path, service) = service();
+        let created = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Shared Anthropic".to_string(),
+                vendor_hint: None,
+                endpoints: vec![endpoint(
+                    "api-anthropic",
+                    "https://api.anthropic.com",
+                    Some(vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES),
+                )],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: Vec::new(),
+                default_model_id: None,
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+        // Creating it needed no Agent and was accepted.
+        assert_eq!(created.display_name, "Shared Anthropic");
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod shared_bind_tests {
+    use super::*;
+
+    fn service() -> (std::path::PathBuf, ProviderConfigService) {
+        let path = std::env::temp_dir().join(format!(
+            "vibex-shared-bind-{}.db",
+            vibex_core::RequestId::new().as_str()
+        ));
+        let service = ProviderConfigService::new(&path);
+        (path, service)
+    }
+
+    /// A Provider created on the global page can be given to an Agent, which
+    /// materialises the legacy row the launch path needs.
+    #[test]
+    fn a_shared_provider_materialises_for_the_agent_that_binds_it() {
+        let (path, service) = service();
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Shared Messages".to_string(),
+                vendor_hint: None,
+                endpoints: vec![
+                    vibex_core::ModelProviderEndpoint {
+                        id: "api".to_string(),
+                        kind: vibex_core::ModelProviderEndpointKind::Api,
+                        url: "https://api.example.invalid".to_string(),
+                        wire_protocol_id: None,
+                    },
+                    vibex_core::ModelProviderEndpoint {
+                        id: "api-anthropic".to_string(),
+                        kind: vibex_core::ModelProviderEndpointKind::Api,
+                        url: "https://api.example.invalid/anthropic".to_string(),
+                        wire_protocol_id: Some(
+                            vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
+                        ),
+                    },
+                ],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "claude-sonnet-4-5".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities: Default::default(),
+                }],
+                default_model_id: Some("claude-sonnet-4-5".to_string()),
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        let bound = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_provider_profile_id: Some(shared.id.clone()),
+                agent_id: vibex_core::AgentId::parse("claude").unwrap(),
+                make_default: false,
+            })
+            .unwrap();
+
+        assert_eq!(bound.agent_id.as_str(), "claude");
+        // The protocol the shared record published is what the Agent launches
+        // with, and the per-protocol address survived as an option.
+        assert_eq!(
+            provider_option_value(&bound.provider_options, "wireApi").as_deref(),
+            Some(vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES)
+        );
+        assert_eq!(
+            provider_option_value(
+                &bound.provider_options,
+                &vibex_core::ProviderModelWireApi::AnthropicMessages.protocol_base_url_option_key()
+            )
+            .as_deref(),
+            Some("https://api.example.invalid/anthropic")
+        );
+        assert_eq!(
+            bound.configured_models[0].wire_api,
+            Some(vibex_core::ProviderModelWireApi::AnthropicMessages)
+        );
         let _ = std::fs::remove_file(path);
     }
 }
