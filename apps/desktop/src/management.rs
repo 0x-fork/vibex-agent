@@ -11556,6 +11556,26 @@ impl ManagementCenter {
         );
     }
 
+    /// Moves one upstream one step in the routing order.
+    ///
+    /// The stored order is the order the gateway tries upstreams in, so this is
+    /// the user's only way to say "this account first" without removing and
+    /// re-adding the rest.
+    fn move_gateway_upstream(
+        &mut self,
+        upstream: vibex_core::ModelProviderProfileId,
+        direction: GatewayUpstreamMove,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_gateway_settings(
+            move |request| {
+                request.upstreams =
+                    moved_gateway_upstreams(&request.upstreams, &upstream, direction);
+            },
+            cx,
+        );
+    }
+
     /// Points one Agent at the gateway, or takes it back to a direct Provider.
     fn set_gateway_agent(&mut self, agent_id: String, enabled: bool, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
@@ -11766,6 +11786,88 @@ impl ManagementCenter {
                 error.map(|message| div().text_xs().text_color(cx.theme().danger).child(message)),
             )
             .into_any_element()
+    }
+
+    /// Confirms, then clears the gateway's request ledger.
+    ///
+    /// Clearing is not reversible, so it asks first; and it says what it does
+    /// not remove, so the wording cannot be mistaken for resetting usage.
+    fn confirm_clear_gateway_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            dialog
+                .title(management_locale_text(
+                    "Clear gateway request records?",
+                    "清除网关请求记录？",
+                    "清除閘道請求記錄？",
+                ))
+                .child(management_locale_text(
+                    "The metadata of the last seven days is deleted. Usage statistics will no longer include the gateway's own records.",
+                    "将删除最近七天的请求元数据，用量统计将不再包含网关自身的记录。",
+                    "將刪除最近七天的請求中繼資料，用量統計將不再包含閘道自身的記錄。",
+                ))
+                .footer(
+                    gpui_component::dialog::DialogFooter::new()
+                        .child(gpui_component::dialog::DialogClose::new().child(
+                            Button::new("cancel-gateway-clear").outline().label(
+                                management_locale_text("Cancel", "取消", "取消"),
+                            ),
+                        ))
+                        // The destructive action is the dialog's confirm, so
+                        // Enter and the button do the same thing rather than
+                        // letting a stray Return read as "cancel".
+                        .child(
+                            gpui_component::dialog::DialogAction::new().child(
+                                Button::new("confirm-gateway-clear")
+                                    .danger()
+                                    .label(management_locale_text("Clear", "清除", "清除")),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, window, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.clear_gateway_requests(window, cx);
+                    });
+                    true
+                })
+        });
+    }
+
+    /// Clears the ledger and refreshes the card.
+    fn clear_gateway_requests(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::Gateway);
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend.management().clear_model_gateway_requests().await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(cleared) => {
+                        this.gateway_requests.clear();
+                        this.notice = Some(format!(
+                            "{} ({cleared})",
+                            management_locale_text(
+                                "Gateway request records cleared",
+                                "网关请求记录已清除",
+                                "閘道請求記錄已清除",
+                            )
+                        ));
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
     }
 
     /// Stores the typed key on its upstream.
@@ -12228,8 +12330,13 @@ impl ManagementCenter {
             .take(12)
             .cloned()
             .collect::<Vec<_>>();
-        for upstream in &snapshot.upstreams {
+        let upstream_count = snapshot.upstreams.len();
+        for (index, upstream) in snapshot.upstreams.iter().enumerate() {
             let id = upstream.model_provider_profile_id.clone();
+            // A move past either end would silently reorder everything, so the
+            // edge rows offer no move in that direction at all.
+            let first = index == 0;
+            let last = index + 1 == upstream_count;
             let add_key = self.render_gateway_add_key(&id, window, cx);
             let mut key_rows = v_flex().w_full().gap_1();
             for key in &upstream.keys {
@@ -12314,17 +12421,89 @@ impl ManagementCenter {
                                         .child(upstream.display_name.clone()),
                                 )
                                 .child(
-                                    Button::new(SharedString::from(format!(
-                                        "management-gateway-remove-upstream-{}",
-                                        id.as_str()
-                                    )))
-                                    .xsmall()
-                                    .ghost()
-                                    .label(management_locale_text("Remove", "移除", "移除"))
-                                    .disabled(pending)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.remove_gateway_upstream(id.clone(), cx)
-                                    })),
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        // The order of these cards is the
+                                        // routing order, so moving one is how
+                                        // a user says "try this account first"
+                                        // without removing and re-adding the
+                                        // whole list.
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "management-gateway-upstream-earlier-{}",
+                                                id.as_str()
+                                            )))
+                                            .xsmall()
+                                            .ghost()
+                                            .compact()
+                                            .icon(IconName::ArrowUp)
+                                            .tooltip(management_locale_text(
+                                                "Move earlier",
+                                                "上移",
+                                                "上移",
+                                            ))
+                                            .accessibility_label(management_locale_text(
+                                                "Move earlier",
+                                                "上移",
+                                                "上移",
+                                            ))
+                                            .disabled(pending || first)
+                                            .on_click(cx.listener({
+                                                let id = id.clone();
+                                                move |this, _, _, cx| {
+                                                    this.move_gateway_upstream(
+                                                        id.clone(),
+                                                        GatewayUpstreamMove::Earlier,
+                                                        cx,
+                                                    )
+                                                }
+                                            })),
+                                        )
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "management-gateway-upstream-later-{}",
+                                                id.as_str()
+                                            )))
+                                            .xsmall()
+                                            .ghost()
+                                            .compact()
+                                            .icon(IconName::ArrowDown)
+                                            .tooltip(management_locale_text(
+                                                "Move later",
+                                                "下移",
+                                                "下移",
+                                            ))
+                                            .accessibility_label(management_locale_text(
+                                                "Move later",
+                                                "下移",
+                                                "下移",
+                                            ))
+                                            .disabled(pending || last)
+                                            .on_click(cx.listener({
+                                                let id = id.clone();
+                                                move |this, _, _, cx| {
+                                                    this.move_gateway_upstream(
+                                                        id.clone(),
+                                                        GatewayUpstreamMove::Later,
+                                                        cx,
+                                                    )
+                                                }
+                                            })),
+                                        )
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "management-gateway-remove-upstream-{}",
+                                                id.as_str()
+                                            )))
+                                            .xsmall()
+                                            .ghost()
+                                            .label(management_locale_text("Remove", "移除", "移除"))
+                                            .disabled(pending)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.remove_gateway_upstream(id.clone(), cx)
+                                            })),
+                                        ),
                                 ),
                         )
                         .child(key_rows)
@@ -12512,6 +12691,45 @@ impl ManagementCenter {
                 cx,
             ));
         }
+        // The clearing entry sits at the foot of the ledger it clears, and the
+        // retention rule is stated beside it: the copy names both the window
+        // and what the records never contained, so it cannot be mistaken for
+        // "delete my usage history".
+        let mut ledger_foot = h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .pt_2()
+            .child(
+                div()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Metadata from the last 7 days is kept. It never contains the prompt, the reply, a key, or image content.",
+                        "保留最近 7 天的请求元数据，不含提示词、回复、Key 和图片内容。",
+                        "保留最近 7 天的請求中繼資料，不含提示詞、回覆、Key 和圖片內容。",
+                    )),
+            );
+        if !self.gateway_requests.is_empty() {
+            ledger_foot = ledger_foot.child(
+                Button::new("management-gateway-clear-requests")
+                    .xsmall()
+                    .ghost()
+                    .label(management_locale_text(
+                        "Clear records",
+                        "立即清除",
+                        "立即清除",
+                    ))
+                    .disabled(pending)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.confirm_clear_gateway_requests(window, cx)
+                    })),
+            );
+        }
+        request_rows = request_rows.child(ledger_foot);
         body = body.child(management_card_with_icon(
             management_locale_text("Recent requests", "最近请求", "最近請求"),
             management_locale_text(
@@ -22980,6 +23198,48 @@ fn management_primary_section(section: ManagementSection) -> ManagementSection {
     }
 }
 
+/// Which way a routing-order move goes.
+///
+/// It is deliberately one step rather than a target position: the stored order
+/// is a list a user builds by appending, and repeating "earlier" is easier to
+/// follow than dropping a row somewhere in a list whose length is not visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayUpstreamMove {
+    Earlier,
+    Later,
+}
+
+impl GatewayUpstreamMove {
+    const fn offset(self) -> isize {
+        match self {
+            Self::Earlier => -1,
+            Self::Later => 1,
+        }
+    }
+}
+
+/// Moves one upstream one step, leaving every other one where it was.
+///
+/// A move past either end is a no-op rather than a wrap-around: wrapping would
+/// turn an edge row's move into a reorder of the whole list, which is the
+/// opposite of what the button says.
+fn moved_gateway_upstreams(
+    upstreams: &[vibex_core::ModelProviderProfileId],
+    upstream: &vibex_core::ModelProviderProfileId,
+    direction: GatewayUpstreamMove,
+) -> Vec<vibex_core::ModelProviderProfileId> {
+    let mut moved = upstreams.to_vec();
+    let Some(index) = moved.iter().position(|existing| existing == upstream) else {
+        return moved;
+    };
+    let target = index as isize + direction.offset();
+    if target < 0 || target >= moved.len() as isize {
+        return moved;
+    }
+    moved.swap(index, target as usize);
+    moved
+}
+
 fn reordered_provider_profile_ids(
     profile_ids: &[String],
     moving_id: &str,
@@ -32514,5 +32774,165 @@ mod gateway_surface_tests {
         });
         assert_eq!(snapshot.ready_key_count(), 0);
         assert!(!snapshot.is_routable());
+    }
+
+    /// Moving an upstream one step swaps it with its neighbour and nothing else.
+    ///
+    /// The stored order is the routing order, so a move that touched any other
+    /// row would silently change which account answers first.
+    #[test]
+    fn moving_an_upstream_one_step_swaps_only_its_neighbour() {
+        let id = |name: &str| {
+            vibex_core::ModelProviderProfileId::parse(format!("model_provider_{name}")).unwrap()
+        };
+        let ids = vec![id("a"), id("b"), id("c")];
+        let names = |list: &[vibex_core::ModelProviderProfileId]| {
+            list.iter()
+                .map(|id| id.as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&moved_gateway_upstreams(
+                &ids,
+                &ids[1],
+                GatewayUpstreamMove::Earlier
+            )),
+            names(&[id("b"), id("a"), id("c")])
+        );
+        assert_eq!(
+            names(&moved_gateway_upstreams(
+                &ids,
+                &ids[1],
+                GatewayUpstreamMove::Later
+            )),
+            names(&[id("a"), id("c"), id("b")])
+        );
+        // The ends hold: an edge row's move is a no-op, not a wrap-around.
+        assert_eq!(
+            names(&moved_gateway_upstreams(
+                &ids,
+                &ids[0],
+                GatewayUpstreamMove::Earlier
+            )),
+            names(&ids)
+        );
+        assert_eq!(
+            names(&moved_gateway_upstreams(
+                &ids,
+                &ids[2],
+                GatewayUpstreamMove::Later
+            )),
+            names(&ids)
+        );
+        // An id that is no longer in the list changes nothing.
+        assert_eq!(
+            names(&moved_gateway_upstreams(
+                &ids,
+                &id("gone"),
+                GatewayUpstreamMove::Later
+            )),
+            names(&ids)
+        );
+        assert!(moved_gateway_upstreams(&[], &id("a"), GatewayUpstreamMove::Later).is_empty());
+    }
+
+    /// A plan's models are what a fetch lands on, not whatever the vendor sent.
+    ///
+    /// This is the wiring between the preset data and the picker: the filter
+    /// and the fallback are `offered_models`'s, and the protocol written on to
+    /// each Model is the preset's, so a Claude-only plan's Models are stored
+    /// with the Anthropic protocol rather than inferred when they are called.
+    #[test]
+    fn a_preset_decides_what_a_fetch_lands_on() {
+        let cline = vibex_core::provider_preset(vibex_core::PROVIDER_PRESET_CLINEPASS).unwrap();
+        let metered = configured_models_from_preset(&cline, &["gpt-5".to_string()]);
+        assert_eq!(metered.len(), cline.models.len());
+        assert_eq!(metered[0].id, cline.models[0]);
+        assert!(
+            metered
+                .iter()
+                .all(|model| model.enabled && model.wire_api == cline.default_wire_api())
+        );
+
+        let command = vibex_core::provider_preset(vibex_core::PROVIDER_PRESET_COMMANDCODE).unwrap();
+        let models = configured_models_from_preset(
+            &command,
+            &["claude-sonnet-5".to_string(), "gpt-5".to_string()],
+        );
+        assert_eq!(models.len(), 2);
+        // The preset's default protocol is Chat Completions, and every model
+        // the fetch adds is declared with it rather than guessed from its id.
+        assert!(
+            models
+                .iter()
+                .all(|model| model.wire_api == command.default_wire_api())
+        );
+    }
+
+    /// Every caveat the preset table can declare has a sentence to show.
+    #[test]
+    fn every_declared_preset_caveat_has_copy() {
+        for caveat in [
+            vibex_core::ProviderPresetCaveat::FreeTierNeedsClient,
+            vibex_core::ProviderPresetCaveat::ModelListExcludesPlan,
+            vibex_core::ProviderPresetCaveat::ProtocolPerModel,
+        ] {
+            assert!(!provider_preset_caveat_text(caveat).trim().is_empty());
+        }
+        for preset in vibex_core::provider_presets() {
+            for caveat in preset.caveats {
+                assert!(
+                    !provider_preset_caveat_text(caveat).trim().is_empty(),
+                    "{} declares a caveat the panel cannot name",
+                    preset.id
+                );
+            }
+        }
+    }
+
+    /// The "from preset" marker reads the value, so it cannot outlive an edit.
+    #[test]
+    fn a_preset_marker_is_a_reading_not_a_record() {
+        assert!(provider_preset_filled_marker(false).is_none());
+        assert!(provider_preset_filled_marker(true).is_some());
+    }
+
+    /// The two preset paths that were data-only reach the surfaces that use them.
+    ///
+    /// A fetch applies the preset it was started from, and a vendor list that
+    /// cannot be read still leaves the plan's models in the picker; the ledger
+    /// asks before it deletes, because clearing it cannot be undone.
+    #[test]
+    fn the_preset_and_ledger_paths_are_wired_to_their_surfaces() {
+        let source = include_str!("management.rs");
+        let fetch = source
+            .split_once("    fn apply_fetched_models(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn "))
+            .map(|(body, _)| body)
+            .expect("the fetched-model handler should remain inspectable");
+        assert!(fetch.contains("configured_models_from_preset(preset"));
+        assert!(fetch.contains("preset.no_list || preset.only.is_some()"));
+        assert!(fetch.contains("preset.models.is_empty()"));
+
+        let clear = source
+            .split_once("    fn confirm_clear_gateway_requests(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn clear_gateway_requests("))
+            .map(|(body, _)| body)
+            .expect("the ledger confirmation should remain inspectable");
+        assert!(clear.contains("window.open_dialog"));
+        assert!(clear.contains("DialogAction::new()"));
+        assert!(clear.contains(".on_ok("));
+        assert!(clear.contains("clear_gateway_requests(window, cx)"));
+
+        let editor = source
+            .split_once("    fn render_profile_connection_section(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn "))
+            .map(|(body, _)| body)
+            .expect("the connection section should remain inspectable");
+        // The region picker resolves against the preset as shipped, so a second
+        // choice replaces the first one's addresses instead of keeping them.
+        assert!(editor.contains("provider-preset-region"));
+        assert!(editor.contains("with_region(self.provider_preset_region.as_deref())"));
+        assert!(editor.contains("provider-preset-keys-"));
     }
 }
