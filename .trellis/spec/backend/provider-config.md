@@ -5072,6 +5072,28 @@ ProviderConfigService::{
   explicitly: the editor's last-resort fallback is "the first protocol that has a
   URL", which otherwise relabels an Anthropic Provider as Chat Completions on
   reopen.
+- **A plan preset states what its vendor's list cannot.** A plan that resells
+  models carries its own `models`, an `only` prefix that keeps a metered model
+  from being mistaken for a covered one, and a caveat. A fetch that returns none
+  of the plan's ids falls back to that list instead of reporting an empty
+  account, and a fetch that cannot be read at all keeps the plan's models in the
+  picker. `caveats` is editor copy; no runtime branch keys off it. A plan whose
+  free models its vendor refuses to other clients is not listed at all — an
+  editor that offered them would send the user into a `403`.
+- **A preset is a starting point, never a mode.** A region choice rewrites only
+  the address fields, and it resolves against the preset as shipped, so a second
+  choice replaces the first one's addresses. The editor marks a field that still
+  holds its preset value by re-reading the draft: nothing records "came from a
+  preset", so an edit removes the mark by itself and restoring the value brings
+  it back.
+- **The routing order is the upstream order.** Moving an upstream swaps it with
+  its neighbour and changes nothing else; an edge row offers no move past the
+  end rather than wrapping. The order lives in
+  `ModelGatewaySettings.upstreams`, which is the order the gateway tries.
+- **Clearing the ledger is confirmed and bounded by its copy.** The request is
+  confirmed before it runs, and the wording names both the seven-day window and
+  what the records never contained (prompt, reply, key, image content), so it
+  cannot be read as clearing usage history.
 
 ### 4. Validation & Error Matrix
 
@@ -5143,7 +5165,13 @@ ProviderConfigService::{
 - `cargo test -p vibex-desktop gateway_surface_tests` asserts every gateway state
   is named in words, that a gateway without a ready Key is not routable, that a
   shared Provider appears once with every binding Agent named, that a deleted
-  binding drops out of that list, and that a cooldown names its remaining time.
+  binding drops out of that list, that a cooldown names its remaining time, that
+  moving an upstream swaps only one neighbour, that every caveat the preset table
+  declares has copy, and that the preset and ledger paths stay wired to their
+  surfaces.
+- `cargo test -p vibex-core provider_presets` asserts every preset is addressable
+  by its own id and that a plan preset's model list survives a vendor answer that
+  omits it.
 - `cargo test -p vibex-model-gateway limit` asserts the lane serializes, queues
   within its bound, refuses when full or waited out, and that a minute allows
   exactly its limit.
