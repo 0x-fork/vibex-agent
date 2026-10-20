@@ -3,7 +3,7 @@
 
 use super::*;
 use chrono::{Local, NaiveDateTime, TimeZone as _};
-use gpui::InteractiveElement as _;
+use gpui::{App, InteractiveElement as _, KeyBinding};
 // The popover answers Enter and Space with its own confirm action; the panel
 // claims it while it is open.
 use gpui_base::actions::Confirm as PopoverConfirm;
@@ -15,6 +15,31 @@ use gpui_component::{
 };
 
 const MAX_COUNTDOWN_SECONDS: u64 = 365 * 24 * 60 * 60;
+/// The time field's own key context, nested inside the popover content.
+///
+/// `PopoverContent` binds Enter to `NoAction` so a focused control does not
+/// confirm the surface. The segmented time field has no Enter binding of its
+/// own, so without this context that `NoAction` would swallow the keystroke
+/// before the panel's `Confirm` handler could commit the deadline.
+const TIME_CONTEXT: &str = "MessageScheduleTimeField";
+
+#[derive(Default)]
+struct Bindings;
+
+impl gpui::Global for Bindings {}
+
+fn init(cx: &mut App) {
+    if cx.has_global::<Bindings>() {
+        return;
+    }
+    cx.set_global(Bindings);
+    cx.bind_keys([KeyBinding::new(
+        "enter",
+        PopoverConfirm { secondary: false },
+        Some(TIME_CONTEXT),
+    )]);
+}
+
 const CLOCK_ICON: &str = "icons/vibex/clock.svg";
 /// The inline calendar's day grid is seven `size_7` cells (1.75rem each) with
 /// six `gap_0p5` gaps (0.125rem), so 13rem is exactly as wide as the calendar
@@ -204,6 +229,7 @@ struct MessageScheduleEditorView {
 
 impl MessageScheduleEditorView {
     fn new(initial: Option<MessageSchedule>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        init(cx);
         let at_ms = match initial {
             Some(MessageSchedule::At(at_ms)) => at_ms,
             _ => unix_timestamp_ms() + 5 * 60 * 1_000,
@@ -392,7 +418,11 @@ impl Render for MessageScheduleEditorView {
                                     .text_color(cx.theme().muted_foreground)
                                     .child(locale::text("Time", "时间", "時間")),
                             )
-                            .child(TimeField::new(&self.time_field).small()),
+                            .child(
+                                div()
+                                    .key_context(TIME_CONTEXT)
+                                    .child(TimeField::new(&self.time_field).small()),
+                            ),
                     )
                     .into_any_element()
             })
