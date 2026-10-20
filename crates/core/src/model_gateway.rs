@@ -21,6 +21,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ModelProviderProfileId, RequestId};
+use crate::provider_projection::ModelProviderProfile;
 use crate::{VibexError, VibexResult, unix_timestamp_ms};
 
 /// How the gateway picks one of a Provider's Keys for the next request.
@@ -648,6 +649,11 @@ pub struct ModelGatewayRequestLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<i64>,
     pub outcome: GatewayRequestOutcome,
+    /// What the router did before a Key answered. Absent on a row written
+    /// before the trace existed, and on a request that never got as far as a
+    /// routing decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<GatewayRouteTrace>,
     pub created_at_ms: i64,
 }
 
@@ -661,6 +667,66 @@ impl ModelGatewayRequestLog {
             .saturating_add(self.cached_read_tokens)
             .saturating_add(self.cached_write_tokens)
             .saturating_add(self.reasoning_tokens)
+    }
+}
+
+/// The payload version of [`GatewayRouteTrace`] as it is stored on a row.
+///
+/// The trace is the one ledger column whose shape may grow, so it carries its
+/// own version. A reader that meets a version it does not know reports the row
+/// as having no trace rather than failing the whole list: the ledger is a
+/// diagnostic, and one unreadable annotation must not hide every other request.
+pub const GATEWAY_ROUTE_TRACE_SCHEMA_VERSION: u32 = 1;
+
+/// One Key the gateway tried and set aside before another one answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayRouteAttempt {
+    pub credential_id: RequestId,
+    /// Why this Key did not serve the reply.
+    pub failure: GatewayFailureKind,
+}
+
+/// What the router did with one request, as the ledger records it.
+///
+/// Only ids appear here. The trace explains a failover — which Key was cooled
+/// or over its ceiling, and which Key was tried and failed — without ever
+/// naming Key material, a prompt, or a reply. Payload schema
+/// [`GATEWAY_ROUTE_TRACE_SCHEMA_VERSION`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayRouteTrace {
+    pub schema_version: u32,
+    /// Keys set aside before the first attempt because they were cooling.
+    #[serde(default)]
+    pub skipped_cooling: u32,
+    /// Keys set aside because they had spent their local token ceiling.
+    #[serde(default)]
+    pub skipped_over_limit: u32,
+    /// Keys tried, in order, that did not answer.
+    #[serde(default)]
+    pub failed_attempts: Vec<GatewayRouteAttempt>,
+}
+
+impl GatewayRouteTrace {
+    /// A fresh trace at the current payload version.
+    pub fn new(skipped_cooling: usize, skipped_over_limit: usize) -> Self {
+        Self {
+            schema_version: GATEWAY_ROUTE_TRACE_SCHEMA_VERSION,
+            skipped_cooling: u32::try_from(skipped_cooling).unwrap_or(u32::MAX),
+            skipped_over_limit: u32::try_from(skipped_over_limit).unwrap_or(u32::MAX),
+            failed_attempts: Vec::new(),
+        }
+    }
+
+    /// Whether the trace says anything beyond "the first Key answered".
+    pub fn is_unremarkable(&self) -> bool {
+        self.skipped_cooling == 0 && self.skipped_over_limit == 0 && self.failed_attempts.is_empty()
+    }
+
+    /// Whether a reader can interpret this payload.
+    pub fn is_current(&self) -> bool {
+        self.schema_version == GATEWAY_ROUTE_TRACE_SCHEMA_VERSION
     }
 }
 
@@ -933,8 +999,104 @@ pub struct GatewayRequestSummary {
     pub wire_out: String,
     pub status: Option<u16>,
     pub total_tokens: u64,
+    /// The split behind `total_tokens`, so a detail view can name each part.
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_read_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<i64>,
     pub outcome: GatewayRequestOutcome,
+    /// The Key that answered, under the name its Provider gives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_name: Option<String>,
+    /// The route, once a Key has answered and the trace says something the
+    /// caller could not already see.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<GatewayRouteSummary>,
     pub created_at_ms: i64,
+}
+
+impl GatewayRequestSummary {
+    /// Projects one stored row for a client.
+    ///
+    /// Key ids become the names their Provider gave them, because a client
+    /// showing a route is explaining a decision, not exposing an id table. A
+    /// Key that has since been removed keeps its row and loses only its name.
+    pub fn from_log(mut log: ModelGatewayRequestLog, profiles: &[ModelProviderProfile]) -> Self {
+        let profile = profiles
+            .iter()
+            .find(|profile| profile.id == log.model_provider_profile_id);
+        let name_of = |credential: &RequestId| {
+            profile.and_then(|profile| {
+                profile
+                    .credentials
+                    .iter()
+                    .find(|candidate| &candidate.id == credential)
+                    .map(|candidate| candidate.display_name.clone())
+            })
+        };
+        let route = log
+            .route
+            .take()
+            .filter(|trace| !trace.is_unremarkable())
+            .map(|trace| GatewayRouteSummary {
+                skipped_cooling: trace.skipped_cooling,
+                skipped_over_limit: trace.skipped_over_limit,
+                failed_attempts: trace
+                    .failed_attempts
+                    .into_iter()
+                    .map(|attempt| GatewayRouteAttemptSummary {
+                        credential_name: name_of(&attempt.credential_id),
+                        credential_id: attempt.credential_id,
+                        failure: attempt.failure,
+                    })
+                    .collect(),
+            });
+        Self {
+            total_tokens: log.total_tokens(),
+            input_tokens: log.input_tokens,
+            output_tokens: log.output_tokens,
+            cached_read_tokens: log.cached_read_tokens,
+            request_id: log.request_id,
+            agent_id: log.agent_id,
+            provider_name: profile
+                .map(|profile| profile.display_name.clone())
+                .unwrap_or_else(|| log.model_provider_profile_id.as_str().to_string()),
+            model_requested: log.model_requested,
+            model_served: log.model_served,
+            wire_in: log.wire_in,
+            wire_out: log.wire_out,
+            status: log.status,
+            latency_ms: log.latency_ms,
+            outcome: log.outcome,
+            credential_name: log.credential_id.as_ref().and_then(&name_of),
+            route,
+            created_at_ms: log.created_at_ms,
+        }
+    }
+}
+
+/// The route, with each Key named the way its Provider labels it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayRouteSummary {
+    pub skipped_cooling: u32,
+    pub skipped_over_limit: u32,
+    pub failed_attempts: Vec<GatewayRouteAttemptSummary>,
+}
+
+/// One failed attempt, named for display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayRouteAttemptSummary {
+    /// Absent once the Key has been removed from its Provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_name: Option<String>,
+    pub credential_id: RequestId,
+    pub failure: GatewayFailureKind,
 }
 
 /// The settings mutation the Config Center submits.
@@ -1158,6 +1320,7 @@ mod tests {
             reasoning_tokens: 0,
             latency_ms: Some(42),
             outcome: GatewayRequestOutcome::Ok,
+            route: None,
             created_at_ms: unix_timestamp_ms(),
         };
         let encoded = serde_json::to_string(&log).unwrap().to_lowercase();
@@ -1202,6 +1365,104 @@ mod tests {
         state.cooldown_reason = None;
         state.enabled = false;
         assert_eq!(state.visibility_at(now), GatewayKeyState::Disabled);
+    }
+
+    /// A summary names the Keys a route used, and says nothing when there is
+    /// nothing to explain.
+    ///
+    /// The two behaviours are one contract: the UI shows a route only when the
+    /// trace has something a reader could not already see, so a first-try
+    /// success must not produce one.
+    #[test]
+    fn a_request_summary_names_the_keys_its_route_used() {
+        let profile_id = ModelProviderProfileId::new();
+        let primary = RequestId::new();
+        let backup = RequestId::new();
+        let credential = |id: RequestId, name: &str| crate::ModelProviderCredentialReference {
+            id,
+            display_name: name.to_string(),
+            status: crate::AgentCredentialStatus::Ready,
+            credential: crate::AgentCredential::Local { runtime: None },
+            revision: 1,
+        };
+        let profile = ModelProviderProfile {
+            id: profile_id.clone(),
+            display_name: "DeepSeek".to_string(),
+            credentials: vec![
+                credential(primary.clone(), "Primary"),
+                credential(backup.clone(), "Backup"),
+            ],
+            ..ModelProviderProfile::default()
+        };
+        let log = |route: Option<GatewayRouteTrace>| ModelGatewayRequestLog {
+            request_id: RequestId::new(),
+            agent_id: None,
+            model_provider_profile_id: profile_id.clone(),
+            credential_id: Some(backup.clone()),
+            model_requested: "deepseek/deepseek-chat".to_string(),
+            model_served: None,
+            wire_in: "openai_chat_completions".to_string(),
+            wire_out: "openai_chat_completions".to_string(),
+            status: Some(200),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_read_tokens: 0,
+            cached_write_tokens: 0,
+            reasoning_tokens: 0,
+            latency_ms: Some(0),
+            outcome: GatewayRequestOutcome::Ok,
+            route,
+            created_at_ms: 0,
+        };
+
+        let unremarkable = GatewayRequestSummary::from_log(
+            log(Some(GatewayRouteTrace::new(0, 0))),
+            &[profile.clone()],
+        );
+        assert_eq!(unremarkable.provider_name, "DeepSeek");
+        assert_eq!(unremarkable.credential_name.as_deref(), Some("Backup"));
+        assert!(unremarkable.route.is_none());
+
+        let failover = GatewayRequestSummary::from_log(
+            log(Some(GatewayRouteTrace {
+                failed_attempts: vec![GatewayRouteAttempt {
+                    credential_id: primary.clone(),
+                    failure: GatewayFailureKind::Quota,
+                }],
+                ..GatewayRouteTrace::new(1, 0)
+            })),
+            &[profile.clone()],
+        );
+        let route = failover.route.expect("a failover is worth reporting");
+        assert_eq!(route.skipped_cooling, 1);
+        assert_eq!(route.failed_attempts.len(), 1);
+        assert_eq!(
+            route.failed_attempts[0].credential_name.as_deref(),
+            Some("Primary")
+        );
+        assert_eq!(route.failed_attempts[0].failure, GatewayFailureKind::Quota);
+
+        // A Key removed since the request keeps its id and loses only its name,
+        // and a row whose Provider is gone keeps its own provider id.
+        let gone = GatewayRequestSummary::from_log(
+            log(Some(GatewayRouteTrace {
+                failed_attempts: vec![GatewayRouteAttempt {
+                    credential_id: RequestId::new(),
+                    failure: GatewayFailureKind::Rate,
+                }],
+                ..GatewayRouteTrace::new(0, 0)
+            })),
+            &[],
+        );
+        assert!(gone.provider_name.starts_with("model_provider_"));
+        assert!(gone.credential_name.is_none());
+        assert!(
+            gone.route
+                .expect("the route survives a removed Key")
+                .failed_attempts[0]
+                .credential_name
+                .is_none()
+        );
     }
 
     #[test]

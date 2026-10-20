@@ -88,6 +88,9 @@ struct MockState {
     stream: String,
     /// Whether the mock answers a non-streaming request with JSON.
     json: Option<Value>,
+    /// One Authorization header the mock refuses, and with which status, so a
+    /// test can make the first Key fail while the next one answers.
+    refuse: Option<(String, u16)>,
 }
 
 async fn mock_handler(
@@ -113,11 +116,19 @@ async fn mock_handler(
             .map(str::to_string);
         recorded.body = serde_json::from_slice(&body).ok();
     }
-    if state.status != 200 {
+    let refused_status = state.refuse.as_ref().and_then(|(refused, status)| {
+        (headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            == Some(refused.as_str()))
+        .then_some(*status)
+    });
+    if let Some(status) = refused_status.or((state.status != 200).then_some(state.status)) {
+        state.overlap.leave();
         let mut response = Response::new(Body::from(
             json!({"error": {"message": "the upstream refused this key"}}).to_string(),
         ));
-        *response.status_mut() = axum::http::StatusCode::from_u16(state.status).unwrap();
+        *response.status_mut() = axum::http::StatusCode::from_u16(status).unwrap();
         return response;
     }
     if let Some(body) = state.json {
@@ -147,6 +158,46 @@ async fn mock_upstream(
     (url, recorder, task)
 }
 
+/// A mock that refuses one Key and serves every other one normally.
+///
+/// A failover needs two different answers from the same upstream, which a
+/// fixed status cannot express.
+async fn mock_upstream_refusing(
+    refused_authorization: &str,
+    stream: String,
+) -> (String, Recorder, tokio::task::JoinHandle<()>) {
+    let (url, recorder, _overlap, task) =
+        mock_upstream_with_refusal(refused_authorization, stream).await;
+    (url, recorder, task)
+}
+
+async fn mock_upstream_with_refusal(
+    refused_authorization: &str,
+    stream: String,
+) -> (String, Recorder, Arc<Overlap>, tokio::task::JoinHandle<()>) {
+    let recorder: Recorder = Arc::new(Mutex::new(Recorded::default()));
+    let overlap = Arc::new(Overlap::default());
+    let state = MockState {
+        recorder: Arc::clone(&recorder),
+        overlap: Arc::clone(&overlap),
+        status: 200,
+        stream,
+        json: None,
+        refuse: Some((refused_authorization.to_string(), 429)),
+    };
+    let router = Router::new()
+        .route("/{*path}", post(mock_handler))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (format!("http://{address}"), recorder, overlap, task)
+}
+
 async fn mock_upstream_with_overlap(
     status: u16,
     stream: String,
@@ -160,6 +211,7 @@ async fn mock_upstream_with_overlap(
         status,
         stream,
         json,
+        refuse: None,
     };
     let router = Router::new()
         .route("/{*path}", post(mock_handler))
@@ -646,6 +698,184 @@ async fn a_cooling_key_is_skipped_and_the_second_key_answers() {
     );
     let logs = service.recent_requests(10).unwrap();
     assert_ne!(logs[0].credential_id.as_ref(), Some(&cooled));
+    // The ledger explains the request without exposing a Key: the cooling Key
+    // is counted, the answering Key is named by id, and nothing was tried and
+    // failed on the way.
+    let trace = logs[0].route.as_ref().expect("the route is recorded");
+    assert_eq!(trace.skipped_cooling, 1);
+    assert_eq!(trace.skipped_over_limit, 0);
+    assert!(trace.failed_attempts.is_empty());
+    assert_eq!(logs[0].outcome, GatewayRequestOutcome::Ok);
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A Key that fails before the reply begins is named, with its reason, on the
+/// row that records the Key which answered instead.
+#[tokio::test]
+async fn a_failover_records_the_refused_key_and_why_it_moved_on() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) =
+        mock_upstream_refusing("Bearer sk-refused", chat_stream()).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-refused",
+    );
+    // A second Key on the same Provider, behind the refused one.
+    let backup = {
+        let mut connection = open_database(&path).unwrap();
+        apply_migrations(&mut connection).unwrap();
+        let mut profile = vibex_db::ModelProviderProfileRepository::get(&connection, &upstream)
+            .unwrap()
+            .unwrap();
+        let lookup_key = format!("vibex-test-secret-{}", RequestId::new().as_str());
+        secrets::store_provider_secret(&lookup_key, "sk-backup").unwrap();
+        let credential = ModelProviderCredentialReference {
+            id: RequestId::new(),
+            display_name: "Backup".to_string(),
+            status: AgentCredentialStatus::Ready,
+            credential: AgentCredential::ApiKey {
+                secret: ProjectionSecretReference {
+                    id: RequestId::new(),
+                    backend: secrets::provider_secret_write_backend(),
+                    setup_state: ProviderSecretSetupState::Available,
+                    lookup_key,
+                    redacted_hint: "stored".to_string(),
+                    revision: 1,
+                    legacy_secret_reference_id: None,
+                },
+                target_hint: None,
+            },
+            revision: 1,
+        };
+        profile.credentials.push(credential.clone());
+        let revision = profile.revision;
+        profile.revision = revision + 1;
+        vibex_db::ModelProviderProfileRepository::update(&connection, &profile, revision).unwrap();
+        credential.id
+    };
+    let refused = {
+        let connection = open_database(&path).unwrap();
+        let profile = vibex_db::ModelProviderProfileRepository::get(&connection, &upstream)
+            .unwrap()
+            .unwrap();
+        profile.credentials[0].id.clone()
+    };
+    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": "deepseek/deepseek-chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.text().await.unwrap();
+    assert_eq!(
+        recorder.lock().await.authorization.as_deref(),
+        Some("Bearer sk-backup")
+    );
+
+    let logs = service.recent_requests(10).unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].outcome, GatewayRequestOutcome::Failover);
+    assert_eq!(logs[0].credential_id.as_ref(), Some(&backup));
+    let trace = logs[0].route.as_ref().expect("the route is recorded");
+    assert_eq!(trace.skipped_cooling, 0);
+    assert_eq!(trace.failed_attempts.len(), 1);
+    assert_eq!(trace.failed_attempts[0].credential_id, refused);
+    assert_eq!(trace.failed_attempts[0].failure, GatewayFailureKind::Rate);
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A Provider that holds more than one Key is not a failover by itself.
+///
+/// The ledger used to call any request from a multi-Key pool a failover, which
+/// made the column useless exactly when failovers were worth reading about.
+#[tokio::test]
+async fn a_first_try_success_on_a_multi_key_provider_is_not_a_failover() {
+    let path = database_path();
+    let (upstream_url, _recorder, upstream_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-first",
+    );
+    {
+        let mut connection = open_database(&path).unwrap();
+        apply_migrations(&mut connection).unwrap();
+        let mut profile = vibex_db::ModelProviderProfileRepository::get(&connection, &upstream)
+            .unwrap()
+            .unwrap();
+        let lookup_key = format!("vibex-test-secret-{}", RequestId::new().as_str());
+        secrets::store_provider_secret(&lookup_key, "sk-second").unwrap();
+        profile.credentials.push(ModelProviderCredentialReference {
+            id: RequestId::new(),
+            display_name: "Secondary".to_string(),
+            status: AgentCredentialStatus::Ready,
+            credential: AgentCredential::ApiKey {
+                secret: ProjectionSecretReference {
+                    id: RequestId::new(),
+                    backend: secrets::provider_secret_write_backend(),
+                    setup_state: ProviderSecretSetupState::Available,
+                    lookup_key,
+                    redacted_hint: "stored".to_string(),
+                    revision: 1,
+                    legacy_secret_reference_id: None,
+                },
+                target_hint: None,
+            },
+            revision: 1,
+        });
+        let revision = profile.revision;
+        profile.revision = revision + 1;
+        vibex_db::ModelProviderProfileRepository::update(&connection, &profile, revision).unwrap();
+    }
+    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": "deepseek/deepseek-chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.text().await.unwrap();
+
+    let logs = service.recent_requests(10).unwrap();
+    assert_eq!(logs[0].outcome, GatewayRequestOutcome::Ok);
+    assert!(
+        logs[0]
+            .route
+            .as_ref()
+            .is_some_and(|trace| trace.is_unremarkable())
+    );
 
     gateway_task.abort();
     upstream_task.abort();
@@ -1009,6 +1239,7 @@ fn ledger_retention_is_seven_days() {
                 reasoning_tokens: 0,
                 latency_ms: Some(1),
                 outcome: GatewayRequestOutcome::Ok,
+                route: None,
                 created_at_ms: now - age,
             },
         )

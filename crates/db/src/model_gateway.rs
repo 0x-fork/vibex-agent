@@ -13,8 +13,8 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use vibex_core::{
-    GatewayConversationPin, GatewayFailureKind, GatewayRequestOutcome, GatewayTokenWindow,
-    GatewayTokenWindowUsage, ModelGatewayRequestLog, ModelGatewaySettings,
+    GatewayConversationPin, GatewayFailureKind, GatewayRequestOutcome, GatewayRouteTrace,
+    GatewayTokenWindow, GatewayTokenWindowUsage, ModelGatewayRequestLog, ModelGatewaySettings,
     ModelProviderAccountState, ModelProviderProfileId, RequestId, VibexError, VibexResult,
     unix_timestamp_ms,
 };
@@ -533,9 +533,9 @@ impl ModelGatewayRequestLogRepository {
                 request_id, agent_id, model_provider_profile_id, credential_id,
                 model_requested, model_served, wire_in, wire_out, status,
                 input_tokens, output_tokens, cached_read_tokens, cached_write_tokens,
-                reasoning_tokens, latency_ms, outcome, created_at_ms
+                reasoning_tokens, latency_ms, outcome, route_trace, created_at_ms
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             ",
             params![
                 log.request_id.as_str(),
@@ -554,6 +554,10 @@ impl ModelGatewayRequestLogRepository {
                 i64::try_from(log.reasoning_tokens).unwrap_or(i64::MAX),
                 log.latency_ms,
                 log.outcome.id(),
+                log.route
+                    .as_ref()
+                    .map(|trace| encode_json("model_gateway_route_encode_failed", trace))
+                    .transpose()?,
                 log.created_at_ms,
             ],
         )
@@ -572,7 +576,7 @@ impl ModelGatewayRequestLogRepository {
                 SELECT request_id, agent_id, model_provider_profile_id, credential_id,
                        model_requested, model_served, wire_in, wire_out, status,
                        input_tokens, output_tokens, cached_read_tokens, cached_write_tokens,
-                       reasoning_tokens, latency_ms, outcome, created_at_ms
+                       reasoning_tokens, latency_ms, outcome, route_trace, created_at_ms
                 FROM model_gateway_request_log
                 ORDER BY created_at_ms DESC, request_id ASC
                 LIMIT ?1
@@ -601,7 +605,8 @@ impl ModelGatewayRequestLogRepository {
                     row.get::<_, i64>(13)?,
                     row.get::<_, Option<i64>>(14)?,
                     row.get::<_, String>(15)?,
-                    row.get::<_, i64>(16)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, i64>(17)?,
                 ))
             })
             .map_err(storage_err(
@@ -632,7 +637,8 @@ impl ModelGatewayRequestLogRepository {
                 latency_ms: row.14,
                 outcome: GatewayRequestOutcome::from_id(&row.15)
                     .unwrap_or(GatewayRequestOutcome::Failed),
-                created_at_ms: row.16,
+                route: row.16.as_deref().and_then(read_route_trace),
+                created_at_ms: row.17,
             });
         }
         Ok(logs)
@@ -774,6 +780,39 @@ pub(crate) fn migrate(conn: &mut DbConnection, applied: &mut Vec<String>) -> Vib
     Ok(())
 }
 
+/// Adds the route trace to the request ledger.
+///
+/// The trace answers the only question a failover leaves behind: which Key was
+/// set aside, and why the request moved on. It is additive and nullable, so a
+/// database written before it keeps every existing row and simply has no trace
+/// for them. `ALTER TABLE ... ADD COLUMN` is not idempotent, so the version
+/// check is the guard.
+pub(crate) fn migrate_route_trace(
+    conn: &mut DbConnection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 65;
+    const NAME: &str = "model_gateway_route_trace";
+    if crate::migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE model_gateway_request_log ADD COLUMN route_trace TEXT NULL;")
+        .map_err(storage_err(
+            "migration_apply_failed",
+            "failed to add the gateway request route trace",
+        ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the gateway route trace migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
 fn encode_upstreams(upstreams: &[ModelProviderProfileId]) -> VibexResult<String> {
     let values = upstreams
         .iter()
@@ -813,6 +852,18 @@ fn decode_json<T: serde::de::DeserializeOwned>(
         .map_err(|_| VibexError::storage(code, "gateway settings hold an invalid policy"))
 }
 
+/// Reads a stored route trace.
+///
+/// The trace annotates a diagnostics row; nothing is routed from it. An
+/// unreadable payload — a blob written by a newer build, or one that has been
+/// tampered with — therefore reads as "no trace" rather than failing the whole
+/// request list, and the row's own decision columns stay authoritative.
+fn read_route_trace(encoded: &str) -> Option<GatewayRouteTrace> {
+    serde_json::from_str::<GatewayRouteTrace>(encoded)
+        .ok()
+        .filter(GatewayRouteTrace::is_current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,12 +891,15 @@ mod tests {
     #[test]
     fn migration_64_creates_gateway_tables_and_is_idempotent() {
         let (path, mut conn) = database();
-        assert_eq!(crate::current_schema_version(&conn).unwrap(), 64);
+        assert_eq!(crate::current_schema_version(&conn).unwrap(), 65);
         assert!(crate::migration_applied(&conn, 64).unwrap());
+        assert!(crate::migration_applied(&conn, 65).unwrap());
         let applied = apply_migrations(&mut conn).unwrap();
         assert!(
-            !applied.iter().any(|entry| entry.starts_with("64:")),
-            "re-applying migrations must not re-run the gateway migration"
+            !applied
+                .iter()
+                .any(|entry| entry.starts_with("64:") || entry.starts_with("65:")),
+            "re-applying migrations must not re-run the gateway migrations"
         );
         let settings = ModelGatewaySettingsRepository::get_or_create(&conn).unwrap();
         assert_eq!(settings.port, 0);
@@ -1007,6 +1061,15 @@ mod tests {
             reasoning_tokens: 0,
             latency_ms: Some(42),
             outcome: GatewayRequestOutcome::Ok,
+            route: Some(GatewayRouteTrace {
+                schema_version: vibex_core::GATEWAY_ROUTE_TRACE_SCHEMA_VERSION,
+                skipped_cooling: 1,
+                skipped_over_limit: 0,
+                failed_attempts: vec![vibex_core::GatewayRouteAttempt {
+                    credential_id: RequestId::new(),
+                    failure: GatewayFailureKind::Quota,
+                }],
+            }),
             created_at_ms: now,
         };
         ModelGatewayRequestLogRepository::insert(&conn, &log).unwrap();
@@ -1016,6 +1079,29 @@ mod tests {
 
         let recent = ModelGatewayRequestLogRepository::recent(&conn, 10).unwrap();
         assert_eq!(recent.len(), 2);
+        // The trace survives the round trip, and a reader that meets an
+        // unreadable or newer payload reports the row as having no trace
+        // instead of failing the list around it.
+        let stored = recent[0].route.as_ref().expect("the trace round-trips");
+        assert_eq!(stored.skipped_cooling, 1);
+        assert_eq!(stored.failed_attempts.len(), 1);
+        assert_eq!(stored.failed_attempts[0].failure, GatewayFailureKind::Quota);
+        conn.execute(
+            "UPDATE model_gateway_request_log SET route_trace = ?1 WHERE request_id = ?2",
+            params![
+                "{\"schemaVersion\":99,\"skippedCooling\":3}",
+                log.request_id.as_str()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE model_gateway_request_log SET route_trace = ?1 WHERE request_id != ?2",
+            params!["not json at all", log.request_id.as_str()],
+        )
+        .unwrap();
+        let recent = ModelGatewayRequestLogRepository::recent(&conn, 10).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert!(recent.iter().all(|row| row.route.is_none()));
         let encoded = serde_json::to_string(&recent).unwrap();
         for forbidden in ["sk-", "prompt", "reply", "base64", "cost", "price"] {
             assert!(

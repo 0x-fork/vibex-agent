@@ -2986,31 +2986,13 @@ impl ManagementBackend for NativeBackend {
             let logs = service
                 .recent_requests(50)
                 .map_err(vibex_core::VibexError::from)?;
-            let names = runtime
+            let profiles = runtime
                 .providers()
                 .service()
-                .list_model_provider_profiles()?
-                .into_iter()
-                .map(|profile| (profile.id, profile.display_name))
-                .collect::<std::collections::BTreeMap<_, _>>();
+                .list_model_provider_profiles()?;
             Ok(logs
                 .into_iter()
-                .map(|log| GatewayRequestSummary {
-                    total_tokens: log.total_tokens(),
-                    request_id: log.request_id,
-                    agent_id: log.agent_id,
-                    provider_name: names
-                        .get(&log.model_provider_profile_id)
-                        .cloned()
-                        .unwrap_or_else(|| log.model_provider_profile_id.as_str().to_string()),
-                    model_requested: log.model_requested,
-                    model_served: log.model_served,
-                    wire_in: log.wire_in,
-                    wire_out: log.wire_out,
-                    status: log.status,
-                    outcome: log.outcome,
-                    created_at_ms: log.created_at_ms,
-                })
+                .map(|log| GatewayRequestSummary::from_log(log, &profiles))
                 .collect())
         })
     }

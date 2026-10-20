@@ -20,8 +20,9 @@ use tokio::sync::mpsc;
 use vibex_config_switch::{ProviderConfigService, secrets};
 use vibex_core::{
     GatewayConversationPin, GatewayFailureKind, GatewayPinScope, GatewayPolicy,
-    GatewayRequestOutcome, GatewayTokenWindow, GatewayTokenWindowUsage, ModelGatewayRequestLog,
-    ModelGatewayRuntimeState, ModelGatewaySettings, ModelGatewayStatus, ModelProviderAccountState,
+    GatewayRequestOutcome, GatewayRouteAttempt, GatewayRouteTrace, GatewayTokenWindow,
+    GatewayTokenWindowUsage, ModelGatewayRequestLog, ModelGatewayRuntimeState,
+    ModelGatewaySettings, ModelGatewayStatus, ModelProviderAccountState,
     ModelProviderCredentialReference, ModelProviderEndpoint, ModelProviderEndpointKind,
     ModelProviderProfileId, ModelProviderProfileStatus, RequestId,
 };
@@ -805,6 +806,11 @@ impl ModelGatewayService {
             conversation,
             stream: request.stream,
             limits: policy.account_limits.clone(),
+            // The ledger keeps this much of the routing decision even when the
+            // first attempt answers: "the gateway had to step over a cooling
+            // Key" is exactly what a later failover investigation asks for.
+            skipped_cooling: plan.skipped_cooling,
+            skipped_over_limit: plan.skipped_over_limit,
         })
     }
 
@@ -814,24 +820,25 @@ impl ModelGatewayService {
     pub(crate) async fn open_attempt(
         &self,
         prepared: &PreparedCall,
-    ) -> GatewayResult<(UpstreamAttempt, KeyReference, Vec<String>)> {
+    ) -> GatewayResult<(UpstreamAttempt, KeyReference)> {
         if self.shutting_down.read().map(|flag| *flag).unwrap_or(false) {
             return Err(GatewayError::NotConfigured(
                 "the gateway is shutting down".to_string(),
             ));
         }
         let mut last_error: Option<GatewayError> = None;
-        let mut skipped = Vec::new();
-        for (index, (candidate, credential)) in prepared.keys.iter().enumerate() {
-            if index > 0 {
-                skipped.push(format!(
-                    "{} failed before the reply began",
-                    candidate.credential.as_str()
-                ));
-            }
+        // Every Key this loop walks past, with the reason it did not answer.
+        // This is what the ledger's route trace is built from, so it records
+        // the decision rather than a formatted sentence about it.
+        let mut failed_attempts: Vec<GatewayRouteAttempt> = Vec::new();
+        for (candidate, credential) in prepared.keys.iter() {
             let secret = match resolve_key_secret(credential) {
                 Ok(Some(secret)) => secret,
                 Ok(None) => {
+                    failed_attempts.push(GatewayRouteAttempt {
+                        credential_id: candidate.credential.clone(),
+                        failure: GatewayFailureKind::Auth,
+                    });
                     last_error = Some(GatewayError::NotConfigured(format!(
                         "`{}` has no usable Key",
                         prepared.provider_name
@@ -839,6 +846,10 @@ impl ModelGatewayService {
                     continue;
                 }
                 Err(error) => {
+                    failed_attempts.push(GatewayRouteAttempt {
+                        credential_id: candidate.credential.clone(),
+                        failure: GatewayFailureKind::Auth,
+                    });
                     last_error = Some(GatewayError::NotConfigured(format!(
                         "`{}` has no usable Key: {}",
                         prepared.provider_name, error.code
@@ -867,6 +878,10 @@ impl ModelGatewayService {
             {
                 Ok(permit) => permit,
                 Err(error) => {
+                    failed_attempts.push(GatewayRouteAttempt {
+                        credential_id: candidate.credential.clone(),
+                        failure: GatewayFailureKind::Rate,
+                    });
                     last_error = Some(error);
                     continue;
                 }
@@ -880,6 +895,10 @@ impl ModelGatewayService {
                 )
                 .await
             {
+                failed_attempts.push(GatewayRouteAttempt {
+                    credential_id: candidate.credential.clone(),
+                    failure: GatewayFailureKind::Rate,
+                });
                 last_error = Some(error);
                 continue;
             }
@@ -906,6 +925,10 @@ impl ModelGatewayService {
                         GatewayFailureKind::Proxy
                     };
                     self.mark_failure(&prepared.profile_id, &candidate.credential, kind);
+                    failed_attempts.push(GatewayRouteAttempt {
+                        credential_id: candidate.credential.clone(),
+                        failure: kind,
+                    });
                     last_error = Some(GatewayError::Upstream {
                         status: 502,
                         message: format!(
@@ -925,17 +948,21 @@ impl ModelGatewayService {
                         response,
                         target: prepared.target,
                         passthrough: prepared.passthrough,
+                        failed_attempts,
                     },
                     KeyReference {
                         id: candidate.credential.clone(),
                     },
-                    skipped,
                 ));
             }
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
             let kind = classify_failure(status, &body);
             self.mark_failure(&prepared.profile_id, &candidate.credential, kind);
+            failed_attempts.push(GatewayRouteAttempt {
+                credential_id: candidate.credential.clone(),
+                failure: kind,
+            });
             last_error = Some(GatewayError::Upstream {
                 status,
                 message: upstream_message(&body),
@@ -1019,6 +1046,10 @@ impl ModelGatewayService {
             reasoning_tokens: outcome.usage.reasoning_tokens,
             latency_ms: outcome.latency_ms,
             outcome: outcome.kind,
+            route: Some(GatewayRouteTrace {
+                failed_attempts: outcome.failed_attempts.clone(),
+                ..GatewayRouteTrace::new(prepared.skipped_cooling, prepared.skipped_over_limit)
+            }),
             created_at_ms: now,
         };
         let _ = ModelGatewayRequestLogRepository::insert(&connection, &log);
@@ -1140,6 +1171,9 @@ pub struct PreparedCall {
     pub stream: bool,
     /// Per-credential concurrency and rate limits.
     pub limits: BTreeMap<RequestId, vibex_core::GatewayAccountLimits>,
+    /// Keys the route plan set aside before the first attempt, and why.
+    pub skipped_cooling: usize,
+    pub skipped_over_limit: usize,
 }
 
 /// What one finished request produced, as the ledger records it.
@@ -1151,6 +1185,8 @@ pub(crate) struct RequestOutcome {
     pub latency_ms: Option<i64>,
     /// The model the upstream said it served, when it said one.
     pub served: Option<String>,
+    /// Keys tried before the answering one, in order.
+    pub failed_attempts: Vec<GatewayRouteAttempt>,
 }
 
 /// The credential a request authenticates with.
@@ -1165,6 +1201,8 @@ pub(crate) struct UpstreamAttempt {
     pub response: reqwest::Response,
     pub target: WireProtocol,
     pub passthrough: bool,
+    /// Keys that did not answer before this one did.
+    pub failed_attempts: Vec<GatewayRouteAttempt>,
 }
 
 /// Chooses the protocol the upstream is called with.
@@ -1335,6 +1373,7 @@ pub(crate) async fn forward(
         response,
         target,
         passthrough,
+        failed_attempts,
     } = attempt;
     if let (Some(conversation), Some((_, credential))) =
         (prepared.conversation.as_deref(), prepared.keys.first())
@@ -1479,18 +1518,23 @@ pub(crate) async fn forward(
     service.record(
         &prepared,
         &RequestOutcome {
+            // A request only counts as a failover when a Key actually failed
+            // before this one answered. Counting the size of the candidate pool
+            // instead would label a first-try success as a failover on every
+            // Provider that happens to hold more than one Key.
             kind: if failed {
                 GatewayRequestOutcome::Failed
-            } else if prepared.keys.len() > 1 {
-                GatewayRequestOutcome::Failover
-            } else {
+            } else if failed_attempts.is_empty() {
                 GatewayRequestOutcome::Ok
+            } else {
+                GatewayRequestOutcome::Failover
             },
             credential: Some(key.id.clone()),
             status: Some(if failed { 502 } else { 200 }),
             usage,
             latency_ms: Some(started.elapsed().as_millis() as i64),
             served: None,
+            failed_attempts,
         },
     );
 }
@@ -1506,12 +1550,33 @@ pub(crate) async fn gather(
         response,
         target,
         passthrough,
+        failed_attempts,
     } = attempt;
     let started = std::time::Instant::now();
-    let bytes = response.bytes().await.map_err(|_| GatewayError::Upstream {
-        status: 502,
-        message: "the upstream reply ended before it was complete".to_string(),
-    })?;
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            // The reply body never arrived. The ledger keeps the fact, so a
+            // request that produced neither an answer nor a token count is
+            // still visible as a failure rather than as a gap.
+            service.record(
+                prepared,
+                &RequestOutcome {
+                    kind: GatewayRequestOutcome::Failed,
+                    credential: Some(key.id.clone()),
+                    status: Some(502),
+                    usage: CanonicalUsage::default(),
+                    latency_ms: Some(started.elapsed().as_millis() as i64),
+                    served: None,
+                    failed_attempts,
+                },
+            );
+            return Err(GatewayError::Upstream {
+                status: 502,
+                message: "the upstream reply ended before it was complete".to_string(),
+            });
+        }
+    };
     let (response, usage) = if passthrough {
         let parsed = parse_reply(target, &bytes).unwrap_or_default();
         let usage = parsed.usage.clone();
@@ -1544,12 +1609,17 @@ pub(crate) async fn gather(
     service.record(
         prepared,
         &RequestOutcome {
-            kind: GatewayRequestOutcome::Ok,
+            kind: if failed_attempts.is_empty() {
+                GatewayRequestOutcome::Ok
+            } else {
+                GatewayRequestOutcome::Failover
+            },
             credential: Some(key.id.clone()),
             status: Some(200),
             usage,
             latency_ms: Some(started.elapsed().as_millis() as i64),
             served: (!response.model.is_empty()).then(|| response.model.clone()),
+            failed_attempts,
         },
     );
     Ok(rendered)

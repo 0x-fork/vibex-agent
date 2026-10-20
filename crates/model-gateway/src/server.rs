@@ -150,7 +150,7 @@ async fn serve(
             return service.error_response(protocol, &error);
         }
     };
-    let (attempt, key, _skipped) = match service.open_attempt(&prepared).await {
+    let (attempt, key) = match service.open_attempt(&prepared).await {
         Ok(attempt) => attempt,
         Err(error) => {
             // A request that could not reach any upstream is what degrades the

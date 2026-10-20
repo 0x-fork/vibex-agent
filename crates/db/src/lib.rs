@@ -93,7 +93,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 64;
+pub const CURRENT_SCHEMA_VERSION: i64 = 65;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12428,6 +12428,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_vibex_use(conn, &mut applied)?;
     vibex_use::budget::migrate(conn, &mut applied)?;
     model_gateway::migrate(conn, &mut applied)?;
+    model_gateway::migrate_route_trace(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
