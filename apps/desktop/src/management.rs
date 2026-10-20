@@ -972,6 +972,14 @@ pub struct ManagementCenter {
     gateway_limit_inputs: BTreeMap<String, GatewayLimitInputs>,
     /// A rejected limit field, shown beside the Key it belongs to.
     gateway_limits_error: Option<String>,
+    /// The gateway-wide token ceiling draft. Created on demand, like a Key's
+    /// limits: a gateway with no ceiling has no field to leave empty.
+    gateway_token_limit_input: Option<Entity<InputState>>,
+    /// The window the draft is measured over. `None` means "the one already
+    /// stored", so opening the page does not silently change it.
+    gateway_token_limit_window: Option<vibex_core::GatewayTokenWindow>,
+    /// A rejected token ceiling, shown under its field.
+    gateway_token_limit_error: Option<String>,
     /// The key being added to one upstream, keyed by profile id.
     gateway_key_drafts: BTreeMap<String, Entity<InputState>>,
     /// Which upstream the add-key field belongs to.
@@ -2010,6 +2018,9 @@ impl ManagementCenter {
             gateway_request_detail: None,
             gateway_limit_inputs: BTreeMap::new(),
             gateway_limits_error: None,
+            gateway_token_limit_input: None,
+            gateway_token_limit_window: None,
+            gateway_token_limit_error: None,
             gateway_key_drafts: BTreeMap::new(),
             gateway_key_add_target: None,
             gateway_key_add_error: None,
@@ -11582,6 +11593,9 @@ impl ManagementCenter {
             // replaces the whole map, so omitting them would silently clear a
             // limit the user set earlier.
             account_limits: snapshot.settings.policy.account_limits.clone(),
+            // Account commands are one-shot: an unrelated edit sends none, so
+            // it cannot re-apply a toggle the user already made.
+            account_updates: Vec::new(),
             expected_revision: snapshot.settings.revision,
         };
         update(&mut request);
@@ -11661,6 +11675,95 @@ impl ManagementCenter {
                 } else {
                     vibex_core::GatewayPinScope::Off
                 }
+            },
+            cx,
+        );
+    }
+
+    /// Writes the token ceiling the draft describes.
+    ///
+    /// The ceiling is a policy, not an account state: it applies to everything
+    /// the gateway routes, so it is saved through the same settings write as
+    /// routing and upstream order. Clearing the field is how a user removes a
+    /// ceiling; typing `0` is not, because zero would refuse every request.
+    fn save_gateway_token_limit(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self.gateway_token_limit_input.clone() else {
+            return;
+        };
+        let window = self
+            .gateway_token_limit_window
+            .or_else(|| {
+                self.gateway
+                    .settings
+                    .policy
+                    .token_limit
+                    .map(|limit| limit.window)
+            })
+            .unwrap_or(vibex_core::GatewayTokenWindow::Day);
+        let text = input.read(cx).value().to_string();
+        match parse_gateway_token_limit(&text, window) {
+            Ok(limit) => {
+                self.gateway_token_limit_error = None;
+                self.update_gateway_settings(move |request| request.token_limit = Some(limit), cx);
+            }
+            Err(message) => {
+                self.gateway_token_limit_error = Some(message.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    /// Removes the token ceiling, returning the gateway to unrestricted use.
+    fn clear_gateway_token_limit(&mut self, cx: &mut Context<Self>) {
+        self.gateway_token_limit_error = None;
+        self.update_gateway_settings(|request| request.token_limit = None, cx);
+    }
+
+    /// Turns one Key on or off without touching its Provider or its secret.
+    ///
+    /// Re-enabling is also how a Key set aside by an authentication failure
+    /// gets another chance; the write clears that cooldown.
+    fn set_gateway_key_enabled(
+        &mut self,
+        profile: vibex_core::ModelProviderProfileId,
+        credential: vibex_core::RequestId,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_gateway_settings(
+            move |request| {
+                request
+                    .account_updates
+                    .push(vibex_core::GatewayAccountUpdate {
+                        model_provider_profile_id: profile,
+                        credential_id: credential,
+                        enabled: Some(enabled),
+                        preferred: None,
+                    });
+            },
+            cx,
+        );
+    }
+
+    /// Makes one Key the first the router tries for its Provider, or returns
+    /// that Provider to its configured order.
+    fn set_gateway_key_preferred(
+        &mut self,
+        profile: vibex_core::ModelProviderProfileId,
+        credential: vibex_core::RequestId,
+        preferred: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_gateway_settings(
+            move |request| {
+                request
+                    .account_updates
+                    .push(vibex_core::GatewayAccountUpdate {
+                        model_provider_profile_id: profile,
+                        credential_id: credential,
+                        enabled: None,
+                        preferred: Some(preferred),
+                    });
             },
             cx,
         );
@@ -12559,16 +12662,122 @@ impl ManagementCenter {
                         })),
                 ),
         );
-        policy_rows = policy_rows.child(stat_line(
-            management_locale_text("Token limit", "token 上限", "token 上限"),
-            match snapshot.settings.policy.token_limit {
-                Some(limit) => {
-                    format!("{} tokens / {:?}", limit.tokens, limit.window).to_lowercase()
-                }
-                None => management_locale_text("not limited", "不限制", "不限制").to_string(),
-            },
-            cx,
-        ));
+        // Token ceiling. The window and the count are edited together because
+        // neither means anything alone: "1,000,000" says nothing without "per
+        // day", and the stored pair is replaced as a unit.
+        let stored_limit = snapshot.settings.policy.token_limit;
+        let limit_window = self
+            .gateway_token_limit_window
+            .or_else(|| stored_limit.map(|limit| limit.window))
+            .unwrap_or(vibex_core::GatewayTokenWindow::Day);
+        let limit_input = self
+            .gateway_token_limit_input
+            .get_or_insert_with(|| {
+                cx.new(|cx| {
+                    InputState::new(window, cx).placeholder(management_locale_text(
+                        "tokens",
+                        "token 数",
+                        "token 數",
+                    ))
+                })
+            })
+            .clone();
+        let mut limit_window_row = h_flex().w_full().items_center().gap_1();
+        for window_choice in vibex_core::GatewayTokenWindow::ALL {
+            let selected = window_choice == limit_window;
+            limit_window_row = limit_window_row.child(
+                Button::new(SharedString::from(format!(
+                    "management-gateway-token-window-{}",
+                    window_choice.id()
+                )))
+                .xsmall()
+                .when(selected, |button| button.primary())
+                .when(!selected, |button| button.outline())
+                .label(gateway_token_window_label(window_choice))
+                .disabled(pending)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.gateway_token_limit_window = Some(window_choice);
+                    cx.notify();
+                })),
+            );
+        }
+        let limit_error = self.gateway_token_limit_error.clone();
+        policy_rows =
+            policy_rows.child(
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(management_field_label(management_locale_text(
+                                "Token limit",
+                                "token 上限",
+                                "token 上限",
+                            )))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(match stored_limit {
+                                        Some(limit) => format!(
+                                            "{} / {}",
+                                            gateway_token_count(limit.tokens),
+                                            gateway_token_window_label(limit.window)
+                                        ),
+                                        None => management_locale_text(
+                                            "not limited",
+                                            "不限制",
+                                            "不限制",
+                                        )
+                                        .to_string(),
+                                    }),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .child(limit_window_row)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Input::new(&limit_input).small().w_full()),
+                            )
+                            .child(
+                                Button::new("management-gateway-token-limit-save")
+                                    .xsmall()
+                                    .primary()
+                                    .label(management_locale_text("Save", "保存", "儲存"))
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save_gateway_token_limit(cx)
+                                    })),
+                            )
+                            .children(stored_limit.map(|_| {
+                                Button::new("management-gateway-token-limit-clear")
+                                    .xsmall()
+                                    .ghost()
+                                    .label(management_locale_text(
+                                        "Remove limit",
+                                        "移除上限",
+                                        "移除上限",
+                                    ))
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.clear_gateway_token_limit(cx)
+                                    }))
+                            })),
+                    )
+                    .children(limit_error.map(|message| {
+                        div().text_xs().text_color(cx.theme().danger).child(message)
+                    })),
+            );
         policy_rows = policy_rows.child(
             div()
                 .text_xs()
@@ -12610,6 +12819,13 @@ impl ManagementCenter {
             let add_key = self.render_gateway_add_key(&id, window, cx);
             let mut key_rows = v_flex().w_full().gap_1();
             for key in &upstream.keys {
+                let preferred_key = snapshot
+                    .settings
+                    .policy
+                    .preferred_keys
+                    .get(&id)
+                    .is_some_and(|credential| credential == &key.credential_id);
+                let enabled = key.state != vibex_core::GatewayKeyState::Disabled;
                 key_rows = key_rows.child(
                     h_flex()
                         .w_full()
@@ -12618,17 +12834,83 @@ impl ManagementCenter {
                         .gap_2()
                         .py_1()
                         .child(
-                            div()
+                            h_flex()
                                 .min_w_0()
-                                .truncate()
-                                .text_sm()
-                                .child(key.display_name.clone()),
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Switch::new(SharedString::from(format!(
+                                        "management-gateway-key-enabled-{}-{}",
+                                        id.as_str(),
+                                        key.credential_id.as_str()
+                                    )))
+                                    .small()
+                                    .checked(enabled)
+                                    .disabled(pending)
+                                    .on_click(cx.listener({
+                                        let profile = id.clone();
+                                        let credential = key.credential_id.clone();
+                                        move |this, checked, _, cx| {
+                                            this.set_gateway_key_enabled(
+                                                profile.clone(),
+                                                credential.clone(),
+                                                *checked,
+                                                cx,
+                                            )
+                                        }
+                                    })),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_sm()
+                                        .child(key.display_name.clone()),
+                                )
+                                .children(preferred_key.then(|| {
+                                    Tag::info().xsmall().child(management_locale_text(
+                                        "Preferred",
+                                        "优先",
+                                        "優先",
+                                    ))
+                                })),
                         )
                         .child(
                             h_flex()
                                 .items_center()
                                 .gap_2()
                                 .child(gateway_key_state_badge(key, cx))
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "management-gateway-prefer-key-{}-{}",
+                                        id.as_str(),
+                                        key.credential_id.as_str()
+                                    )))
+                                    .xsmall()
+                                    .ghost()
+                                    .label(if preferred_key {
+                                        management_locale_text(
+                                            "Use in order",
+                                            "按顺序使用",
+                                            "按順序使用",
+                                        )
+                                    } else {
+                                        management_locale_text("Use first", "优先使用", "優先使用")
+                                    })
+                                    .disabled(pending)
+                                    .on_click(cx.listener({
+                                        let profile = id.clone();
+                                        let credential = key.credential_id.clone();
+                                        move |this, _, _, cx| {
+                                            this.set_gateway_key_preferred(
+                                                profile.clone(),
+                                                credential.clone(),
+                                                !preferred_key,
+                                                cx,
+                                            )
+                                        }
+                                    })),
+                                )
                                 .child(
                                     Button::new(SharedString::from(format!(
                                         "management-gateway-remove-key-{}-{}",
@@ -25209,6 +25491,69 @@ fn gateway_cooldown_label(until_ms: Option<i64>) -> String {
     }
 }
 
+/// The window a token ceiling is measured over, in interface language.
+fn gateway_token_window_label(window: vibex_core::GatewayTokenWindow) -> &'static str {
+    gateway_token_window_label_for(locale::current_locale(), window)
+}
+
+fn gateway_token_window_label_for(
+    locale: ResolvedLocale,
+    window: vibex_core::GatewayTokenWindow,
+) -> &'static str {
+    match window {
+        vibex_core::GatewayTokenWindow::Day => {
+            management_locale_text_for(locale, "day", "天", "天")
+        }
+        vibex_core::GatewayTokenWindow::Week => {
+            management_locale_text_for(locale, "week", "周", "週")
+        }
+        vibex_core::GatewayTokenWindow::Month => {
+            management_locale_text_for(locale, "month", "月", "月")
+        }
+    }
+}
+
+/// A token count with thousands separators.
+///
+/// A seven-digit ceiling is unreadable as `20000000`; grouping is what makes
+/// the number confirmable at a glance.
+fn gateway_token_count(tokens: u64) -> String {
+    let digits = tokens.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// Reads the token ceiling draft.
+///
+/// Grouping separators are accepted because that is how the current limit is
+/// displayed; removing them before parsing means "1,000,000" round-trips.
+/// An empty field is an error here rather than "unlimited": the field only
+/// exists next to a window, and removing the ceiling has its own control.
+fn parse_gateway_token_limit(
+    value: &str,
+    window: vibex_core::GatewayTokenWindow,
+) -> Result<vibex_core::GatewayTokenLimit, &'static str> {
+    let value = value
+        .chars()
+        .filter(|character| !matches!(character, '_' | ',' | ' '))
+        .collect::<String>();
+    if value.is_empty() {
+        return Err("enter a token count");
+    }
+    let tokens = value
+        .parse::<u64>()
+        .map_err(|_| "must be a whole number of tokens")?;
+    let limit = vibex_core::GatewayTokenLimit { window, tokens };
+    limit.validate().map_err(|_| "must be greater than zero")?;
+    Ok(limit)
+}
+
 /// One line describing why the gateway is or is not serving.
 fn gateway_runtime_text(state: &vibex_core::ModelGatewayRuntimeState) -> String {
     if let Some(notice) = state.notice.as_deref() {
@@ -33328,6 +33673,52 @@ mod gateway_surface_tests {
         assert!(parse_optional_limit("many").is_err());
     }
 
+    /// The token ceiling round-trips through the grouping the page displays.
+    ///
+    /// The field shows `1,000,000`; a parser that refused the comma would make
+    /// the displayed value unsaveable, and one that silently read `1,5` as
+    /// something would set a ceiling the user never asked for.
+    #[test]
+    fn a_token_ceiling_accepts_the_grouping_it_displays() {
+        use vibex_core::GatewayTokenWindow;
+        assert_eq!(gateway_token_count(1_000_000), "1,000,000");
+        assert_eq!(gateway_token_count(20_000_000), "20,000,000");
+        assert_eq!(gateway_token_count(999), "999");
+        assert_eq!(gateway_token_count(0), "0");
+
+        let limit = parse_gateway_token_limit("1,000,000", GatewayTokenWindow::Day).unwrap();
+        assert_eq!(limit.tokens, 1_000_000);
+        assert_eq!(limit.window, GatewayTokenWindow::Day);
+        assert_eq!(
+            parse_gateway_token_limit(" 20_000_000 ", GatewayTokenWindow::Month).unwrap(),
+            vibex_core::GatewayTokenLimit {
+                tokens: 20_000_000,
+                window: GatewayTokenWindow::Month,
+            }
+        );
+
+        assert!(parse_gateway_token_limit("", GatewayTokenWindow::Day).is_err());
+        assert!(parse_gateway_token_limit("0", GatewayTokenWindow::Day).is_err());
+        assert!(parse_gateway_token_limit("-1", GatewayTokenWindow::Day).is_err());
+        assert!(parse_gateway_token_limit("1.5", GatewayTokenWindow::Day).is_err());
+        assert!(parse_gateway_token_limit("many", GatewayTokenWindow::Day).is_err());
+    }
+
+    /// A window is a word on screen, never the stored enum id.
+    #[test]
+    fn a_token_window_is_named_in_words() {
+        use vibex_core::GatewayTokenWindow;
+        // English happens to use the same word as the id, so the assertion
+        // that matters is the translated one: a stored `day` in a Chinese page
+        // would be an untranslated enum leaking through.
+        for window in GatewayTokenWindow::ALL {
+            assert!(!gateway_token_window_label_for(ResolvedLocale::En, window).is_empty());
+            let chinese = gateway_token_window_label_for(ResolvedLocale::ZhCn, window);
+            assert!(!chinese.is_empty());
+            assert_ne!(chinese, window.id());
+        }
+    }
+
     /// Every unrelated gateway edit carries the stored limits forward.
     ///
     /// The settings write replaces the whole limit map, so a routing change made
@@ -33355,6 +33746,7 @@ mod gateway_surface_tests {
             token_limit: None,
             upstreams: Vec::new(),
             account_limits: policy.account_limits.clone(),
+            account_updates: Vec::new(),
             expected_revision: 1,
         };
         assert_eq!(
@@ -33911,6 +34303,45 @@ mod gateway_surface_tests {
         assert!(picker.contains("management-provider-preset-custom"));
         assert!(picker.contains("management_search_input"));
         assert!(picker.contains("provider_preset_picker_groups"));
+    }
+
+    /// The token ceiling is edited, not only displayed.
+    ///
+    /// The page used to print the stored pair and offer no way to change it;
+    /// the control is only useful if both writing and removing reach the
+    /// settings command.
+    #[test]
+    fn the_token_ceiling_editor_writes_and_removes_through_settings() {
+        let source = include_str!("management.rs");
+        let editor = source
+            .split_once("        // Token ceiling. The window and the count")
+            .and_then(|(_, tail)| tail.split_once("        // Upstreams, with their keys."))
+            .map(|(body, _)| body)
+            .expect("the token ceiling editor should remain inspectable");
+        assert!(editor.contains("management-gateway-token-window-"));
+        assert!(editor.contains("save_gateway_token_limit(cx)"));
+        assert!(editor.contains("clear_gateway_token_limit(cx)"));
+        assert!(editor.contains("Input::new(&limit_input)"));
+    }
+
+    /// The Key row's controls are wired, not merely drawn.
+    ///
+    /// Both verbs used to be missing from a row that showed the state they act
+    /// on; the test runs over the rendered row, not the methods, so a handler
+    /// that stops being attached fails here.
+    #[test]
+    fn a_gateway_key_row_wires_its_switch_and_preference() {
+        let source = include_str!("management.rs");
+        let row = source
+            .split_once("            for key in &upstream.keys {")
+            .and_then(|(_, tail)| tail.split_once("\n            if upstream.keys.is_empty()"))
+            .map(|(body, _)| body)
+            .expect("the Key row should remain inspectable");
+        assert!(row.contains("set_gateway_key_enabled("));
+        assert!(row.contains("set_gateway_key_preferred("));
+        assert!(row.contains("gateway_key_state_badge(key, cx)"));
+        assert!(row.contains("management-gateway-key-enabled-"));
+        assert!(row.contains("management-gateway-prefer-key-"));
     }
 
     /// One ledger row, built the way the authority reports it.

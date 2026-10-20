@@ -1569,11 +1569,66 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
         let mut connection = open_database(service.database_path())?;
         apply_migrations(&mut connection)?;
         let current = vibex_db::ModelGatewaySettingsRepository::get_or_create(&connection)?;
+        // A Key command names a Provider and a Key; both have to be real and
+        // still listed before anything is written.
+        let profiles = provider.list_model_provider_profiles()?;
+        for update in &request.account_updates {
+            update.validate()?;
+            if !request
+                .upstreams
+                .contains(&update.model_provider_profile_id)
+            {
+                return Err(VibexError::validation(
+                    "model_gateway_account_upstream_unknown",
+                    "the account update names a Provider that is not an upstream",
+                ));
+            }
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.id == update.model_provider_profile_id)
+                .ok_or_else(|| {
+                    VibexError::validation(
+                        "model_gateway_account_provider_unknown",
+                        "the account update names a Provider that does not exist",
+                    )
+                })?;
+            if !profile
+                .credentials
+                .iter()
+                .any(|credential| credential.id == update.credential_id)
+            {
+                return Err(VibexError::validation(
+                    "model_gateway_account_key_unknown",
+                    "the account update names a Key that this Provider does not have",
+                ));
+            }
+        }
         let mut policy = current.policy.clone();
         policy.routing = request.routing;
         policy.pin = request.pin;
         policy.token_limit = request.token_limit;
         policy.account_limits = request.account_limits;
+        for update in &request.account_updates {
+            match update.preferred {
+                Some(true) => {
+                    policy.preferred_keys.insert(
+                        update.model_provider_profile_id.clone(),
+                        update.credential_id.clone(),
+                    );
+                }
+                Some(false)
+                    if policy.preferred_keys.get(&update.model_provider_profile_id)
+                        == Some(&update.credential_id) =>
+                {
+                    policy
+                        .preferred_keys
+                        .remove(&update.model_provider_profile_id);
+                }
+                // The guard covers clearing this Key's preference; a
+                // different Key's preference is left alone.
+                Some(false) | None => {}
+            }
+        }
         policy.validate()?;
         let mut next = current.clone();
         next.display_name = request.display_name;
@@ -1585,6 +1640,18 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
             &next,
             request.expected_revision,
         )?;
+        // Enabled/disabled is per-Key durable state rather than policy, so it
+        // is written beside the settings that carried the command.
+        let now = vibex_core::unix_timestamp_ms();
+        for update in &request.account_updates {
+            if update.enabled.is_some() {
+                vibex_db::ModelProviderAccountStateRepository::apply_update(
+                    &connection,
+                    update,
+                    now,
+                )?;
+            }
+        }
         service.invalidate_snapshot();
         // Enabling or disabling must reach the listener now, not on the next
         // runtime start: the switch is the user's control over a live service.

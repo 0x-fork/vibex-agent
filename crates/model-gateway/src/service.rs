@@ -736,6 +736,7 @@ impl ModelGatewayService {
             .map(|pin| (pin.model_provider_profile_id, pin.credential_id));
 
         let mut candidates = Vec::new();
+        let preferred = policy.preferred_keys.get(&profile_id);
         for (index, credential) in upstream.credentials.iter().enumerate() {
             let state = state_by_key
                 .get(&credential.id)
@@ -743,8 +744,13 @@ impl ModelGatewayService {
                 .unwrap_or_else(|| {
                     ModelProviderAccountState::ready(profile_id.clone(), credential.id.clone())
                 });
+            // A preferred Key leads the pool; every other Key keeps the
+            // position the Provider gave it.
             let mut candidate =
                 CandidateKey::new(profile_id.clone(), credential.id.clone(), index as i64);
+            if preferred == Some(&credential.id) {
+                candidate = candidate.preferred();
+            }
             if let Some(limit) = policy.token_limit {
                 candidate = candidate.with_token_limit(limit, snapshot.gateway_used_tokens);
             }

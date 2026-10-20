@@ -5022,6 +5022,21 @@ ProviderConfigService::{
 - **Neither list is derived from the other.** The gateway's upstream picker uses
   the v2 identity the settings store, and a client never computes one id from
   the other; the authority resolves the pair once and publishes candidates.
+- **The token ceiling is set where its window is.** The gateway page edits the
+  count and the window (day/week/month) as one pair, because a count without a
+  window is not a ceiling. An empty field is refused, not read as zero; removing
+  the ceiling has its own control. The copy states that the count is local
+  tokens the gateway observed, not the vendor's own quota or balance.
+- **A Key is switched off where it is listed.** `enabled` is durable account
+  state, not policy: turning a Key off takes it out of rotation without touching
+  its Provider or its secret, and works even before the Key ever failed. Turning
+  it back on clears any failure cooldown, because an authentication failure never
+  expires on its own and the user has just asked for the Key to be tried again.
+- **A preferred Key leads every strategy.** The preference lives in
+  `GatewayPolicy.preferred_keys`, one credential per Provider. Marking a Key
+  edits policy, so it is carried by the settings write and appears in the
+  snapshot; the router puts it first, then applies rotation or usage to the rest
+  of the pool. Clearing it returns the Provider to its configured Key order.
 - **Concurrency and rate limits are per Key.** A lane bounds in-flight requests
   and a rolling minute bounds request starts. A request that cannot start within
   its own queue deadline is refused with `429` instead of waiting forever, and a
@@ -5155,6 +5170,12 @@ ProviderConfigService::{
   upstream call.
 - A Key's `max_concurrency` or `max_rpm` is zero -> `model_gateway_concurrency_invalid`
   / `model_gateway_rpm_invalid` when the settings are validated.
+- An account update changes neither `enabled` nor `preferred` ->
+  `model_gateway_account_update_empty`.
+- An account update names a Provider that is not an upstream ->
+  `model_gateway_account_upstream_unknown`; names a Provider that does not exist
+  -> `model_gateway_account_provider_unknown`; names a Key the Provider does not
+  have -> `model_gateway_account_key_unknown`. None of them writes anything.
 
 ### 5. Good / Base / Bad Cases
 
@@ -5177,6 +5198,12 @@ ProviderConfigService::{
 - `cargo test -p vibex-model-gateway` covers the IR, all four decoders and
   encoders, SSE frame boundaries, tool-call accumulation, failure classification,
   route planning, and the loopback perimeter.
+- `cargo test -p vibex-db model_gateway` covers a Key switched off before it
+  ever failed and re-enabling clearing an authentication failure.
+- `cargo test -p vibex-model-gateway` covers a preferred Key leading the
+  ordered, round-robin, and least-used strategies.
+- `cargo test -p vibex-desktop gateway` covers the token-ceiling editor's parsing
+  and the Key row's switch/preference wiring.
 - `cargo test -p vibex-model-gateway --test gateway` drives a real listener
   against a mock upstream: passthrough, translation, gathering, cooling, auth
   invalidation, the token ceiling, pinning, an unknown model, `file_id` refusal,

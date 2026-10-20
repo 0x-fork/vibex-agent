@@ -267,6 +267,10 @@ pub struct GatewayPolicy {
     /// Concurrency and rate limits, keyed by credential id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub account_limits: BTreeMap<RequestId, GatewayAccountLimits>,
+    /// The Key the router tries first for each Provider, when the user asked
+    /// for one. A Provider without an entry keeps its configured Key order.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub preferred_keys: BTreeMap<ModelProviderProfileId, RequestId>,
 }
 
 impl Default for GatewayPolicy {
@@ -278,6 +282,7 @@ impl Default for GatewayPolicy {
             token_limit: None,
             translate: GatewayTranslatePolicy::default(),
             account_limits: BTreeMap::new(),
+            preferred_keys: BTreeMap::new(),
         }
     }
 }
@@ -1113,7 +1118,47 @@ pub struct GatewaySettingsUpdateRequest {
     /// Key unlimited, and the whole map replaces the stored one.
     #[serde(default)]
     pub account_limits: BTreeMap<RequestId, GatewayAccountLimits>,
+    /// Routing-state changes submitted with this write.
+    ///
+    /// These are commands, not a snapshot: only the Keys named here are
+    /// touched, so turning one Key off does not rewrite every other Key's
+    /// cooldown or limits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_updates: Vec<GatewayAccountUpdate>,
     pub expected_revision: i64,
+}
+
+/// One Key's routing-state change, as the Config Center submits it.
+///
+/// `enabled` and `preferred` are independent: a Key can be turned off without
+/// changing which Key is preferred, and a Key can be preferred while it is
+/// off (the preference takes effect again once it is enabled).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayAccountUpdate {
+    pub model_provider_profile_id: ModelProviderProfileId,
+    pub credential_id: RequestId,
+    /// `Some(true)` re-enables the Key and clears any failure cooldown, so an
+    /// account repaired outside Vibex can be tried again; `Some(false)` takes
+    /// it out of rotation; `None` leaves it as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// `Some(true)` makes this the Key the router tries first for its
+    /// Provider; `Some(false)` returns that Provider to its configured order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred: Option<bool>,
+}
+
+impl GatewayAccountUpdate {
+    pub fn validate(&self) -> VibexResult<()> {
+        if self.enabled.is_none() && self.preferred.is_none() {
+            return Err(VibexError::validation(
+                "model_gateway_account_update_empty",
+                "an account update must change `enabled` or `preferred`",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The editor's question: what does the catalogue suggest for this model?
@@ -1332,6 +1377,60 @@ mod tests {
                 "gateway request log must not carry `{forbidden}`: {encoded}"
             );
         }
+    }
+
+    /// An empty command is a client bug, not a no-op: it would bump the
+    /// settings revision and rewrite settings for no visible reason.
+    #[test]
+    fn an_account_update_must_change_something() {
+        let profile = ModelProviderProfileId::new();
+        let update = GatewayAccountUpdate {
+            model_provider_profile_id: profile.clone(),
+            credential_id: RequestId::new(),
+            enabled: None,
+            preferred: None,
+        };
+        assert_eq!(
+            update.validate().unwrap_err().code,
+            "model_gateway_account_update_empty"
+        );
+
+        for (enabled, preferred) in [
+            (Some(false), None),
+            (None, Some(true)),
+            (Some(true), Some(false)),
+        ] {
+            let update = GatewayAccountUpdate {
+                model_provider_profile_id: profile.clone(),
+                credential_id: RequestId::new(),
+                enabled,
+                preferred,
+            };
+            update.validate().unwrap();
+        }
+    }
+
+    /// Preference is settings, so it round-trips with the policy and stays out
+    /// of the Key's own state (which only holds health).
+    #[test]
+    fn a_preferred_key_round_trips_in_the_policy() {
+        let profile = ModelProviderProfileId::new();
+        let credential = RequestId::new();
+        let policy = GatewayPolicy {
+            preferred_keys: BTreeMap::from([(profile.clone(), credential.clone())]),
+            ..GatewayPolicy::default()
+        };
+        let encoded = serde_json::to_string(&policy).unwrap();
+        assert!(encoded.contains("preferredKeys"), "{encoded}");
+        let decoded: GatewayPolicy = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.preferred_keys.get(&profile), Some(&credential));
+
+        // An older payload without the field still loads: preference is
+        // additive, not a migration gate.
+        let bare: GatewayPolicy =
+            serde_json::from_str(r#"{"enabled":true,"routing":"ordered","pin":"conversation"}"#)
+                .unwrap();
+        assert!(bare.preferred_keys.is_empty());
     }
 
     #[test]

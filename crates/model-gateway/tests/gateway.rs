@@ -585,6 +585,98 @@ async fn an_invalid_key_is_marked_and_the_next_key_answers() {
 }
 
 #[tokio::test]
+async fn a_preferred_key_is_tried_before_the_provider_order() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) =
+        mock_upstream_refusing("Bearer sk-refused", chat_stream()).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-refused",
+    );
+    // The second Key is valid but sits behind the refused one in the Provider's
+    // order; preferring it is the only thing that makes it first.
+    let preferred = {
+        let mut connection = open_database(&path).unwrap();
+        apply_migrations(&mut connection).unwrap();
+        let mut profile = vibex_db::ModelProviderProfileRepository::get(&connection, &upstream)
+            .unwrap()
+            .unwrap();
+        let lookup_key = format!("vibex-test-secret-{}", RequestId::new().as_str());
+        secrets::store_provider_secret(&lookup_key, "sk-good").unwrap();
+        let credential = ModelProviderCredentialReference {
+            id: RequestId::new(),
+            display_name: "Backup".to_string(),
+            status: AgentCredentialStatus::Ready,
+            credential: AgentCredential::ApiKey {
+                secret: ProjectionSecretReference {
+                    id: RequestId::new(),
+                    backend: secrets::provider_secret_write_backend(),
+                    setup_state: ProviderSecretSetupState::Available,
+                    lookup_key,
+                    redacted_hint: "stored".to_string(),
+                    revision: 1,
+                    legacy_secret_reference_id: None,
+                },
+                target_hint: None,
+            },
+            revision: 1,
+        };
+        let id = credential.id.clone();
+        profile.credentials.push(credential);
+        let revision = profile.revision;
+        profile.revision = revision + 1;
+        vibex_db::ModelProviderProfileRepository::update(&connection, &profile, revision).unwrap();
+        id
+    };
+    point_gateway_at(
+        &path,
+        upstream.clone(),
+        GatewayPolicy {
+            preferred_keys: std::collections::BTreeMap::from([(
+                upstream.clone(),
+                preferred.clone(),
+            )]),
+            ..GatewayPolicy::default()
+        },
+    );
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": "deepseek/deepseek-chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.text().await.unwrap();
+    assert_eq!(
+        recorder.lock().await.authorization.as_deref(),
+        Some("Bearer sk-good")
+    );
+
+    // The refused Key was never attempted, so no cooldown was recorded for it:
+    // preference is routing order, not a failover that happened to work.
+    let mut connection = open_database(&path).unwrap();
+    apply_migrations(&mut connection).unwrap();
+    let states = ModelProviderAccountStateRepository::list(&connection, &upstream).unwrap();
+    assert!(states.is_empty(), "{states:?}");
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+#[tokio::test]
 async fn an_authentication_failure_cools_the_key_until_it_is_replaced() {
     let path = database_path();
     let (upstream_url, _recorder, upstream_task) = mock_upstream(401, String::new(), None).await;

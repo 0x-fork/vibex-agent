@@ -316,6 +316,39 @@ impl ModelProviderAccountStateRepository {
         ))?;
         Ok(())
     }
+
+    /// Applies one user setting to a Key, creating its state row if this is the
+    /// first thing that ever touched it.
+    ///
+    /// Re-enabling clears the cooldown: the user just asked for this Key to be
+    /// tried, and an authentication failure otherwise never expires, which
+    /// would make the switch look broken after the account was repaired.
+    pub fn apply_update(
+        conn: &Connection,
+        update: &vibex_core::GatewayAccountUpdate,
+        now_ms: i64,
+    ) -> VibexResult<ModelProviderAccountState> {
+        let mut state = Self::list(conn, &update.model_provider_profile_id)?
+            .into_iter()
+            .find(|state| state.credential_id == update.credential_id)
+            .unwrap_or_else(|| {
+                ModelProviderAccountState::ready(
+                    update.model_provider_profile_id.clone(),
+                    update.credential_id.clone(),
+                )
+            });
+        if let Some(enabled) = update.enabled {
+            state.enabled = enabled;
+            if enabled {
+                state.cooldown_until_ms = None;
+                state.cooldown_reason = None;
+                state.consecutive_failures = 0;
+            }
+        }
+        state.updated_at_ms = now_ms;
+        Self::upsert(conn, &state)?;
+        Ok(state)
+    }
 }
 
 pub struct GatewayTokenWindowRepository;
@@ -958,6 +991,76 @@ mod tests {
         assert!(!states[0].is_ready_at(unix_timestamp_ms()));
 
         ModelProviderAccountStateRepository::clear_cooldown(&conn, &upstream, &credential).unwrap();
+        let states = ModelProviderAccountStateRepository::list(&conn, &upstream).unwrap();
+        assert!(states[0].is_ready_at(unix_timestamp_ms()));
+        assert_eq!(states[0].consecutive_failures, 0);
+        cleanup(path);
+    }
+
+    #[test]
+    fn a_key_can_be_turned_off_before_it_ever_fails() {
+        let (path, conn) = database();
+        let upstream = profile(&conn);
+        let credential = RequestId::new();
+        let update = |enabled| vibex_core::GatewayAccountUpdate {
+            model_provider_profile_id: upstream.clone(),
+            credential_id: credential.clone(),
+            enabled: Some(enabled),
+            preferred: None,
+        };
+
+        // No state row exists yet: the first thing that touched this Key is the
+        // user turning it off, which must work rather than being a no-op.
+        ModelProviderAccountStateRepository::apply_update(
+            &conn,
+            &update(false),
+            unix_timestamp_ms(),
+        )
+        .unwrap();
+        let states = ModelProviderAccountStateRepository::list(&conn, &upstream).unwrap();
+        assert_eq!(states.len(), 1);
+        assert!(!states[0].enabled);
+        assert_eq!(
+            states[0].visibility_at(unix_timestamp_ms()),
+            vibex_core::GatewayKeyState::Disabled
+        );
+
+        ModelProviderAccountStateRepository::apply_update(
+            &conn,
+            &update(true),
+            unix_timestamp_ms(),
+        )
+        .unwrap();
+        let states = ModelProviderAccountStateRepository::list(&conn, &upstream).unwrap();
+        assert!(states[0].enabled);
+        assert_eq!(
+            states[0].visibility_at(unix_timestamp_ms()),
+            vibex_core::GatewayKeyState::Ready
+        );
+        cleanup(path);
+    }
+
+    /// Saying "use this Key again" is how an auth-rejected Key comes back: the
+    /// failure itself never expires, so without clearing it the switch would
+    /// look broken even after the account was repaired elsewhere.
+    #[test]
+    fn re_enabling_a_key_clears_an_authentication_failure() {
+        let (path, conn) = database();
+        let upstream = profile(&conn);
+        let credential = RequestId::new();
+        let mut state = ModelProviderAccountState::ready(upstream.clone(), credential.clone());
+        state.cooldown_reason = Some(GatewayFailureKind::Auth);
+        state.consecutive_failures = 1;
+        ModelProviderAccountStateRepository::upsert(&conn, &state).unwrap();
+
+        let update = vibex_core::GatewayAccountUpdate {
+            model_provider_profile_id: upstream.clone(),
+            credential_id: credential.clone(),
+            enabled: Some(true),
+            preferred: None,
+        };
+        ModelProviderAccountStateRepository::apply_update(&conn, &update, unix_timestamp_ms())
+            .unwrap();
         let states = ModelProviderAccountStateRepository::list(&conn, &upstream).unwrap();
         assert!(states[0].is_ready_at(unix_timestamp_ms()));
         assert_eq!(states[0].consecutive_failures, 0);

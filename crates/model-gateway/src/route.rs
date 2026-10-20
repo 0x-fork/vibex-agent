@@ -26,6 +26,9 @@ pub struct CandidateKey {
     pub credential: RequestId,
     /// Lower sorts first within a strategy's own ordering.
     pub priority: i64,
+    /// The user asked for this Key first. It leads every strategy, and the
+    /// strategy orders the rest.
+    pub preferred: bool,
     /// The Key may answer right now.
     pub ready: bool,
     /// Why it is not ready, when it is not.
@@ -44,12 +47,19 @@ impl CandidateKey {
             profile,
             credential,
             priority,
+            preferred: false,
             ready: true,
             cooling: None,
             used_tokens: 0,
             token_limit: None,
             window_used_tokens: None,
         }
+    }
+
+    /// Marks this Key as the user's preferred first attempt.
+    pub fn preferred(mut self) -> Self {
+        self.preferred = true;
+        self
     }
 
     pub fn cooling(mut self, kind: GatewayFailureKind) -> Self {
@@ -203,19 +213,25 @@ pub fn plan_route(request: RouteRequest) -> RoutePlan {
 }
 
 fn sort_ready(ready: &mut [CandidateKey], strategy: GatewayRoutingStrategy, rotation: u64) {
+    // A preferred Key is the user's explicit choice of what to try first. That
+    // holds under every strategy: rotation and usage decide the rest of the
+    // pool, they do not overrule the one Key the user asked for.
+    ready.sort_by_key(|candidate| (!candidate.preferred, candidate.priority));
+    let preferred = ready
+        .iter()
+        .take_while(|candidate| candidate.preferred)
+        .count();
+    let rest = &mut ready[preferred..];
     match strategy {
-        GatewayRoutingStrategy::Ordered => {
-            ready.sort_by_key(|candidate| candidate.priority);
-        }
+        GatewayRoutingStrategy::Ordered => {}
         GatewayRoutingStrategy::RoundRobin => {
-            ready.sort_by_key(|candidate| candidate.priority);
-            if !ready.is_empty() {
-                let offset = (rotation as usize) % ready.len();
-                ready.rotate_left(offset);
+            if !rest.is_empty() {
+                let offset = (rotation as usize) % rest.len();
+                rest.rotate_left(offset);
             }
         }
         GatewayRoutingStrategy::LeastUsed => {
-            ready.sort_by(|left, right| {
+            rest.sort_by(|left, right| {
                 left.used_tokens
                     .cmp(&right.used_tokens)
                     .then(left.priority.cmp(&right.priority))
@@ -670,6 +686,49 @@ mod tests {
         });
         assert_eq!(plan.order[0].used_tokens, 10);
         assert_eq!(plan.order[2].used_tokens, 100);
+    }
+
+    /// The user's preferred Key leads every strategy, not only the ordered one.
+    ///
+    /// A preference is what the user asked for; rotation and usage decide the
+    /// rest of the pool. Otherwise "Use first" would quietly mean "first only
+    /// while this strategy is selected".
+    #[test]
+    fn a_preferred_key_leads_every_strategy() {
+        let list = candidates();
+        let preferred = list[1].credential.clone();
+        let marked = |strategy, rotation| {
+            let mut list = list.clone();
+            list[1] = list[1].clone().preferred();
+            plan_route(RouteRequest {
+                candidates: list,
+                strategy,
+                rotation,
+                pinned: None,
+            })
+        };
+
+        for (strategy, rotation) in [
+            (GatewayRoutingStrategy::Ordered, 0),
+            (GatewayRoutingStrategy::RoundRobin, 1),
+            (GatewayRoutingStrategy::RoundRobin, 2),
+            (GatewayRoutingStrategy::LeastUsed, 0),
+        ] {
+            let plan = marked(strategy, rotation);
+            assert_eq!(
+                plan.order[0].credential, preferred,
+                "{strategy:?} rotation {rotation} must still start with the preferred Key"
+            );
+        }
+
+        // Only the preferred Key moves; the remaining pool keeps the size it
+        // had, so failover still has every other Key to try.
+        assert_eq!(
+            marked(GatewayRoutingStrategy::RoundRobin, 1)
+                .attemptable()
+                .count(),
+            3
+        );
     }
 
     #[test]
