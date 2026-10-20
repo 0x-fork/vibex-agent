@@ -974,6 +974,18 @@ pub struct ManagementCenter {
     /// Which upstream the add-key field belongs to.
     gateway_key_add_target: Option<String>,
     gateway_key_add_error: Option<String>,
+    /// The preset the editor's draft started from, until it is saved.
+    ///
+    /// It is kept beside the draft rather than inside it because a preset is a
+    /// starting point, not a Provider property: once saved, the Provider's own
+    /// model list is what matters.
+    provider_preset_draft: Option<vibex_core::ProviderPreset>,
+    /// The Preset region whose endpoints the draft currently carries.
+    ///
+    /// A region only rewrites addresses, so the choice is remembered here so
+    /// the picker can show it and a second change can replace the first one's
+    /// endpoints rather than only its own.
+    provider_preset_region: Option<String>,
     /// The catalogue's suggestion for the Model currently being edited.
     ///
     /// It is only ever a suggestion: nothing here is applied until the user
@@ -1975,6 +1987,8 @@ impl ManagementCenter {
             gateway_key_drafts: BTreeMap::new(),
             gateway_key_add_target: None,
             gateway_key_add_error: None,
+            provider_preset_draft: None,
+            provider_preset_region: None,
             model_capability_suggestion: None,
             selected_global_provider_id: None,
             profile_editor_open: false,
@@ -4643,6 +4657,8 @@ impl ManagementCenter {
     }
 
     fn open_profile_creator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.provider_preset_draft = None;
+        self.provider_preset_region = None;
         self.sync_projection_editor();
         self.projection_editor.preview = None;
         self.profile_name.update(cx, |state, cx| {
@@ -4785,6 +4801,11 @@ impl ManagementCenter {
         // behind a disclosure that looks empty.
         self.profile_protocol_advanced_open = self.pending_protocol_overrides() > 0;
         self.editing_profile_id = Some(profile.id.clone());
+        // Editing an existing Provider is never a preset session: it already
+        // has its own addresses and models, and a preset left over from an
+        // abandoned draft must not filter the next model fetch here.
+        self.provider_preset_draft = None;
+        self.provider_preset_region = None;
         self.projection_editor.draft_revision = 0;
         // The stored Secret is read back so the field can show it masked and
         // reveal it on request; until the read lands the field stays blank,
@@ -4870,6 +4891,8 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_editor_open = false;
         self.editing_profile_id = None;
+        self.provider_preset_draft = None;
+        self.provider_preset_region = None;
         self.projection_editor.draft_revision = 0;
         self.profile_secret_configured = false;
         self.profile_secret_loaded = None;
@@ -6288,6 +6311,10 @@ impl ManagementCenter {
                         this.navigation.mark_dirty(ManagementSection::Agents, false);
                         this.profile_editor_open = false;
                         this.editing_profile_id = None;
+                        // The preset has done its job: from here the saved
+                        // Provider's own models are the only list that matters.
+                        this.provider_preset_draft = None;
+                        this.provider_preset_region = None;
                         this.selected_provider_profile_id = Some(saved_profile_id);
                         this.profile_secret_clear = false;
                         this.projection_editor.set_secret_intent(false, false);
@@ -6450,6 +6477,20 @@ impl ManagementCenter {
         self.mutation = None;
         match outcome {
             Ok(Ok(models)) => {
+                // A preset's `only` prefix filters the vendor's answer, and a
+                // preset whose plan models are absent from that answer supplies
+                // its own list instead. Without this the filter existed in the
+                // data and reached nothing.
+                let models = match self.provider_preset_draft.as_ref() {
+                    Some(preset) => configured_models_from_preset(
+                        preset,
+                        &models
+                            .iter()
+                            .map(|model| model.id.clone())
+                            .collect::<Vec<_>>(),
+                    ),
+                    None => models,
+                };
                 let count = models.len();
                 if authoritative {
                     replace_provider_models_keeping_capabilities(
@@ -6467,6 +6508,32 @@ impl ManagementCenter {
                 });
             }
             Ok(Err(error)) => {
+                // A preset whose plan models never appear in its vendor's list
+                // supplies them itself rather than failing: ClinePass's `/models`
+                // only returns metered models, so a plan user would otherwise be
+                // left with nothing to choose.
+                if let Some(preset) = self.provider_preset_draft.as_ref()
+                    && (preset.no_list || preset.only.is_some())
+                    && !preset.models.is_empty()
+                {
+                    let models = configured_models_from_preset(preset, &[]);
+                    let count = models.len();
+                    self.profile_available_models = models;
+                    self.notice = Some(match active_locale {
+                        ResolvedLocale::En => format!(
+                            "The vendor list was unavailable; showing {count} model(s) from the preset"
+                        ),
+                        ResolvedLocale::ZhCn => {
+                            format!("厂商列表不可用，已显示预设中的 {count} 个模型")
+                        }
+                        ResolvedLocale::ZhTw => {
+                            format!("廠商清單不可用，已顯示預設中的 {count} 個模型")
+                        }
+                    });
+                    self.navigation.mark_dirty(ManagementSection::Agents, true);
+                    cx.notify();
+                    return;
+                }
                 // A catalogue fetch answers the button the user just pressed,
                 // so its failure rides the dialog's failure lane — the light
                 // hint `present_feedback` puts above the dialog — rather than a
@@ -14953,7 +15020,41 @@ impl ManagementCenter {
                     ),
             );
 
-        let mut body_column = v_flex().min_w_0().min_h_0().flex_1().child(list);
+        // A preset's caveats say what its own data cannot: which models the
+        // vendor's list leaves out and why. They sit directly above the list
+        // because they change the way it should be read, and a model the preset
+        // knows about but the endpoint never returns would otherwise look like
+        // a bug in the fetch.
+        let mut caveats = v_flex().w_full().gap_1p5().px_3().py_2();
+        let mut shows_caveats = false;
+        if let Some(preset) = self.provider_preset_draft.as_ref() {
+            for caveat in &preset.caveats {
+                shows_caveats = true;
+                caveats = caveats.child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .items_start()
+                        .gap_1p5()
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(cx.theme().info)
+                        .p_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().info)
+                                .child(provider_preset_caveat_text(*caveat)),
+                        ),
+                );
+            }
+        }
+
+        let mut body_column = v_flex().min_w_0().min_h_0().flex_1();
+        if shows_caveats {
+            body_column = body_column.child(caveats);
+        }
+        body_column = body_column.child(list);
         if shows_select_all || shows_bulk || shows_search {
             body_column = v_flex()
                 .min_w_0()
@@ -15864,6 +15965,24 @@ impl ManagementCenter {
 
     fn render_projection_credential_control(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let surface = self.projection_editor.credential_surface();
+        // A local service authenticates nothing, so its Key field is not shown
+        // at all: an empty box labelled "API Key" on Ollama reads as a
+        // requirement the user has failed rather than one that does not exist.
+        if surface == ProjectionCredentialSurface::ApiKey
+            && self
+                .provider_preset_draft
+                .as_ref()
+                .is_some_and(|preset| preset.no_key)
+        {
+            return management_field_hint(
+                management_locale_text(
+                    "This service runs locally and needs no API key.",
+                    "本地服务，不需要 API Key。",
+                    "本機服務，不需要 API Key。",
+                ),
+                cx,
+            );
+        }
         let auth_state = self
             .projection_editor
             .capability
@@ -16296,6 +16415,10 @@ impl ManagementCenter {
         let Some(preset) = vibex_core::provider_preset(preset_id) else {
             return;
         };
+        self.provider_preset_draft = Some(preset.clone());
+        // A fresh preset starts at its own default addresses, not at whichever
+        // region the previous draft had selected.
+        self.provider_preset_region = None;
         self.profile_name.update(cx, |state, cx| {
             state.set_value(preset.display_name.clone(), window, cx)
         });
@@ -16304,37 +16427,7 @@ impl ManagementCenter {
                 state.set_value(website.to_string(), window, cx)
             });
         }
-        let mut options = self.profile_provider_options.clone();
-        if let Some(wire_api) = preset.default_wire_api() {
-            options = with_provider_option(
-                options,
-                "wireApi",
-                Some(wire_api.wire_protocol_id().to_string()),
-            );
-            self.profile_model_edit_wire_api = Some(wire_api);
-        }
-        // A protocol-specific address is stored the way the projection reads
-        // it, so the preset's own endpoint survives a save and reopen.
-        for (protocol, url) in &preset.endpoints {
-            if let Some(wire_api) =
-                vibex_core::ProviderModelWireApi::from_wire_protocol_id(protocol)
-            {
-                options = with_provider_option(
-                    options,
-                    &wire_api.protocol_base_url_option_key(),
-                    Some(url.clone()),
-                );
-            }
-        }
-        if let Some(url) = preset
-            .default_wire_api()
-            .and_then(|wire_api| preset.endpoint_for(wire_api))
-        {
-            self.profile_base_url
-                .update(cx, |state, cx| state.set_value(url.to_string(), window, cx));
-        }
-        self.profile_provider_options = options;
-        self.rebuild_profile_protocol_base_urls(window, cx);
+        self.apply_preset_endpoints(&preset, window, cx);
         // The preset's models are added as declared entries, which is what a
         // manual add produces too: their capabilities stay empty rather than
         // being guessed from the id.
@@ -16378,6 +16471,82 @@ impl ManagementCenter {
         cx.notify();
     }
 
+    /// Writes a preset's addresses into the draft, protocol by protocol.
+    ///
+    /// The default protocol's address also fills the single request-URL field,
+    /// because that is the one a user reads; the per-protocol options carry the
+    /// rest so the projection reads back exactly what the preset declares.
+    fn apply_preset_endpoints(
+        &mut self,
+        preset: &vibex_core::ProviderPreset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut options = self.profile_provider_options.clone();
+        if let Some(wire_api) = preset.default_wire_api() {
+            options = with_provider_option(
+                options,
+                "wireApi",
+                Some(wire_api.wire_protocol_id().to_string()),
+            );
+            self.profile_model_edit_wire_api = Some(wire_api);
+        }
+        for (protocol, url) in &preset.endpoints {
+            if let Some(wire_api) =
+                vibex_core::ProviderModelWireApi::from_wire_protocol_id(protocol)
+            {
+                options = with_provider_option(
+                    options,
+                    &wire_api.protocol_base_url_option_key(),
+                    Some(url.clone()),
+                );
+            }
+        }
+        if let Some(url) = preset
+            .default_wire_api()
+            .and_then(|wire_api| preset.endpoint_for(wire_api))
+        {
+            self.profile_base_url
+                .update(cx, |state, cx| state.set_value(url.to_string(), window, cx));
+        }
+        self.profile_provider_options = options;
+        self.rebuild_profile_protocol_base_urls(window, cx);
+    }
+
+    /// Switches the draft to one of the preset's regional endpoints.
+    ///
+    /// A region is only a different set of addresses for the same Provider, so
+    /// nothing outside the endpoint fields moves: the name, the models and the
+    /// key hint stay what the preset said.
+    fn apply_provider_preset_region(
+        &mut self,
+        region_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(preset) = self.provider_preset_draft.clone() else {
+            return;
+        };
+        // Resolve against the base preset, never against the already-regional
+        // one: otherwise switching A → B would keep A's addresses for every
+        // protocol B does not override.
+        let regional = preset.with_region(region_id.as_deref());
+        self.apply_preset_endpoints(&regional, window, cx);
+        self.provider_preset_region = region_id.clone();
+        let label = match region_id.as_deref() {
+            Some(region_id) => preset
+                .regions
+                .iter()
+                .find(|region| region.id == region_id)
+                .map(|region| region.display_name.clone())
+                .unwrap_or_else(|| region_id.to_string()),
+            None => management_locale_text("Default", "默认", "預設").to_string(),
+        };
+        self.notice = Some(format!("{}: {label}", preset.display_name));
+        self.navigation.mark_dirty(ManagementSection::Agents, true);
+        cx.notify();
+    }
+
     fn render_profile_identity_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
         // A preset is a starting point, not a mode: it only appears while a new
         // Provider is being created, and editing an existing one never rewrites
@@ -16387,6 +16556,13 @@ impl ManagementCenter {
             let mut row = h_flex().w_full().gap_2().flex_wrap();
             for preset in vibex_core::provider_presets() {
                 let preset_id = preset.id.clone();
+                // A plan's price is a static description of what the user
+                // bought, not a computed amount, and it is the difference
+                // between the plan presets and a vendor's own API.
+                let label = match preset.plan_note.as_deref() {
+                    Some(note) => format!("{} · {note}", preset.display_name),
+                    None => preset.display_name.clone(),
+                };
                 row = row.child(
                     Button::new(SharedString::from(format!(
                         "management-provider-preset-{}",
@@ -16394,7 +16570,7 @@ impl ManagementCenter {
                     )))
                     .xsmall()
                     .outline()
-                    .label(preset.display_name.clone())
+                    .label(SharedString::from(label))
                     .disabled(pending)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.apply_provider_preset(&preset_id, window, cx)
@@ -16412,6 +16588,18 @@ impl ManagementCenter {
                 .child(row)
                 .into_any_element()
         });
+        let preset = self.provider_preset_draft.clone();
+        // "This came from the preset" is recomputed from the value on every
+        // frame rather than recorded when the preset was applied, so typing a
+        // different value removes the marker by itself and restoring the
+        // preset's value brings it back.
+        let name_filled = preset
+            .as_ref()
+            .is_some_and(|preset| preset.display_name == self.profile_name.read(cx).value().trim());
+        let website_filled = preset
+            .as_ref()
+            .and_then(|preset| preset.website.as_deref())
+            .is_some_and(|website| website == self.profile_website_url.read(cx).value().trim());
         profile_editor_section(
             management_locale_text("Basics", "基本信息", "基本資訊"),
             None,
@@ -16419,8 +16607,9 @@ impl ManagementCenter {
                 .w_full()
                 .gap_2p5()
                 .children(preset_row)
-                .child(management_input_field_with_error(
+                .child(management_input_field_marked(
                     management_locale_text("Provider name", "供应商名称", "供應商名稱"),
+                    provider_preset_filled_marker(name_filled),
                     &self.profile_name,
                     false,
                     self.profile_name_error.as_deref(),
@@ -16432,10 +16621,12 @@ impl ManagementCenter {
                     false,
                     cx,
                 ))
-                .child(management_input_field(
+                .child(management_input_field_marked(
                     management_locale_text("Website URL", "官网链接", "官網連結"),
+                    provider_preset_filled_marker(website_filled),
                     &self.profile_website_url,
                     false,
+                    None,
                     cx,
                 ))
                 .into_any_element(),
@@ -16455,7 +16646,102 @@ impl ManagementCenter {
         // per-protocol overrides disappear with it.
         let fixed_endpoint = self.projection_editor.fixed_endpoint().map(str::to_string);
         let credential_control = self.render_projection_credential_control(cx);
+        let preset = self.provider_preset_draft.clone();
+        // A region only swaps addresses, so the preset with the chosen region
+        // already applied is what every endpoint comparison below reads.
+        let regional_preset = preset
+            .as_ref()
+            .map(|preset| preset.with_region(self.provider_preset_region.as_deref()));
         let mut connection_content = v_flex().w_full().gap_2p5().child(credential_control);
+        // A preset that sends the user to a page to create a key says so beside
+        // the field. This is the one Link in the dialog: its target is an
+        // external page, while every actual command is a Button.
+        if let Some(preset) = preset.as_ref()
+            && let Some(url) = preset.keys_url.as_deref()
+        {
+            connection_content = connection_content.child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(management_field_label(management_locale_text(
+                        "Get a key",
+                        "获取 Key",
+                        "取得 Key",
+                    )))
+                    .child(
+                        gpui_component::link::Link::new(SharedString::from(format!(
+                            "provider-preset-keys-{}",
+                            preset.id
+                        )))
+                        .href(url.to_string())
+                        .child(management_locale_text(
+                            "Open the vendor's key page",
+                            "打开厂商的 Key 页面",
+                            "開啟廠商的 Key 頁面",
+                        )),
+                    ),
+            );
+        }
+        // A vendor with several sites (a domestic and an international one, or
+        // two regions) is one preset with several endpoint sets, not several
+        // entries in the preset list: the difference is an address, and the
+        // picker shows that as a choice beside the address it changes.
+        if let Some(preset) = preset.as_ref()
+            && !preset.regions.is_empty()
+        {
+            let mut choices = vec![(
+                None,
+                management_locale_text("Default", "默认", "預設").to_string(),
+            )];
+            choices.extend(
+                preset
+                    .regions
+                    .iter()
+                    .map(|region| (Some(region.id.clone()), region.display_name.clone())),
+            );
+            let current_label = choices
+                .iter()
+                .find(|(id, _)| id == &self.provider_preset_region)
+                .map(|(_, label)| label.clone())
+                .unwrap_or_else(|| management_locale_text("Default", "默认", "預設").to_string());
+            let center = cx.weak_entity();
+            connection_content = connection_content.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(management_field_label(management_locale_text(
+                        "Region", "区域", "區域",
+                    )))
+                    .child(
+                        Button::new("provider-preset-region")
+                            .xsmall()
+                            .outline()
+                            .label(current_label)
+                            .dropdown_menu(move |menu, _, _| {
+                                let mut menu = menu;
+                                for (region_id, label) in &choices {
+                                    let region_id = region_id.clone();
+                                    let center = center.clone();
+                                    menu = menu.item(PopupMenuItem::new(label.clone()).on_click(
+                                        move |_, window, cx| {
+                                            let region_id = region_id.clone();
+                                            let _ = center.update(cx, |this, cx| {
+                                                this.apply_provider_preset_region(
+                                                    region_id, window, cx,
+                                                )
+                                            });
+                                        },
+                                    ));
+                                }
+                                menu
+                            }),
+                    ),
+            );
+        }
         if shows_endpoint {
             let endpoint_label = management_locale_text(
                 "Default API request URL",
@@ -16474,7 +16760,22 @@ impl ManagementCenter {
                     cx,
                 ),
                 None => {
-                    management_input_field(endpoint_label, &self.profile_base_url, false, cx)
+                    let filled = regional_preset.as_ref().is_some_and(|preset| {
+                        preset
+                            .default_wire_api()
+                            .and_then(|wire_api| preset.endpoint_for(wire_api))
+                            .is_some_and(|endpoint| {
+                                endpoint == self.profile_base_url.read(cx).value().trim()
+                            })
+                    });
+                    management_input_field_marked(
+                        endpoint_label,
+                        provider_preset_filled_marker(filled),
+                        &self.profile_base_url,
+                        false,
+                        None,
+                        cx,
+                    )
                 }
             });
         }
@@ -26305,6 +26606,113 @@ fn management_input_field_with_error(
         .child(Form::new().child(Field::new().label(label).child(input)))
         .children(error.map(|message| management_field_error(message.to_string(), cx)))
         .into_any_element()
+}
+
+/// The badge a field wears while it still holds the value its preset supplied.
+///
+/// It is only ever a reading of the draft: the caller compares the current
+/// value with the preset's before asking for it, so the marker disappears the
+/// moment the user changes the field and comes back if the value is restored.
+fn provider_preset_filled_marker(filled: bool) -> Option<&'static str> {
+    filled.then(|| management_locale_text("✓ from preset", "✓ 预设已填", "✓ 預設已填"))
+}
+
+/// A labeled field that also carries its own problem and a preset marker.
+///
+/// The marker sits in the label row, where it reads as a property of the field
+/// rather than of the value underneath it.
+fn management_input_field_marked(
+    label: impl Into<SharedString>,
+    marker: Option<&'static str>,
+    state: &Entity<InputState>,
+    masked: bool,
+    error: Option<&str>,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    let label: SharedString = label.into();
+    let marker_color = cx.theme().success;
+    let mut input = Input::new(state).small().w_full();
+    if masked {
+        input = input.mask_toggle();
+    }
+    if error.is_some() {
+        input = input.border_color(cx.theme().danger);
+    }
+    let field = Form::new().child(match marker {
+        Some(marker) => Field::new()
+            .label_fn(move |_, _| {
+                h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(div().child(label.clone()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(marker_color)
+                            .child(SharedString::from(marker)),
+                    )
+            })
+            .child(input),
+        None => Field::new().label(label).child(input),
+    });
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_1()
+        .child(field)
+        .children(error.map(|message| management_field_error(message.to_string(), cx)))
+        .into_any_element()
+}
+
+/// The sentence a preset caveat shows, in the active locale.
+///
+/// The preset data carries the kind of caveat, not the sentence: the same
+/// limitation has to read in every locale the app serves.
+fn provider_preset_caveat_text(caveat: vibex_core::ProviderPresetCaveat) -> &'static str {
+    use vibex_core::ProviderPresetCaveat::{
+        FreeTierNeedsClient, ModelListExcludesPlan, ProtocolPerModel,
+    };
+    match caveat {
+        FreeTierNeedsClient => management_locale_text(
+            "Free models only work inside the vendor's own client; only paid models are listed here.",
+            "免费模型只能在厂商自己的客户端里使用，这里只列出付费模型。",
+            "免費模型只能在廠商自己的用戶端裡使用，這裡只列出付費模型。",
+        ),
+        ModelListExcludesPlan => management_locale_text(
+            "Plan models are not in the vendor's model list; these come from the plan description.",
+            "套餐内的模型不在厂商的模型列表里，以下来自套餐说明。",
+            "套餐內的模型不在廠商的模型清單裡，以下來自套餐說明。",
+        ),
+        ProtocolPerModel => management_locale_text(
+            "Claude models use the Anthropic API; other models use the OpenAI APIs.",
+            "Claude 模型使用 Anthropic 接口，其他模型使用 OpenAI 系接口。",
+            "Claude 模型使用 Anthropic 介面，其他模型使用 OpenAI 系介面。",
+        ),
+    }
+}
+
+/// The Model entries a preset wants for one fetched catalogue.
+///
+/// `offered_models` decides which ids belong to the plan and supplies the plan
+/// list when the vendor's answer cannot; the protocol comes from the preset so
+/// a Claude-only preset's models are stored with the Anthropic protocol rather
+/// than inferred when they are called. An empty `fetched` list therefore means
+/// "the vendor could not answer", which is exactly the fallback case.
+fn configured_models_from_preset(
+    preset: &vibex_core::ProviderPreset,
+    fetched: &[String],
+) -> Vec<vibex_core::ProviderConfiguredModel> {
+    preset
+        .offered_models(fetched)
+        .into_iter()
+        .map(|id| vibex_core::ProviderConfiguredModel {
+            id,
+            display_name: None,
+            enabled: true,
+            wire_api: preset.default_wire_api(),
+            capabilities: Default::default(),
+        })
+        .collect()
 }
 
 /// A labeled read-only field for a value the Agent owns. It mirrors
