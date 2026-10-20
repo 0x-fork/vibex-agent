@@ -5094,6 +5094,37 @@ ProviderConfigService::{
   confirmed before it runs, and the wording names both the seven-day window and
   what the records never contained (prompt, reply, key, image content), so it
   cannot be read as clearing usage history.
+- **The ledger explains the route, not only the outcome.** A row carries a
+  versioned trace (`gatewayRouteTrace` payload v1) naming the Keys the router set
+  aside because they were cooling or over their ceiling, and the Keys it tried
+  before one answered, each with its failure kind. It holds ids and kinds only, so
+  it still carries no prompt, reply, or Key material. A payload the reader cannot
+  interpret — an older or newer version, or a corrupt blob — reads as *no trace*
+  rather than failing the list: the ledger is a diagnostic, and one unreadable
+  annotation must not hide every other request.
+- **A failover is an attempt that failed, not a pool that had more than one Key.**
+  The outcome follows the recorded attempts. A request served on the first try
+  from a Provider holding five Keys is `ok`; labelling it `failover` made the
+  column useless exactly where it mattered.
+- **A created Provider is verified by one real minimal request, and the check
+  cannot undo it.** The save writes the row first and probes it afterwards, so a
+  blocked probe — a proxy, a rate limit, a vendor that refuses this client — is
+  reported as a failed check rather than rolled back into a Provider that does not
+  exist. Updates are not re-verified; that Provider already has an answer.
+- **Creating a Provider starts by choosing a preset.** The picker groups vendors,
+  local services, and third-party plans, and its filter matches the id, the
+  display name, and the address, because those are the three things a user
+  remembers about a vendor. Plan rows carry the vendor's own price copy; plan
+  limits are marked in the list and stated in full only once the preset is
+  chosen. "Custom provider" sits at the foot of the list and resets the draft the
+  way a fresh dialog does, so a preset that was looked at and left behind cannot
+  leave its addresses in a form the user asked to start empty.
+- **The composer's model menu leads with the model the user already chose.** The
+  remembered selections — most-recent-last, already capped — break ties inside a
+  group after stars; a search term outranks both, so recency never displaces a
+  better match. An empty search echoes the term back and names the two things
+  that produce a match, because from inside a filtered panel a missing Provider
+  and a typo look identical.
 
 ### 4. Validation & Error Matrix
 
@@ -5146,9 +5177,18 @@ ProviderConfigService::{
 - `cargo test -p vibex-config-switch gateway` asserts one hidden Profile per
   Agent, that it stays out of the visible list, that the address follows the
   listener, and that a no-op refresh does not churn the binding.
-- `cargo test -p vibex-db model_gateway` asserts migration 64 idempotency,
-  revision compare-and-swap, window bucketing, pin expiry, ledger retention, and
-  that no prompt or Key text reaches the ledger.
+- `cargo test -p vibex-db model_gateway` asserts migration 64 and 65
+  idempotency, revision compare-and-swap, window bucketing, pin expiry, ledger
+  retention, that the route trace round-trips, that an unreadable trace reads as
+  absent instead of failing the list, and that no prompt or Key text reaches the
+  ledger.
+- `cargo test -p vibex-model-gateway --test gateway` asserts the route trace
+  against a real upstream: a cooling Key is counted, a refused Key is named with
+  its failure kind on the row that records the Key that answered instead, and a
+  first-try success on a multi-Key Provider is not labelled a failover.
+- `cargo test -p vibex-core model_gateway` asserts a request summary names the
+  Provider and each Key in its route, drops a trace that says nothing, and keeps
+  the id of a Key that has since been removed.
 - `cargo test -p vibex-model-gateway --test gateway` asserts that three
   unreachable requests degrade the gateway, that a degraded gateway refuses with
   `503` instead of retrying, and that the state is reported with a reason.
@@ -5167,8 +5207,14 @@ ProviderConfigService::{
   shared Provider appears once with every binding Agent named, that a deleted
   binding drops out of that list, that a cooldown names its remaining time, that
   moving an upstream swaps only one neighbour, that every caveat the preset table
-  declares has copy, and that the preset and ledger paths stay wired to their
-  surfaces.
+  declares has copy, that every failure kind has human copy in every locale, that
+  the ledger row opens its route and that the route line names the Key that
+  answered and the one it stepped over, that the preset picker groups and filters
+  its library, and that the preset, verification, and ledger paths stay wired to
+  their surfaces.
+- `cargo test -p vibex-desktop --lib a_remembered_model_floats_to_the_top_of_its_group`
+  asserts the composer's model menu leads with a remembered model and that a
+  search term still outranks recency.
 - `cargo test -p vibex-core provider_presets` asserts every preset is addressable
   by its own id and that a plan preset's model list survives a vendor answer that
   omits it.
