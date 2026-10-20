@@ -1828,6 +1828,98 @@ impl ProviderConfigService {
         Ok(created)
     }
 
+    /// Gives one Agent its own Profile for a Provider another Agent already has.
+    ///
+    /// This is what the global Providers page offers as "use this Provider for
+    /// another Agent". It copies rather than shares, because an Agent's provider
+    /// is projected through its own legacy Profile: the protocol pin, the ACP
+    /// config and the launch revision all belong to that row. Sharing the *v2*
+    /// record is what makes the Keys and endpoints common; the legacy rows stay
+    /// per-Agent so each Agent can launch with its own protocol.
+    ///
+    /// The copy keeps the source's Keys by reference, so rotating a Key on the
+    /// shared Provider still reaches every Agent that uses it.
+    pub fn bind_provider_to_agent(
+        &self,
+        request: vibex_core::AgentModelProviderBindRequest,
+    ) -> VibexResult<ProviderProfile> {
+        require_agent_definition(&request.agent_id)?;
+        let conn = self.open_connection()?;
+        let source = ProviderProfileRepository::get(&conn, &request.provider_profile_id)?
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "provider_profile_not_found",
+                    "provider profile was not found",
+                )
+                .with_diagnostic("providerProfileId", request.provider_profile_id.as_str())
+            })?;
+        if source.agent_id == request.agent_id {
+            return Err(VibexError::validation(
+                "agent_model_provider_binding_same_agent",
+                "the Provider already belongs to this Agent",
+            )
+            .with_diagnostic("agentId", request.agent_id.as_str()));
+        }
+        // The copy has to be launchable by the target Agent. Its protocol comes
+        // from the source, and an interface the target cannot speak would fail
+        // deep inside the projection instead of here.
+        validate_agent_model_interfaces(
+            &request.agent_id,
+            &source.configured_models,
+            Some(&source.provider_options),
+        )?;
+        let now = unix_timestamp_ms();
+        let id = ProviderProfileId::new();
+        let mut bound = ProviderProfile {
+            id: id.clone(),
+            agent_id: request.agent_id.clone(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+            secrets: Vec::new(),
+            ..source.clone()
+        };
+        // The copy owns its own secret rows: two Profiles must never share a
+        // secret id, or deleting one Key would remove it from both.
+        bound.secrets = source
+            .secrets
+            .iter()
+            .map(|secret| vibex_core::ProviderSecretReference {
+                id: RequestId::new(),
+                provider_profile_id: id.clone(),
+                created_at_ms: now,
+                updated_at_ms: now,
+                ..secret.clone()
+            })
+            .collect();
+        ProviderProfileRepository::insert(&conn, &bound)?;
+        let created = ProviderProfileRepository::get(&conn, &bound.id)?.ok_or_else(|| {
+            VibexError::storage(
+                "agent_model_provider_bind_readback_failed",
+                "failed to read the Provider after binding it to the Agent",
+            )
+        })?;
+        self.sync_legacy_projection(&conn, &created)?;
+        // The new Profile becomes the Agent's default only when the caller asked
+        // for it; binding a second Provider to an Agent should not silently take
+        // over from the one already in use.
+        if request.make_default {
+            self.set_agent_model_provider_default(
+                vibex_core::AgentModelProviderSetDefaultRequest {
+                    scope: vibex_core::ProviderProfileDefaultScope {
+                        kind: vibex_core::ProviderDefaultScopeKind::Global,
+                        project_id: None,
+                        workspace_id: None,
+                    },
+                    agent_id: request.agent_id.clone(),
+                    provider_profile_id: created.id.clone(),
+                },
+            )?;
+        }
+        self.notify_profile_saved(&created);
+        Ok(created)
+    }
+
     pub fn delete_profile(&self, request: ProviderProfileDeleteRequest) -> VibexResult<()> {
         if is_local_default_profile(&request.provider_profile_id) {
             return Err(VibexError::validation(

@@ -4716,6 +4716,33 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn bind_agent_model_provider(
+        &self,
+        request: MutationRequest<vibex_core::AgentModelProviderBindRequest>,
+    ) -> BackendFuture<'_, vibex_core::ProviderProfile> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::BindAgentModelProvider(
+                vibex_core::RemoteAgentModelProviderBindRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentModelProviderBindResponse>(value)?.profile)
+        })
+    }
+
     fn agent_model_provider_display_order(
         &self,
         request: vibex_core::AgentModelProviderDisplayOrderListRequest,

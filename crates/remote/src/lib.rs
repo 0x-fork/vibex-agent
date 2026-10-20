@@ -3133,6 +3133,32 @@ async fn dispatch_provider_request(
             serde_json::to_value(vibex_core::RemoteAgentModelProviderBindingResponse { binding })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::BindAgentModelProvider(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let subject = format!(
+                "agent_model_provider_binding:{}",
+                request.request.agent_id.as_str()
+            );
+            let result = service.bind_provider_to_agent(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                subject,
+                "Agent model provider bound to an Agent from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let profile = result?;
+            serde_json::to_value(vibex_core::RemoteAgentModelProviderBindResponse { profile })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::DeleteAgentModelProviderProfile(request) => {
             let auth = authorize_provider_action(
                 runtime,

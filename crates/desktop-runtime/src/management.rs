@@ -478,6 +478,15 @@ impl ProviderManagementFacade {
         self.service.duplicate_profile(request)
     }
 
+    /// Gives one Agent its own Profile for a Provider another Agent holds.
+    pub fn bind_provider_to_agent(
+        &self,
+        request: vibex_core::AgentModelProviderBindRequest,
+    ) -> VibexResult<vibex_core::ProviderProfile> {
+        let _claim = self.mutation_guard.claim("provider:profile:bind")?;
+        self.service.bind_provider_to_agent(request)
+    }
+
     pub fn delete_profile(
         &self,
         request: vibex_core::ProviderProfileDeleteRequest,

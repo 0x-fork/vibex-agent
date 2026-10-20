@@ -327,6 +327,12 @@ pub trait ManagementBackend: BackendBound {
         request: MutationRequest<AgentModelProviderProfileDeleteRequest>,
     ) -> BackendFuture<'_, ()>;
 
+    /// Gives one Agent its own Profile for a Provider another Agent holds.
+    fn bind_agent_model_provider(
+        &self,
+        request: MutationRequest<vibex_core::AgentModelProviderBindRequest>,
+    ) -> BackendFuture<'_, vibex_core::ProviderProfile>;
+
     fn agent_model_provider_display_order(
         &self,
         request: AgentModelProviderDisplayOrderListRequest,

@@ -1513,6 +1513,13 @@ mod tests {
             error_future()
         }
 
+        fn bind_agent_model_provider(
+            &self,
+            _request: MutationRequest<vibex_core::AgentModelProviderBindRequest>,
+        ) -> BackendFuture<'_, vibex_core::ProviderProfile> {
+            error_future()
+        }
+
         fn agent_model_provider_display_order(
             &self,
             _request: AgentModelProviderDisplayOrderListRequest,

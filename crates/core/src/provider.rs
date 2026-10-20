@@ -2002,6 +2002,24 @@ pub struct AgentModelProviderDefaultRequest {
     pub agent_id: AgentId,
 }
 
+/// Points one Agent at a Provider another Agent already holds.
+///
+/// The work is a copy of the source Profile into a new one owned by
+/// `agent_id`: an Agent's provider is projected through its own legacy row, so
+/// the protocol pin and the launch revision cannot be shared. What the copy
+/// keeps from the source is the address, the models and the Key references,
+/// which is what makes "one Provider for several Agents" hold in practice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelProviderBindRequest {
+    pub provider_profile_id: ProviderProfileId,
+    pub agent_id: AgentId,
+    /// Make the copy the Agent's default. Off by default, so binding a second
+    /// Provider does not silently take over from the one in use.
+    #[serde(default)]
+    pub make_default: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentModelProviderSetDefaultRequest {

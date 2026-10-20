@@ -1055,3 +1055,297 @@ mod credential_tests {
         let _ = std::fs::remove_file(path);
     }
 }
+
+#[cfg(test)]
+mod legacy_mirror_tests {
+    use super::*;
+
+    fn service() -> (std::path::PathBuf, ProviderConfigService) {
+        let path = std::env::temp_dir().join(format!(
+            "vibex-legacy-mirror-{}.db",
+            vibex_core::RequestId::new().as_str()
+        ));
+        let service = ProviderConfigService::new(&path);
+        (path, service)
+    }
+
+    /// A legacy Profile with no ACP config: Claude's kind, so the projection
+    /// accepts it without the typed ACP contract an `Acp` Profile requires.
+    fn legacy_profile(service: &ProviderConfigService) -> ProviderProfileId {
+        service
+            .create_profile(vibex_core::ProviderProfileCreateRequest {
+                agent_id: Some(vibex_core::AgentId::parse("claude").unwrap()),
+                kind: ProviderKind::Claude,
+                display_name: "Mirror Probe".to_string(),
+                account_alias: None,
+                base_url: Some("https://api.example.invalid".to_string()),
+                default_model: Some("m1".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: vec![vibex_core::ProviderConfiguredModel {
+                    id: "m1".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    wire_api: Some(vibex_core::ProviderModelWireApi::AnthropicMessages),
+                    capabilities: Default::default(),
+                }],
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: Some(vibex_core::ProviderOptions {
+                    schema_version: 1,
+                    entries: vec![vibex_core::ProviderBindingMetadata {
+                        key: "wireApi".to_string(),
+                        value: "anthropic_messages".to_string(),
+                    }],
+                }),
+                secret_references: Vec::new(),
+            })
+            .unwrap()
+            .id
+    }
+
+    fn shared(
+        service: &ProviderConfigService,
+        legacy: &ProviderProfileId,
+    ) -> vibex_core::ModelProviderProfile {
+        service
+            .list_model_provider_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.legacy_provider_profile_id.as_ref() == Some(legacy))
+            .expect("a legacy create projects a shared Profile")
+    }
+
+    /// The regression this module exists for: a Key added through v2 must not
+    /// vanish when the same Provider is next written through v1.
+    #[test]
+    fn a_v2_key_survives_a_later_v1_write() {
+        let (path, service) = service();
+        let legacy_id = legacy_profile(&service);
+        let profile = shared(&service, &legacy_id);
+
+        service
+            .add_model_provider_credential(vibex_core::AddModelProviderCredentialRequest {
+                model_provider_profile_id: profile.id.clone(),
+                display_name: Some("Primary".to_string()),
+                value: "sk-mirror-value".to_string(),
+            })
+            .unwrap();
+
+        // The legacy row is what the launch path resolves a Key from.
+        let mirrored = service.get_profile(&legacy_id).unwrap().unwrap();
+        assert_eq!(
+            mirrored.secrets.len(),
+            1,
+            "a v2 Key must reach the legacy secret table"
+        );
+
+        service
+            .update_profile(vibex_core::ProviderProfileUpdateRequest {
+                provider_profile_id: legacy_id.clone(),
+                display_name: Some("Renamed from the Agent page".to_string()),
+                status: None,
+                account_alias: None,
+                base_url: None,
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: None,
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+            })
+            .unwrap();
+
+        let after = service
+            .list_model_provider_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == profile.id)
+            .unwrap();
+        assert_eq!(
+            after.credentials.len(),
+            1,
+            "a v1 write dropped the Key the v2 API added"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A rename and a status change made on the global page must reach the
+    /// record the launch path reads, and must not be undone by a v1 write.
+    #[test]
+    fn a_v2_rename_and_status_reach_the_legacy_record() {
+        let (path, service) = service();
+        let legacy_id = legacy_profile(&service);
+        let profile = shared(&service, &legacy_id);
+
+        let mut next = profile.clone();
+        next.display_name = "Renamed on the global page".to_string();
+        next.status = vibex_core::ModelProviderProfileStatus::Disabled;
+        service
+            .update_model_provider_profile(vibex_core::ModelProviderProfileUpdateRequest {
+                profile: next,
+                expected_revision: profile.revision,
+            })
+            .unwrap();
+
+        let mirrored = service.get_profile(&legacy_id).unwrap().unwrap();
+        assert_eq!(mirrored.display_name, "Renamed on the global page");
+        assert_eq!(mirrored.status, ProviderProfileStatus::Disabled);
+
+        // A v1 write restates the same values, so the name survives it rather
+        // than snapping back to whatever v1 last held.
+        service
+            .update_profile(vibex_core::ProviderProfileUpdateRequest {
+                provider_profile_id: legacy_id.clone(),
+                display_name: None,
+                status: None,
+                account_alias: None,
+                base_url: Some("https://moved.example.invalid".to_string()),
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: None,
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+            })
+            .unwrap();
+        let after = service.get_profile(&legacy_id).unwrap().unwrap();
+        assert_eq!(after.display_name, "Renamed on the global page");
+        assert_eq!(after.status, ProviderProfileStatus::Disabled);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The projection must not strip what v2 cannot express. The protocol pin
+    /// and the ACP config live only in `provider_options`, and losing them
+    /// would silently re-point the Agent at the wrong API.
+    #[test]
+    fn the_projection_keeps_the_options_v2_cannot_express() {
+        let (path, service) = service();
+        let legacy_id = legacy_profile(&service);
+        let profile = shared(&service, &legacy_id);
+
+        let mut next = profile.clone();
+        next.display_name = "Only the name moves".to_string();
+        service
+            .update_model_provider_profile(vibex_core::ModelProviderProfileUpdateRequest {
+                profile: next,
+                expected_revision: profile.revision,
+            })
+            .unwrap();
+
+        let mirrored = service.get_profile(&legacy_id).unwrap().unwrap();
+        assert_eq!(
+            provider_option_value(&mirrored.provider_options, "wireApi").as_deref(),
+            Some("anthropic_messages"),
+            "the protocol pin was lost"
+        );
+        // And the Models keep their declared protocol rather than reverting to
+        // "inherit", which the projection would read as the Provider default.
+        assert_eq!(
+            mirrored.configured_models[0].wire_api,
+            Some(vibex_core::ProviderModelWireApi::AnthropicMessages)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod bind_to_agent_tests {
+    use super::*;
+
+    fn service() -> (std::path::PathBuf, ProviderConfigService) {
+        let path = std::env::temp_dir().join(format!(
+            "vibex-bind-agent-{}.db",
+            vibex_core::RequestId::new().as_str()
+        ));
+        let service = ProviderConfigService::new(&path);
+        (path, service)
+    }
+
+    fn profile(service: &ProviderConfigService, agent: &str) -> ProviderProfile {
+        service
+            .create_profile(vibex_core::ProviderProfileCreateRequest {
+                agent_id: Some(vibex_core::AgentId::parse(agent).unwrap()),
+                kind: ProviderKind::Claude,
+                display_name: format!("Shared for {agent}"),
+                account_alias: None,
+                base_url: Some("https://api.example.invalid".to_string()),
+                default_model: Some("m1".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: vec![vibex_core::ProviderConfiguredModel {
+                    id: "m1".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    wire_api: Some(vibex_core::ProviderModelWireApi::AnthropicMessages),
+                    capabilities: Default::default(),
+                }],
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+                secret_references: Vec::new(),
+            })
+            .unwrap()
+    }
+
+    /// One Provider reaches a second Agent without re-entering its address,
+    /// protocol or Key, and each Agent keeps its own launch row.
+    #[test]
+    fn a_provider_can_be_given_to_a_second_agent() {
+        let (path, service) = service();
+        let source = profile(&service, "claude");
+        assert_eq!(source.agent_id.as_str(), "claude");
+
+        let bound = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: source.id.clone(),
+                agent_id: vibex_core::AgentId::parse("deepseek-harness").unwrap(),
+                make_default: false,
+            })
+            .unwrap();
+
+        assert_eq!(bound.agent_id.as_str(), "deepseek-harness");
+        assert_ne!(bound.id, source.id, "the copy must be its own Profile");
+        assert_eq!(bound.base_url, source.base_url);
+        assert_eq!(
+            bound.configured_models.len(),
+            source.configured_models.len()
+        );
+        // The two rows keep independent identities, which is what lets each
+        // Agent launch with its own protocol.
+        assert!(bound.secrets.iter().all(|bound_secret| {
+            source
+                .secrets
+                .iter()
+                .all(|source_secret| source_secret.id != bound_secret.id)
+        }));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Binding the Provider an Agent already holds is refused rather than
+    /// silently creating a duplicate row for the same Agent.
+    #[test]
+    fn binding_a_provider_to_its_own_agent_is_refused() {
+        let (path, service) = service();
+        let source = profile(&service, "claude");
+        let error = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: source.id.clone(),
+                agent_id: vibex_core::AgentId::parse("claude").unwrap(),
+                make_default: false,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "agent_model_provider_binding_same_agent");
+        let _ = std::fs::remove_file(path);
+    }
+}

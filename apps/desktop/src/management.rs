@@ -703,6 +703,7 @@ enum ManagementMutation {
     ProfileCreate,
     ProfileUpdate(String),
     ProfileDelete(String),
+    ProviderBind(String),
     AcpConfig(String),
     ProviderProbe(String),
     AgentAuth { agent_id: String, action: String },
@@ -849,6 +850,7 @@ impl ManagementMutation {
             Self::ProfileCreate => "profile:create".into(),
             Self::ProfileUpdate(id) => format!("profile:update:{id}"),
             Self::ProfileDelete(id) => format!("profile:delete:{id}"),
+            Self::ProviderBind(id) => format!("provider:bind:{id}"),
             Self::AcpConfig(id) => format!("provider:acp-config:{id}"),
             Self::ProviderProbe(id) => format!("provider:probe:{id}"),
             Self::AgentAuth { agent_id, action } => format!("agent:auth:{agent_id}:{action}"),
@@ -11664,6 +11666,98 @@ impl ManagementCenter {
             cx,
         ));
 
+        // The other half of "used by": letting a further Agent use it. Without
+        // this the page could only report the sharing, and the user had to go
+        // to the Agent's own page and re-enter the address, the protocol and
+        // the Key to get the same Provider there.
+        //
+        // An Agent that already has it is not offered again, and one that
+        // manages its own provider cannot be pointed at this one at all.
+        let configurable = vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
+        let bindable = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+            .filter(|agent| configurable.contains(&agent.id))
+            .filter(|agent| !row.agents.contains(agent.id.as_str()))
+            .map(|agent| (agent.id.clone(), agent.label.clone()))
+            .collect::<Vec<_>>();
+        // The copy is made from the legacy Profile that owns this shared
+        // record: that is the shape carrying the protocol pin and the ACP
+        // config an Agent needs to launch. A shared Provider created outside
+        // that layer has no such row, so it offers nothing to copy.
+        let bind_profile = profile.legacy_provider_profile_id.clone();
+        let bindable = match &bind_profile {
+            Some(_) => bindable,
+            None => Vec::new(),
+        };
+        let bind_count = bindable.len();
+        let mut bind_rows = v_flex().w_full().gap_1();
+        for (agent_id, label) in bindable {
+            let bind_agent = agent_id.clone();
+            let Some(bind_profile) = bind_profile.clone() else {
+                continue;
+            };
+            bind_rows = bind_rows.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .py_1()
+                    .child(div().min_w_0().truncate().text_sm().child(label))
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-provider-bind-{}",
+                            agent_id.as_str()
+                        )))
+                        .xsmall()
+                        .outline()
+                        .label(management_locale_text(
+                            "Use for this Agent",
+                            "让此 Agent 使用",
+                            "讓此 Agent 使用",
+                        ))
+                        .disabled(self.mutation.is_some())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.bind_provider_to_agent(
+                                bind_agent.clone(),
+                                bind_profile.clone(),
+                                cx,
+                            )
+                        })),
+                    ),
+            );
+        }
+        if bind_count == 0 {
+            bind_rows = bind_rows.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Every Agent that can use a Provider already uses this one.",
+                        "所有能使用供应商的 Agent 都已经在使用该供应商。",
+                        "所有能使用供應商的 Agent 都已經在使用該供應商。",
+                    )),
+            );
+        }
+        body = body.child(management_card_with_icon(
+            management_locale_text(
+                "Use for another Agent",
+                "让其他 Agent 使用",
+                "讓其他 Agent 使用",
+            ),
+            management_locale_text(
+                "Each Agent keeps its own protocol and launch settings; the address, the models and the keys come from this Provider.",
+                "每个 Agent 保留自己的协议与启动设置；地址、模型和 Key 来自该供应商。",
+                "每個 Agent 保留自己的協定與啟動設定；位址、模型和 Key 來自該供應商。",
+            ),
+            "icons/vibex/file-plus.svg",
+            bind_rows.into_any_element(),
+            cx,
+        ));
+
         v_flex()
             .id("management-provider-page")
             .w_full()
@@ -11671,6 +11765,67 @@ impl ManagementCenter {
             .gap_3()
             .child(body)
             .into_any_element()
+    }
+
+    /// Gives another Agent its own Profile for this Provider.
+    ///
+    /// The copy is what the Agent page can then edit: its protocol pin, its
+    /// ACP config and its launch revision are per-Agent, so a shared Provider
+    /// is shared through the Keys and the address, not through one launch
+    /// contract. The new Profile becomes the Agent's default, because choosing
+    /// "use this Provider for this Agent" is the whole gesture.
+    fn bind_provider_to_agent(
+        &mut self,
+        agent_id: vibex_core::AgentId,
+        profile_id: vibex_core::ProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let active_locale = locale::current_locale();
+        self.mutation = Some(ManagementMutation::ProviderBind(
+            agent_id.as_str().to_string(),
+        ));
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .bind_agent_model_provider(vibex_backend::MutationRequest::new(
+                    vibex_core::AgentModelProviderBindRequest {
+                        provider_profile_id: profile_id,
+                        agent_id: agent_id.clone(),
+                        make_default: true,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(profile) => {
+                        this.notice = Some(format!(
+                            "{} · {}",
+                            management_locale_text_for(
+                                active_locale,
+                                "Provider now used by",
+                                "该供应商现在也用于",
+                                "該供應商現在也用於",
+                            ),
+                            profile.agent_id.as_str()
+                        ));
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
     }
 
     /// One shared Provider's header: name, status, and the facts that decide
@@ -20743,11 +20898,25 @@ impl ManagementCenter {
                 .child(self.render_agent_authentication(window, cx))
                 .into_any_element();
         }
+        // The binding list decides which Providers this Agent has, and the
+        // legacy Profile is the handle its controls address. Falling back to
+        // the `agent_id` filter when the authority reports no bindings keeps
+        // an older runtime usable instead of showing an empty card.
+        let bound_agent_id = vibex_core::AgentId::parse(selected_agent_id.clone()).ok();
+        let bound_profile_ids = match (&bound_agent_id, self.provider_bindings.is_empty()) {
+            (Some(agent_id), false) => {
+                Some(agent_bound_profile_ids(agent_id, &self.provider_bindings))
+            }
+            _ => None,
+        };
         let mut profiles = self
             .snapshot
             .profiles
             .iter()
-            .filter(|profile| profile.agent_id == selected_agent_id)
+            .filter(|profile| match &bound_profile_ids {
+                Some(ids) => ids.contains(&profile.id),
+                None => profile.agent_id == selected_agent_id,
+            })
             .cloned()
             .collect::<Vec<_>>();
         profiles.sort_by_key(|profile| {
@@ -26472,6 +26641,33 @@ fn shared_provider_rows(
             .then(left.profile.id.as_str().cmp(right.profile.id.as_str()))
     });
     rows
+}
+
+/// The legacy Provider ids one Agent's bindings point at.
+///
+/// The Agent page used to derive its Provider rows by filtering the legacy
+/// Profile list on `agent_id`. That is the shape the binding replaced: the same
+/// upstream bound to three Agents is three legacy Profiles, and a binding is
+/// what says which of them this Agent actually selected.
+///
+/// The ids rather than the records are returned because the page renders the
+/// display-safe projection, which carries no Provider options or Secrets. The
+/// binding decides *which* rows appear; the legacy id stays the handle every
+/// control on the card addresses.
+///
+/// A binding whose legacy Profile is missing is skipped rather than
+/// synthesised: a Profile the authority does not list is one this client cannot
+/// edit, and a row that cannot be opened is a dead end.
+fn agent_bound_profile_ids(
+    agent_id: &vibex_core::AgentId,
+    bindings: &[vibex_core::AgentModelProviderBinding],
+) -> BTreeSet<String> {
+    bindings
+        .iter()
+        .filter(|binding| binding.deleted_at_ms.is_none() && &binding.agent_id == agent_id)
+        .filter_map(|binding| binding.legacy_provider_profile_id.as_ref())
+        .map(|profile_id| profile_id.as_str().to_string())
+        .collect()
 }
 
 /// Why a Key did not serve a reply, in words.
@@ -35848,6 +36044,49 @@ mod gateway_surface_tests {
                 );
             }
         }
+    }
+
+    /// The Agent page lists the Providers its bindings name, not every legacy
+    /// Profile that happens to carry its `agent_id`.
+    ///
+    /// The two disagree exactly when a binding was removed but the legacy
+    /// Profile still exists, which is the state a half-finished migration
+    /// leaves behind.
+    #[test]
+    fn an_agents_providers_come_from_its_bindings() {
+        use vibex_core::{
+            AgentId, AgentModelProviderBinding, AgentModelProviderBindingId, AgentRuntimeProfileId,
+            ModelProviderProfileId, ProviderProfileId,
+        };
+
+        let agent = AgentId::parse("claude").unwrap();
+        let bound = ProviderProfileId::parse("provider_bound").unwrap();
+        let unbound = ProviderProfileId::parse("provider_unbound").unwrap();
+        let binding = AgentModelProviderBinding {
+            id: AgentModelProviderBindingId::new(),
+            legacy_provider_profile_id: Some(bound.clone()),
+            agent_id: agent.clone(),
+            runtime_profile_id: AgentRuntimeProfileId::new(),
+            model_provider_profile_id: ModelProviderProfileId::new(),
+            deleted_at_ms: None,
+            ..AgentModelProviderBinding::default()
+        };
+        let deleted = AgentModelProviderBinding {
+            legacy_provider_profile_id: Some(unbound.clone()),
+            deleted_at_ms: Some(1),
+            ..binding.clone()
+        };
+        // A binding for another Agent must not leak into this one's list.
+        let other_agent = AgentModelProviderBinding {
+            agent_id: AgentId::parse("codex").unwrap(),
+            legacy_provider_profile_id: Some(unbound.clone()),
+            ..binding.clone()
+        };
+
+        let ids = agent_bound_profile_ids(&agent, &[binding, deleted, other_agent]);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(bound.as_str()));
+        assert!(!ids.contains(unbound.as_str()));
     }
 
     /// The "from preset" marker reads the value, so it cannot outlive an edit.

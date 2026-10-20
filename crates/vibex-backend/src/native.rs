@@ -3454,6 +3454,23 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn bind_agent_model_provider(
+        &self,
+        request: MutationRequest<vibex_core::AgentModelProviderBindRequest>,
+    ) -> BackendFuture<'_, vibex_core::ProviderProfile> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .bind_provider_to_agent(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
     fn agent_model_provider_display_order(
         &self,
         request: AgentModelProviderDisplayOrderListRequest,

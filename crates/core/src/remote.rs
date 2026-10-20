@@ -2310,6 +2310,7 @@ pub enum RemoteProviderOperationKind {
     MutateProviderCredentialSecret,
     SetAgentModelProviderDefault,
     DeleteAgentModelProviderProfile,
+    BindAgentModelProvider,
     CreateAgentModelProviderProfile,
     UpdateAgentModelProviderProfile,
     MutateAgentModelProviderProfileSecret,
@@ -3707,6 +3708,19 @@ pub struct RemoteAgentModelProviderProfileDeleteResponse {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderBindRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::provider::AgentModelProviderBindRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderBindResponse {
+    pub profile: ProviderProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteAgentModelProviderDisplayOrderGetResponse {
     pub order: crate::AgentModelProviderDisplayOrderListResponse,
 }
@@ -3781,6 +3795,7 @@ pub enum RemoteProviderRequest {
     MutateProviderCredentialSecret(RemoteProviderCredentialSecretMutationRequest),
     SetAgentModelProviderDefault(RemoteAgentModelProviderDefaultRequest),
     DeleteAgentModelProviderProfile(RemoteAgentModelProviderProfileDeleteRequest),
+    BindAgentModelProvider(RemoteAgentModelProviderBindRequest),
     CreateAgentModelProviderProfile(RemoteAgentModelProviderProfileCreateRequest),
     UpdateAgentModelProviderProfile(RemoteAgentModelProviderProfileUpdateRequest),
     MutateAgentModelProviderProfileSecret(RemoteAgentModelProviderProfileSecretMutationRequest),
@@ -3960,6 +3975,7 @@ impl RemoteProviderRequest {
             Self::DeleteAgentModelProviderProfile(_) => {
                 RemoteProviderOperationKind::DeleteAgentModelProviderProfile
             }
+            Self::BindAgentModelProvider(_) => RemoteProviderOperationKind::BindAgentModelProvider,
             Self::CreateAgentModelProviderProfile(_) => {
                 RemoteProviderOperationKind::CreateAgentModelProviderProfile
             }

@@ -23,9 +23,9 @@ use vibex_core::{
 };
 
 use super::{
-    AgentManagedInstallationRepository, ProviderSecretReferenceRepository, enum_from_db_sql,
-    enum_to_db, json_from_db_sql, json_to_db, map_provider_profile_without_secrets, parse_id_sql,
-    storage_err,
+    AgentManagedInstallationRepository, ProviderProfileRepository,
+    ProviderSecretReferenceRepository, enum_from_db_sql, enum_to_db, json_from_db_sql, json_to_db,
+    map_provider_profile_without_secrets, parse_id_sql, storage_err,
 };
 
 const LEGACY_ACP_CONFIG_OPTION_KEY: &str = "acp.config.v1";
@@ -632,6 +632,58 @@ impl ProviderProjectionCompatibilityRepository {
         })
     }
 
+    /// Projects one shared Provider Profile back onto its legacy Profile row.
+    ///
+    /// The compatibility layer is the only thing that made v1 and v2 agree, and it
+    /// runs one way: a v1 write becomes a v2 row. Without the reverse, a Key added
+    /// on the global Providers page exists only in the v2 record, and the next v1
+    /// write on the same Provider rebuilds `credentials` from the v1 secret table
+    /// and drops it.
+    ///
+    /// The reverse therefore writes only what both shapes share, plus the one thing
+    /// the launch path resolves from v1: the Key list. `provider_options` is left
+    /// exactly as it is, because it carries the ACP config, the protocol pin and the
+    /// import markers — properties of how an Agent launches, not of a shared
+    /// Provider. Overwriting it from v2 would strip the Agent of its protocol.
+    ///
+    /// A Profile with no legacy row is not projected: it was created outside the v1
+    /// surface and has no launch path to keep in step.
+    pub fn project_model_provider_to_legacy(
+        conn: &Connection,
+        provider: &ModelProviderProfile,
+    ) -> VibexResult<bool> {
+        let Some(legacy_id) = provider.legacy_provider_profile_id.as_ref() else {
+            return Ok(false);
+        };
+        let Some(mut legacy) = ProviderProfileRepository::get(conn, legacy_id)? else {
+            return Ok(false);
+        };
+        let before = legacy.clone();
+
+        legacy.display_name = provider.display_name.clone();
+        legacy.status = match provider.status {
+            ModelProviderProfileStatus::Enabled => ProviderProfileStatus::Enabled,
+            ModelProviderProfileStatus::Disabled => ProviderProfileStatus::Disabled,
+        };
+        legacy.base_url = primary_legacy_base_url(provider);
+        legacy.default_model = provider.default_model_id.clone();
+        legacy.configured_models = legacy_configured_models_from_model_provider(provider, &before);
+        legacy.secrets = legacy_secrets_from_model_provider(provider, &before, legacy_id);
+
+        // `updated_at_ms` is part of the comparison the launch contract hashes, so a
+        // projection that changes nothing must not move it: every binding reading
+        // this Profile would otherwise go stale on a no-op.
+        legacy.updated_at_ms = before.updated_at_ms;
+        if legacy == before {
+            return Ok(false);
+        }
+        legacy.updated_at_ms =
+            vibex_core::unix_timestamp_ms().max(before.updated_at_ms.saturating_add(1));
+        ProviderProfileRepository::update(conn, &legacy)?;
+        ProviderSecretReferenceRepository::replace_for_profile(conn, legacy_id, &legacy.secrets)?;
+        Ok(true)
+    }
+
     pub fn mark_legacy_deleted(
         conn: &Connection,
         legacy_id: &ProviderProfileId,
@@ -672,6 +724,93 @@ impl ProviderProjectionCompatibilityRepository {
             "failed to commit provider projection compatibility delete",
         ))
     }
+}
+
+/// The address a legacy Profile should call: the provider-wide one, else the first.
+///
+/// v2 keeps one endpoint per protocol; v1 keeps one `base_url` plus a
+/// per-protocol override that stays in `provider_options`. The endpoint with no
+/// protocol is the fallback and is exactly what `base_url` means.
+fn primary_legacy_base_url(provider: &ModelProviderProfile) -> Option<String> {
+    provider
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.wire_protocol_id.is_none())
+        .or_else(|| provider.endpoints.first())
+        .map(|endpoint| endpoint.url.trim().to_string())
+        .filter(|url| !url.is_empty())
+}
+
+/// Rebuilds the legacy Model list, keeping each Model's declared protocol.
+///
+/// A v2 catalogue entry does not carry a wire protocol: the protocol belongs to
+/// the Agent binding that selects the Model, not to the shared Provider. The
+/// legacy Profile is where the declaration lives, so a Model the two shapes
+/// share keeps the protocol it already had, and one v2 newly offers inherits
+/// the Provider's pinned protocol.
+fn legacy_configured_models_from_model_provider(
+    provider: &ModelProviderProfile,
+    previous: &ProviderProfile,
+) -> Vec<ProviderConfiguredModel> {
+    let pinned = provider_option(previous, LEGACY_WIRE_API_OPTION_KEY)
+        .and_then(|value| ProviderModelWireApi::from_wire_protocol_id(&value));
+    provider
+        .configured_models
+        .iter()
+        .map(|model| ProviderConfiguredModel {
+            id: model.id.clone(),
+            display_name: model.display_name.clone(),
+            enabled: model.enabled,
+            wire_api: previous
+                .configured_models
+                .iter()
+                .find(|known| known.id == model.id)
+                .and_then(|known| known.wire_api)
+                .or(pinned),
+            capabilities: model.capabilities.clone(),
+        })
+        .collect()
+}
+
+/// Rebuilds the legacy secret rows from the v2 credential list.
+///
+/// The legacy table is what the launch path resolves a Key from, so a v2 Key
+/// that never reached it is invisible to the Agent. Ids are preserved, which is
+/// what lets a binding's `auth_source_revision` keep pointing at the same
+/// secret after a projection.
+fn legacy_secrets_from_model_provider(
+    provider: &ModelProviderProfile,
+    previous: &ProviderProfile,
+    legacy_id: &ProviderProfileId,
+) -> Vec<vibex_core::ProviderSecretReference> {
+    provider
+        .credentials
+        .iter()
+        .filter_map(|credential| {
+            let reference = credential.credential.secret_reference()?;
+            let existing = previous
+                .secrets
+                .iter()
+                .find(|secret| secret.id == reference.id);
+            Some(vibex_core::ProviderSecretReference {
+                id: reference.id.clone(),
+                provider_profile_id: legacy_id.clone(),
+                secret_kind: match credential.credential {
+                    AgentCredential::OAuth { .. } => ProviderSecretKind::OAuthAccount,
+                    _ => ProviderSecretKind::ApiKey,
+                },
+                backend: reference.backend,
+                setup_state: reference.setup_state,
+                lookup_key: reference.lookup_key.clone(),
+                display_label: credential.display_name.clone(),
+                redacted_hint: reference.redacted_hint.clone(),
+                created_at_ms: existing
+                    .map(|secret| secret.created_at_ms.max(1))
+                    .unwrap_or_else(|| vibex_core::unix_timestamp_ms().max(1)),
+                updated_at_ms: vibex_core::unix_timestamp_ms().max(1),
+            })
+        })
+        .collect()
 }
 
 fn insert_model_provider_profile(
@@ -1714,6 +1853,8 @@ fn legacy_agent_model_id(profile: &ProviderProfile, provider_model_id: &str) -> 
 /// profile could look edited on one build and not on another, and the settings
 /// UI would list the same headers in a different order.
 const LEGACY_HEADER_OVERRIDE_OPTION_KEY: &str = "headerOverrideJson";
+/// The Provider option that pins the protocol a new Model inherits.
+const LEGACY_WIRE_API_OPTION_KEY: &str = "wireApi";
 
 fn legacy_headers(profile: &ProviderProfile) -> Vec<ModelProviderHeaderReference> {
     let Some(raw) = provider_option(profile, LEGACY_HEADER_OVERRIDE_OPTION_KEY) else {

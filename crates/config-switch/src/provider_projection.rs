@@ -1228,11 +1228,32 @@ impl ProviderConfigService {
             })
     }
 
+    /// Mirrors a v2 write onto the legacy record, then restales its bindings.
+    ///
+    /// Every v2 mutation funnels through here so the two shapes cannot drift.
+    /// The legacy Profile is what the launch path reads for its protocol, its
+    /// `provider_options` and its Keys, so a v2 edit that never reached it would
+    /// be invisible to the Agent and would be reverted by the next v1 write.
+    fn sync_model_provider_to_legacy(
+        &self,
+        conn: &vibex_db::DbConnection,
+        provider_id: &ModelProviderProfileId,
+    ) -> VibexResult<()> {
+        let Some(provider) = ModelProviderProfileRepository::get(conn, provider_id)? else {
+            return Ok(());
+        };
+        vibex_db::ProviderProjectionCompatibilityRepository::project_model_provider_to_legacy(
+            conn, &provider,
+        )?;
+        Ok(())
+    }
+
     fn refresh_bindings_for_model_provider(
         &self,
         conn: &vibex_db::DbConnection,
         provider_id: &ModelProviderProfileId,
     ) -> VibexResult<()> {
+        self.sync_model_provider_to_legacy(conn, provider_id)?;
         for binding in
             AgentModelProviderBindingRepository::list_for_model_provider(conn, provider_id)?
         {
