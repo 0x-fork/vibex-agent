@@ -44,6 +44,7 @@ use crate::bottom_sheet::{
 };
 use crate::locale;
 use crate::markdown;
+use crate::platform::WindowInsetsExt as _;
 use crate::theme;
 use crate::toast::{Hint, Tone};
 use gpui_component::ActiveTheme as _;
@@ -726,6 +727,11 @@ pub struct MobileWorkbench {
     /// coordinates. A touch point is turned into a cell against it, which is
     /// what makes a long press select the place the finger is actually on.
     terminal_grid_bounds: Option<Bounds<Pixels>>,
+    /// The row count the painted frame holds, with the pane height those rows
+    /// were painted to fill. The frame only changes size when the PTY resize
+    /// comes back, so this is what tells a pane that grew ahead of its rows
+    /// from one that grew with them.
+    terminal_grid_rows: Option<(u16, f32)>,
     /// The anchor and live head of a touch selection, in grid points. Its
     /// presence is what raises the copy bar.
     terminal_selection: Option<TerminalSelection>,
@@ -875,6 +881,7 @@ impl MobileWorkbench {
             terminal_fit_error: None,
             terminal_poll_generation: 0,
             terminal_grid_bounds: None,
+            terminal_grid_rows: None,
             terminal_selection: None,
             terminal_selection_text: None,
             terminal_selection_handle: None,
@@ -3214,6 +3221,35 @@ impl MobileWorkbench {
         }
     }
 
+    /// The room the keyboard left below the terminal grid, in logical pixels.
+    ///
+    /// The grid hangs from the bottom of a pane that grows the instant the
+    /// keyboard closes, while the rows that fill it only exist once the runtime
+    /// has answered `TerminalResize` and the resized frame has been polled back.
+    /// Between those two moments a pane that grew without its rows drags the
+    /// whole terminal down by the keyboard's height and springs back when they
+    /// arrive. The frame's own row count is what says whether the rows are
+    /// current: until it moves, the room the keyboard gave up is held open below
+    /// the grid instead, and the rows never leave the place the reader was
+    /// looking at.
+    fn hold_terminal_grid(&mut self, window: &Window) -> f32 {
+        let rows = self
+            .terminal
+            .state
+            .render
+            .as_ref()
+            .map(|render| render.frame.rows);
+        let Some(rows) = rows else {
+            self.terminal_grid_rows = None;
+            return 0.0;
+        };
+        // The pane's height up to the chrome that never moves with a keyboard:
+        // whatever resized the window, this is what the rows have to fill.
+        let insets = window.insets();
+        let height = f32::from(window.viewport_size().height) - insets.top - insets.bottom;
+        terminal_grid_hold(rows, height, &mut self.terminal_grid_rows)
+    }
+
     /// Auto-fits the PTY to the available surface. The desktop grid geometry
     /// (8x18px cells at 13px) determines how many rows/columns fit, and the
     /// shared render model is resized in lock-step so the frame matches.
@@ -3737,6 +3773,7 @@ impl MobileWorkbench {
     /// were resolved against.
     fn reset_terminal_text_state(&mut self) {
         self.terminal_grid_bounds = None;
+        self.terminal_grid_rows = None;
         self.terminal_selection = None;
         self.terminal_selection_text = None;
         self.terminal_selection_handle = None;
@@ -7389,7 +7426,10 @@ impl MobileWorkbench {
     /// [`Self::forward_terminal_sink`]). There is deliberately no "type here,
     /// then press Send" row — a terminal that needs a second send gesture is
     /// not a terminal.
-    fn render_terminal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_terminal(&mut self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // The room a keyboard that just closed left behind, which the grid
+        // keeps holding open until the rows that fill it arrive.
+        let hold = self.hold_terminal_grid(window);
         let view = self.terminal.state.view(ShellKind::Compact);
         // Only the terminals that are still running are tabs, which is the rule
         // the desktop's own list keeps. A closed session stays in the
@@ -7626,7 +7666,19 @@ impl MobileWorkbench {
                         ),
                 )
             })
-            .child(self.render_terminal_grid(cx))
+            // The grid sits in a wrapper so the room the keyboard gave up can be
+            // held open below it without the surface itself growing: the surface
+            // is what the rows are measured and painted against, and a fit is
+            // asked for the pane, not for the hold (see [`Self::render_terminal_grid`]).
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .pb(px(hold))
+                    .flex()
+                    .flex_col()
+                    .child(self.render_terminal_grid(hold, cx)),
+            )
             // ── modifier bar ─────────────────────────────────────────────────
             .when_some(active.clone(), |terminal, _| {
                 terminal.child(
@@ -7832,7 +7884,11 @@ impl MobileWorkbench {
     /// The cell grid. The surface reports its bounds on paint so the PTY is
     /// auto-fitted to fill the screen, and the shared render model frame is
     /// rendered cell-by-cell with the desktop palette and cursor treatment.
-    fn render_terminal_grid(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    ///
+    /// `hold` is the room the pane keeps below the surface while a keyboard that
+    /// just closed is still waiting for its rows; the fit is asked for the pane
+    /// including it, because that is the height the rows will have to fill.
+    fn render_terminal_grid(&self, hold: f32, cx: &mut Context<Self>) -> gpui::AnyElement {
         let weak_entity = cx.weak_entity();
         let frame = self
             .terminal
@@ -7914,7 +7970,10 @@ impl MobileWorkbench {
                 canvas(
                     move |bounds, _, cx| {
                         let width = f32::from(bounds.size.width);
-                        let height = f32::from(bounds.size.height);
+                        // The grid's own height plus the room a pending resize
+                        // is still holding open: the rows are what the pane will
+                        // have to fill once they arrive.
+                        let height = f32::from(bounds.size.height) + hold;
                         let _ = prepaint_entity.update(cx, |this, cx| {
                             // The grid's own geometry, kept for turning a touch
                             // point into the cell under it.
@@ -8268,7 +8327,7 @@ impl Render for MobileWorkbench {
             .child(div().flex_1().min_h_0().child(match surface {
                 WorkbenchSurface::Files => self.render_files(window, cx),
                 WorkbenchSurface::Git => self.render_git(window, cx),
-                WorkbenchSurface::Terminal => self.render_terminal(cx),
+                WorkbenchSurface::Terminal => self.render_terminal(window, cx),
             }))
     }
 }
@@ -9612,6 +9671,26 @@ fn terminal_feed_snapshot(
     applied
 }
 
+/// How much room the pane is holding for a painted terminal frame, given the
+/// rows that frame holds and the height the pane now has.
+///
+/// `fitted` carries the rows and the pane height they were last seen at. A frame
+/// whose row count has not moved was fitted for the height it recorded, so
+/// whatever the pane has gained since then is room the rows cannot fill yet and
+/// the grid must keep holding open below itself. A pane that lost height instead
+/// — the keyboard opening, a rotation, a smaller window — holds nothing: there
+/// the rows follow the surface, and the frame's own resize catches up with it.
+fn terminal_grid_hold(rows: u16, height: f32, fitted: &mut Option<(u16, f32)>) -> f32 {
+    let fit = match *fitted {
+        Some((painted, height)) if painted == rows => height,
+        _ => {
+            *fitted = Some((rows, height));
+            height
+        }
+    };
+    (height - fit).max(0.0)
+}
+
 /// What a stretch of committed text stands for, in order: each part of the
 /// text, and whether a Return came before it.
 ///
@@ -10350,6 +10429,40 @@ index 3333333..4444444 100644
         assert_eq!(cell(500.0, 295.0).column, 9);
 
         assert!(terminal_cell_at_point(bounds, 0, 10, point(px(6.0), px(295.0))).is_none());
+    }
+
+    /// A keyboard that closes gives the pane its room back before the runtime
+    /// has resized the PTY, and a pane that grew ahead of its rows is what used
+    /// to drag the whole terminal down and spring it back. The frame's row count
+    /// is the only thing that says when the rows are current, so the room is
+    /// held open below the grid until it moves.
+    #[test]
+    fn terminal_grid_holds_the_keyboard_s_room_until_the_rows_arrive() {
+        let mut fitted = None;
+        // Sixteen rows and the grid's padding fill the 296px pane the keyboard
+        // leaves, so there is nothing to hold.
+        assert_eq!(terminal_grid_hold(16, 296.0, &mut fitted), 0.0);
+        // The keyboard closes and the pane grows to 576px, but the rows that
+        // fill it are still a PTY round trip away: the 280px it gained are held
+        // open below the grid instead of dragging it down.
+        assert_eq!(terminal_grid_hold(16, 576.0, &mut fitted), 280.0);
+        // The resized frame lands at the pane it now fills (thirty-one rows),
+        // and the hold is given back in the same frame.
+        assert_eq!(terminal_grid_hold(31, 576.0, &mut fitted), 0.0);
+        // Opening the keyboard takes room away rather than giving it: the rows
+        // follow the surface down, and the frame's own resize catches up with
+        // it, exactly as it did before the hold existed.
+        assert_eq!(terminal_grid_hold(31, 296.0, &mut fitted), 0.0);
+        assert_eq!(terminal_grid_hold(16, 296.0, &mut fitted), 0.0);
+        // A pane that shrinks for another reason — a rotation, a smaller window
+        // — never holds room it does not have.
+        assert_eq!(terminal_grid_hold(16, 200.0, &mut fitted), 0.0);
+
+        // A runtime that never answers the resize leaves the rows where the
+        // reader was reading them instead of dropping them by the keyboard.
+        let mut unanswered = None;
+        assert_eq!(terminal_grid_hold(16, 296.0, &mut unanswered), 0.0);
+        assert_eq!(terminal_grid_hold(16, 576.0, &mut unanswered), 280.0);
     }
 
     /// A long press selects the non-blank run around the cell it landed on, and
