@@ -1763,6 +1763,7 @@ fn a_history_page_a_switch_superseded_returns_its_slot(cx: &mut TestAppContext) 
                 has_newer: false,
                 starts_at_turn_start: true,
                 leading_turn_start: None,
+                omitted: None,
             }),
         );
     });
@@ -1776,6 +1777,55 @@ fn a_history_page_a_switch_superseded_returns_its_slot(cx: &mut TestAppContext) 
         slots,
         Some(0),
         "the parked view must not keep the slot its superseded page spent"
+    );
+}
+
+/// A window that skipped stored rows never becomes the view's projection.
+///
+/// This is the session-switch path: the view was parked while its session kept
+/// working, comes back lagged, and re-reads the newest window. When that window
+/// is a live turn whose tail cap cut its middle, installing it would show a
+/// conversation with a hole and — because the page still carries the session's
+/// first row — `has_older` would be false, so nothing would fetch the hole back.
+/// The install must refuse it instead.
+#[gpui::test]
+fn a_window_that_skipped_stored_rows_is_not_installed(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let (workbench, cx) = live_tool_timeline(cx, true);
+    let before = workbench.read_with(cx, |workbench, _| workbench.timeline.items.clone());
+    let first = before.first().map(|item| item.sequence).unwrap_or(0);
+    let last = before.last().map(|item| item.sequence).unwrap_or(0);
+    let session_id = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline.session_id.clone().unwrap()
+    });
+
+    let installed = workbench.update(cx, |workbench, _| {
+        let updates = workbench.begin_timeline_load();
+        let prepared = runtime
+            .block_on(PreparedTimeline::prepare_with_older(
+                session_id,
+                before,
+                false,
+                false,
+                None,
+                Some(vibex_core::TimelineSequenceGap {
+                    after: first,
+                    before: last,
+                }),
+                None,
+                false,
+                ReasoningDisplayMode::LatestAtBottom,
+            ))
+            .expect("the fixture page prepares");
+        workbench.install_prepared_timeline(prepared, &mut updates.borrow_mut())
+    });
+
+    assert!(
+        !installed,
+        "a page that skipped stored rows must not be installed as the projection"
     );
 }
 
@@ -1932,6 +1982,7 @@ fn an_older_page_moves_the_views_leading_end(cx: &mut TestAppContext) {
             has_newer: false,
             starts_at_turn_start,
             leading_turn_start,
+            omitted: None,
         };
     // The page's items all sit below the cursor it was read for.
     let cursor = items.last().map(|item| item.sequence).unwrap_or(0) + 1;

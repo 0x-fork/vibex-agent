@@ -47,10 +47,10 @@ use vibex_core::{
     ScheduledTaskStatus, ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix, SkillCreateRequest,
     SkillId, SkillProviderMatrix, SkillStatus, TerminalId, TerminalSession, TimelineItem,
     TimelineItemId, TimelineItemKind, TimelinePage, TimelinePayload, TimelinePayloadDepth,
-    TimelineRedactionState, TimelineSource, TimelineTurnStart, TurnExecutionAttribution,
-    VibexError, VibexExecutionId, VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode,
-    WorkspaceRecord, agent_id_for_provider_kind, legacy_status_for_phase, phase_for_legacy_status,
-    unix_timestamp_ms,
+    TimelineRedactionState, TimelineSequenceGap, TimelineSource, TimelineTurnStart,
+    TurnExecutionAttribution, VibexError, VibexExecutionId, VibexResult, VibexSessionId,
+    WorkspaceId, WorkspaceMode, WorkspaceRecord, agent_id_for_provider_kind,
+    legacy_status_for_phase, phase_for_legacy_status, unix_timestamp_ms,
 };
 
 mod remote_v2;
@@ -9072,6 +9072,7 @@ impl TimelineRepository {
                 starts_at_turn_start,
                 start_sequence,
             )?,
+            omitted: None,
         })
     }
 
@@ -9206,6 +9207,7 @@ impl TimelineRepository {
                 starts_at_turn_start,
                 start_sequence,
             )?,
+            omitted: None,
         })
     }
 
@@ -9337,13 +9339,30 @@ impl TimelineRepository {
         // the reader's live view, and the stream that is writing it is what
         // will finish it. See [`in_flight_turn_window`] for what such a read
         // answers with instead.
+        // `max_turns: None` asks for a window that cannot skip stored rows: the
+        // banded read below drops the live turn's middle on purpose, and the
+        // recovery path after such a page is refused must not be answered with
+        // another one.
         if after_sequence.is_none()
             && let Some(turns) = turn_window
             && let Some(budget) = budget
-            && let Some(items) =
+            && let Some(window) =
                 in_flight_turn_window(conn, session_id, before_sequence, turns, budget, limit)?
         {
-            return finish_timeline_page(conn, session_id, items, depth);
+            return finish_timeline_page_at(conn, session_id, window.items, window.gap, depth);
+        }
+        // A read addressed from inside the turn in flight is answered with the
+        // rows just below its cursor, aligned to a turn boundary like any other
+        // older page. That is what makes the gap a banded page reports
+        // recoverable: the read lands on exactly the rows the cap skipped,
+        // instead of on the turns above the live one.
+        if after_sequence.is_none()
+            && let Some(turns) = turn_window
+            && let Some(budget) = budget
+            && let Some(some) = before_sequence
+            && let Some(page) = in_flight_older_page(conn, session_id, some, turns, budget, limit)?
+        {
+            return finish_timeline_page_at(conn, session_id, page, None, depth);
         }
         // A page is anchored at one end of its span and has to be cut at the
         // other, or the reader is handed the wrong end of the conversation.
@@ -16518,7 +16537,22 @@ fn scan_timeline_span(
 fn finish_timeline_page(
     conn: &Connection,
     session_id: &VibexSessionId,
+    items: Vec<TimelineItem>,
+    depth: TimelinePayloadDepth,
+) -> VibexResult<TimelinePage> {
+    finish_timeline_page_at(conn, session_id, items, None, depth)
+}
+
+/// [`finish_timeline_page`] for a read that already knows it skipped stored rows.
+///
+/// The existence probes at the page's own ends cannot see a hole in its middle,
+/// so the read that cut the page hands the hole in rather than letting it be
+/// inferred from rows the page never carried.
+fn finish_timeline_page_at(
+    conn: &Connection,
+    session_id: &VibexSessionId,
     mut items: Vec<TimelineItem>,
+    omitted: Option<TimelineSequenceGap>,
     depth: TimelinePayloadDepth,
 ) -> VibexResult<TimelinePage> {
     if depth == TimelinePayloadDepth::Summary {
@@ -16579,6 +16613,7 @@ fn finish_timeline_page(
             starts_at_turn_start,
             start_sequence,
         )?,
+        omitted: omitted.filter(|gap| !gap.is_empty()),
     })
 }
 
@@ -16634,15 +16669,23 @@ fn session_turn_is_in_flight(conn: &Connection, session_id: &VibexSessionId) -> 
 /// - whole turns above it, up to the read's byte budget and turn count, cut and
 ///   aligned exactly like any other page.
 ///
-/// A read with a `before` cursor already holds the rows above that cursor, so
-/// it is answered with the second band alone; a cursor-less read is what a
-/// client opens a session with, and gets both. The rows the tail band leaves
-/// out sit between the two bands: they are the reader's live view, and the
-/// stream that is writing them is what delivers them where they appear.
+/// The cap is the one place the page can skip stored rows: the rows between the
+/// turn's head and the oldest row the cap kept are neither in the tail nor above
+/// it. The page reports that range, because a client that took the page as a
+/// whole projection would show a hole and — with `has_older` false at the
+/// session's first row — never fetch the missing part back. The range is
+/// addressable: a read addressed `before` the oldest kept row lands on exactly
+/// the rows this page left out.
+///
+/// Only a cursor-less read is answered here. A read with a `before` cursor
+/// already holds the rows above that cursor, so it wants the rows below it and
+/// nothing else; taking the bands above the live turn instead would hand it a
+/// page that starts at the session's beginning and skips everything the cursor
+/// asked for.
 ///
 /// Returns `None` when the ordinary window is the right read — a session whose
-/// newest turn has settled, a read addressed below the turn in flight, or a
-/// session with no whole turn above the one in flight to hand over.
+/// newest turn has settled, a read addressed from a cursor, or a session whose
+/// live turn is short enough to be carried whole.
 fn in_flight_turn_window(
     conn: &Connection,
     session_id: &VibexSessionId,
@@ -16650,7 +16693,10 @@ fn in_flight_turn_window(
     turns: u32,
     budget: usize,
     ceiling: i64,
-) -> VibexResult<Option<Vec<TimelineItem>>> {
+) -> VibexResult<Option<InFlightTurnWindow>> {
+    if before_sequence.is_some() {
+        return Ok(None);
+    }
     if turns == 0 || budget == 0 || !session_turn_is_in_flight(conn, session_id)? {
         return Ok(None);
     }
@@ -16663,10 +16709,7 @@ fn in_flight_turn_window(
     else {
         return Ok(None);
     };
-    // A read addressed at or below the turn in flight is an ordinary older
-    // page: only a reader who is inside that turn is watching it arrive.
-    let cursor = before_sequence.unwrap_or(anchored).min(anchored);
-    if cursor <= turn_start {
+    if anchored <= turn_start {
         return Ok(None);
     }
 
@@ -16675,10 +16718,6 @@ fn in_flight_turn_window(
     let mut band = scan_timeline_span(conn, session_id, floor, Some(turn_start), ceiling, true)?;
     if band.len() as i64 > ceiling {
         band.truncate(ceiling as usize);
-    }
-    if band.is_empty() {
-        // Nothing above the turn in flight: the ordinary window is the read.
-        return Ok(None);
     }
     let mut cut = {
         let mut spent = 0_usize;
@@ -16699,51 +16738,158 @@ fn in_flight_turn_window(
     band.truncate(cut.max(1).min(band.len()));
     band.reverse();
 
-    // What the reader is watching, and the row that begins it.
-    let mut tail = Vec::new();
-    if before_sequence.is_none() {
-        // The span is exclusive of its lower bound, so it starts at the turn's
-        // own first row; with no cursor there is no upper bound to exclude the
-        // newest row the live turn has reached.
-        let mut newest = scan_timeline_span(
-            conn,
-            session_id,
-            turn_start.saturating_sub(1),
-            None,
-            ceiling,
-            true,
-        )?;
-        if newest.len() as i64 > ceiling {
-            newest.truncate(ceiling as usize);
+    // What the reader is watching, and where the cap stopped.
+    //
+    // The span is exclusive of its lower bound, so it starts at the turn's own
+    // first row; with no cursor there is no upper bound to exclude the newest
+    // row the live turn has reached.
+    let mut newest = scan_timeline_span(
+        conn,
+        session_id,
+        turn_start.saturating_sub(1),
+        None,
+        ceiling,
+        true,
+    )?;
+    if newest.len() as i64 > ceiling {
+        newest.truncate(ceiling as usize);
+    }
+    // The cap, widened to the turn's own head when the rows between them fit
+    // the page allowance. Cutting a hole in the middle of a turn is the option
+    // of last resort: the page can only say the hole exists, and while it says
+    // so the reader cannot see those rows at all. Finishing the turn instead
+    // costs what this read already has an allowance for and leaves nothing out.
+    let skipped_cost = newest
+        .iter()
+        .scan(0_usize, |spent, item| {
+            *spent = spent.saturating_add(page_payload_cost(item));
+            Some(*spent)
+        })
+        .collect::<Vec<_>>();
+    let mut keep = 0_usize;
+    let mut spent = 0_usize;
+    for item in &newest {
+        let cost = page_payload_cost(item);
+        if keep > 0 && spent.saturating_add(cost) > TIMELINE_IN_FLIGHT_TAIL_MAX_BYTES {
+            break;
         }
+        spent = spent.saturating_add(cost);
+        keep += 1;
+    }
+    // What carrying the whole live turn would spend, so a cap that would leave a
+    // hole can be widened past it while that stays inside the allowance.
+    let whole_turn_cost = skipped_cost.last().copied().unwrap_or(0);
+    let widened = if whole_turn_cost <= TIMELINE_TURN_ALIGNED_PAGE_MAX_BYTES {
+        newest.len()
+    } else {
+        keep
+    };
+    newest.truncate(widened.max(1).min(newest.len()));
+    // The oldest row the cap kept, read before the tail is put back in order.
+    let tail_floor = newest.last().map(|item| item.sequence);
+    newest.reverse();
+    // The row that begins the turn travels with the page when the cap cut
+    // above it, because the projection needs a boundary for the rows it
+    // carries: the turn's header counts from its own start instead of moving
+    // with the cut, and the reader keeps the question the work answers.
+    if newest.first().map(|item| item.sequence) != Some(turn_start)
+        && let Some(head) = TimelineRepository::fetch_item(conn, session_id, turn_start)?
+    {
+        newest.insert(0, head);
+    }
+
+    // The rows between the turn's head and the oldest row the cap kept. The
+    // head is on the page, so the omission starts there; an uncut tail keeps
+    // every row down to its own start and leaves nothing out.
+    let gap = tail_floor.and_then(|before| {
+        let gap = TimelineSequenceGap {
+            after: turn_start,
+            before,
+        };
+        (!gap.is_empty()).then_some(gap)
+    });
+
+    if band.is_empty() && newest.len() <= 1 {
+        // Nothing above the live turn and nothing of it either: the ordinary
+        // window is the read.
+        return Ok(None);
+    }
+
+    band.extend(newest);
+    Ok(Some(InFlightTurnWindow { items: band, gap }))
+}
+
+/// A page assembled from a live turn and the history above it.
+struct InFlightTurnWindow {
+    items: Vec<TimelineItem>,
+    /// The stored rows the tail cap skipped, when it skipped any.
+    gap: Option<TimelineSequenceGap>,
+}
+
+/// The rows just below a cursor that sits inside the turn in flight.
+///
+/// This is the read that repairs a banded page: the cap cut the live turn's
+/// middle, the page reported the range, and the client walks down through it one
+/// page at a time. Answering with the turns above the live one — which is what
+/// the ordinary window would do — would leave that range unreachable, because
+/// every read would keep landing above the same rows.
+///
+/// The page is cut and aligned exactly like any other backward page, so it opens
+/// on a turn boundary or finishes the turn it landed in. `None` means the caller
+/// should take the ordinary window: the session has no live turn, the cursor is
+/// not inside it, or the aligned page came back empty.
+fn in_flight_older_page(
+    conn: &Connection,
+    session_id: &VibexSessionId,
+    before_sequence: i64,
+    turns: u32,
+    budget: usize,
+    ceiling: i64,
+) -> VibexResult<Option<Vec<TimelineItem>>> {
+    if turns == 0 || budget == 0 || !session_turn_is_in_flight(conn, session_id)? {
+        return Ok(None);
+    }
+    let anchored = TimelineRepository::timeline_end_sequence(conn, session_id)?;
+    if anchored <= 0 {
+        return Ok(None);
+    }
+    let Some(turn_start) =
+        timeline_turn_start_at(conn, session_id, anchored)?.map(|start| start.sequence)
+    else {
+        return Ok(None);
+    };
+    // Only a cursor inside the live turn is repairing a banded page. At or below
+    // its start the ordinary window already pages the conversation normally.
+    if before_sequence <= turn_start || before_sequence > anchored {
+        return Ok(None);
+    }
+
+    let mut items = scan_timeline_span(conn, session_id, 0, Some(before_sequence), ceiling, true)?;
+    if items.len() as i64 > ceiling {
+        items.truncate(ceiling as usize);
+    }
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let mut cut = {
         let mut spent = 0_usize;
         let mut kept = 0_usize;
-        for item in &newest {
+        for item in &items {
             let cost = page_payload_cost(item);
-            if kept > 0 && spent.saturating_add(cost) > TIMELINE_IN_FLIGHT_TAIL_MAX_BYTES {
+            if kept > 0 && spent.saturating_add(cost) > budget {
                 break;
             }
             spent = spent.saturating_add(cost);
             kept += 1;
         }
-        newest.truncate(kept.max(1).min(newest.len()));
-        newest.reverse();
-        // The row that begins the turn travels with the page when the cap cut
-        // above it, because the projection needs a boundary for the rows it
-        // carries: the turn's header counts from its own start instead of
-        // moving with the cut, and the reader keeps the question the work
-        // answers. A read with a cursor already holds the rows above it, so it
-        // is answered with the turns above the live one alone.
-        if newest.first().map(|item| item.sequence) != Some(turn_start)
-            && let Some(head) = TimelineRepository::fetch_item(conn, session_id, turn_start)?
-        {
-            newest.insert(0, head);
-        }
-        tail = newest;
+        kept.max(1).min(items.len())
+    };
+    if items.len() > 1 {
+        cut = align_backward_page_to_turn_start(conn, session_id, &items, cut, Some(budget))?;
     }
-
-    band.extend(tail);
-    Ok(Some(band))
+    items.truncate(cut.max(1).min(items.len()));
+    items.reverse();
+    Ok(Some(items))
 }
 
 /// A merge key for one streamed payload, part of deciding whether two rows
@@ -21787,14 +21933,19 @@ mod tests {
                 .any(|item| item.sequence == in_flight.sequence),
             "the question the in-flight turn answers travels with its newest rows"
         );
-        let sequences = page
-            .items
-            .iter()
-            .map(|item| item.sequence)
-            .collect::<std::collections::BTreeSet<_>>();
+        // The live turn here is 400 small rows: well inside the page allowance,
+        // so the read finishes it rather than cutting a hole through it. Cutting
+        // is the last resort — it costs the reader those rows outright until
+        // they walk the gap back.
         assert!(
-            !sequences.contains(&(in_flight.sequence + 1)),
-            "the rows the tail band left out are the reader's live view, not part of the page"
+            page.omitted.is_none(),
+            "a live turn that fits the allowance is carried whole, not cut"
+        );
+        assert!(
+            page.items
+                .iter()
+                .any(|item| item.sequence == in_flight.sequence + 1),
+            "the rows just below the head are on the page"
         );
         let live_rows = page
             .items
@@ -21806,21 +21957,24 @@ mod tests {
             "the newest rows of the live turn are on the page"
         );
         assert!(
-            live_rows < 400,
-            "the live turn is capped rather than carried whole: got {live_rows} of its rows"
+            live_rows >= 400,
+            "a turn inside the allowance is carried whole: got {live_rows} of its rows"
         );
 
         cleanup_db(temp);
     }
 
-    /// An older page asked for from inside an in-flight turn lands above it.
+    /// An older page asked for from inside an in-flight turn lands just below
+    /// its cursor.
     ///
-    /// This is the gesture a reader makes when they scroll up in a running
-    /// session: the cursor sits inside the live turn, and answering it with the
-    /// next rows down hands them more of the same turn instead of history.
+    /// This is the gesture that repairs a banded page: the cap cut the live
+    /// turn's middle, the page said so, and the client walks down through the
+    /// range one page at a time. Answering with the turns above the live turn —
+    /// which is where the banded page's own leading end already is — would leave
+    /// that range unreachable, because every read would land above it again.
     #[test]
-    fn an_older_page_from_inside_an_in_flight_turn_lands_on_the_turns_above_it() {
-        let (temp, conn, session, earlier, in_flight, newest) = seed_session_with_a_turn_in_flight(
+    fn an_older_page_from_inside_an_in_flight_turn_lands_below_its_cursor() {
+        let (temp, conn, session, _earlier, in_flight, newest) = seed_session_with_a_turn_in_flight(
             "in-flight-before",
             AgentSessionState::Running,
             400,
@@ -21839,19 +21993,184 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(page.start_sequence, Some(earlier.sequence));
-        assert_eq!(
-            page.end_sequence,
-            Some(in_flight.sequence - 1),
-            "the page ends where the whole turns end, not inside the live one"
+        assert!(
+            page.end_sequence.is_some_and(|end| end < newest),
+            "the page stays below the cursor: got {:?}",
+            page.end_sequence
         );
-        assert!(page.starts_at_turn_start);
-        assert!(page.leading_turn_start.is_none());
+        assert!(
+            page.start_sequence
+                .is_some_and(|start| start <= in_flight.sequence),
+            "the page reaches down to the live turn's head, which is where the skipped rows are: got {:?}",
+            page.start_sequence
+        );
         assert!(
             page.items
                 .iter()
-                .all(|item| item.sequence < in_flight.sequence),
-            "a page below the live turn carries none of it"
+                .any(|item| item.sequence > in_flight.sequence),
+            "the page carries rows from inside the live turn, not just the history above it"
+        );
+        assert!(
+            page.items.iter().all(|item| item.sequence < newest),
+            "a cursor read never returns the row the reader is already at"
+        );
+        assert!(
+            page.omitted.is_none(),
+            "an ordinary older page carries every row in its own span"
+        );
+
+        cleanup_db(temp);
+    }
+
+    /// A live turn bigger than the allowance is cut, and the cut is declared.
+    ///
+    /// This is the only case where a banded page may skip stored rows. The page
+    /// has to say so: `has_older` is false at the session's first row, so a
+    /// client that trusted it would show the hole forever. The reported range is
+    /// what the repair read above walks back in.
+    #[test]
+    fn a_live_turn_bigger_than_the_allowance_is_cut_and_declared() {
+        // 400 rows of 16 KiB each is ~6 MiB, past the 4 MiB allowance, so the
+        // read cannot finish the turn without blowing its own bound.
+        let (temp, conn, session, _earlier, in_flight, newest) = seed_session_with_a_turn_in_flight(
+            "in-flight-oversized",
+            AgentSessionState::Running,
+            400,
+            16 * 1024,
+        );
+
+        let page = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            None,
+            500,
+            Some(8),
+            Some(1_048_576),
+            TimelinePayloadDepth::Summary,
+        )
+        .unwrap();
+
+        assert_eq!(page.end_sequence, Some(newest));
+        let gap = page
+            .omitted
+            .expect("a live turn past the allowance is cut, and the cut is declared");
+        assert_eq!(
+            gap.after, in_flight.sequence,
+            "the gap starts at the row the page also carries as the turn's head"
+        );
+        assert!(
+            gap.before > gap.after,
+            "the gap ends at the oldest row the read kept"
+        );
+        let sequences = page
+            .items
+            .iter()
+            .map(|item| item.sequence)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            sequences.contains(&gap.after) && sequences.contains(&gap.before),
+            "both ends of the gap are rows the reader already has"
+        );
+        let live_rows = page
+            .items
+            .iter()
+            .filter(|item| item.sequence >= in_flight.sequence)
+            .count();
+        assert!(
+            live_rows < 400,
+            "the oversized turn is capped rather than carried whole: got {live_rows} of its rows"
+        );
+
+        cleanup_db(temp);
+    }
+
+    /// Walking down from a banded page's gap recovers exactly the rows it cut.
+    ///
+    /// The page reports the range it skipped. This is the read the client makes
+    /// against that report, repeated as a walk: each page ends below the row the
+    /// previous one held, and the walk closes when it reaches the turn's head.
+    /// A single page cannot close a large gap — the ordinary bound applies to
+    /// each step — which is why the walk, not one read, is the contract.
+    #[test]
+    fn a_banded_page_gap_is_reachable_by_the_cursor_it_reports() {
+        // The walk only has a gap to repair when the live turn is past the
+        // allowance and the read had to cut it.
+        let (temp, conn, session, _earlier, in_flight, _newest) =
+            seed_session_with_a_turn_in_flight(
+                "in-flight-gap-walk",
+                AgentSessionState::Running,
+                400,
+                16 * 1024,
+            );
+
+        let banded = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            None,
+            500,
+            Some(8),
+            Some(1_048_576),
+            TimelinePayloadDepth::Summary,
+        )
+        .unwrap();
+        let gap = banded
+            .omitted
+            .expect("the capped tail reports what it skipped");
+        assert!(
+            banded.items.iter().any(|item| item.sequence == gap.after),
+            "the page carries the row the gap starts after"
+        );
+
+        let mut reached: std::collections::BTreeSet<i64> =
+            banded.items.iter().map(|item| item.sequence).collect();
+        let mut cursor = gap.before;
+        let mut steps = 0;
+        while (gap.after + 1..gap.before).any(|sequence| !reached.contains(&sequence)) {
+            let page = TimelineRepository::fetch_window(
+                &conn,
+                &session.id,
+                None,
+                Some(cursor),
+                500,
+                Some(8),
+                Some(1_048_576),
+                TimelinePayloadDepth::Summary,
+            )
+            .unwrap();
+            steps += 1;
+            assert!(
+                steps < 64,
+                "the walk must converge, not re-ask the same cursor"
+            );
+            // A downward page is anchored at its newest row and its oldest row
+            // is where the next read resumes: `before` is exclusive, so asking
+            // for the newest row again would re-read the same page forever.
+            let next = page
+                .start_sequence
+                .filter(|start| *start < cursor)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a repair read must extend below its cursor: cursor={cursor} got {:?}",
+                        page.start_sequence
+                    )
+                });
+            reached.extend(page.items.iter().map(|item| item.sequence));
+            cursor = next;
+            assert!(page.omitted.is_none(), "a repair page omits nothing itself");
+        }
+
+        let missing: Vec<i64> = (gap.after + 1..gap.before)
+            .filter(|sequence| !reached.contains(sequence))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "walking the reported gap must recover every row it cut: missing {missing:?}"
+        );
+        assert!(
+            reached.contains(&in_flight.sequence),
+            "the walk closes on the live turn's head"
         );
 
         cleanup_db(temp);

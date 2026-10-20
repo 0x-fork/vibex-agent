@@ -7826,6 +7826,7 @@ async fn session_timeline_preview(
             has_newer: false,
             starts_at_turn_start: true,
             leading_turn_start: None,
+            omitted: None,
         });
     }
     manager

@@ -24,6 +24,13 @@ pub(super) struct PreparedTimeline {
     /// a resumed load refreshes the tail above a prefix and must not overwrite
     /// what that prefix already knew about the history below it.
     timeline_has_older: bool,
+    /// Stored rows the read skipped in the middle of its own span.
+    ///
+    /// A window assembled from a live turn and the turns above it leaves the
+    /// live turn's middle out when its tail cap cuts. The page reports the
+    /// range; the view refuses it, because installing it would show a
+    /// conversation with a hole that `has_older` cannot fetch back.
+    timeline_omitted: Option<vibex_core::TimelineSequenceGap>,
     /// Whether the prepared window's oldest row sits inside a turn.
     ///
     /// Carried for the same reason: a resumed load keeps the prefix's own
@@ -96,7 +103,7 @@ impl PreparedTimeline {
         reasoning: ReasoningDisplayMode,
     ) -> VibexResult<Self> {
         Self::prepare_with_older(
-            session_id, items, false, false, None, state, pending, reasoning,
+            session_id, items, false, false, None, None, state, pending, reasoning,
         )
         .await
     }
@@ -108,6 +115,7 @@ impl PreparedTimeline {
         timeline_has_older: bool,
         timeline_starts_mid_turn: bool,
         leading_turn_start: Option<TimelineTurnStart>,
+        timeline_omitted: Option<vibex_core::TimelineSequenceGap>,
         state: Option<AgentSessionState>,
         pending: bool,
         reasoning: ReasoningDisplayMode,
@@ -127,6 +135,7 @@ impl PreparedTimeline {
                 pending,
                 reasoning,
                 timeline_has_older,
+                timeline_omitted,
                 timeline_starts_mid_turn,
                 leading_turn_start,
             }
@@ -160,6 +169,15 @@ impl VibexWorkbench {
         // Edits/replacements outside the live stream invalidate the read. Live
         // events, including same-sequence revisions, are replayed over it.
         if updates.invalidated || self.timeline.revision != updates.revision {
+            return false;
+        }
+        // A window that skipped stored rows is not a projection of the
+        // conversation, whatever its own end probes say: the hole is in the
+        // middle of the span, so `has_older` is false while rows are missing
+        // and no later read would ask for them. Refusing the install sends the
+        // caller through its authoritative reload, which reads a contiguous
+        // window.
+        if prepared.timeline_omitted.is_some_and(|gap| !gap.is_empty()) {
             return false;
         }
         let Some(session_id) = prepared.timeline.session_id.clone() else {

@@ -1621,6 +1621,54 @@ pub struct TimelinePage {
     /// peer too old to report one.
     #[serde(default)]
     pub leading_turn_start: Option<TimelineTurnStart>,
+    /// Rows this page deliberately skipped even though the store still holds
+    /// them.
+    ///
+    /// A client has two ways to learn that a window is not the whole history:
+    /// `has_older` says something sits below the oldest row, and `has_newer`
+    /// says something sits above the newest one. Neither can describe a window
+    /// missing rows *in the middle* of its own span, and that is what a page
+    /// assembled from two bands is: the newest rows of a live turn plus the
+    /// turns above it, with the live turn's middle left out because the stream
+    /// writing it was going to deliver that part.
+    ///
+    /// Only the read knows which of those rows exist, so only the read can say
+    /// so. A client that installs such a page as a complete projection shows a
+    /// conversation with a hole in it and — because `has_older` is false at the
+    /// session's first row — never fetches the missing part back.
+    ///
+    /// `None` means the page omitted nothing the store holds, and is also what
+    /// a peer too old to report a gap sends. A client must read it as "nothing
+    /// known to be missing": proof of contiguity is the gap being absent, not
+    /// the field being absent.
+    #[serde(default)]
+    pub omitted: Option<TimelineSequenceGap>,
+}
+
+/// A range of stored rows a page did not carry.
+///
+/// The bounds are the sequences of the rows on either side of the omission, so
+/// the range itself is exclusive: the missing rows are those with
+/// `after < sequence < before`. Both ends are rows the reader already has,
+/// which is what makes the gap addressable — a read addressed `before` the
+/// upper bound lands on exactly the rows this page skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineSequenceGap {
+    /// The newest row below the omission, carried by the page.
+    pub after: i64,
+    /// The oldest row above the omission, carried by the page.
+    pub before: i64,
+}
+
+impl TimelineSequenceGap {
+    /// Whether this describes a range that actually skips stored rows.
+    ///
+    /// Adjacent sequences leave nothing out, so a page that reports such a
+    /// pair is making no claim at all and should not be treated as partial.
+    pub fn is_empty(&self) -> bool {
+        self.before <= self.after.saturating_add(1)
+    }
 }
 
 /// The first row of the turn a page opens inside.

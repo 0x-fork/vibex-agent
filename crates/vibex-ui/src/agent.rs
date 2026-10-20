@@ -2116,6 +2116,18 @@ fn validate_timeline_window(session_id: &VibexSessionId, page: &TimelinePage) ->
             "the Agent timeline page contains an invalid item",
         ));
     }
+    // A page assembled from a live turn reports the rows its tail cap skipped.
+    // Installing it as a whole projection would leave a hole the client has no
+    // way to notice: `has_older` is false when the page still carries the
+    // session's first row, so nothing would ever ask for the missing range.
+    // Refusing the page sends the caller down its authoritative path, which
+    // reads a contiguous window instead.
+    if page.omitted.is_some_and(|gap| !gap.is_empty()) {
+        return Err(BackendError::failed(
+            "agent_timeline_page_incomplete",
+            "the Agent timeline window omits rows the session still holds",
+        ));
+    }
     Ok(())
 }
 
@@ -2343,6 +2355,7 @@ mod tests {
                         has_newer: true,
                         starts_at_turn_start: true,
                         leading_turn_start: None,
+                        omitted: None,
                         items: page,
                     });
                 }
@@ -2362,6 +2375,7 @@ mod tests {
                     has_newer: total_after > page.len(),
                     starts_at_turn_start: true,
                     leading_turn_start: None,
+                    omitted: None,
                     items: page,
                 })
             })
@@ -2725,6 +2739,7 @@ mod tests {
             has_newer: false,
             starts_at_turn_start: true,
             leading_turn_start: None,
+            omitted: None,
         };
         assert!(
             controller
@@ -2740,6 +2755,47 @@ mod tests {
         // nothing left to ask for.
         let exhausted = controller.begin_timeline_before().unwrap_err();
         assert_eq!(exhausted.code, "agent_timeline_older_unavailable");
+    }
+
+    /// A window that skipped stored rows is not a projection of the history.
+    ///
+    /// `has_older` only describes the edge the page starts at, so a page can
+    /// carry the session's first row and still be missing its middle — which is
+    /// what a window assembled from a live turn does when its tail cap cuts.
+    /// Installing such a page leaves a hole nothing fetches back, so the shared
+    /// validator refuses it and the caller reads a contiguous window instead.
+    #[tokio::test]
+    async fn a_window_that_skipped_stored_rows_is_refused() {
+        let session = session();
+        let page = TimelinePage {
+            session_id: session.id.clone(),
+            items: sequenced_items(&session.id, 1..=4),
+            start_sequence: Some(1),
+            end_sequence: Some(4),
+            has_older: false,
+            has_newer: false,
+            starts_at_turn_start: true,
+            leading_turn_start: None,
+            omitted: Some(vibex_core::TimelineSequenceGap {
+                after: 1,
+                before: 4,
+            }),
+        };
+
+        let error = validate_timeline_window(&session.id, &page)
+            .expect_err("a page with a hole in it is not a projectable window");
+        assert_eq!(error.code, "agent_timeline_page_incomplete");
+
+        // A page whose reported range is adjacent skips nothing and stays
+        // installable: the field describes a range, it does not mark the page.
+        let contiguous = TimelinePage {
+            omitted: Some(vibex_core::TimelineSequenceGap {
+                after: 3,
+                before: 4,
+            }),
+            ..page
+        };
+        validate_timeline_window(&session.id, &contiguous).expect("an empty gap claims nothing");
     }
 
     #[tokio::test]
@@ -2759,6 +2815,7 @@ mod tests {
             has_newer: true,
             starts_at_turn_start: true,
             leading_turn_start: None,
+            omitted: None,
         };
         assert!(controller.apply_timeline_before(&ticket, Ok(page)).unwrap());
         assert!(!controller.state.timeline_has_older);
@@ -2869,6 +2926,7 @@ mod tests {
             has_newer: true,
             starts_at_turn_start: true,
             leading_turn_start: None,
+            omitted: None,
         };
         assert!(controller.apply_timeline_before(&ticket, Ok(page)).unwrap());
 
@@ -2903,6 +2961,7 @@ mod tests {
             has_newer: true,
             starts_at_turn_start: true,
             leading_turn_start: None,
+            omitted: None,
         };
         assert!(!controller.apply_timeline_before(&ticket, Ok(page)).unwrap());
     }

@@ -5968,6 +5968,7 @@ mod tests {
             has_newer: true,
             starts_at_turn_start: true,
             leading_turn_start: None,
+            omitted: None,
         };
         apply_message(
             &mut app,

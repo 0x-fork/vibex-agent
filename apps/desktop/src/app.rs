@@ -2091,14 +2091,18 @@ async fn fetch_authoritative_timeline_via_backend(
     }
 }
 
-/// The newest turn-aligned window of one session.
+/// The newest window of one session, banded or contiguous.
 ///
-/// Opening a session reads this instead of paging the whole archive, so the
-/// wait stops being proportional to how long the conversation has been
-/// running. Older history is a reader gesture from here on.
-async fn fetch_timeline_window(
+/// The banded window is what makes a running session open onto its history
+/// instead of onto a slice of its live turn, but it can skip the live turn's
+/// middle and says so through `omitted`. A client that refused such a page asks
+/// for this with `contiguous`, which takes the ordinary turn window: it pages
+/// the live turn row by row instead of handing it over in two bands, so it
+/// cannot leave a hole.
+async fn fetch_timeline_window_or_contiguous(
     runtime: Arc<DesktopRuntime>,
     session_id: VibexSessionId,
+    contiguous: bool,
 ) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
     runtime
         .agent()
@@ -2107,16 +2111,17 @@ async fn fetch_timeline_window(
             after_sequence: None,
             before_sequence: None,
             limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
-            max_turns: Some(AGENT_TIMELINE_TURN_WINDOW),
+            max_turns: (!contiguous).then_some(AGENT_TIMELINE_TURN_WINDOW),
             max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
         })
         .await
 }
 
-/// Authority-agnostic twin of [`fetch_timeline_window`].
-async fn fetch_timeline_window_via_backend(
+/// Authority-agnostic twin of [`fetch_timeline_window_or_contiguous`].
+async fn fetch_timeline_window_or_contiguous_via_backend(
     backend: BackendFacade,
     session_id: VibexSessionId,
+    contiguous: bool,
 ) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
     backend
         .agent()
@@ -2125,7 +2130,7 @@ async fn fetch_timeline_window_via_backend(
             after_sequence: None,
             before_sequence: None,
             limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
-            max_turns: Some(AGENT_TIMELINE_TURN_WINDOW),
+            max_turns: (!contiguous).then_some(AGENT_TIMELINE_TURN_WINDOW),
             max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
         })
         .await
@@ -2272,6 +2277,38 @@ async fn fetch_timeline_page_before_via_backend(
         })
         .await
         .map_err(remote_error_into_vibex)
+}
+
+/// How a session load may answer, and what it may resume from.
+#[derive(Default)]
+struct TimelineWindowRead {
+    /// The prefix the view already holds, when the read may patch it.
+    resume: Option<TimelineResume>,
+    /// Ask for a window that cannot skip stored rows.
+    ///
+    /// The banded window is what makes a running session open onto its history,
+    /// but it can leave the live turn's middle out and says so through
+    /// `omitted`. The recovery path after such a page is refused sets this:
+    /// asking again with the ordinary window cannot produce another one.
+    contiguous: bool,
+}
+
+impl TimelineWindowRead {
+    /// A read that patches `resume`, or falls back to the newest window.
+    fn resuming(resume: Option<TimelineResume>) -> Self {
+        Self {
+            resume,
+            contiguous: false,
+        }
+    }
+
+    /// A read that must not skip stored rows.
+    fn contiguous() -> Self {
+        Self {
+            resume: None,
+            contiguous: true,
+        }
+    }
 }
 
 /// What a session load resumes from, when it is not a cold window.
@@ -23572,7 +23609,7 @@ impl VibexWorkbench {
                 session_id.clone(),
                 workspace_id.clone(),
                 generation,
-                resume,
+                TimelineWindowRead::resuming(resume),
                 cx,
             );
             if let Some(backend) = self.backend.clone() {
@@ -23631,18 +23668,25 @@ impl VibexWorkbench {
             // Remote-client mode: the authoritative timeline arrives over the
             // backend RPC; terminals, the projection cache, and the heartbeat
             // are authority-local concerns.
-            self.load_agent_session_timeline_remote(session_id, generation, resume, cx);
+            self.load_agent_session_timeline_remote(
+                session_id,
+                generation,
+                TimelineWindowRead::resuming(resume),
+                cx,
+            );
         }
     }
 
     /// Remote twin of [`Self::load_agent_session_timeline`]: pages the
     /// authoritative timeline through the backend and applies the same
     /// replacement bookkeeping the native loader performs.
+    /// `window` says how the read may answer, and carries the prefix a resumed
+    /// view already holds.
     fn load_agent_session_timeline_remote(
         &mut self,
         session_id: VibexSessionId,
         generation: u64,
-        resume: Option<TimelineResume>,
+        window: TimelineWindowRead,
         cx: &mut Context<Self>,
     ) {
         let Some(backend) = self.backend.clone() else {
@@ -23659,65 +23703,79 @@ impl VibexWorkbench {
         let load_revision = self
             .registered_session(session_id.as_str())
             .map(|session| session.updated_at_ms);
+        let TimelineWindowRead { resume, contiguous } = window;
         // A resumed load keeps the prefix the view already holds, so its leading
         // end — and whether that end sits inside a turn — is whatever the view
         // had. Only the window a read fetches can move it.
         let resumed_starts_mid_turn = self.timeline_starts_mid_turn;
         let resumed_leading_turn_start = self.timeline.leading_turn_start;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let (items, timeline_has_older, timeline_starts_mid_turn, leading_turn_start) =
-                match resume {
-                    Some(resume) => {
-                        match fetch_timeline_tail_via_backend(
-                            backend.clone(),
-                            request_session_id.clone(),
-                            resume.after_sequence,
-                        )
-                        .await?
-                        {
-                            Some(tail) => (
-                                resume.prefix.into_iter().chain(tail).collect(),
-                                resume.timeline_has_older,
-                                resumed_starts_mid_turn,
-                                resumed_leading_turn_start,
-                            ),
-                            None => {
-                                let page = fetch_timeline_window_via_backend(
-                                    backend,
-                                    request_session_id.clone(),
-                                )
-                                .await?;
-                                let starts_mid_turn = !page.starts_at_turn_start;
-                                let leading_turn_start = page.leading_turn_start;
-                                (
-                                    page.items,
-                                    page.has_older,
-                                    starts_mid_turn,
-                                    leading_turn_start,
-                                )
-                            }
+            let (
+                items,
+                timeline_has_older,
+                timeline_omitted,
+                timeline_starts_mid_turn,
+                leading_turn_start,
+            ) = match resume {
+                Some(resume) => {
+                    match fetch_timeline_tail_via_backend(
+                        backend.clone(),
+                        request_session_id.clone(),
+                        resume.after_sequence,
+                    )
+                    .await?
+                    {
+                        Some(tail) => (
+                            resume.prefix.into_iter().chain(tail).collect(),
+                            resume.timeline_has_older,
+                            None,
+                            resumed_starts_mid_turn,
+                            resumed_leading_turn_start,
+                        ),
+                        None => {
+                            let page = fetch_timeline_window_or_contiguous_via_backend(
+                                backend,
+                                request_session_id.clone(),
+                                contiguous,
+                            )
+                            .await?;
+                            let starts_mid_turn = !page.starts_at_turn_start;
+                            let leading_turn_start = page.leading_turn_start;
+                            (
+                                page.items,
+                                page.has_older,
+                                page.omitted,
+                                starts_mid_turn,
+                                leading_turn_start,
+                            )
                         }
                     }
-                    None => {
-                        let page =
-                            fetch_timeline_window_via_backend(backend, request_session_id.clone())
-                                .await?;
-                        let starts_mid_turn = !page.starts_at_turn_start;
-                        let leading_turn_start = page.leading_turn_start;
-                        (
-                            page.items,
-                            page.has_older,
-                            starts_mid_turn,
-                            leading_turn_start,
-                        )
-                    }
-                };
+                }
+                None => {
+                    let page = fetch_timeline_window_or_contiguous_via_backend(
+                        backend,
+                        request_session_id.clone(),
+                        contiguous,
+                    )
+                    .await?;
+                    let starts_mid_turn = !page.starts_at_turn_start;
+                    let leading_turn_start = page.leading_turn_start;
+                    (
+                        page.items,
+                        page.has_older,
+                        page.omitted,
+                        starts_mid_turn,
+                        leading_turn_start,
+                    )
+                }
+            };
             PreparedTimeline::prepare_with_older(
                 request_session_id,
                 items,
                 timeline_has_older,
                 timeline_starts_mid_turn,
                 leading_turn_start,
+                timeline_omitted,
                 state,
                 pending,
                 reasoning,
@@ -23783,13 +23841,15 @@ impl VibexWorkbench {
         ));
     }
 
+    /// `window` says how the read may answer, and carries the prefix a resumed
+    /// view already holds.
     fn load_agent_session_timeline(
         &mut self,
         runtime: Arc<DesktopRuntime>,
         session_id: VibexSessionId,
         workspace_id: Option<vibex_core::WorkspaceId>,
         generation: u64,
-        resume: Option<TimelineResume>,
+        window: TimelineWindowRead,
         cx: &mut Context<Self>,
     ) {
         let poll_runtime = runtime.clone();
@@ -23807,65 +23867,82 @@ impl VibexWorkbench {
         let load_revision = self
             .registered_session(session_id.as_str())
             .map(|session| session.updated_at_ms);
+        let TimelineWindowRead { resume, contiguous } = window;
         // A resumed load keeps the prefix the view already holds, so its leading
         // end — and whether that end sits inside a turn — is whatever the view
         // had. Only the window a read fetches can move it.
         let resumed_starts_mid_turn = self.timeline_starts_mid_turn;
         let resumed_leading_turn_start = self.timeline.leading_turn_start;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let (items, timeline_has_older, timeline_starts_mid_turn, leading_turn_start) =
-                match resume {
-                    Some(resume) => {
-                        match fetch_timeline_tail(
-                            runtime.clone(),
-                            request_session_id.clone(),
-                            resume.after_sequence,
-                        )
-                        .await?
-                        {
-                            Some(tail) => (
-                                resume.prefix.into_iter().chain(tail).collect(),
-                                resume.timeline_has_older,
-                                resumed_starts_mid_turn,
-                                resumed_leading_turn_start,
-                            ),
-                            // Nothing above the prefix is worth patching, so open
-                            // the session again rather than replay the history
-                            // between where the view stopped and where it is.
-                            None => {
-                                let page =
-                                    fetch_timeline_window(runtime, request_session_id.clone())
-                                        .await?;
-                                let starts_mid_turn = !page.starts_at_turn_start;
-                                let leading_turn_start = page.leading_turn_start;
-                                (
-                                    page.items,
-                                    page.has_older,
-                                    starts_mid_turn,
-                                    leading_turn_start,
-                                )
-                            }
+            let (
+                items,
+                timeline_has_older,
+                timeline_omitted,
+                timeline_starts_mid_turn,
+                leading_turn_start,
+            ) = match resume {
+                Some(resume) => {
+                    match fetch_timeline_tail(
+                        runtime.clone(),
+                        request_session_id.clone(),
+                        resume.after_sequence,
+                    )
+                    .await?
+                    {
+                        Some(tail) => (
+                            resume.prefix.into_iter().chain(tail).collect(),
+                            resume.timeline_has_older,
+                            None,
+                            resumed_starts_mid_turn,
+                            resumed_leading_turn_start,
+                        ),
+                        // Nothing above the prefix is worth patching, so open
+                        // the session again rather than replay the history
+                        // between where the view stopped and where it is.
+                        None => {
+                            let page = fetch_timeline_window_or_contiguous(
+                                runtime,
+                                request_session_id.clone(),
+                                contiguous,
+                            )
+                            .await?;
+                            let starts_mid_turn = !page.starts_at_turn_start;
+                            let leading_turn_start = page.leading_turn_start;
+                            (
+                                page.items,
+                                page.has_older,
+                                page.omitted,
+                                starts_mid_turn,
+                                leading_turn_start,
+                            )
                         }
                     }
-                    None => {
-                        let page =
-                            fetch_timeline_window(runtime, request_session_id.clone()).await?;
-                        let starts_mid_turn = !page.starts_at_turn_start;
-                        let leading_turn_start = page.leading_turn_start;
-                        (
-                            page.items,
-                            page.has_older,
-                            starts_mid_turn,
-                            leading_turn_start,
-                        )
-                    }
-                };
+                }
+                None => {
+                    let page = fetch_timeline_window_or_contiguous(
+                        runtime,
+                        request_session_id.clone(),
+                        contiguous,
+                    )
+                    .await?;
+                    let starts_mid_turn = !page.starts_at_turn_start;
+                    let leading_turn_start = page.leading_turn_start;
+                    (
+                        page.items,
+                        page.has_older,
+                        page.omitted,
+                        starts_mid_turn,
+                        leading_turn_start,
+                    )
+                }
+            };
             PreparedTimeline::prepare_with_older(
                 request_session_id,
                 items,
                 timeline_has_older,
                 timeline_starts_mid_turn,
                 leading_turn_start,
+                timeline_omitted,
                 state,
                 pending,
                 reasoning,
@@ -24140,7 +24217,15 @@ impl VibexWorkbench {
             if let Some(session_id) = self.selected_session_id.clone() {
                 self.timeline.mark_lagged();
                 let generation = self.session_generation;
-                self.load_agent_session_timeline_remote(session_id, generation, None, cx);
+                // This is the recovery read: a window that skipped stored rows
+                // is refused and lands here, so it must not be answered with
+                // the same banded window again.
+                self.load_agent_session_timeline_remote(
+                    session_id,
+                    generation,
+                    TimelineWindowRead::contiguous(),
+                    cx,
+                );
             }
             return;
         };
@@ -24153,7 +24238,7 @@ impl VibexWorkbench {
             session_id,
             workspace_id,
             self.session_generation,
-            None,
+            TimelineWindowRead::contiguous(),
             cx,
         );
     }
@@ -93289,7 +93374,7 @@ mod tests {
         assert!(!overview.contains("runtime_catalog().list()"));
         assert!(!catalog.contains("runtime_catalog()"));
         assert!(catalog.contains("backend.agent().list_runtime_options().await"));
-        assert!(timeline.contains("fetch_timeline_window("));
+        assert!(timeline.contains("fetch_timeline_window_or_contiguous("));
         assert!(timeline.contains("fetch_timeline_tail("));
         assert!(timeline.contains("this.agent_loading = false"));
         assert!(!timeline.contains(".attach_runtime("));
@@ -109502,6 +109587,7 @@ mod tests {
             has_newer: true,
             starts_at_turn_start: true,
             leading_turn_start: None,
+            omitted: None,
         };
 
         assert_eq!(
