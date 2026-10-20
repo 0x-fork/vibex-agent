@@ -989,6 +989,15 @@ pub struct ManagementCenter {
     /// the picker can show it and a second change can replace the first one's
     /// endpoints rather than only its own.
     provider_preset_region: Option<String>,
+    /// Whether a new Provider's dialog is still on the "which preset" step.
+    ///
+    /// Creating a Provider starts with the choice rather than with a blank
+    /// form: the fields a preset fills are the ones most users cannot fill
+    /// from memory, and a blank form hides that the choice existed.
+    provider_preset_picker: bool,
+    /// The picker's filter. It matches id, name, and address, because those
+    /// are the three things a user remembers about a vendor.
+    provider_preset_query: Entity<InputState>,
     /// The catalogue's suggestion for the Model currently being edited.
     ///
     /// It is only ever a suggestion: nothing here is applied until the user
@@ -1411,6 +1420,13 @@ impl ManagementCenter {
                 "搜尋模型",
             ))
         });
+        let provider_preset_query = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Search vendors",
+                "搜索厂商",
+                "搜尋廠商",
+            ))
+        });
         let profile_model_edit_id = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
                 "Model id",
@@ -1661,6 +1677,12 @@ impl ManagementCenter {
                 },
             ),
             cx.subscribe(&profile_model_search, |_, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
+                cx.notify();
+            }),
+            cx.subscribe(&provider_preset_query, |_, _, event: &InputEvent, cx| {
                 if !management_input_changed(event) {
                     return;
                 }
@@ -1993,6 +2015,8 @@ impl ManagementCenter {
             gateway_key_add_error: None,
             provider_preset_draft: None,
             provider_preset_region: None,
+            provider_preset_picker: false,
+            provider_preset_query,
             model_capability_suggestion: None,
             selected_global_provider_id: None,
             profile_editor_open: false,
@@ -4663,6 +4687,11 @@ impl ManagementCenter {
     fn open_profile_creator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.provider_preset_draft = None;
         self.provider_preset_region = None;
+        // Every new Provider starts by choosing; even "none of these" is a
+        // choice the user makes rather than one the form makes for them.
+        self.provider_preset_picker = true;
+        self.provider_preset_query
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.sync_projection_editor();
         self.projection_editor.preview = None;
         self.profile_name.update(cx, |state, cx| {
@@ -4810,6 +4839,7 @@ impl ManagementCenter {
         // abandoned draft must not filter the next model fetch here.
         self.provider_preset_draft = None;
         self.provider_preset_region = None;
+        self.provider_preset_picker = false;
         self.projection_editor.draft_revision = 0;
         // The stored Secret is read back so the field can show it masked and
         // reveal it on request; until the read lands the field stays blank,
@@ -4897,6 +4927,7 @@ impl ManagementCenter {
         self.editing_profile_id = None;
         self.provider_preset_draft = None;
         self.provider_preset_region = None;
+        self.provider_preset_picker = false;
         self.projection_editor.draft_revision = 0;
         self.profile_secret_configured = false;
         self.profile_secret_loaded = None;
@@ -16607,6 +16638,36 @@ impl ManagementCenter {
         let pending =
             self.mutation.is_some() || self.agent_mutations.contains_key(&selected_agent_id);
         let updating = self.editing_profile_id.is_some();
+        // Creating a Provider asks what to start from before it asks for
+        // fields. There is nothing to save yet, so the step owns the body and
+        // the only action that ends it is Cancel.
+        if !updating && self.provider_preset_picker {
+            return v_flex()
+                .size_full()
+                .min_h_0()
+                .child(self.render_provider_preset_picker(window, cx))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .flex_none()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .pt_3()
+                        .child(
+                            Button::new("provider-preset-close")
+                                .small()
+                                .ghost()
+                                .label(management_locale_text("Cancel", "取消", "取消"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_profile_editor(window, cx)
+                                })),
+                        ),
+                )
+                .into_any_element();
+        }
         let saving = matches!(
             self.mutation,
             Some(ManagementMutation::ProfileCreate) | Some(ManagementMutation::ProfileUpdate(_))
@@ -16785,6 +16846,214 @@ impl ManagementCenter {
     }
 
     /// Identity: name, note, and website. Name gets the primary emphasis.
+    /// The picker a new Provider starts on.
+    ///
+    /// It is a step in the same dialog rather than a second modal: the dialog
+    /// owns the draft, the draft is what both steps write, and a nested modal
+    /// would make the draft's owner ambiguous.
+    fn render_provider_preset_picker(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let query = self.provider_preset_query.read(cx).value().to_string();
+        let groups = provider_preset_picker_groups(vibex_core::provider_presets(), &query);
+        let matched = !groups.is_empty();
+        let mut rows = v_flex().w_full().gap_1();
+        for group in groups {
+            rows = rows.child(
+                div()
+                    .px_2()
+                    .pt_2()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(SharedString::from(group.title.to_string())),
+            );
+            for row in group.rows {
+                let preset_id = row.id.clone();
+                let plan_note = row.plan_note.clone();
+                rows = rows.child(
+                    h_flex()
+                        .id(SharedString::from(format!(
+                            "management-provider-preset-{}",
+                            row.id
+                        )))
+                        .w_full()
+                        .items_center()
+                        .gap_3()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(6.0))
+                        .when(!pending, |this| {
+                            this.cursor_pointer()
+                                .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.choose_provider_preset(&preset_id, window, cx)
+                                }))
+                        })
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .flex_1()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_medium()
+                                        .child(row.display_name),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(row.detail),
+                                ),
+                        )
+                        .when_some(plan_note, |this, note| {
+                            this.child(Tag::secondary().xsmall().child(note))
+                        })
+                        // The limits are the reason a plan is grouped apart, so
+                        // the marker says a limit exists without repeating it
+                        // here; choosing the preset states it in full.
+                        .when(row.has_caveat, |this| {
+                            this.child(
+                                Icon::new(IconName::Info)
+                                    .size(px(14.0))
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                        }),
+                );
+            }
+        }
+        if !matched {
+            // The term is echoed back: from inside a filtered list, a vendor
+            // that is not in the library and a typo look the same.
+            rows = rows.child(
+                v_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .py_8()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().foreground.opacity(0.8))
+                            .child(format!(
+                                "{} \u{201c}{query}\u{201d}",
+                                management_locale_text("No match for", "没有匹配", "沒有符合")
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Try a vendor name, or start a custom Provider.",
+                                "试试厂商名，或直接创建自定义供应商。",
+                                "試試廠商名稱，或直接新增自訂供應商。",
+                            )),
+                    ),
+            );
+        }
+        let list = v_flex()
+            .id("provider-preset-picker-list")
+            .w_full()
+            .min_h_0()
+            .flex_1()
+            .overflow_y_scrollbar()
+            .scroll_gutter()
+            .pb_2()
+            .child(rows);
+
+        v_flex()
+            .w_full()
+            .min_h_0()
+            .flex_1()
+            .gap_2()
+            .child(management_field_label(management_locale_text(
+                "Add a provider",
+                "添加供应商",
+                "新增供應商",
+            )))
+            .child(management_search_input(&self.provider_preset_query, cx))
+            .child(list)
+            .child(
+                // The manual path never disappears: a preset library that
+                // covered every Provider would still be a wall, not a shortcut.
+                h_flex()
+                    .id("management-provider-preset-custom")
+                    .w_full()
+                    .items_center()
+                    .gap_3()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .pt_2()
+                    .when(!pending, |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.choose_custom_provider(window, cx)
+                            }))
+                    })
+                    .child(
+                        Icon::new(IconName::Plus)
+                            .size(px(14.0))
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(div().text_sm().font_medium().child(management_locale_text(
+                                "Custom provider",
+                                "自定义供应商",
+                                "自訂供應商",
+                            )))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "Start from an empty form",
+                                        "从零开始配置",
+                                        "從零開始設定",
+                                    )),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Enters the form with one preset applied.
+    fn choose_provider_preset(
+        &mut self,
+        preset_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_provider_preset(preset_id, window, cx);
+        self.provider_preset_picker = false;
+        cx.notify();
+    }
+
+    /// Enters the form with nothing applied.
+    ///
+    /// A preset the user looked at and left behind is discarded here, so
+    /// "start from an empty form" cannot inherit the addresses of the choice
+    /// that was just abandoned.
+    fn choose_custom_provider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_profile_creator(window, cx);
+        self.provider_preset_picker = false;
+        cx.notify();
+    }
+
     /// Fills the draft from a built-in preset.
     ///
     /// The protocol is written explicitly into `provider_options["wireApi"]`
@@ -16938,39 +17207,51 @@ impl ManagementCenter {
         // what it already holds.
         let preset_row = (self.editing_profile_id.is_none()).then(|| {
             let pending = self.mutation.is_some();
-            let mut row = h_flex().w_full().gap_2().flex_wrap();
-            for preset in vibex_core::provider_presets() {
-                let preset_id = preset.id.clone();
-                // A plan's price is a static description of what the user
-                // bought, not a computed amount, and it is the difference
-                // between the plan presets and a vendor's own API.
-                let label = match preset.plan_note.as_deref() {
-                    Some(note) => format!("{} · {note}", preset.display_name),
-                    None => preset.display_name.clone(),
-                };
-                row = row.child(
-                    Button::new(SharedString::from(format!(
-                        "management-provider-preset-{}",
-                        preset.id
-                    )))
-                    .xsmall()
-                    .outline()
-                    .label(SharedString::from(label))
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.apply_provider_preset(&preset_id, window, cx)
-                    })),
-                );
-            }
-            v_flex()
+            // The chosen preset is named here, because this is the only place
+            // that says what the filled fields came from. The choice itself
+            // lives on the picker step, one press away.
+            let label = match self.provider_preset_draft.as_ref() {
+                Some(preset) => format!(
+                    "{}{}",
+                    management_locale_text("Start from a preset", "从预设开始", "從預設開始"),
+                    format!(" · {}", preset.display_name)
+                ),
+                None => management_locale_text(
+                    "No preset: every field is manual",
+                    "未使用预设：全部手动填写",
+                    "未使用預設：全部手動填寫",
+                )
+                .to_string(),
+            };
+            h_flex()
                 .w_full()
-                .gap_1()
-                .child(management_field_label(management_locale_text(
-                    "Start from a preset",
-                    "从预设开始",
-                    "從預設開始",
-                )))
-                .child(row)
+                .min_w_0()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label),
+                )
+                .child(
+                    Button::new("management-provider-preset-change")
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text(
+                            "Change preset",
+                            "更换预设",
+                            "更換預設",
+                        ))
+                        .disabled(pending)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.provider_preset_picker = true;
+                            cx.notify();
+                        })),
+                )
                 .into_any_element()
         });
         let preset = self.provider_preset_draft.clone();
@@ -27230,6 +27511,128 @@ fn provider_preset_caveat_text(caveat: vibex_core::ProviderPresetCaveat) -> &'st
     }
 }
 
+/// One preset as the picker lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderPresetRow {
+    id: String,
+    display_name: String,
+    /// The line under the name: where the vendor answers, or why it needs no
+    /// Key at all.
+    detail: String,
+    /// The plan's own price description. Vendor copy, not a computed amount.
+    plan_note: Option<String>,
+    /// Whether choosing this puts a caveat above the model list.
+    has_caveat: bool,
+}
+
+/// One titled block of the picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderPresetGroup {
+    title: &'static str,
+    rows: Vec<ProviderPresetRow>,
+}
+
+/// Whether a preset answers to a filter term.
+///
+/// The term is matched against the three things a user remembers about a
+/// vendor — the id, the name, and where it answers — so "deepseek",
+/// "DeepSeek" and "deepseek.com" all find the same row.
+fn provider_preset_matches(preset: &vibex_core::ProviderPreset, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let mut haystacks = vec![preset.id.to_lowercase(), preset.display_name.to_lowercase()];
+    if let Some(website) = preset.website.as_deref() {
+        haystacks.push(website.to_lowercase());
+        haystacks.push(provider_preset_host(website));
+    }
+    if let Some(plan_note) = preset.plan_note.as_deref() {
+        haystacks.push(plan_note.to_lowercase());
+    }
+    haystacks.extend(preset.endpoints.values().map(|url| url.to_lowercase()));
+    haystacks.iter().any(|haystack| haystack.contains(&query))
+}
+
+/// The host of an address, for the picker's second line.
+fn provider_preset_host(url: &str) -> String {
+    url.split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url)
+        .to_string()
+}
+
+/// What the picker shows for one preset, after the filter.
+///
+/// Vendors come first because that is what most Providers are; local servers
+/// are their own group because "no Key" is their defining difference; plans are
+/// last because their limits are the thing a user has to read before choosing.
+fn provider_preset_picker_groups(
+    presets: Vec<vibex_core::ProviderPreset>,
+    query: &str,
+) -> Vec<ProviderPresetGroup> {
+    let mut vendors = Vec::new();
+    let mut local = Vec::new();
+    let mut plans = Vec::new();
+    for preset in presets {
+        if !provider_preset_matches(&preset, query) {
+            continue;
+        }
+        let is_plan = preset.plan_note.is_some() || preset.only.is_some();
+        let detail = if preset.no_key {
+            management_locale_text(
+                "Runs on this machine · no key needed",
+                "本机运行 · 无需 Key",
+                "本機執行 · 無需 Key",
+            )
+            .to_string()
+        } else if let Some(plan_note) = preset.plan_note.as_deref() {
+            plan_note.to_string()
+        } else if let Some(website) = preset.website.as_deref() {
+            provider_preset_host(website)
+        } else {
+            preset
+                .endpoints
+                .values()
+                .next()
+                .map(|url| provider_preset_host(url))
+                .unwrap_or_default()
+        };
+        let row = ProviderPresetRow {
+            id: preset.id.clone(),
+            display_name: preset.display_name.clone(),
+            detail,
+            plan_note: preset.plan_note.clone(),
+            has_caveat: !preset.caveats.is_empty(),
+        };
+        if is_plan {
+            plans.push(row);
+        } else if preset.no_key {
+            local.push(row);
+        } else {
+            vendors.push(row);
+        }
+    }
+    [
+        (management_locale_text("Vendors", "厂商", "廠商"), vendors),
+        (
+            management_locale_text("Local services", "本地服务", "本機服務"),
+            local,
+        ),
+        (
+            management_locale_text("Third-party plans", "第三方套餐", "第三方套餐"),
+            plans,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, rows)| !rows.is_empty())
+    .map(|(title, rows)| ProviderPresetGroup { title, rows })
+    .collect()
+}
+
 /// The Model entries a preset wants for one fetched catalogue.
 ///
 /// `offered_models` decides which ids belong to the plan and supplies the plan
@@ -33215,6 +33618,160 @@ mod gateway_surface_tests {
         assert!(editor.contains("provider-preset-keys-"));
     }
 
+    /// Every preset lands in exactly one group, and the grouping says what the
+    /// rows have in common: a vendor, a local server, or a plan.
+    #[test]
+    fn the_preset_picker_groups_vendors_local_services_and_plans() {
+        let groups = provider_preset_picker_groups(vibex_core::provider_presets(), "");
+        assert_eq!(groups.len(), 3, "a full library fills all three groups");
+
+        let ids = groups
+            .iter()
+            .flat_map(|group| group.rows.iter().map(|row| row.id.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids.len(),
+            vibex_core::provider_presets().len(),
+            "no preset may be listed twice or dropped"
+        );
+        assert_eq!(
+            ids.iter().collect::<BTreeSet<_>>().len(),
+            ids.len(),
+            "the picker must not list the same preset in two groups"
+        );
+
+        let group_of = |id: &str| {
+            groups
+                .iter()
+                .position(|group| group.rows.iter().any(|row| row.id == id))
+                .unwrap_or_else(|| panic!("{id} is missing from the picker"))
+        };
+        assert_eq!(group_of("deepseek"), 0, "a vendor is a vendor");
+        assert_eq!(group_of("ollama"), 1, "a local server needs no key");
+        assert_eq!(
+            group_of("clinepass"),
+            2,
+            "a plan carries limits a vendor row has no room for"
+        );
+
+        let ollama = groups[1]
+            .rows
+            .iter()
+            .find(|row| row.id == "ollama")
+            .expect("the local group lists the local server");
+        assert!(
+            ollama.detail.to_lowercase().contains("key"),
+            "the local row must say why it has no key field: {}",
+            ollama.detail
+        );
+        assert!(
+            groups[2].rows.iter().any(|row| row.plan_note.is_some()),
+            "a plan row keeps the vendor's own price description"
+        );
+    }
+
+    /// The filter matches what a user remembers: the id, the name, or the
+    /// address they were given.
+    #[test]
+    fn the_preset_picker_filter_matches_id_name_and_address() {
+        let presets = vibex_core::provider_presets();
+        let deepseek = vibex_core::provider_preset("deepseek").expect("the preset ships");
+        assert!(provider_preset_matches(&deepseek, ""));
+        assert!(provider_preset_matches(&deepseek, "DEEPSEEK"));
+        assert!(provider_preset_matches(&deepseek, "deepseek.com"));
+        assert!(provider_preset_matches(&deepseek, "api.deepseek.com"));
+        assert!(!provider_preset_matches(&deepseek, "gemini"));
+
+        let filtered = provider_preset_picker_groups(presets.clone(), "cline");
+        let ids = filtered
+            .iter()
+            .flat_map(|group| group.rows.iter().map(|row| row.id.clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            ids.contains(&"clinepass".to_string()),
+            "a plan is reachable by its own name: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"deepseek".to_string()),
+            "a filter must actually filter: {ids:?}"
+        );
+
+        let nothing = provider_preset_picker_groups(presets, "not-a-vendor-anywhere");
+        assert!(
+            nothing.is_empty(),
+            "an unmatched term shows no group at all"
+        );
+    }
+
+    /// Creating a Provider starts on the picker, and the manual path leaves it.
+    ///
+    /// The step is the feature: an empty form used to be what "add a provider"
+    /// meant, which hid the fact that the fields it asks for are the ones a
+    /// preset already knows.
+    #[test]
+    fn a_new_provider_starts_on_the_preset_picker() {
+        let source = include_str!("management.rs");
+        let opening = source
+            .split_once("    fn open_profile_creator(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The picker a new Provider starts on."))
+            .map(|(body, _)| body)
+            .expect("the creator should remain inspectable");
+        assert!(opening.contains("self.provider_preset_picker = true;"));
+        assert!(opening.contains("self.provider_preset_query"));
+
+        let dialog = source
+            .split_once("    fn render_profile_editor_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The picker a new Provider starts on."))
+            .map(|(body, _)| body)
+            .expect("the dialog should remain inspectable");
+        assert!(dialog.contains("!updating && self.provider_preset_picker"));
+        assert!(dialog.contains("render_provider_preset_picker(window, cx)"));
+        // The picker step creates nothing: the save action belongs to the form
+        // that follows it.
+        let (_, after_picker) = dialog
+            .split_once("render_provider_preset_picker(window, cx)")
+            .expect("the picker step is rendered");
+        let picker_step = after_picker
+            .split_once("let saving")
+            .expect("the form follows the picker")
+            .0;
+        assert!(!picker_step.contains("save_profile(cx)"));
+
+        let picking = source
+            .split_once("    fn choose_provider_preset(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Fills the draft from a built-in preset.")
+            })
+            .map(|(body, _)| body)
+            .expect("the preset chooser should remain inspectable");
+        assert!(picking.contains("apply_provider_preset(preset_id"));
+        assert!(picking.contains("self.provider_preset_picker = false;"));
+
+        let custom = source
+            .split_once("    fn choose_custom_provider(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Fills the draft from a built-in preset.")
+            })
+            .map(|(body, _)| body)
+            .expect("the custom chooser should remain inspectable");
+        assert!(
+            custom.contains("self.open_profile_creator(window, cx);"),
+            "an abandoned preset must not leave its addresses in the empty form"
+        );
+        assert!(custom.contains("self.provider_preset_picker = false;"));
+
+        let picker = source
+            .split_once("    fn render_provider_preset_picker(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Enters the form with one preset applied.")
+            })
+            .map(|(body, _)| body)
+            .expect("the picker should remain inspectable");
+        assert!(picker.contains("management-provider-preset-custom"));
+        assert!(picker.contains("management_search_input"));
+        assert!(picker.contains("provider_preset_picker_groups"));
+    }
+
     /// One ledger row, built the way the authority reports it.
     fn ledger_request(
         credential_name: Option<&str>,
@@ -33348,7 +33905,11 @@ mod gateway_surface_tests {
             vibex_core::GatewayFailureKind::Upstream,
             vibex_core::GatewayFailureKind::Other,
         ] {
-            for locale in [ResolvedLocale::En, ResolvedLocale::ZhCn, ResolvedLocale::ZhTw] {
+            for locale in [
+                ResolvedLocale::En,
+                ResolvedLocale::ZhCn,
+                ResolvedLocale::ZhTw,
+            ] {
                 let text = gateway_failure_text(kind, locale);
                 assert!(!text.trim().is_empty(), "{kind:?} has no copy");
                 assert_ne!(
@@ -33377,7 +33938,9 @@ mod gateway_surface_tests {
 
         let detail = source
             .split_once("    fn render_gateway_request_detail(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// Clears the ledger and refreshes the card."))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Clears the ledger and refreshes the card.")
+            })
             .map(|(body, _)| body)
             .expect("the request detail should remain inspectable");
         assert!(detail.contains("gateway_route_lines(request"));
