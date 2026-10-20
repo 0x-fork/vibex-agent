@@ -1064,6 +1064,7 @@ strings! {
     config_action_sign_out => { "Sign out", "退出登录", "登出" },
     config_action_activate => { "Use", "设为当前", "設為目前" },
     config_action_prefer => { "Use first", "优先使用", "優先使用" },
+    config_action_pin => { "Keep conversation", "对话固定", "對話固定" },
     config_action_routing => { "Switching", "切换方式", "切換方式" },
     config_action_token_limit => { "Token limit", "token 上限", "token 上限" },
     config_requests_empty => { "No requests have gone through the gateway yet.", "还没有请求经过网关。", "還沒有請求經過閘道。" },

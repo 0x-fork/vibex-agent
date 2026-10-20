@@ -1882,7 +1882,7 @@ impl App {
                     }],
                 )
             }
-            (ConfigSection::Providers, ConfigAction::Prefer) if key == "gateway" => {
+            (ConfigSection::Providers, ConfigAction::Pin) if key == "gateway" => {
                 let Some(snapshot) = self.management_data.gateway.as_ref() else {
                     return Outcome::quiet();
                 };

@@ -5209,8 +5209,8 @@ ProviderConfigService::{
 - **The TUI's Providers table mirrors the gateway's hierarchy.** The gateway
   row is followed by one row per upstream (`├`) and one per Key (`│ ├`), so the
   reader can see which account is cooling without opening the desktop. A Key
-  row offers `Toggle` and `Prefer`; the gateway row offers `Switching`,
-  `Prefer` (conversation pin), `Token limit`, and `Recent requests`. The token
+  row offers `Toggle` and `Prefer`; the gateway row offers `Switching`, `Pin`,
+  `Token limit`, and `Recent requests`. The token
   ceiling is a prompt because a character grid has no room for a combined
   number-and-window control; an empty answer removes the ceiling. The request
   ledger is a read-only text view with the model, route, tokens, and skipped

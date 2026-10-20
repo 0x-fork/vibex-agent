@@ -244,6 +244,8 @@ pub enum ConfigAction {
     /// Make one of a Provider's Keys the one the router tries first, or pin
     /// the gateway's conversations to one.
     Prefer,
+    /// Keep the gateway's conversations on one Key.
+    Pin,
     /// Cycle the gateway's routing strategy.
     Routing,
     /// Edit the gateway's local token ceiling.
@@ -302,6 +304,7 @@ impl ConfigAction {
             Self::Logout => strings.config_action_sign_out(),
             Self::Activate => strings.config_action_activate(),
             Self::Prefer => strings.config_action_prefer(),
+            Self::Pin => strings.config_action_pin(),
             Self::Routing => strings.config_action_routing(),
             Self::TokenLimit => strings.config_action_token_limit(),
             Self::Requests => strings.config_action_requests(),
@@ -1823,7 +1826,7 @@ fn gateway_row(data: &ManagementData, strings: Strings) -> Option<ConfigRow> {
         .actions(&[
             ConfigAction::Toggle,
             ConfigAction::Routing,
-            ConfigAction::Prefer,
+            ConfigAction::Pin,
             ConfigAction::TokenLimit,
             ConfigAction::Requests,
             ConfigAction::RefreshSnapshot,
