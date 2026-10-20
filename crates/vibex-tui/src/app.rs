@@ -1471,7 +1471,11 @@ pub struct App {
     pub row_marks: crate::row_marks::RowMarks,
     /// A transient message above the composer, dismissed on the next key.
     pub banner: Option<Banner>,
-    /// When the running turn started, for the elapsed-time readout.
+    /// Whether a turn has been running since the client last looked.
+    ///
+    /// The elapsed readout is dated from the turn's own start, so this latch
+    /// only keeps the band on screen through the round trip before the
+    /// projection describes the turn.
     pub turn_started: Option<std::time::Instant>,
     /// The running turn as the line above the composer reads it: its phase, how
     /// many tools it has called, and how fast it is producing output.
@@ -5353,11 +5357,29 @@ impl App {
     }
 
     /// How long the running turn has been going.
+    ///
+    /// Dated from the turn's own wall-clock start rather than from when this
+    /// client first saw it run: a reader who opens a session that is already
+    /// mid-turn reads the turn's elapsed time — the number the desktop shows
+    /// for it — instead of a clock that began at their arrival.
+    ///
+    /// A send the runtime has not answered yet has no turn to date, so it
+    /// counts from the moment it was submitted. With neither there is nothing
+    /// running to measure.
     pub fn turn_elapsed(&self) -> Option<std::time::Duration> {
         if !self.page_owns_session() {
             return None;
         }
-        self.turn_started.map(|started| started.elapsed())
+        if let Some(turn) = self.live_turn() {
+            return Some(crate::turn::worked_duration(&turn));
+        }
+        self.pending_send_for_selected().map(|pending| {
+            std::time::Duration::from_millis(
+                vibex_core::unix_timestamp_ms()
+                    .saturating_sub(pending.submitted_at_ms)
+                    .max(0) as u64,
+            )
+        })
     }
 
     /// The reading of the running turn, for the line above the composer.
@@ -5601,18 +5623,18 @@ impl App {
         !was_waiting || !self.landing_mark_waits()
     }
 
-    /// Keep the turn clock in step with what the session actually is.
+    /// Keep the running band in step with what the session actually is.
     ///
-    /// The elapsed readout and the spinner answer to "is a turn running", which
-    /// is a property of the session rather than an event. Deriving it here means
-    /// no path can leave the clock running after the turn stopped — which would
-    /// keep the client repainting for the rest of the session — or leave it at
-    /// zero while the runtime works.
+    /// The band and the spinner answer to "is a turn running", which is a
+    /// property of the session rather than an event. Deriving it here means no
+    /// path can leave the band running after the turn stopped — which would
+    /// keep the client repainting for the rest of the session — or hide it
+    /// while the runtime works.
     ///
-    /// The inquiry is page-independent even though the readout is not: the
-    /// composing page does not draw the clock, and a reader who steps out to
-    /// write a new session and comes back must find the turn's own elapsed time
-    /// rather than one that restarted when they returned.
+    /// The inquiry is page-independent even though the band is not: the
+    /// composing page does not draw it, and a reader who steps out to write a
+    /// new session and comes back must find the turn's own elapsed time rather
+    /// than one that restarted when they returned.
     pub fn sync_turn_clock(&mut self) -> bool {
         let running = self.open_session_is_running()
             || self.pending_send_for_selected().is_some()

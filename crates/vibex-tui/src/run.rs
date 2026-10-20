@@ -293,9 +293,9 @@ fn event_loop(
         if app.sync_transcript_liveness() {
             dirty = true;
         }
-        // The turn clock follows the session's state, so the elapsed readout
-        // starts when the turn does and stops when it ends, whatever path the
-        // state took to get there.
+        // The running band follows the session's state, so it appears when the
+        // turn starts and leaves when it ends, whatever path the state took to
+        // get there.
         if app.sync_turn_clock() {
             dirty = true;
         }
@@ -4085,6 +4085,63 @@ mod tests {
         assert!(
             !app.is_animating(),
             "the settled page is still repainting for a turn that ended"
+        );
+    }
+
+    #[test]
+    fn a_running_turn_is_timed_from_its_own_start_not_from_the_readers_arrival() {
+        // The line above the composer dates the turn, not the visit: opening a
+        // session that is already working must show how long that work has
+        // taken — the same number the desktop shows — rather than a clock that
+        // started when the reader arrived.
+        use vibex_core::{
+            AgentMessageDeltaPayload, AgentMessagePhase, TimelinePayload, UserMessagePayload,
+        };
+        let mut app = isolation_app();
+        let mut running = isolation_session(vibex_core::VibexSessionId::new(), "codex");
+        running.state = vibex_core::AgentSessionState::Running;
+        app.agent.apply_sessions(Ok(vec![running.clone()])).unwrap();
+        app.agent.state.selected_session_id = Some(running.id.clone());
+        app.agent.state.active_session.resolve(running.clone());
+        app.navigate_to(Page::Agent);
+
+        // The turn began a minute and a half before this client opened it.
+        let started_at_ms = vibex_core::unix_timestamp_ms() - 90_000;
+        let mut prompt = conversation_item(
+            &running.id,
+            1,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "what is taking so long?".into(),
+                ..Default::default()
+            }),
+        );
+        prompt.timestamp_ms = started_at_ms;
+        let mut answer = conversation_item(
+            &running.id,
+            2,
+            TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                text_delta: "still working".into(),
+                chunk_index: 0,
+                phase: Some(AgentMessagePhase::FinalAnswer),
+            }),
+        );
+        answer.timestamp_ms = started_at_ms + 1_000;
+        app.agent
+            .state
+            .timeline
+            .replace_authoritative(running.id.clone(), vec![prompt, answer]);
+        app.sync_transcript();
+
+        let elapsed = app
+            .turn_elapsed()
+            .expect("a running turn has an elapsed time");
+        assert!(
+            elapsed >= Duration::from_secs(89),
+            "the clock restarted when the reader arrived: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(91),
+            "the clock is not the turn's own: {elapsed:?}"
         );
     }
 

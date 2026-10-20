@@ -3186,7 +3186,7 @@ fn render_turn_status(
     };
     if live {
         if let Some(elapsed) = app.turn_elapsed() {
-            measure_part(&mut line, format_turn_timer(elapsed));
+            measure_part(&mut line, crate::turn::format_worked_duration(elapsed));
         }
         let readout = app.turn_readout();
         if let Some(tool_calls) = readout
@@ -3273,18 +3273,6 @@ fn truncate_spans(spans: &mut Vec<Span<'static>>, width: usize) {
             spans.push(Span::styled(trimmed, style));
         }
         return;
-    }
-}
-
-/// Format an elapsed duration the way a person reads it.
-pub fn format_turn_timer(elapsed: std::time::Duration) -> String {
-    let seconds = elapsed.as_secs();
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 3600 {
-        format!("{}m{:02}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{}h{:02}m", seconds / 3600, (seconds % 3600) / 60)
     }
 }
 

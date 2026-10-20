@@ -6200,6 +6200,9 @@ fn the_turn_line_reports_what_the_running_turn_has_done() {
         }),
     );
     user.correlation_id = Some(correlation.clone());
+    // The clock is the turn's own: it has been running for a while, and this
+    // client only arrives now.
+    user.timestamp_ms = vibex_core::unix_timestamp_ms() - 189_000;
     let mut call = seeded_item(
         &session_id,
         2,
@@ -6242,8 +6245,6 @@ fn the_turn_line_reports_what_the_running_turn_has_done() {
         .state
         .timeline
         .replace_authoritative(session_id.clone(), timeline.clone());
-    // The clock is the session's: the turn has been running for a while.
-    app.turn_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(189));
     app.sync_transcript();
 
     // The pace is a difference between two readings, so the answer has to grow
@@ -6270,7 +6271,7 @@ fn the_turn_line_reports_what_the_running_turn_has_done() {
         .find(|line| line.contains(app.strings.phase_generating()))
         .unwrap_or_else(|| panic!("no turn line on the session page:\n{screen}"));
     assert!(
-        line.contains("3m09s"),
+        line.contains("3m 9s"),
         "the turn's clock is not on the line: {line:?}"
     );
     assert!(
