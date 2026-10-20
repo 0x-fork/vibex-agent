@@ -17309,9 +17309,9 @@ impl ManagementCenter {
             // lives on the picker step, one press away.
             let label = match self.provider_preset_draft.as_ref() {
                 Some(preset) => format!(
-                    "{}{}",
+                    "{} · {}",
                     management_locale_text("Start from a preset", "从预设开始", "從預設開始"),
-                    format!(" · {}", preset.display_name)
+                    preset.display_name
                 ),
                 None => management_locale_text(
                     "No preset: every field is manual",
