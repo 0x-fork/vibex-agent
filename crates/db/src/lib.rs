@@ -17522,6 +17522,7 @@ mod tests {
                 "62:vibex_use",
                 "63:vibex_use_budget_policy",
                 "64:model_gateway",
+                "65:model_gateway_route_trace",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -17670,6 +17671,7 @@ mod tests {
                 "62:vibex_use",
                 "63:vibex_use_budget_policy",
                 "64:model_gateway",
+                "65:model_gateway_route_trace",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -17799,6 +17801,7 @@ mod tests {
                 "62:vibex_use",
                 "63:vibex_use_budget_policy",
                 "64:model_gateway",
+                "65:model_gateway_route_trace",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -17966,6 +17969,7 @@ mod tests {
                 "62:vibex_use",
                 "63:vibex_use_budget_policy",
                 "64:model_gateway",
+                "65:model_gateway_route_trace",
             ]
         );
         assert_eq!(
@@ -19393,6 +19397,7 @@ mod tests {
                 "62:vibex_use",
                 "63:vibex_use_budget_policy",
                 "64:model_gateway",
+                "65:model_gateway_route_trace",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
