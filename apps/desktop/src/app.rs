@@ -58033,13 +58033,16 @@ impl VibexWorkbench {
         scroll
     }
 
-    /// Whether an opened body is read through a viewport of its own.
+    /// Whether a body is read through a viewport of its own.
     ///
-    /// Opening a body is the reader saying they want the rest of it; a rest this
-    /// long cannot be laid out whole on every frame, so it is drawn inside a box
-    /// that lays out only the chunks it shows.
-    fn timeline_body_windowed(&self, text: &str, revealed: bool) -> bool {
-        revealed && text.len() > TIMELINE_BODY_VIEWPORT_MIN_BYTES
+    /// The body's length is the whole question. A folded body draws its head,
+    /// and the head is as long as the fold allowance; once that allowance passed
+    /// the viewport minimum, every folded report would put a body-sized surface
+    /// back on the frame path. Splitting by length instead makes the allowance a
+    /// reading choice: what a fold hides costs a frame nothing, and what it
+    /// shows costs only the chunks the screen reaches.
+    fn timeline_body_windowed(&self, text: &str) -> bool {
+        text.len() > TIMELINE_BODY_VIEWPORT_MIN_BYTES
     }
 
     /// The height a row's prose takes: a body's own estimate, or what the chunk
@@ -58062,7 +58065,9 @@ impl VibexWorkbench {
         }
         self.timeline_body_windows
             .get(row.id.as_str())
-            .filter(|(revision, _)| *revision == row.last_sequence)
+            .filter(|(revision, window)| {
+                *revision == row.last_sequence && window.body_len == visible_body.len()
+            })
             .map(|(_, window)| f32::from(window.total_height()))
             .unwrap_or_else(|| estimated_markdown_body_height(visible_body, chars_per_line))
     }
@@ -58082,6 +58087,7 @@ impl VibexWorkbench {
     ) -> Rc<TimelineBodyWindow> {
         if let Some((cached_revision, window)) = self.timeline_body_windows.get(row_id)
             && *cached_revision == revision
+            && window.body_len == body.len()
         {
             return window.clone();
         }
@@ -58097,6 +58103,7 @@ impl VibexWorkbench {
             .collect();
         let window = Rc::new(TimelineBodyWindow {
             revision,
+            body_len: body.len(),
             chunks,
             heights,
         });
@@ -58181,7 +58188,7 @@ impl VibexWorkbench {
                     else {
                         return Empty.into_any_element();
                     };
-                    if *cached_revision != revision {
+                    if *cached_revision != revision || window.body_len != build_body.len() {
                         return Empty.into_any_element();
                     }
                     let source = window.source(&build_body, index);
@@ -58735,11 +58742,11 @@ impl VibexWorkbench {
             }
             TimelineRowKind::AgentMessage => {
                 let (visible_body, hidden_body_bytes) = self.visible_row_body(row);
-                // A windowed body is measured by its box, not by its prose: the
-                // box is what the timeline lays out, and the prose inside it is
-                // the box's own scrolling to do.
-                let body_windowed = self
-                    .timeline_body_windowed(visible_body, self.timeline_row_body_revealed(&row.id));
+                // A windowed body is measured by its table, not by its prose:
+                // the table is what the timeline lays out, and scaling the prose
+                // instead would put the body's own length back into every frame.
+                let body_windowed =
+                    !self.row_is_arriving(row) && self.timeline_body_windowed(visible_body);
                 let mut height = self.timeline_body_drawn_height(
                     row,
                     visible_body,
@@ -58754,7 +58761,6 @@ impl VibexWorkbench {
                     height += 36.0;
                 }
                 if hidden_body_bytes > 0
-                    || body_windowed
                     || (self.timeline_row_body_revealed(&row.id) && self.row_body_folds(row))
                 {
                     height += TIMELINE_BODY_REVEAL_CONTROL_HEIGHT;
@@ -58775,8 +58781,8 @@ impl VibexWorkbench {
                         None => {
                             let (visible, hidden) = self.visible_reasoning_body(row, remaining);
                             let visible = visible.unwrap_or_default();
-                            let body_windowed = self
-                                .timeline_body_windowed(visible, self.reasoning_body_revealed(row));
+                            let body_windowed =
+                                !self.row_is_arriving(row) && self.timeline_body_windowed(visible);
                             let mut height = self.timeline_body_drawn_height(
                                 row,
                                 visible,
@@ -58784,7 +58790,6 @@ impl VibexWorkbench {
                                 body_windowed,
                             ) + 4.0;
                             if hidden > 0
-                                || body_windowed
                                 || (self.reasoning_body_revealed(row) && self.row_body_folds(row))
                             {
                                 height += TIMELINE_BODY_REVEAL_CONTROL_HEIGHT;
@@ -59826,19 +59831,23 @@ impl VibexWorkbench {
         let body_revealed = self.timeline_row_body_revealed(&row.id);
         let (markdown_source, hidden_body_bytes) =
             self.timeline_row_body_source(row, body_revealed);
-        // A body past the viewport allowance is read through a box of its own:
-        // the row keeps a bounded height and only the chunks the box shows are
-        // laid out, so an opened report costs a screenful instead of itself.
-        let body_windowed = self.row_body_folds(row)
-            && self.timeline_body_windowed(&markdown_source, body_revealed);
+        // A body past the viewport allowance is read through a chunk table of
+        // its own: what it costs stops following its length, so the fold
+        // allowance above only decides how much of a message the reader sees.
+        // A body still arriving keeps one surface — its table would be re-cut
+        // on every chunk that lands.
+        let body_windowed =
+            !self.row_is_arriving(row) && self.timeline_body_windowed(&markdown_source);
         let windowed_body = body_windowed.then(|| {
             self.render_windowed_body(row, markdown_source.clone(), search_highlight.clone(), cx)
         });
         // An opened body is always collapsible again: the control is the way
-        // back even when the surface draws the whole of it.
-        let body_reveal_control =
-            (hidden_body_bytes > 0 || body_windowed || (body_revealed && self.row_body_folds(row)))
-                .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
+        // back even when the surface draws the whole of it. A body that is not
+        // folded has nothing behind the control, so a windowed body alone does
+        // not carry one.
+        let body_reveal_control = (hidden_body_bytes > 0
+            || (body_revealed && self.row_body_folds(row)))
+        .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
         let markdown_view = (!body_windowed).then(|| {
             let arriving = self.row_is_arriving(row);
             let markdown_state = self.markdown_text_state(
@@ -60342,11 +60351,11 @@ impl VibexWorkbench {
             let (remaining_source, hidden_body_bytes) =
                 self.reasoning_row_body_source(row, remaining_source);
             // The same viewport a settled message body gets: a long thought is
-            // read through a box that lays out the chunks it shows.
-            let body_windowed = self.timeline_body_windowed(
-                remaining_source.as_deref().unwrap_or_default(),
-                body_revealed,
-            );
+            // read through a chunk table that lays out the chunks it shows. A
+            // thought still arriving keeps one surface; the live window decides
+            // its shape.
+            let body_windowed = !self.row_is_arriving(row)
+                && self.timeline_body_windowed(remaining_source.as_deref().unwrap_or_default());
             let windowed_body = body_windowed.then(|| {
                 let body = remaining_source
                     .clone()
@@ -60354,7 +60363,6 @@ impl VibexWorkbench {
                 self.render_windowed_body(row, body, search_highlight.clone(), cx)
             });
             let body_reveal_control = (hidden_body_bytes > 0
-                || body_windowed
                 || (body_revealed && self.row_body_folds(row)))
             .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
             // The disclosure header is one short, muted line. Rendering it as a
@@ -68738,30 +68746,30 @@ fn reasoning_preview_text(label: &str) -> String {
     truncate_agent_thinking_label(normalized.trim())
 }
 
-/// How much of a settled row body the timeline lays out at once.
+/// How much of a settled row body the reader sees before asking for the rest.
 ///
-/// A Markdown surface lays its whole body out on every frame it is on screen,
-/// and the cost follows the text rather than the row count: measured against a
-/// real session, a screenful whose bodies run to ~1.1 MB costs ~54 ms a frame
-/// and the same screenful costs ~7 ms once its long bodies are cut down to this
-/// allowance. A settled body longer than this is therefore drawn as its head,
-/// with a control on the row that opens the rest.
-const TIMELINE_BODY_VISIBLE_BYTES: usize = 4 * 1024;
+/// A settled body longer than this is drawn as its head, with a control on the
+/// row that opens the rest. The allowance is a reading choice rather than a
+/// performance one: a body past [`TIMELINE_BODY_VIEWPORT_MIN_BYTES`] is laid out
+/// as chunks whether it is folded or opened, so what a fold hides costs a frame
+/// nothing. Twelve kilobytes is about four thousand Chinese characters — a long
+/// message, in a language where a smaller allowance reads as a third of the text.
+const TIMELINE_BODY_VISIBLE_BYTES: usize = 12 * 1024;
 
-/// The shortest body that an opened row reads as chunks of itself.
+/// The shortest body that is read as chunks of itself.
 ///
-/// Below this, opening a body is the reader saying they want to see the rest of
-/// a message, and the rest is small enough to hand to one surface whole. Above
-/// it the body is cut into chunks, and the transcript lays out only the chunks
-/// the screen shows — so what an opened body costs stops following the body's
-/// length while the body itself still scrolls with the page.
+/// Below this a body is small enough to hand to one surface whole. Above it the
+/// body is cut into chunks and the transcript lays out only the chunks the
+/// screen shows, so what the body costs stops following its length while the
+/// body itself still scrolls with the page. The decision is the length's alone,
+/// not whether the reader has opened the body: a folded body draws its head
+/// through the same window, which is why the fold allowance sits above this one.
 ///
-/// The allowance is deliberately close to the folded one: a Markdown surface's
+/// The allowance is deliberately below the folded one: a Markdown surface's
 /// frame cost is not linear in what it is handed so much as it is punishing
-/// past a point, and a body between the two used to fall in the gap — too long
-/// to draw cheaply, too short to be split (measured: revealing every body of a
-/// real session cost 104 ms a frame with one 31 KB surface in view, against
-/// 4.2 ms a frame for the same page laid out as chunks).
+/// past a point (measured: revealing every body of a real session cost 104 ms a
+/// frame with one 31 KB surface in view, against 4.2 ms a frame for the same
+/// page laid out as chunks).
 const TIMELINE_BODY_VIEWPORT_MIN_BYTES: usize = 8 * 1024;
 
 /// How much prose one chunk of a windowed body holds.
@@ -68824,13 +68832,16 @@ fn timeline_row_body_folds(row: &TimelineRow, turn_live: bool) -> bool {
 
 /// Where one windowed body is cut into the chunks the window lays out.
 ///
-/// A chunk breaks at a blank line, so a table, a list or a paragraph travels
-/// inside one chunk and every chunk starts on a whole Markdown block. A fence
-/// travels whole when it fits: the split refuses to cut inside one until a
-/// chunk has run past [`TIMELINE_BODY_CHUNK_MAX_BYTES`], at which point the cut
-/// is forced and the chunk is a layout unit rather than a semantic one. The
-/// chunks are the body's own ranges: concatenating them is the body, so the
-/// window can address prose by chunk without copying it.
+/// A chunk breaks at a blank line when one is available, so a table, a list or a
+/// paragraph travels inside one chunk and every chunk starts on a whole
+/// Markdown block. A paragraph too long to fit is cut on its own line boundary
+/// at the chunk size instead, so prose written as one block still travels in
+/// chunks rather than in one body-sized surface. A fence travels whole when it
+/// fits: the split refuses to cut inside one until a chunk has run past
+/// [`TIMELINE_BODY_CHUNK_MAX_BYTES`], at which point the cut is forced and the
+/// chunk is a layout unit rather than a semantic one. The chunks are the body's
+/// own ranges: concatenating them is the body, so the window can address prose
+/// by chunk without copying it.
 fn timeline_body_chunks(body: &str) -> Vec<Range<usize>> {
     let mut chunks = Vec::new();
     let mut start = 0_usize;
@@ -68852,9 +68863,8 @@ fn timeline_body_chunks(body: &str) -> Vec<Range<usize>> {
         }
         offset += line.len();
         let held = offset - start;
-        let at_break = fence.is_none() && blank.is_some_and(|end| end > start);
-        if (held >= TIMELINE_BODY_CHUNK_BYTES && at_break) || held >= TIMELINE_BODY_CHUNK_MAX_BYTES
-        {
+        let at_chunk = fence.is_none() && held >= TIMELINE_BODY_CHUNK_BYTES;
+        if at_chunk || held >= TIMELINE_BODY_CHUNK_MAX_BYTES {
             let end = match blank.filter(|end| *end > start && *end <= offset) {
                 Some(end) if held < TIMELINE_BODY_CHUNK_MAX_BYTES => end,
                 _ => offset,
@@ -68895,6 +68905,13 @@ fn timeline_markdown_fence(line: &str) -> Option<String> {
 struct TimelineBodyWindow {
     /// The row revision the chunks were cut from.
     revision: i64,
+    /// How many bytes the text these ranges address holds.
+    ///
+    /// A row draws its head while folded and the whole body once the reader
+    /// opens it, and both shapes share a revision. The length is what tells the
+    /// two tables apart, so a reveal cannot leave the frame addressing the
+    /// opened body through the head's ranges.
+    body_len: usize,
     /// The body's own byte ranges, in order.
     chunks: Vec<Range<usize>>,
     /// The height of each chunk: measured where the window has shown it,

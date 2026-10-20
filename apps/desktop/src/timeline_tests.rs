@@ -2440,20 +2440,52 @@ fn a_body_cut_is_memoized_by_the_row_revision(cx: &mut TestAppContext) {
     );
 }
 
+/// A row's chunk table is keyed by the text the row draws, not by its revision
+/// alone.
+///
+/// The folded and opened shapes of one row share a revision — revealing is not a
+/// new item — so a table cut from the head would otherwise be reused to lay out
+/// the whole body, with the head's ranges and the head's height. The length of
+/// the text is what tells the two tables apart.
+#[gpui::test]
+fn a_body_window_follows_the_text_the_row_draws(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, cx) = live_tool_timeline(cx, true);
+    let body: String = (0..500)
+        .map(|index| format!("paragraph {index} of a report the row draws\n\n"))
+        .collect();
+    let head = folded_body_parts(&body).0;
+    assert!(head.len() < body.len(), "the fixture has to fold");
+    let (head_len, whole_len) = workbench.update(cx, |workbench, _| {
+        let head_window = workbench.timeline_body_window("row", 7, head, 80);
+        let whole_window = workbench.timeline_body_window("row", 7, &body, 80);
+        (head_window.body_len, whole_window.body_len)
+    });
+    assert_eq!(head_len, head.len(), "the folded table stops at the head");
+    assert_eq!(whole_len, body.len(), "opening the row re-cuts the table");
+}
+
 /// A long settled body is drawn as its head until the reader opens it.
 ///
 /// The Markdown surface lays its whole body out on every frame it is on screen,
 /// so a screenful of long answers is what turns a 60 fps timeline into a 20 fps
 /// one. A settled body that outruns the allowance therefore travels as its head,
-/// with a control on the row that pays for the rest — and the row's measurement
-/// follows the cut, or the timeline would reserve height nothing fills.
+/// with a control on the row that pays for the rest — and the head itself is
+/// past the viewport minimum, so it is laid out as chunks of itself. The row's
+/// measurement follows both cuts, or the timeline would reserve height nothing
+/// fills.
 #[gpui::test]
 fn a_long_settled_body_is_drawn_as_its_head_until_the_reader_opens_it(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let session_id = VibexSessionId::parse("session_layout").unwrap();
-    let long_body: String = (0..400)
+    let long_body: String = (0..900)
         .map(|line| format!("line {line} of a settled answer\n"))
         .collect();
+    assert!(
+        long_body.len() > TIMELINE_BODY_VISIBLE_BYTES,
+        "the fixture has to outrun the fold allowance: {} bytes",
+        long_body.len()
+    );
     let (view, cx) = cx.add_window_view({
         let long_body = long_body.clone();
         move |window, cx| {
@@ -2533,16 +2565,33 @@ fn a_long_settled_body_is_drawn_as_its_head_until_the_reader_opens_it(cx: &mut T
     });
 
     let folded_source = folded_body_parts(&long_body).0.len();
-    let drawn = workbench.read_with(cx, |workbench, _| {
-        workbench
+    // The head is past the viewport minimum, so the fold draws it through the
+    // same chunk table an opened body gets. The table's length is the proof it
+    // was cut from the head: the row still draws the allowance, not the body.
+    let (folded_table, whole_surface) = workbench.read_with(cx, |workbench, _| {
+        let table = workbench
+            .timeline_body_windows
+            .get(&row_id)
+            .map(|(_, window)| {
+                (
+                    window.body_len,
+                    window.chunks.last().map_or(0, |chunk| chunk.end),
+                )
+            });
+        let surface = workbench
             .markdown_text_states
             .get(&format!("markdown:{row_id}"))
-            .map(|state| state.source.len())
+            .map(|state| state.source.len());
+        (table, surface)
     });
     assert_eq!(
-        drawn,
-        Some(folded_source),
-        "the surface lays out the head, not the whole body"
+        folded_table,
+        Some((folded_source, folded_source)),
+        "the chunk table stops at the fold's head"
+    );
+    assert!(
+        whole_surface.is_none(),
+        "the head is not handed to one surface whole: {whole_surface:?}"
     );
     assert!(
         folded_height < full_estimate,
@@ -2556,12 +2605,36 @@ fn a_long_settled_body_is_drawn_as_its_head_until_the_reader_opens_it(cx: &mut T
         cx.debug_bounds(control_selector).is_some(),
         "a folded body carries the control that opens it"
     );
+    let body_selector: &'static str =
+        Box::leak(format!("timeline-body-window:{row_id}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(body_selector).is_some(),
+        "the folded head is laid out in the transcript like any windowed body"
+    );
 
     // The press belongs to the control: without claiming it, the same press
     // starts a window-level text selection over the body the click opens.
+    // The folded head is taller than the test window, so the control below it
+    // is off screen. Scroll the transcript the way a reader would until the
+    // control is in view, then press it where it now sits.
     let control_bounds = cx
         .debug_bounds(control_selector)
         .expect("the folded row's control is laid out");
+    workbench.update(cx, |workbench, cx| {
+        // Scrolling up is the reader leaving the live edge; without this the
+        // next frame pulls the transcript back to the bottom.
+        workbench.timeline_follow.set_following_bottom(false);
+        let offset = workbench.timeline_scroll.offset();
+        workbench.timeline_scroll.set_offset(point(
+            px(0.0),
+            offset.y + px(120.0) - control_bounds.origin.y,
+        ));
+        cx.notify();
+    });
+    let _ = draw_live_timeline_frames(&workbench, cx, 2);
+    let control_bounds = cx
+        .debug_bounds(control_selector)
+        .expect("the folded row's control is still laid out");
     cx.simulate_mouse_down(
         control_bounds.center(),
         MouseButton::Left,
@@ -2598,11 +2671,9 @@ fn a_long_settled_body_is_drawn_as_its_head_until_the_reader_opens_it(cx: &mut T
     // Opening a body this long splits it into chunks the transcript lays out as
     // the screen reaches them: one surface never receives the whole body, and
     // the row is as tall as the body so the reader scrolls the page through it.
-    let body_selector: &'static str =
-        Box::leak(format!("timeline-body-window:{row_id}").into_boxed_str());
     assert!(
         cx.debug_bounds(body_selector).is_some(),
-        "the opened row is laid out in the transcript"
+        "the opened row is still laid out in the transcript"
     );
     assert!(
         !opened_surfaces.is_empty()
@@ -2640,6 +2711,149 @@ fn a_long_settled_body_is_drawn_as_its_head_until_the_reader_opens_it(cx: &mut T
             "only prose bodies fold"
         );
     });
+}
+
+/// A body between the two allowances is read as chunks even though it is shown
+/// whole.
+///
+/// The fold allowance decides how much of a message the reader sees; the
+/// viewport allowance decides how it is laid out. Tying the second to the first
+/// — or to the reader having opened the body — left the band between them on the
+/// single-surface frame path, which is the band the larger fold allowance now
+/// admits.
+#[gpui::test]
+fn a_settled_body_between_the_allowances_is_read_as_chunks(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+    let body: String = (0..150)
+        .map(|index| {
+            format!("line {index} of an answer that is shown whole but laid out in chunks\n")
+        })
+        .collect();
+    assert!(
+        body.len() > TIMELINE_BODY_VIEWPORT_MIN_BYTES && body.len() <= TIMELINE_BODY_VISIBLE_BYTES,
+        "the fixture has to sit between the allowances: {} bytes",
+        body.len()
+    );
+    let (view, cx) = cx.add_window_view({
+        let body = body.clone();
+        move |window, cx| {
+            let workbench = cx.new(|cx| {
+                let mut ui_state = DesktopUiStateV1::default();
+                ui_state.appearance.locale = LocaleMode::En;
+                ui_state.session.turn_preview_rail = false;
+                let mut workbench =
+                    VibexWorkbench::with_initial_state(None, ui_state, None, window, cx);
+                workbench.agent_loading = false;
+                workbench.selected_session_id = Some(session_id.clone());
+                workbench.view_session_id = Some(session_id.clone());
+                workbench.timeline.replace_authoritative(
+                    session_id.clone(),
+                    vec![
+                        live_timeline_item(
+                            1,
+                            TimelinePayload::UserMessage(UserMessagePayload {
+                                text: "first question".into(),
+                                attachments: Vec::new(),
+                                ..Default::default()
+                            }),
+                        ),
+                        live_timeline_item(
+                            2,
+                            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                                text: body.clone(),
+                                is_final: true,
+                            }),
+                        ),
+                        // The answer is followed by another turn, which is what
+                        // settles it: only the last turn can still be live.
+                        live_timeline_item(
+                            3,
+                            TimelinePayload::UserMessage(UserMessagePayload {
+                                text: "second question".into(),
+                                attachments: Vec::new(),
+                                ..Default::default()
+                            }),
+                        ),
+                        live_timeline_item(
+                            4,
+                            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                                text: "short answer".into(),
+                                is_final: true,
+                            }),
+                        ),
+                    ],
+                );
+                workbench.conversation_turns_cache_key = None;
+                workbench.rebuild_timeline_sizes();
+                workbench
+            });
+            LiveTimelineProbe { workbench }
+        }
+    });
+    let workbench = view.read_with(cx, |view, _| view.workbench.clone());
+    let _ = draw_live_timeline_frames(&workbench, cx, 2);
+    let (row_id, hidden, table, surface) = workbench.read_with(cx, |workbench, _| {
+        let row = workbench.conversation_turns_cache[0]
+            .conclusion_row
+            .as_ref()
+            .expect("the settled turn's answer is a row");
+        (
+            row.id.clone(),
+            folded_body_parts(&row.body).1,
+            workbench
+                .timeline_body_windows
+                .get(&row.id)
+                .map(|(_, window)| (window.body_len, window.chunks.len())),
+            workbench
+                .markdown_text_states
+                .get(&format!("markdown:{}", row.id))
+                .map(|state| state.source.len()),
+        )
+    });
+    assert_eq!(hidden, 0, "the whole body is shown");
+    let (table_len, chunks) = table.expect("a body past the viewport minimum has a table");
+    assert_eq!(
+        table_len,
+        body.len(),
+        "the table is cut from the whole body"
+    );
+    assert!(chunks > 1, "one surface would lay the body out whole");
+    assert!(
+        surface.is_none(),
+        "the body is not handed to one surface: {surface:?}"
+    );
+    let control: &'static str =
+        Box::leak(format!("timeline-body-reveal:{row_id}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(control).is_none(),
+        "nothing is hidden, so the row carries no fold control"
+    );
+}
+
+/// The allowance in a language where a character is three bytes.
+///
+/// Twelve kilobytes is about four thousand Chinese characters, and a body at the
+/// allowance is not folded at all; one character more is, and what it shows is at
+/// least half the allowance — the fold is a reading choice, and a reader looking
+/// at a Chinese message should get as much of it as the allowance promises.
+#[test]
+fn a_chinese_body_folds_at_the_allowance_and_keeps_at_least_half_of_it() {
+    let at_allowance = "中".repeat(TIMELINE_BODY_VISIBLE_BYTES / 3);
+    assert_eq!(at_allowance.len(), TIMELINE_BODY_VISIBLE_BYTES);
+    let (head, hidden) = folded_body_parts(&at_allowance);
+    assert_eq!(hidden, 0, "a body at the allowance is not folded");
+    assert_eq!(head.len(), at_allowance.len());
+
+    let over = format!("{at_allowance}中");
+    let (head, hidden) = folded_body_parts(&over);
+    assert_eq!(hidden, 3, "one character past the allowance folds");
+    assert_eq!(head.len(), TIMELINE_BODY_VISIBLE_BYTES);
+    assert!(
+        head.len() >= TIMELINE_BODY_VISIBLE_MIN_BYTES,
+        "the head keeps at least half the allowance"
+    );
+    assert!(head.is_char_boundary(head.len()));
 }
 
 /// A windowed body's chunks are the body itself, cut on paragraph breaks.
@@ -2878,6 +3092,23 @@ fn a_revealed_long_body_lays_out_only_the_chunks_the_screen_shows(cx: &mut TestA
     assert!(
         laid_out < chunk_count,
         "and still only the band it shows: {laid_out} of {chunk_count}"
+    );
+
+    // Folding it back has to cut a table for the head, not reuse the one the
+    // whole body was read through.
+    workbench.update(cx, |workbench, cx| {
+        workbench.toggle_timeline_row_body(row_id.clone(), Some(turn_id.clone()), cx);
+    });
+    for _ in 0..3 {
+        cx.run_until_parked();
+        let _ = draw_live_timeline_frames(&workbench, cx, 1);
+    }
+    let folded_again = workbench.read_with(cx, |workbench, _| {
+        f32::from(workbench.timeline_row_sizes[0].height)
+    });
+    assert!(
+        folded_again < row_height,
+        "folding back measures the head again: {folded_again} against {row_height}"
     );
 }
 

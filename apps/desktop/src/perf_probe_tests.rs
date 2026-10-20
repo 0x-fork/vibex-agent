@@ -1534,3 +1534,111 @@ fn probe_message_delta_folding(cx: &mut TestAppContext) {
         }
     });
 }
+
+/// Probe: what an unrevealed long body costs a frame, by its size.
+///
+/// The fold allowance is a reading choice only if a body that is *not* folded is
+/// still laid out as chunks: an unrevealed row draws its head, and the head is as
+/// long as the allowance. This measures what that costs at each size, so raising
+/// the allowance stays a decision about reading rather than a guess about frames.
+/// `VIBEX_PROBE_SIZES` sets the sizes in bytes (default
+/// 4096,8192,12288,16384,32768); the label reports the head actually drawn, which
+/// is the body until it passes the fold allowance and the allowance after that.
+#[gpui::test]
+#[ignore = "performance probe: --ignored to run"]
+fn probe_unrevealed_body_frames(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+    let sizes = std::env::var("VIBEX_PROBE_SIZES")
+        .unwrap_or_else(|_| "4096,8192,12288,16384,32768".to_string())
+        .split(',')
+        .filter_map(|value| value.trim().parse::<usize>().ok())
+        .collect::<Vec<_>>();
+    for bytes in sizes {
+        let body = synthetic_body(bytes);
+        let head_bytes = folded_body_parts(&body).0.len();
+        let items = vec![
+            probe_item(
+                1,
+                TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                    text: "question".into(),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+            ),
+            probe_item(
+                2,
+                TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                    text: body,
+                    is_final: true,
+                }),
+            ),
+        ];
+        let (workbench, render_millis, cx) = build(cx, items, false);
+        // A finished session: the answer is settled, so the row folds.
+        workbench.update(cx, |workbench, _| {
+            workbench.upsert_session_snapshot(AgentSession {
+                id: session_id.clone(),
+                title: "Probe".into(),
+                project_id: ProjectId::parse("project_probe").unwrap(),
+                workspace_id: vibex_core::WorkspaceId::parse("workspace_probe").unwrap(),
+                workspace_root: "/probe".into(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                agent_id: AgentId::parse("codex").unwrap(),
+                state: AgentSessionState::Idle,
+                safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                last_message_at_ms: 1,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+            });
+            workbench.conversation_turns_cache_key = None;
+            workbench.rebuild_timeline_sizes();
+        });
+        measure(
+            &workbench,
+            cx,
+            &format!("unrevealed head {head_bytes} B of {bytes} B"),
+            10,
+        );
+        drop(render_millis);
+    }
+}
+
+/// One timeline item of a probe's own making.
+fn probe_item(sequence: i64, payload: TimelinePayload) -> TimelineItem {
+    TimelineItem {
+        id: TimelineItemId::parse(format!("timeline_probe-{sequence}")).unwrap(),
+        session_id: VibexSessionId::parse("session_layout").unwrap(),
+        sequence,
+        timestamp_ms: sequence,
+        source: if matches!(payload, TimelinePayload::UserMessage(_)) {
+            TimelineSource::User
+        } else {
+            TimelineSource::Agent
+        },
+        kind: payload.kind(),
+        correlation_id: None,
+        provider_correlation_id: None,
+        redaction_state: TimelineRedactionState::None,
+        execution_attribution: None,
+        payload_depth: vibex_core::TimelinePayloadDepth::Detail,
+        payload,
+    }
+}
+
+/// A body of exactly `bytes` bytes of prose.
+fn synthetic_body(bytes: usize) -> String {
+    let mut body = String::with_capacity(bytes + 64);
+    let mut line = 0_usize;
+    while body.len() < bytes {
+        body.push_str(&format!(
+            "line {line} of a settled answer that is read folded\n"
+        ));
+        line += 1;
+    }
+    let cut = vibex_ui::markdown::utf8_prefix(&body, bytes).len();
+    body.truncate(cut);
+    body
+}
