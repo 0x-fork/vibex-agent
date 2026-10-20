@@ -9632,6 +9632,15 @@ pub enum Effect {
     FetchProviderModels {
         profile_id: vibex_core::ProviderProfileId,
     },
+    /// Turn the local gateway on or off, as its own row's switch asks.
+    ///
+    /// The switch is the one write this table offers on a record that is not a
+    /// Provider: a direct Provider is chosen, not switched, while the gateway
+    /// is either serving the Agents that point at it or stepping aside for
+    /// their own configuration.
+    SetGatewayEnabled {
+        enabled: bool,
+    },
     ListAgents,
     InstallAgent {
         agent_id: vibex_core::AgentId,
@@ -9915,6 +9924,7 @@ impl Effect {
             Effect::ListAudit => "audit",
             Effect::ListProfiles => "profiles",
             Effect::LoadGateway => "gateway",
+            Effect::SetGatewayEnabled { .. } => "gateway_toggle",
             Effect::SelectProfile { .. } => "select_profile",
             Effect::WriteProviderSecret { .. } => "provider_secret",
             Effect::ClearProviderSecret { .. } => "provider_secret_clear",

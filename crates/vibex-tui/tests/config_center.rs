@@ -4976,6 +4976,104 @@ fn the_gateway_leads_the_providers_table_and_reports_its_state() {
     );
 }
 
+/// A running gateway with one upstream, for the switch tests.
+fn running_gateway() -> vibex_core::GatewaySnapshot {
+    let upstream = vibex_core::ModelProviderProfileId::new();
+    vibex_core::GatewaySnapshot {
+        settings: vibex_core::ModelGatewaySettings {
+            display_name: "Vibex Gateway".to_string(),
+            upstreams: vec![upstream.clone()],
+            ..vibex_core::ModelGatewaySettings::default()
+        },
+        runtime: vibex_core::ModelGatewayRuntimeState::running(3425, 1),
+        upstreams: vec![vibex_core::GatewayUpstreamSummary {
+            model_provider_profile_id: upstream,
+            display_name: "DeepSeek".to_string(),
+            model_count: 2,
+            keys: Vec::new(),
+        }],
+        models: Vec::new(),
+        agents: Vec::new(),
+        upstream_candidates: Vec::new(),
+    }
+}
+
+/// The gateway's switch is a write, not decoration on the row.
+///
+/// The row has always advertised `Toggle` while the table had no arm for it, so
+/// the verb was drawn, pressed, and dropped. What it means is what the row
+/// shows: a gateway that is serving is turned off, and anything else asks to be
+/// turned on.
+#[test]
+fn the_gateway_switch_writes_and_answers_the_press() {
+    let mut app = loaded(140, 40);
+    app.management_data.gateway = Some(running_gateway());
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+
+    let before = app.config_center.rows(&app.management_data, app.strings);
+    assert_eq!(before[0].key, "gateway");
+    assert_eq!(before[0].chip, "Enabled");
+    assert!(
+        before[0]
+            .detail
+            .iter()
+            .any(|(label, value)| label == "address" && value.contains("3425")),
+        "the running row must name the port it serves on: {:?}",
+        before[0].detail
+    );
+
+    app.run_config_action_by_key("gateway", ConfigAction::Toggle);
+    let after = app.config_center.rows(&app.management_data, app.strings);
+    assert_eq!(
+        after[0].chip, "Disabled",
+        "the row waited for the authority"
+    );
+    assert!(
+        app.config_center.pending.contains_key("gateway"),
+        "the switch was not filed as a write"
+    );
+    assert!(
+        after[0]
+            .detail
+            .iter()
+            .all(|(label, value)| label != "address" || !value.contains("3425")),
+        "a port the authority has not confirmed must not stay on the row: {:?}",
+        after[0].detail
+    );
+}
+
+/// A gateway nobody has read yet has no row to switch.
+#[test]
+fn a_gateway_that_is_not_there_cannot_be_switched() {
+    let mut app = loaded(140, 40);
+    app.management_data.gateway = None;
+    app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
+    app.run_config_action_by_key("gateway", ConfigAction::Toggle);
+    assert!(
+        !app.config_center.pending.contains_key("gateway"),
+        "a press with no row behind it must not file a write"
+    );
+}
+
+/// The switch reaches the authority, and the answer it returns is the row's
+/// next state.
+///
+/// Only the authority knows which port comes back when the gateway is turned
+/// on, and turning it off moves every bound Agent back to its own Provider, so
+/// the client draws the snapshot it was handed rather than a guess.
+#[test]
+fn the_gateway_switch_reaches_the_authority() {
+    let source = include_str!("../src/worker.rs");
+    let arm = source
+        .split_once("Effect::SetGatewayEnabled { enabled } => {")
+        .and_then(|(_, tail)| tail.split_once("\n            Effect::"))
+        .map(|(body, _)| body)
+        .expect("the gateway switch must remain inspectable");
+    assert!(arm.contains("set_model_gateway_enabled(enabled)"));
+    assert!(arm.contains("AppMessage::Gateway(Ok(snapshot))"));
+    assert!(arm.contains("failure_for(\"gateway_toggle\""));
+}
+
 /// A gateway that cannot be read leaves the direct Providers readable.
 #[test]
 fn a_missing_gateway_does_not_remove_the_direct_providers() {

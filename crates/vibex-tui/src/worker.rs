@@ -2211,6 +2211,30 @@ impl Dispatch {
                 let result = self.facade.management().model_gateway_snapshot().await;
                 self.send(AppMessage::Gateway(result));
             }
+            Effect::SetGatewayEnabled { enabled } => {
+                // The answer is the snapshot that resulted, so the row is drawn
+                // from what the authority did rather than from the press: only
+                // it knows which port comes back, and turning the gateway off
+                // moves every Agent bound to it back to its own Provider.
+                match self
+                    .facade
+                    .management()
+                    .set_model_gateway_enabled(enabled)
+                    .await
+                {
+                    Ok(snapshot) => {
+                        self.send(AppMessage::Gateway(Ok(snapshot)));
+                        self.ok_with(
+                            "gateway_toggle",
+                            Some("gateway".to_string()),
+                            crate::app::MutationOutcome::Plain,
+                        )
+                    }
+                    Err(error) => {
+                        self.failure_for("gateway_toggle", Some("gateway".to_string()), error)
+                    }
+                }
+            }
             Effect::RenameProfile { profile_id, name } => {
                 let record = profile_id.as_str().to_string();
                 let Some(request) = self.profile_update(profile_id, Some(name)).await else {

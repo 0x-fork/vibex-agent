@@ -1807,6 +1807,20 @@ impl App {
             (ConfigSection::Agents, ConfigAction::Logout) => {
                 self.open_agent_auth_at(key, crate::config_center::AgentAuthLine::SignOut)
             }
+            // The gateway's own row is the only switch in this table. A direct
+            // Provider is chosen rather than switched, so this arm is the row
+            // it names and nothing else: the verbs a Provider row advertises do
+            // not include Toggle.
+            (ConfigSection::Providers, ConfigAction::Toggle) if key == "gateway" => {
+                let Some(snapshot) = self.management_data.gateway.as_ref() else {
+                    return Outcome::quiet();
+                };
+                // "On" means it is serving; anything else — disabled, still
+                // starting, or stepped aside — is a row that asks to be turned
+                // on, so the press is the opposite of what the row shows.
+                let enabled = snapshot.runtime.status != vibex_core::ModelGatewayStatus::Running;
+                self.begin_toggle(key, enabled, Effect::SetGatewayEnabled { enabled })
+            }
             (ConfigSection::Providers, ConfigAction::Activate) => {
                 let Some(profile_id) = self.provider_id(key) else {
                     return Outcome::quiet();
@@ -4487,6 +4501,22 @@ impl App {
                     } else {
                         vibex_core::PromptStatus::Disabled
                     };
+                }
+            }
+            ConfigSection::Providers => {
+                if key == "gateway"
+                    && let Some(snapshot) = self.management_data.gateway.as_mut()
+                {
+                    // The port is not flipped with the status: only the
+                    // authority knows which port comes back, and a client that
+                    // guessed one would draw an address nobody is listening on.
+                    snapshot.runtime.status = if enabled {
+                        vibex_core::ModelGatewayStatus::Running
+                    } else {
+                        vibex_core::ModelGatewayStatus::Disabled
+                    };
+                    snapshot.runtime.port = None;
+                    snapshot.runtime.notice = None;
                 }
             }
             _ => {}
