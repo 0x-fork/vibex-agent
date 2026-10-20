@@ -472,8 +472,6 @@ struct ManagementCopy {
     prompts: &'static str,
     /// The global Providers tab caption.
     providers: &'static str,
-    /// The local model gateway's own tab caption.
-    gateway: &'static str,
     search_agents: &'static str,
     search_mcp: &'static str,
     search_skills: &'static str,
@@ -497,7 +495,6 @@ fn management_copy() -> ManagementCopy {
             skills: "Skills",
             prompts: "Prompt",
             providers: "Providers",
-            gateway: "Gateway",
             search_agents: "Search Agent",
             search_mcp: "Search MCP",
             search_skills: "Search Skills",
@@ -518,7 +515,6 @@ fn management_copy() -> ManagementCopy {
             skills: "Skill",
             prompts: "Prompt",
             providers: "供应商",
-            gateway: "网关",
             search_agents: "搜索 Agent",
             search_mcp: "搜索 MCP",
             search_skills: "搜索 Skill",
@@ -539,7 +535,6 @@ fn management_copy() -> ManagementCopy {
             skills: "Skill",
             prompts: "Prompt",
             providers: "供應商",
-            gateway: "閘道",
             search_agents: "搜尋 Agent",
             search_mcp: "搜尋 MCP",
             search_skills: "搜尋 Skill",
@@ -986,6 +981,10 @@ pub struct ManagementCenter {
     /// The one-shot wake-up for the soonest cooling Key. One at a time: a
     /// second timer would only repeat the first one's read.
     gateway_refresh_task: Option<Task<()>>,
+    /// The display-name draft, open only while the header is editing.
+    gateway_name_editing: bool,
+    gateway_name_input: Option<Entity<InputState>>,
+    gateway_name_error: Option<String>,
     /// The Key whose stored value is being replaced, and the draft for it.
     gateway_key_replace_target: Option<(vibex_core::ModelProviderProfileId, vibex_core::RequestId)>,
     gateway_key_replace_input: Option<Entity<InputState>>,
@@ -2033,6 +2032,9 @@ impl ManagementCenter {
             gateway_token_limit_error: None,
             gateway_agent_pending: None,
             gateway_refresh_task: None,
+            gateway_name_editing: false,
+            gateway_name_input: None,
+            gateway_name_error: None,
             gateway_key_replace_target: None,
             gateway_key_replace_input: None,
             gateway_key_replace_error: None,
@@ -4143,7 +4145,7 @@ impl ManagementCenter {
         let section = match section {
             ManagementSection::ModelProviders => ManagementSection::Agents,
             ManagementSection::Providers => ManagementSection::Providers,
-            ManagementSection::Gateway => ManagementSection::Gateway,
+            ManagementSection::Gateway => ManagementSection::Providers,
             ManagementSection::Scheduled
             | ManagementSection::Automation
             | ManagementSection::Recovery => ManagementSection::Advanced,
@@ -11223,7 +11225,6 @@ impl ManagementCenter {
                 copy.providers,
                 IconName::Folder,
             ),
-            (ManagementSection::Gateway, copy.gateway, IconName::Network),
             (ManagementSection::Mcp, copy.mcp, IconName::Network),
             (ManagementSection::Skills, copy.skills, IconName::BookOpen),
             (
@@ -11280,19 +11281,134 @@ impl ManagementCenter {
         self.schedule_gateway_cooldown_refresh(cx);
         let rows = self.shared_providers();
         let selected = self.selected_global_provider_id.clone();
+        let locale = locale::current_locale();
         let mut list = v_flex().w_full().gap_1();
-        let mut first_id = None;
+
+        // The gateway is a Provider row, pinned above the Providers it consumes.
+        // It is the row that answers "where does a shared model come from?", so
+        // it is not allowed to hide behind a second navigation item.
+        let gateway_selected = selected.as_deref() == Some(GATEWAY_ROW_ID);
+        let gateway = &self.gateway;
+        let enabled = gateway.settings.policy.enabled;
+        let (gateway_state, gateway_state_color) = match gateway.runtime.status {
+            vibex_core::ModelGatewayStatus::Running => (
+                management_locale_text("Automatic routing · on", "自动调度 · 开", "自動調度 · 開"),
+                cx.theme().success,
+            ),
+            vibex_core::ModelGatewayStatus::Disabled => (
+                management_locale_text("Automatic routing · off", "自动调度 · 关", "自動調度 · 關"),
+                cx.theme().muted_foreground,
+            ),
+            // Starting is a normal moment on first load, not a fallback: saying
+            // the gateway is unavailable here would be a lie that clears itself.
+            vibex_core::ModelGatewayStatus::Starting => (
+                management_locale_text("Starting…", "启动中…", "啟動中…"),
+                cx.theme().info,
+            ),
+            vibex_core::ModelGatewayStatus::Unavailable
+            | vibex_core::ModelGatewayStatus::Degraded => (
+                management_locale_text(
+                    "Gateway unavailable · using direct",
+                    "网关不可用，已回退直连",
+                    "閘道無法使用，已退回直連",
+                ),
+                cx.theme().warning,
+            ),
+        };
+        let gateway_agents = gateway
+            .agents
+            .iter()
+            .filter(|agent| agent.enabled)
+            .map(|agent| {
+                // The binding carries the id; the Agent catalogue carries the
+                // name the reader knows. Fall back to the id so a newly added
+                // Agent is still named before its snapshot lands.
+                self.snapshot
+                    .agents
+                    .iter()
+                    .find(|known| known.id.as_str() == agent.agent_id)
+                    .map(|known| known.label.clone())
+                    .unwrap_or_else(|| agent.agent_id.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let gateway_used = if gateway_agents.is_empty() {
+            management_locale_text("not used yet", "未被使用", "未被使用").to_string()
+        } else {
+            gateway_agents
+        };
+        list = list.child(
+            v_flex()
+                .id("management-global-provider-row-gateway")
+                .w_full()
+                .min_w_0()
+                .gap_1()
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(if gateway_selected {
+                    cx.theme().primary
+                } else {
+                    cx.theme().border
+                })
+                .p_2()
+                .cursor_pointer()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(if enabled {
+                                            cx.theme().primary
+                                        } else {
+                                            cx.theme().muted_foreground
+                                        })
+                                        .child("●"),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_medium()
+                                        .child(gateway.settings.display_name.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(gateway_state_color)
+                                .child(gateway_state),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{} · {gateway_used}",
+                            gateway_overall_key_summary(gateway, locale)
+                        )),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());
+                    cx.notify();
+                })),
+        );
+
         for row in &rows {
             let id = row.profile.id.as_str().to_string();
-            if first_id.is_none() {
-                first_id = Some(id.clone());
-            }
             let is_selected = selected.as_deref() == Some(id.as_str());
-            let key_summary = shared_provider_key_summary(
-                &row.profile,
-                &self.gateway.upstreams,
-                locale::current_locale(),
-            );
+            let key_summary =
+                shared_provider_key_summary(&row.profile, &self.gateway.upstreams, locale);
             let used = if row.agents.is_empty() {
                 management_locale_text("not used yet", "未被使用", "未被使用").to_string()
             } else {
@@ -11323,12 +11439,24 @@ impl ManagementCenter {
                             .justify_between()
                             .gap_2()
                             .child(
-                                div()
+                                h_flex()
                                     .min_w_0()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_medium()
-                                    .child(row.profile.display_name.clone()),
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("○"),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_medium()
+                                            .child(row.profile.display_name.clone()),
+                                    ),
                             )
                             .child(gateway_provider_status_badge(&row.profile, cx)),
                     )
@@ -11344,13 +11472,27 @@ impl ManagementCenter {
                     })),
             );
         }
-        // Keep a selection valid as Profiles come and go.
+        // The gateway row is always there and is the page's first answer; a
+        // selected Provider keeps the selection while it still exists.
         if selected.is_none()
-            || !rows
-                .iter()
-                .any(|row| Some(row.profile.id.as_str()) == selected.as_deref())
+            || (selected.as_deref() != Some(GATEWAY_ROW_ID)
+                && !rows
+                    .iter()
+                    .any(|row| Some(row.profile.id.as_str()) == selected.as_deref()))
         {
-            self.selected_global_provider_id = first_id;
+            self.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());
+        }
+
+        if rows.is_empty() {
+            list = list.child(compact_empty_state(
+                management_locale_text("No Providers yet", "还没有供应商", "還沒有供應商"),
+                management_locale_text(
+                    "Add one to give your Agents a model source.",
+                    "添加后 Agent 才有可用的模型来源。",
+                    "新增後 Agent 才有可用的模型來源。",
+                ),
+                cx,
+            ));
         }
         v_flex()
             .id("management-provider-page-sidebar")
@@ -11386,43 +11528,29 @@ impl ManagementCenter {
                             })),
                     ),
             )
-            .child(if rows.is_empty() {
-                compact_empty_state(
-                    management_locale_text("No Providers yet", "还没有供应商", "還沒有供應商"),
-                    management_locale_text(
-                        "Add one to give your Agents a model source.",
-                        "添加后 Agent 才有可用的模型来源。",
-                        "新增後 Agent 才有可用的模型來源。",
-                    ),
-                    cx,
-                )
-            } else {
-                list.into_any_element()
-            })
+            .child(list)
             .into_any_element()
     }
 
-    /// The global Providers panel: what the selected Provider is, which keys it
-    /// holds, and which Agents bind it.
-    fn render_provider_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// The global Providers panel: the pinned gateway row's detail, or one
+    /// Provider's keys and bindings.
+    fn render_provider_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // The gateway is a row on this page, so its detail is the page's detail
+        // pane rather than a page of its own.
+        if self.selected_global_provider_id.as_deref() == Some(GATEWAY_ROW_ID) {
+            return self.render_gateway(window, cx);
+        }
         let rows = self.shared_providers();
+        // No selection yet, or a Provider that has gone away, resolves to the
+        // pinned gateway row: it is the page's default subject.
         let Some(row) = rows
             .iter()
             .find(|row| {
                 Some(row.profile.id.as_str()) == self.selected_global_provider_id.as_deref()
             })
-            .or_else(|| rows.first())
             .cloned()
         else {
-            return detail_empty_state(
-                management_locale_text("No Providers yet", "还没有供应商", "還沒有供應商"),
-                management_locale_text(
-                    "Add a Provider, or point an Agent at the gateway to share one.",
-                    "添加一个供应商，或让 Agent 走网关来共享。",
-                    "新增一個供應商，或讓 Agent 走閘道來共享。",
-                ),
-                cx,
-            );
+            return self.render_gateway(window, cx);
         };
         let profile = &row.profile;
         let mut body = v_flex().w_full().min_w_0().gap_3();
@@ -11797,6 +11925,43 @@ impl ManagementCenter {
         );
     }
 
+    /// Opens the header's display-name editor with the current name.
+    fn open_gateway_name_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mutation.is_some() {
+            return;
+        }
+        let name = self.gateway.settings.display_name.clone();
+        self.gateway_name_error = None;
+        match self.gateway_name_input.as_ref() {
+            Some(input) => input.update(cx, |input, cx| input.set_value(name, window, cx)),
+            None => {
+                self.gateway_name_input =
+                    Some(cx.new(|cx| InputState::new(window, cx).default_value(name)));
+            }
+        }
+        self.gateway_name_editing = true;
+        cx.notify();
+    }
+
+    /// Writes the display name the header's editor holds.
+    fn save_gateway_name(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self.gateway_name_input.clone() else {
+            return;
+        };
+        let text = input.read(cx).value().to_string();
+        match parse_gateway_display_name(&text) {
+            Ok(name) => {
+                self.gateway_name_error = None;
+                self.gateway_name_editing = false;
+                self.update_gateway_settings(move |request| request.display_name = name, cx);
+            }
+            Err(message) => {
+                self.gateway_name_error = Some(message.to_string());
+                cx.notify();
+            }
+        }
+    }
+
     /// Writes the token ceiling the draft describes.
     ///
     /// The ceiling is a policy, not an account state: it applies to everything
@@ -12103,91 +12268,6 @@ impl ManagementCenter {
         }));
     }
 
-    fn render_gateway_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let copy = management_copy();
-        let snapshot = &self.gateway;
-        let mut rows = v_flex().w_full().gap_2();
-        rows = rows.child(
-            h_flex()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_semibold()
-                        .child(management_locale_text(
-                            "Local gateway",
-                            "本地网关",
-                            "本機閘道",
-                        )),
-                )
-                .child(gateway_status_badge(&snapshot.runtime, cx)),
-        );
-        for upstream in &snapshot.upstreams {
-            rows = rows.child(
-                v_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_1()
-                    .rounded(px(6.0))
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .p_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_medium()
-                            .truncate()
-                            .child(upstream.display_name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{} · {}",
-                                gateway_key_summary_text(upstream, locale::current_locale()),
-                                management_locale_text("models", "个模型", "個模型")
-                            )),
-                    ),
-            );
-        }
-        if snapshot.upstreams.is_empty() {
-            rows = rows.child(compact_empty_state(
-                management_locale_text(
-                    "No upstream Providers",
-                    "还没有上游供应商",
-                    "還沒有上游供應商",
-                ),
-                management_locale_text(
-                    "Add a Provider below, then it can serve models here.",
-                    "在右侧添加供应商后，它就能在这里提供模型。",
-                    "在右側新增供應商後，它就能在這裡提供模型。",
-                ),
-                cx,
-            ));
-        }
-        v_flex()
-            .id("management-gateway-sidebar")
-            .w_full()
-            .h_full()
-            .min_w_0()
-            .gap_3()
-            .p_3()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(copy.gateway),
-            )
-            .child(rows)
-            .into_any_element()
-    }
-
-    /// The gateway's panel: runtime state, routing policy, upstreams, and the
-    /// Agents that walk through it.
     /// The field that adds a key to one upstream.
     ///
     /// The value is masked by default and the field only exists while its own
@@ -12941,6 +13021,84 @@ impl ManagementCenter {
         let pending = self.mutation.is_some();
         let status = &snapshot.runtime;
 
+        let name_input = if self.gateway_name_editing {
+            Some(
+                self.gateway_name_input
+                    .get_or_insert_with(|| {
+                        cx.new(|cx| {
+                            InputState::new(window, cx)
+                                .default_value(snapshot.settings.display_name.clone())
+                        })
+                    })
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let name_row = if let Some(input) = name_input {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&input).small().w_full()),
+                )
+                .child(
+                    Button::new("management-gateway-name-save")
+                        .xsmall()
+                        .primary()
+                        .label(management_locale_text("Save", "保存", "儲存"))
+                        .disabled(pending)
+                        .on_click(cx.listener(|this, _, _, cx| this.save_gateway_name(cx))),
+                )
+                .child(
+                    Button::new("management-gateway-name-cancel")
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text("Cancel", "取消", "取消"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.gateway_name_editing = false;
+                            this.gateway_name_error = None;
+                            cx.notify();
+                        })),
+                )
+        } else {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_base()
+                        .font_semibold()
+                        .child(snapshot.settings.display_name.clone()),
+                )
+                .child(
+                    Button::new("management-gateway-name-edit")
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                        .tooltip(management_locale_text("Rename", "重命名", "重新命名"))
+                        .accessibility_label(management_locale_text("Rename", "重命名", "重新命名"))
+                        .disabled(pending)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_gateway_name_editor(window, cx)
+                        })),
+                )
+        };
+        let name_error = self
+            .gateway_name_editing
+            .then(|| self.gateway_name_error.clone())
+            .flatten();
+
         let mut body = v_flex().w_full().min_w_0().gap_3();
         body = body.child(
             h_flex()
@@ -12952,12 +13110,10 @@ impl ManagementCenter {
                     v_flex()
                         .min_w_0()
                         .gap_1()
-                        .child(
-                            div()
-                                .text_base()
-                                .font_semibold()
-                                .child(snapshot.settings.display_name.clone()),
-                        )
+                        .child(name_row)
+                        .children(name_error.map(|message| {
+                            div().text_xs().text_color(cx.theme().danger).child(message)
+                        }))
                         .child(
                             div()
                                 .text_xs()
@@ -13904,12 +14060,13 @@ impl ManagementCenter {
     }
 
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        match self.navigation.active {
+        match management_primary_section(self.navigation.active) {
             ManagementSection::Agents | ManagementSection::ModelProviders => {
                 self.render_providers(window, cx)
             }
-            ManagementSection::Providers => self.render_provider_page(cx),
-            ManagementSection::Gateway => self.render_gateway(window, cx),
+            ManagementSection::Providers | ManagementSection::Gateway => {
+                self.render_provider_page(window, cx)
+            }
             ManagementSection::Mcp => self.render_mcp(cx),
             ManagementSection::Skills => self.render_skills(cx),
             ManagementSection::PromptsHooks => self.render_prompts(cx),
@@ -13927,8 +14084,9 @@ impl ManagementCenter {
     ) -> AnyElement {
         match management_primary_section(self.navigation.active) {
             ManagementSection::Agents => self.render_agents(cx),
-            ManagementSection::Providers => self.render_provider_page_sidebar(cx),
-            ManagementSection::Gateway => self.render_gateway_sidebar(cx),
+            ManagementSection::Providers | ManagementSection::Gateway => {
+                self.render_provider_page_sidebar(cx)
+            }
             ManagementSection::Mcp => self.render_mcp_sidebar(cx),
             ManagementSection::Skills => self.render_skills_sidebar(cx),
             ManagementSection::PromptsHooks => self.render_prompts_sidebar(cx),
@@ -24616,7 +24774,9 @@ fn management_primary_section(section: ManagementSection) -> ManagementSection {
     match section {
         ManagementSection::Agents | ManagementSection::ModelProviders => ManagementSection::Agents,
         ManagementSection::Providers => ManagementSection::Providers,
-        ManagementSection::Gateway => ManagementSection::Gateway,
+        // The gateway lives on the Providers page as its pinned row, so an old
+        // cursor parked on the separate page resolves to the page that owns it.
+        ManagementSection::Gateway => ManagementSection::Providers,
         ManagementSection::Mcp => ManagementSection::Mcp,
         ManagementSection::Skills => ManagementSection::Skills,
         ManagementSection::PromptsHooks => ManagementSection::PromptsHooks,
@@ -26011,6 +26171,12 @@ fn parse_optional_limit(value: &str) -> Result<Option<u32>, &'static str> {
     }
 }
 
+/// The Providers page's selection id for its pinned gateway row.
+///
+/// Provider ids carry the `model_provider_` prefix, so a bare `gateway` can
+/// never collide with one.
+const GATEWAY_ROW_ID: &str = "gateway";
+
 /// One row of the global Providers page.
 #[derive(Clone)]
 struct SharedProviderRow {
@@ -26174,6 +26340,21 @@ fn gateway_runtime_text(state: &vibex_core::ModelGatewayRuntimeState) -> String 
         )
         .to_string(),
     }
+}
+
+/// Reads the gateway's display-name draft.
+///
+/// Trimmed, because a name of spaces is empty; length is counted in characters
+/// so a CJK name is measured the way the authority measures it.
+fn parse_gateway_display_name(value: &str) -> Result<String, &'static str> {
+    let name = value.trim();
+    if name.is_empty() {
+        return Err("enter a name");
+    }
+    if name.chars().count() > vibex_core::ModelGatewaySettings::MAX_DISPLAY_NAME_LEN {
+        return Err("the name is too long");
+    }
+    Ok(name.to_string())
 }
 
 /// The soonest future cooldown deadline across every upstream Key.
@@ -26372,8 +26553,6 @@ fn gateway_key_summary_text(
         .iter()
         .filter(|key| matches!(key.state, vibex_core::GatewayKeyState::Cooling { .. }))
         .count();
-    // The soonest recovery is the useful number: it is when the pool starts
-    // answering fully again.
     let soonest_recovery = upstream
         .keys
         .iter()
@@ -26387,10 +26566,54 @@ fn gateway_key_summary_text(
         .iter()
         .filter(|key| key.state == vibex_core::GatewayKeyState::Invalid)
         .count();
+    gateway_key_counts_text(
+        upstream.keys.len(),
+        cooling,
+        soonest_recovery,
+        invalid,
+        locale,
+    )
+}
+
+/// The gateway's own row summary: every upstream Key in one line.
+fn gateway_overall_key_summary(
+    snapshot: &vibex_core::GatewaySnapshot,
+    locale: ResolvedLocale,
+) -> String {
+    let soonest_recovery = snapshot
+        .upstreams
+        .iter()
+        .flat_map(|upstream| upstream.keys.iter())
+        .filter_map(|key| match key.state {
+            vibex_core::GatewayKeyState::Cooling { until_ms, .. } => until_ms,
+            _ => None,
+        })
+        .min();
+    gateway_key_counts_text(
+        snapshot
+            .upstreams
+            .iter()
+            .map(|upstream| upstream.keys.len())
+            .sum(),
+        snapshot.cooling_key_count(),
+        soonest_recovery,
+        snapshot.invalid_key_count(),
+        locale,
+    )
+}
+
+/// Key counts and the two kinds of trouble, in the page's wording.
+fn gateway_key_counts_text(
+    total: usize,
+    cooling: usize,
+    soonest_recovery: Option<i64>,
+    invalid: usize,
+    locale: ResolvedLocale,
+) -> String {
     let keys = match locale {
-        ResolvedLocale::En => format!("{} keys", upstream.keys.len()),
-        ResolvedLocale::ZhCn => format!("{} 个 Key", upstream.keys.len()),
-        ResolvedLocale::ZhTw => format!("{} 個 Key", upstream.keys.len()),
+        ResolvedLocale::En => format!("{total} keys"),
+        ResolvedLocale::ZhCn => format!("{total} 个 Key"),
+        ResolvedLocale::ZhTw => format!("{total} 個 Key"),
     };
     let mut parts = vec![keys];
     if cooling > 0 {
@@ -31442,18 +31665,71 @@ mod tests {
         assert!(!renderer.contains(".bottom_4()"));
     }
 
+    /// The gateway is the first row of the Providers page, not a separate page.
+    #[test]
+    fn the_gateway_is_the_pinned_row_of_the_providers_page() {
+        let source = include_str!("management.rs");
+        let nav = source
+            .split_once("    fn render_nav(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn shared_providers(&self)"))
+            .map(|(body, _)| body)
+            .expect("the navigation should remain inspectable");
+        assert!(
+            !nav.contains("ManagementSection::Gateway"),
+            "the gateway must not get a navigation item"
+        );
+
+        let sidebar = source
+            .split_once("    fn render_provider_page_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The global Providers panel:"))
+            .map(|(body, _)| body)
+            .expect("the Providers sidebar should remain inspectable");
+        assert!(sidebar.contains("management-global-provider-row-gateway"));
+        assert!(sidebar.contains("GATEWAY_ROW_ID"));
+        assert!(sidebar.contains("gateway_overall_key_summary"));
+        assert!(
+            sidebar.find("management-global-provider-row-gateway")
+                < sidebar.find("for row in &rows"),
+            "the gateway row is drawn before the Providers it consumes"
+        );
+        assert!(
+            sidebar.contains("this.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string())"),
+            "the gateway is the page's default selection"
+        );
+
+        let page = source
+            .split_once("    fn render_provider_page(&mut self, window")
+            .and_then(|(_, tail)| tail.split_once("\n        let rows = self.shared_providers();"))
+            .map(|(body, _)| body)
+            .expect("the Providers panel should remain inspectable");
+        assert!(
+            page.contains("self.selected_global_provider_id.as_deref() == Some(GATEWAY_ROW_ID)"),
+            "selecting the gateway row renders its detail in the same pane"
+        );
+        assert!(page.contains("self.render_gateway(window, cx)"));
+    }
+
     #[test]
     fn management_sections_collapse_into_tauri_primary_navigation() {
         assert_eq!(
             management_primary_section(ManagementSection::ModelProviders),
             ManagementSection::Agents
         );
-        // The gateway is a primary tab of its own: it is shared state that
-        // several Agents consume, so burying it under one Agent's provider page
-        // would misrepresent who owns it.
+        // The gateway is the pinned row of the Providers page, not a top-level
+        // section. A cursor stored on the old page resolves to the page that
+        // now owns the row.
         assert_eq!(
             management_primary_section(ManagementSection::Gateway),
-            ManagementSection::Gateway
+            ManagementSection::Providers
+        );
+        assert!(
+            !ManagementSection::ALL.contains(&ManagementSection::Gateway),
+            "the gateway must not be a navigable section"
+        );
+        assert_eq!(
+            ManagementSection::from_key("gateway"),
+            Some(ManagementSection::Gateway),
+            "an old stored cursor still has to resolve"
         );
         assert_eq!(
             management_primary_section(ManagementSection::Mcp),
@@ -34651,6 +34927,48 @@ mod gateway_surface_tests {
         assert!(schedule.contains("if self.gateway_refresh_task.is_some()"));
         assert!(schedule.contains("next_gateway_cooldown_expiry"));
         assert!(schedule.contains("reload_gateway_snapshot(cx)"));
+    }
+
+    /// The gateway's name is trimmed, non-empty, and measured in characters.
+    #[test]
+    fn a_gateway_display_name_is_trimmed_and_bounded() {
+        assert_eq!(
+            parse_gateway_display_name("  Vibex Gateway  "),
+            Ok("Vibex Gateway".to_string())
+        );
+        assert_eq!(parse_gateway_display_name("网关"), Ok("网关".to_string()));
+        assert!(parse_gateway_display_name("   ").is_err());
+        assert!(parse_gateway_display_name("").is_err());
+
+        let longest = "a".repeat(vibex_core::ModelGatewaySettings::MAX_DISPLAY_NAME_LEN);
+        assert!(parse_gateway_display_name(&longest).is_ok());
+        assert!(parse_gateway_display_name(&format!("{longest}a")).is_err());
+        // Characters, not bytes: a CJK name of the same length fits.
+        let cjk = "名".repeat(vibex_core::ModelGatewaySettings::MAX_DISPLAY_NAME_LEN);
+        assert!(parse_gateway_display_name(&cjk).is_ok());
+    }
+
+    /// The header edits the name and writes it through the settings command.
+    #[test]
+    fn the_gateway_header_renames_through_the_settings_write() {
+        let source = include_str!("management.rs");
+        let header = source
+            .split_once("    fn render_gateway(&mut self")
+            .and_then(|(_, tail)| tail.split_once("        // What the service is listening on."))
+            .map(|(body, _)| body)
+            .expect("the gateway header should remain inspectable");
+        assert!(header.contains("management-gateway-name-edit"));
+        assert!(header.contains("open_gateway_name_editor(window, cx)"));
+        assert!(header.contains("management-gateway-name-save"));
+        assert!(header.contains("save_gateway_name(cx)"));
+
+        let save = source
+            .split_once("    fn save_gateway_name(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Writes the token ceiling"))
+            .map(|(body, _)| body)
+            .expect("the name write should remain inspectable");
+        assert!(save.contains("parse_gateway_display_name"));
+        assert!(save.contains("request.display_name = name"));
     }
 
     /// Each translation switch reads and writes exactly its own field.

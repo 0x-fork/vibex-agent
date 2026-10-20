@@ -5022,7 +5022,14 @@ ProviderConfigService::{
 - **Neither list is derived from the other.** The gateway's upstream picker uses
   the v2 identity the settings store, and a client never computes one id from
   the other; the authority resolves the pair once and publishes candidates.
-- **The token ceiling is set where its window is.** The gateway page edits the
+- **The gateway is the pinned row of the Providers page.** It is not a
+  top-level section: `ManagementSection::ALL` omits it, the navigation has no
+  Gateway item, and a stored `gateway` cursor resolves to `Providers`. The
+  Providers list draws the gateway first, with a `●` marker (direct Providers
+  use `○`), its automatic-routing state, the aggregate Key summary, and the
+  Agents bound to it. Selecting that row renders the gateway's detail in the
+  same right pane as any other Provider; the old separate sidebar is gone.
+- **The token ceiling is set where its window is.** The gateway detail edits the
   count and the window (day/week/month) as one pair, because a count without a
   window is not a ceiling. An empty field is refused, not read as zero; removing
   the ceiling has its own control. The copy states that the count is local
@@ -5045,7 +5052,13 @@ ProviderConfigService::{
   so the switch asks first and names the restart and the interrupted
   conversation; the row says `Switching…` until the authority answers. Turning
   the gateway on needs no confirmation, because it restores service.
-- **Translation directions are user policy.** The gateway page lists the four
+- **The gateway's display name is edited in its own header.** The pencil opens
+  the current name in place; the write trims it, rejects an empty or over-long
+  name (counted in characters, so a CJK name is measured like the authority
+  measures it), and goes through the same settings command as routing. The
+  detail pane keeps the name as its heading, so a rename is visible where it was
+  made.
+- **Translation directions are user policy.** The gateway detail lists the four
   protocol directions with switches. The settings write replaces the policy, so
   every unrelated edit carries it forward; turning a direction off makes a
   request that needs it a `400 model_gateway_translation_disabled` rather than

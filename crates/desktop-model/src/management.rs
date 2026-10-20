@@ -40,11 +40,16 @@ pub enum ManagementSection {
 }
 
 impl ManagementSection {
-    pub const ALL: [Self; 11] = [
+    /// Every navigable section.
+    ///
+    /// `Gateway` is deliberately absent: the gateway is the pinned row of the
+    /// Providers page, not a page of its own. The variant survives so a stored
+    /// selection from before the move still resolves, and the Config Center
+    /// normalises it to `Providers`.
+    pub const ALL: [Self; 10] = [
         Self::Agents,
         Self::ModelProviders,
         Self::Providers,
-        Self::Gateway,
         Self::Mcp,
         Self::Skills,
         Self::PromptsHooks,
@@ -87,7 +92,12 @@ impl ManagementSection {
     }
 
     pub fn from_key(value: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|section| section.key() == value)
+        Self::ALL
+            .into_iter()
+            .find(|section| section.key() == value)
+            // A cursor stored on the old gateway page lands on the Providers
+            // page that now owns the gateway row.
+            .or_else(|| (value == Self::Gateway.key()).then_some(Self::Gateway))
     }
 }
 
