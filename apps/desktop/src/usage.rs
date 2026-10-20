@@ -9,8 +9,8 @@ use gpui::{
     WeakEntity, Window, div, point, prelude::*, px, size, transparent_black,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Selectable as _,
-    Sizable as _, Size, StyledExt as _,
+    ActiveTheme as _, Disableable as _, ElementExt as _, FocusableExt as _, Icon, IconName,
+    Selectable as _, Sizable as _, Size, StyledExt as _,
     button::{Button, ButtonGroup, ButtonVariants as _},
     empty::{Empty as EmptyState, EmptyDescription, EmptyHeader, EmptyMedia},
     h_flex,
@@ -1046,6 +1046,10 @@ impl UsageView {
                     .stripe(true)
                     .bordered(false)
                     .scrollbar_visible(false, true)
+                    // A read-only statistics table: the header buttons keep
+                    // their own focus treatment, and the table-level ring only
+                    // draws attention away from the numbers.
+                    .focus_ring(false)
                     .with_size(Size::Size(px(USAGE_TABLE_ROW_HEIGHT))),
             )
             .into_any_element()
