@@ -1417,7 +1417,7 @@ mod tests {
 
         let unremarkable = GatewayRequestSummary::from_log(
             log(Some(GatewayRouteTrace::new(0, 0))),
-            &[profile.clone()],
+            std::slice::from_ref(&profile),
         );
         assert_eq!(unremarkable.provider_name, "DeepSeek");
         assert_eq!(unremarkable.credential_name.as_deref(), Some("Backup"));
@@ -1431,7 +1431,7 @@ mod tests {
                 }],
                 ..GatewayRouteTrace::new(1, 0)
             })),
-            &[profile.clone()],
+            std::slice::from_ref(&profile),
         );
         let route = failover.route.expect("a failover is worth reporting");
         assert_eq!(route.skipped_cooling, 1);
