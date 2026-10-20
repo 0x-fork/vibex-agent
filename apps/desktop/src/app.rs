@@ -11193,6 +11193,19 @@ impl VibexWorkbench {
                 focus.focus(window, cx);
             }
         });
+        // The schedule clock dispatches inside a window, so closing the window
+        // leaves its tick with nowhere to run and the task stops. A window that
+        // comes back has to take the clock over and catch up on anything that
+        // fell due while there was none: drop the handle (it may name the task
+        // that already stopped), arm the clock again, and run the due check
+        // from this window's own deferred pass. `defer_in` also records this
+        // window as the entity's window, so the first tick can update the
+        // workbench even before the frame is drawn.
+        self.message_schedule_task = None;
+        self.start_message_schedule_timer(window, cx);
+        cx.defer_in(window, |this, window, cx| {
+            this.dispatch_due_messages(unix_timestamp_ms(), window, cx);
+        });
     }
 
     pub(crate) fn prepare_for_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -28778,8 +28791,22 @@ impl VibexWorkbench {
         // scheduled head never carries one of these: its deadline pins it to the
         // queue's own order, which is what keeps it from overtaking the entries in
         // front of it.
-        let fence_blocks =
-            !composer_queue_behavior_is_explicit(behavior) && self.composer_queue_fence_blocks();
+        //
+        // The fence keeps the queue one-at-a-time behind the turn the last
+        // hand-over started. A schedule is a promise about a moment, and a turn
+        // running in a *different* session has no claim on that moment: waiting
+        // for it can hold the due message for as long as the other Agent runs,
+        // which is how a schedule misses its time while its own session is
+        // settled. The target session's own state and pending flag below already
+        // keep a schedule from overlapping a turn in the session it sends to.
+        let schedule_overtakes_another_sessions_turn = scheduled_at_ms.is_some()
+            && self
+                .composer_queue_dispatch_fence
+                .as_ref()
+                .is_some_and(|fence| fence.session_id != session_id);
+        let fence_blocks = !composer_queue_behavior_is_explicit(behavior)
+            && !schedule_overtakes_another_sessions_turn
+            && self.composer_queue_fence_blocks();
         // An unobserved revision is not proof of a normal completion, so the
         // queue asks for a verdict. When nothing can judge the boundary right
         // now, the session's own settled state is the best evidence the queue

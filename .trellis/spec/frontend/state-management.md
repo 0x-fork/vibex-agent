@@ -924,21 +924,30 @@ session's own state whether the turn still holds the queue.
 - A scheduled new-session submission creates the session with deferred runtime
   materialization and no initial prompt or optimistic user item. Keep its
   message in the queue until dispatch; show a countdown on its empty timeline.
+- The schedule clock dispatches inside a window. Closing the workbench window to
+  the tray takes that window away and ends the tick without sending anything, so
+  a window that comes back must drop the stopped handle, arm a fresh clock, and
+  release a deadline that passed while no window could take the send.
 - The pre-send queue is one ordered list across sessions, oldest first, and only
   its head is ever a dispatch candidate. A scheduled entry therefore cannot be
   overtaken by the messages behind it, a due schedule cannot jump the entries in
   front of it — including another session's — and a row being edited holds the
-  whole queue until the edit ends.
+  whole queue until the edit ends. Once the entries in front have left, only the
+  scheduled message's own session may hold it: a turn another session's earlier
+  hand-over started has no claim on the promised moment.
 - After an entry leaves the queue, a dispatch fence holds the next one while the
   turn that entry started still occupies its session: the fence blocks on the
   local turn-pending flag or a `Running`/`NeedsInput`/`Initializing` session
   state, and releases the moment that session settles (`Idle`/`Error`), closes,
-  is archived, or leaves the workbench. The fence must never wait on an
-  asynchronous completion verdict: because the queue is global, a fence the
-  workbench cannot resolve would strand every message behind it, including other
-  sessions' messages, so a failed or interrupted stop is still a turn that is
-  over. A submission that never landed, and a command that runs no
-  conversational turn of its own, release the fence outright.
+  is archived, or leaves the workbench. A due schedule is the one exception when
+  the fence belongs to a different session: the message goes to its own settled
+  session, and the target's own pending flag and state already prevent it from
+  overlapping a turn there. The fence must never wait on an asynchronous
+  completion verdict: because the queue is global, a fence the workbench cannot
+  resolve would strand every message behind it, including other sessions'
+  messages, so a failed or interrupted stop is still a turn that is over. A
+  submission that never landed, and a command that runs no conversational turn
+  of its own, release the fence outright.
 - An automatic send of an ordinary head still waits for that session's latest
   turn to be confirmed normal (or absent) instead of risking a send after an
   abnormal stop — but only while a verdict can actually be obtained. When
@@ -1009,6 +1018,7 @@ session's own state whether the turn still holds the queue.
 | Session is running, initializing, closed, archived, or unavailable | Retain the scheduled message without dispatch |
 | A message sits in front of a due schedule | Retain the schedule and send the head first |
 | The turn ahead of a schedule is still running or its submission is in flight | Retain the schedule until that session settles |
+| A due schedule's own session is settled while another session's fenced turn still runs | Send the schedule; a foreign fence does not hold it |
 | The session that owes the queue a turn stops abnormally | Release the fence once the session settles; a stopped turn is still over |
 | No completion verdict can be obtained for a settled session | Hand the head over on the settled session rather than deferring it forever |
 | The submission path hands a message back (local runtime not ready) | Report it as not dispatched, and pause the session it belongs to |
@@ -1023,9 +1033,12 @@ session's own state whether the turn still holds the queue.
 
 ### 5. Good / Base / Bad Cases
 
-- Good: a due message waits for every entry in front of it — and for each turn
-  those entries started to finish — then sends once through the existing queue
-  path, even after the user switches sessions.
+- Good: a due message waits for every entry in front of it, and for a turn in
+  its own session, then sends once through the existing queue path, even after
+  the user switches sessions.
+- Good: a schedule falls due while another session's queued message is still
+  running; its own session is settled, so the due message leaves at the next
+  tick instead of waiting for an Agent that has nothing to do with it.
 - Good: a message moved in front of a schedule sends as soon as its session is
   settled, without waiting for the deadline that used to be ahead of it.
 - Base: unscheduled messages keep their Auto/Manual behavior; a due schedule
@@ -1056,9 +1069,13 @@ settled/closed/archived/untracked session — and the per-behavior admission of
 `AfterCompletion`, `AfterInterrupt`, `Automatic`, `ForceNext` and `Scheduled`.
 `team_tests.rs` drives the real dispatch path: a due head fires while a
 schedule waits behind it, a settled session releases a fence without any probe,
+a due schedule leaves even while another session's fenced turn still runs,
 moving an ordinary message in front of a schedule sends it, a head with no
 obtainable verdict is handed over instead of bouncing back, a refused hand-over
-is not reported as dispatched, a live view settles a revision only for the
+is not reported as dispatched, a schedule survives the workbench window being
+closed to the tray and reopened — the stopped clock releases its handle, the
+returning window re-arms it, and the deadline that passed meanwhile is released
+— a live view settles a revision only for the
 completion it can see, a loaded page never pins an unconfirmed stop to a settled
 revision, an authoritative whole-list read wakes a waiting auto-send, and a
 locally dispatched turn's own settle hands the queued auto-send over. The same

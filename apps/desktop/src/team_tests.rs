@@ -446,6 +446,81 @@ fn the_pre_send_queue_sends_its_head_when_the_session_is_settled(cx: &mut TestAp
     });
 }
 
+/// The schedule clock is armed inside a window, and the workbench outlives that
+/// window when the reader closes it to the tray. The clock must not stop for
+/// good there: reopening the window has to arm it again and release whatever
+/// fell due while no window could take the send.
+#[gpui::test]
+fn a_schedule_survives_a_window_closed_to_the_tray(cx: &mut TestAppContext) {
+    fn open_workbench_window(
+        cx: &mut TestAppContext,
+        workbench: &Entity<VibexWorkbench>,
+    ) -> VisualTestContext {
+        let workbench = workbench.clone();
+        let window = cx.open_window(gpui::size(px(1_280.0), px(800.0)), move |window, cx| {
+            Root::new(workbench, window, cx)
+        });
+        let handle: AnyWindowHandle = window.into();
+        VisualTestContext::from_window(handle, cx)
+    }
+
+    let (workbench, cx, receiver) = fixture(cx, 1);
+    let session_id = session(0).id.clone();
+    cx.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            workbench.composer_queue = vec![head_queue_message(
+                1,
+                &session_id,
+                Some(unix_timestamp_ms() - 1_000),
+            )];
+            workbench.start_message_schedule_timer(window, cx);
+        });
+    });
+    assert!(workbench.read_with(&cx.cx, |workbench, _| {
+        workbench.message_schedule_task.is_some()
+    }));
+
+    // Close the window the clock was armed in. The tray keeps the workbench
+    // alive, but the entity no longer has a window to update in.
+    cx.update(|window, _| window.remove_window());
+    cx.cx.run_until_parked();
+    // A tick runs with no window and cannot dispatch. It must not leave the
+    // clock pointing at a task that has already stopped.
+    cx.background_executor.advance_clock(Duration::from_secs(2));
+    cx.cx.run_until_parked();
+    assert!(
+        workbench.read_with(&cx.cx, |workbench, _| workbench
+            .message_schedule_task
+            .is_none()),
+        "a tick with no window must release the clock it cannot run"
+    );
+
+    // Reopen the window, the way the tray's own "Open Vibex" item does.
+    let mut reopened = open_workbench_window(&mut cx.cx, &workbench);
+    reopened.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| workbench.bind_to_window(window, cx));
+    });
+    for _ in 0..3 {
+        reopened.cx.run_until_parked();
+        reopened
+            .cx
+            .background_executor
+            .advance_clock(Duration::from_secs(1));
+        reopened.cx.run_until_parked();
+    }
+
+    assert!(
+        workbench.read_with(&reopened, |workbench, _| workbench
+            .composer_queue
+            .is_empty()),
+        "the due message left the queue once the window came back"
+    );
+    assert!(matches!(
+        receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(Observed::Message(_))
+    ));
+}
+
 /// The turn a dispatch handed over is what holds the queue: while it occupies
 /// the session nothing behind it leaves, and a settled session releases it
 /// instead of waiting on an asynchronous completion verdict.
@@ -480,6 +555,50 @@ fn a_settled_session_releases_the_pre_send_queue_fence(cx: &mut TestAppContext) 
                 window,
                 cx,
             ));
+            assert!(workbench.composer_queue.is_empty());
+        });
+    });
+}
+
+/// A due schedule is not held by a turn another session's queued message
+/// started.
+///
+/// The dispatch fence keeps the queue one message at a time behind the turn the
+/// last hand-over started. A schedule is a promise about a moment, though, and
+/// an Agent still working in another session has no claim on that moment: the
+/// scheduled head's own session is settled, so it goes out even while the fence
+/// waits. The unblocked case is the one that left a due message sitting behind
+/// an unrelated long-running turn until the reader sent it by hand.
+#[gpui::test]
+fn a_due_schedule_is_not_held_by_another_sessions_turn(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 2);
+    let now = unix_timestamp_ms();
+    cx.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            // The message that last left the queue belongs to another session,
+            // whose turn is still occupying it.
+            workbench.sessions[0].state = AgentSessionState::Running;
+            workbench.composer_queue_dispatch_fence = Some(ComposerQueueDispatchFence {
+                session_id: session(0).id,
+                message_id: 99,
+                awaits_turn: true,
+            });
+            workbench.composer_queue =
+                vec![head_queue_message(1, &session(1).id, Some(now - 1_000))];
+            assert!(
+                workbench.composer_queue_fence_blocks(),
+                "the fixture's other session is still running"
+            );
+
+            assert!(
+                workbench.maybe_dispatch_next_composer_queue_message(
+                    None,
+                    ComposerQueueDispatchBehavior::Automatic,
+                    window,
+                    cx,
+                ),
+                "the due schedule leaves even though the other session's turn runs"
+            );
             assert!(workbench.composer_queue.is_empty());
         });
     });

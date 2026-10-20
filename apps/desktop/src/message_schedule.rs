@@ -1352,21 +1352,33 @@ impl VibexWorkbench {
                     // nothing left to wait for, so the field never points at a
                     // task that has already decided to stop: a schedule armed
                     // later either joins a running timer or starts one.
-                    let keep_running = entity
-                        .update_in(cx, |this, window, cx| {
-                            this.dispatch_due_messages(unix_timestamp_ms(), window, cx);
-                            let pending = this
-                                .composer_queue
-                                .iter()
-                                .any(|message| message.scheduled_at_ms.is_some());
-                            if pending {
-                                cx.notify();
-                            } else {
+                    let keep_running = match entity.update_in(cx, |this, window, cx| {
+                        this.dispatch_due_messages(unix_timestamp_ms(), window, cx);
+                        let pending = this
+                            .composer_queue
+                            .iter()
+                            .any(|message| message.scheduled_at_ms.is_some());
+                        if pending {
+                            cx.notify();
+                        } else {
+                            this.message_schedule_task = None;
+                        }
+                        pending
+                    }) {
+                        Ok(keep_running) => keep_running,
+                        Err(_) => {
+                            // The window the clock was armed in can close while
+                            // the workbench lives on in the tray: there is no
+                            // window left to dispatch in. Releasing the handle
+                            // here is what lets the window that comes back arm
+                            // the clock again instead of finding a task that
+                            // already stopped and a message that never sends.
+                            let _ = entity.update(cx, |this, _| {
                                 this.message_schedule_task = None;
-                            }
-                            pending
-                        })
-                        .unwrap_or(false);
+                            });
+                            false
+                        }
+                    };
                     if !keep_running {
                         break;
                     }
@@ -1375,7 +1387,12 @@ impl VibexWorkbench {
         ));
     }
 
-    fn dispatch_due_messages(&mut self, now_ms: i64, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn dispatch_due_messages(
+        &mut self,
+        now_ms: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // A deadline only matters once its message reaches the head of the
         // queue, but the head is re-evaluated on every tick rather than only
         // for the sessions that hold a due message: the queue is one list, and

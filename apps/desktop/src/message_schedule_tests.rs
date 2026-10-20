@@ -614,15 +614,18 @@ fn the_schedule_surface_is_a_popover_sized_to_its_calendar() {
     );
 }
 
-/// The schedule timer releases its own handle in the update that finds nothing
-/// left to wait for, so the workbench never carries a handle to a task that has
-/// already decided to stop.
+/// The schedule timer releases its own handle wherever it stops.
+///
+/// Two ways out of the loop have to leave the field empty: finding nothing left
+/// to wait for, and finding no window to update in — the workbench outlives its
+/// window when it is closed to the tray, and a handle naming a task that has
+/// stopped would make the reopened window's re-arm a no-op.
 #[test]
 fn the_schedule_timer_releases_its_handle_where_it_stops() {
     let source = include_str!("message_schedule.rs");
     let timer = source
         .split_once("    pub(super) fn start_message_schedule_timer(")
-        .and_then(|(_, tail)| tail.split_once("\n    fn dispatch_due_messages("))
+        .and_then(|(_, tail)| tail.split_once("\n    pub(super) fn dispatch_due_messages("))
         .map(|(body, _)| body)
         .expect("the schedule timer should remain inspectable");
     let pending = timer
@@ -635,9 +638,51 @@ fn the_schedule_timer_releases_its_handle_where_it_stops() {
         pending < release,
         "the handle is released in the same update that finds nothing pending"
     );
+    let lost_window = timer
+        .find("Err(_) => {")
+        .expect("a tick the window no longer supports should be answered");
+    let released_without_a_window = timer[lost_window..]
+        .find("this.message_schedule_task = None;")
+        .expect("a clock that cannot run should release its handle");
+    assert!(
+        released_without_a_window > 0,
+        "the stopped clock releases the handle the reopened window has to replace"
+    );
     assert!(
         !timer.contains("|this, _, _| this.message_schedule_task = None"),
-        "a second update outside the loop describes a decision already made"
+        "the windowless release belongs inside the tick that lost its window"
+    );
+}
+
+/// A window that comes back takes the schedule clock over.
+///
+/// Closing the window stops the tick without sending anything, so reopening it
+/// has to replace the handle, arm a fresh clock for future deadlines, and run
+/// the due check at once — a message that fell due while there was no window
+/// cannot wait for a tick that was never armed. `defer_in` is part of the
+/// wiring: it records the window the entity now lives in, which is what lets
+/// the new tick update the workbench.
+#[test]
+fn reopening_a_window_takes_the_schedule_clock_over() {
+    let source = include_str!("app.rs");
+    let bind = source
+        .split_once("    pub(crate) fn bind_to_window(")
+        .and_then(|(_, tail)| tail.split_once("\n    pub(crate) fn prepare_for_window_close("))
+        .map(|(body, _)| body)
+        .expect("the window binding should remain inspectable");
+    let release = bind
+        .find("self.message_schedule_task = None;")
+        .expect("the reopened window replaces a clock that may have stopped");
+    let arm = bind
+        .find("self.start_message_schedule_timer(window, cx);")
+        .expect("the reopened window arms the clock again");
+    let catch_up = bind
+        .find("this.dispatch_due_messages(unix_timestamp_ms(), window, cx);")
+        .expect("a deadline that passed while closed is released at once");
+    assert!(release < arm && arm < catch_up);
+    assert!(
+        bind.contains("cx.defer_in(window, |this, window, cx| {"),
+        "the catch-up registers the window the new clock will run in"
     );
 }
 
