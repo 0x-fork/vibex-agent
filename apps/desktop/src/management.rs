@@ -6254,6 +6254,7 @@ impl ManagementCenter {
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let updating = editing_profile_id.is_some();
+            let agent_id_for_verification = agent_id.clone();
             let profile = if let Some(provider_profile_id) = editing_profile_id {
                 backend
                     .management()
@@ -6335,14 +6336,19 @@ impl ManagementCenter {
                 )
                 .to_string()
             };
-            Ok::<_, VibexError>((message, saved_profile_id))
+            Ok::<_, VibexError>((
+                message,
+                saved_profile_id,
+                updating,
+                agent_id_for_verification,
+            ))
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
-                    Ok(Ok((message, saved_profile_id))) => {
+                    Ok(Ok((message, saved_profile_id, updating, agent_id))) => {
                         this.navigation.mark_dirty(ManagementSection::Agents, false);
                         this.profile_editor_open = false;
                         this.editing_profile_id = None;
@@ -6350,11 +6356,18 @@ impl ManagementCenter {
                         // Provider's own models are the only list that matters.
                         this.provider_preset_draft = None;
                         this.provider_preset_region = None;
-                        this.selected_provider_profile_id = Some(saved_profile_id);
+                        this.selected_provider_profile_id = Some(saved_profile_id.clone());
                         this.profile_secret_clear = false;
                         this.projection_editor.set_secret_intent(false, false);
                         this.notice = Some(message);
                         this.refresh(cx);
+                        // A new Provider's Key is checked the moment it is
+                        // saved: "it was written" and "it works" are different
+                        // answers, and only the second one is what the user
+                        // came for.
+                        if !updating {
+                            this.verify_new_provider(saved_profile_id, agent_id, active_locale, cx);
+                        }
                     }
                     Ok(Err(error)) => {
                         this.error = Some(format!("{}: {}", error.code, error.message));
@@ -6368,6 +6381,94 @@ impl ManagementCenter {
                                 "供应商配置保存失败",
                                 "供應商配置儲存失敗",
                             )
+                        ));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    /// Checks a Provider the create just wrote, with a real minimal request.
+    ///
+    /// It runs after the save and never undoes it: a probe can be blocked by
+    /// something an Agent would pass — a proxy, a rate limit, a vendor that
+    /// refuses this client — and deleting a Provider because a test endpoint
+    /// was unhappy would make the app harder to configure than the vendor is.
+    /// So a pass is reported as readiness and a failure is reported as what it
+    /// is: the Provider exists, and its Key did not answer.
+    fn verify_new_provider(
+        &mut self,
+        profile_id: String,
+        agent_id: AgentId,
+        active_locale: ResolvedLocale,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Ok(provider_profile_id) = vibex_core::ProviderProfileId::parse(profile_id.clone())
+        else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::ProviderProbe(profile_id.clone()));
+        let entity = cx.weak_entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .test_agent_model_provider_profile(
+                    vibex_core::AgentModelProviderProfileTestRequest {
+                        agent_id,
+                        provider_profile_id,
+                    },
+                )
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(result)
+                        if result.status == vibex_core::AgentModelProviderTestStatus::Pass =>
+                    {
+                        this.notice = Some(format!(
+                            "{} · {}",
+                            management_locale_text_for(
+                                active_locale,
+                                "Provider ready",
+                                "供应商已就绪",
+                                "供應商已就緒",
+                            ),
+                            result.message
+                        ));
+                        this.refresh(cx);
+                    }
+                    Ok(result) => {
+                        this.error = Some(format!(
+                            "{}: {} ({})",
+                            management_locale_text_for(
+                                active_locale,
+                                "Provider saved, but its key did not answer",
+                                "供应商已保存，但 Key 未通过验证",
+                                "供應商已儲存，但 Key 未通過驗證"
+                            ),
+                            result.message,
+                            management_provider_test_status_label(result.status, active_locale)
+                        ));
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!(
+                            "{}: {}: {}",
+                            management_locale_text_for(
+                                active_locale,
+                                "Provider saved, but it could not be verified",
+                                "供应商已保存，但无法验证",
+                                "供應商已儲存，但無法驗證"
+                            ),
+                            error.code,
+                            error.message
                         ));
                         cx.notify();
                     }
@@ -16831,11 +16932,7 @@ impl ManagementCenter {
                             .label(if updating {
                                 management_locale_text("Save changes", "保存修改", "儲存修改")
                             } else {
-                                management_locale_text(
-                                    "Create provider",
-                                    "创建供应商",
-                                    "新增供應商",
-                                )
+                                management_locale_text("Add and verify", "添加并验证", "新增並驗證")
                             })
                             .loading(saving)
                             .disabled(pending)
@@ -33577,6 +33674,50 @@ mod gateway_surface_tests {
     fn a_preset_marker_is_a_reading_not_a_record() {
         assert!(provider_preset_filled_marker(false).is_none());
         assert!(provider_preset_filled_marker(true).is_some());
+    }
+
+    /// A created Provider is verified by a real request, and the verification
+    /// cannot take the Provider away again.
+    ///
+    /// "It was written" and "it works" are different answers; the second one is
+    /// what the button promises. It is also the one that must stay honest when
+    /// a proxy or a rate limit says no, which is why a failed check reports
+    /// itself instead of rolling the row back.
+    #[test]
+    fn creating_a_provider_verifies_it_without_being_able_to_undo_it() {
+        let source = include_str!("management.rs");
+        let save = source
+            .split_once("    fn save_profile(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Checks a Provider the create just wrote")
+            })
+            .map(|(body, _)| body)
+            .expect("the save handler should remain inspectable");
+        assert!(
+            save.contains("if !updating {") && save.contains("this.verify_new_provider("),
+            "only a create is verified: an update already has a working Provider"
+        );
+
+        let verify = source
+            .split_once("    fn verify_new_provider(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn run_provider_health_probe("))
+            .map(|(body, _)| body)
+            .expect("the verification should remain inspectable");
+        assert!(verify.contains("test_agent_model_provider_profile"));
+        assert!(
+            verify.contains("Provider saved, but its key did not answer"),
+            "a failed check must be reported, not swallowed"
+        );
+        // The row is never rewritten or removed by the check.
+        assert!(!verify.contains("delete_agent_model_provider_profile"));
+        assert!(!verify.contains("update_agent_model_provider_profile"));
+
+        // The create action says what it does now.
+        let footer = source
+            .split_once("                    .child(\n                        Button::new(\"provider-profile-save\")")
+            .map(|(_, tail)| tail)
+            .expect("the dialog footer should remain inspectable");
+        assert!(footer.contains("\"Add and verify\""));
     }
 
     /// The two preset paths that were data-only reach the surfaces that use them.
