@@ -5012,7 +5012,7 @@ fn the_gateway_switch_writes_and_answers_the_press() {
 
     let before = app.config_center.rows(&app.management_data, app.strings);
     assert_eq!(before[0].key, "gateway");
-    assert_eq!(before[0].chip, "Enabled");
+    assert_eq!(before[0].chip, "Ready");
     assert!(
         before[0]
             .detail
@@ -5024,10 +5024,7 @@ fn the_gateway_switch_writes_and_answers_the_press() {
 
     app.run_config_action_by_key("gateway", ConfigAction::Toggle);
     let after = app.config_center.rows(&app.management_data, app.strings);
-    assert_eq!(
-        after[0].chip, "Disabled",
-        "the row waited for the authority"
-    );
+    assert_eq!(after[0].chip, "off", "the row waited for the authority");
     assert!(
         app.config_center.pending.contains_key("gateway"),
         "the switch was not filed as a write"

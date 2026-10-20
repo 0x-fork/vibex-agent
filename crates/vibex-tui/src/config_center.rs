@@ -429,10 +429,10 @@ pub fn columns(
             strings.config_col_models(),
         ],
         ConfigSection::Providers => vec![
-            strings.config_col_agent(),
-            strings.config_col_kind(),
-            strings.config_col_model(),
-            strings.config_col_secret(),
+            strings.config_col_upstreams(),
+            strings.config_col_keys(),
+            strings.config_col_state(),
+            strings.config_col_agents(),
         ],
         ConfigSection::Servers => vec![
             strings.config_col_transport(),
@@ -1745,20 +1745,24 @@ fn version_label(agent: &vibex_core::AgentSnapshotEntry, strings: Strings) -> St
 fn gateway_row(data: &ManagementData, strings: Strings) -> Option<ConfigRow> {
     let snapshot = data.gateway.as_ref()?;
     let state = match snapshot.runtime.status {
-        vibex_core::ModelGatewayStatus::Running => strings.config_state_enabled(),
-        vibex_core::ModelGatewayStatus::Disabled => strings.config_state_disabled(),
+        vibex_core::ModelGatewayStatus::Running => strings.config_state_ready(),
+        vibex_core::ModelGatewayStatus::Disabled => strings.config_state_off(),
         _ => strings.config_state_unavailable(),
     };
     let cooling = snapshot.cooling_key_count();
     let invalid = snapshot.invalid_key_count();
+    let total_keys = snapshot
+        .upstreams
+        .iter()
+        .map(|upstream| upstream.keys.len())
+        .sum::<usize>();
     let key_summary = match (cooling, invalid) {
-        (0, 0) => format!("{} keys", snapshot.ready_key_count()),
-        (cooling, 0) => format!("{} keys · {cooling} cooling", snapshot.ready_key_count()),
-        (0, invalid) => format!("{} keys · {invalid} invalid", snapshot.ready_key_count()),
-        (cooling, invalid) => format!(
-            "{} keys · {cooling} cooling · {invalid} invalid",
-            snapshot.ready_key_count()
-        ),
+        (0, 0) => format!("{total_keys} keys"),
+        (cooling, 0) => format!("{total_keys} keys · {cooling} cooling"),
+        (0, invalid) => format!("{total_keys} keys · {invalid} invalid"),
+        (cooling, invalid) => {
+            format!("{total_keys} keys · {cooling} cooling · {invalid} invalid")
+        }
     };
     let agents = snapshot
         .agents
@@ -1827,19 +1831,31 @@ fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
         .into_iter()
         .map(|profile| {
             let enabled = profile.status == vibex_core::ProviderProfileStatus::Enabled;
+            let key_count = matches!(
+                profile.secret_setup_state,
+                vibex_core::ProviderSecretSetupState::Available
+                    | vibex_core::ProviderSecretSetupState::Referenced
+            );
             ConfigRow::new(
                 profile.id.as_str().to_string(),
                 profile.display_name.clone(),
             )
+            // A direct Provider is one upstream with one stored secret, but it
+            // sits in the same five columns as the gateway so the two kinds of
+            // row can be read against one heading.
+            .cell("1")
+            .cell(if key_count { "1" } else { "0" })
+            .cell(if enabled {
+                strings.config_state_ready()
+            } else {
+                strings.config_state_off()
+            })
             .cell(profile.agent_id.as_str())
-            .cell(profile.kind.to_string())
-            .cell(profile.default_model.clone().unwrap_or_default())
-            .cell(secret_label(profile.secret_setup_state, strings))
             .chip(
                 if enabled {
-                    strings.config_state_enabled()
+                    strings.config_state_ready()
                 } else {
-                    strings.config_state_disabled()
+                    strings.config_state_off()
                 },
                 if enabled {
                     ConfigTone::Ok

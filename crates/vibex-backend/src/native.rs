@@ -2896,6 +2896,7 @@ impl ManagementBackend for NativeBackend {
             policy.pin = payload.pin;
             policy.token_limit = payload.token_limit;
             policy.account_limits = payload.account_limits;
+            policy.translate = payload.translate;
             for update in &payload.account_updates {
                 match update.preferred {
                     Some(true) => {

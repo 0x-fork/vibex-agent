@@ -980,6 +980,16 @@ pub struct ManagementCenter {
     gateway_token_limit_window: Option<vibex_core::GatewayTokenWindow>,
     /// A rejected token ceiling, shown under its field.
     gateway_token_limit_error: Option<String>,
+    /// The Agent whose gateway switch is being written, if any. A process
+    /// restart is not instant, so the row says which one is in flight.
+    gateway_agent_pending: Option<String>,
+    /// The one-shot wake-up for the soonest cooling Key. One at a time: a
+    /// second timer would only repeat the first one's read.
+    gateway_refresh_task: Option<Task<()>>,
+    /// The Key whose stored value is being replaced, and the draft for it.
+    gateway_key_replace_target: Option<(vibex_core::ModelProviderProfileId, vibex_core::RequestId)>,
+    gateway_key_replace_input: Option<Entity<InputState>>,
+    gateway_key_replace_error: Option<String>,
     /// The key being added to one upstream, keyed by profile id.
     gateway_key_drafts: BTreeMap<String, Entity<InputState>>,
     /// Which upstream the add-key field belongs to.
@@ -2021,6 +2031,11 @@ impl ManagementCenter {
             gateway_token_limit_input: None,
             gateway_token_limit_window: None,
             gateway_token_limit_error: None,
+            gateway_agent_pending: None,
+            gateway_refresh_task: None,
+            gateway_key_replace_target: None,
+            gateway_key_replace_input: None,
+            gateway_key_replace_error: None,
             gateway_key_drafts: BTreeMap::new(),
             gateway_key_add_target: None,
             gateway_key_add_error: None,
@@ -11262,6 +11277,7 @@ impl ManagementCenter {
 
     /// The global Providers sidebar: one row per shared Provider.
     fn render_provider_page_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.schedule_gateway_cooldown_refresh(cx);
         let rows = self.shared_providers();
         let selected = self.selected_global_provider_id.clone();
         let mut list = v_flex().w_full().gap_1();
@@ -11272,7 +11288,11 @@ impl ManagementCenter {
                 first_id = Some(id.clone());
             }
             let is_selected = selected.as_deref() == Some(id.as_str());
-            let key_count = row.profile.credentials.len();
+            let key_summary = shared_provider_key_summary(
+                &row.profile,
+                &self.gateway.upstreams,
+                locale::current_locale(),
+            );
             let used = if row.agents.is_empty() {
                 management_locale_text("not used yet", "未被使用", "未被使用").to_string()
             } else {
@@ -11316,11 +11336,7 @@ impl ManagementCenter {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{key_count} {} · {}",
-                                management_locale_text("keys", "个 Key", "個 Key"),
-                                used
-                            )),
+                            .child(format!("{key_summary} · {used}")),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_global_provider_id = Some(select_id.clone());
@@ -11593,6 +11609,10 @@ impl ManagementCenter {
             // replaces the whole map, so omitting them would silently clear a
             // limit the user set earlier.
             account_limits: snapshot.settings.policy.account_limits.clone(),
+            // Translation is carried forward for the same reason as the limits:
+            // the write replaces the policy, and a routing change must not
+            // silently re-enable a direction the user turned off.
+            translate: snapshot.settings.policy.translate,
             // Account commands are one-shot: an unrelated edit sends none, so
             // it cannot re-apply a toggle the user already made.
             account_updates: Vec::new(),
@@ -11621,6 +11641,50 @@ impl ManagementCenter {
                 }
             });
         }));
+    }
+
+    /// Asks before turning automatic routing off.
+    ///
+    /// Turning it on is the safe direction and needs no question; turning it
+    /// off stops failover for every Agent at once, which is worth one sentence
+    /// first.
+    fn confirm_disable_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            dialog
+                .title(management_locale_text(
+                    "Turn off automatic routing?",
+                    "关闭自动调度？",
+                    "關閉自動調度？",
+                ))
+                .child(management_locale_text(
+                    "Keys will no longer be switched when one runs out; a failing request fails instead. Every Agent falls back to its own Provider configuration.",
+                    "某个 Key 额度用尽时不再自动切换，请求会直接失败。所有 Agent 会回退到自己的供应商配置。",
+                    "某個 Key 額度用盡時不再自動切換，請求會直接失敗。所有 Agent 會退回自己的供應商設定。",
+                ))
+                .footer(
+                    gpui_component::dialog::DialogFooter::new()
+                        .child(gpui_component::dialog::DialogClose::new().child(
+                            Button::new("cancel-gateway-disable")
+                                .outline()
+                                .label(management_locale_text("Cancel", "取消", "取消")),
+                        ))
+                        .child(
+                            gpui_component::dialog::DialogAction::new().child(
+                                Button::new("confirm-gateway-disable").danger().label(
+                                    management_locale_text("Turn off", "关闭", "關閉"),
+                                ),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.set_gateway_enabled(false, cx);
+                    });
+                    true
+                })
+        });
     }
 
     /// Turns automatic routing on or off.
@@ -11655,6 +11719,59 @@ impl ManagementCenter {
                         cx.notify();
                     }
                 }
+            });
+        }));
+    }
+
+    /// Re-reads the gateway snapshot after a cooldown expires.
+    ///
+    /// Deliberately narrower than [`Self::refresh`]: a cooldown ending changes
+    /// Key health, not the Provider list or the Agent catalogue, and reloading
+    /// the whole Config Center for it would make an automatic recovery feel
+    /// like a page reset.
+    fn reload_gateway_snapshot(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let this = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let outcome = backend.management().model_gateway_snapshot().await;
+            this.update(cx, |this, cx| {
+                if let Ok(snapshot) = outcome {
+                    this.gateway = snapshot;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Wakes for the soonest cooldown, at most a minute apart.
+    ///
+    /// Without this the page keeps drawing "cooling · 12m" after the Key is
+    /// ready again: the router recovers on its own, but the surface has no
+    /// reason to repaint. A minute-granular countdown also has to be refreshed
+    /// to tick, which is why a longer deadline is re-read once a minute rather
+    /// than slept through.
+    fn schedule_gateway_cooldown_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.gateway_refresh_task.is_some() {
+            return;
+        }
+        let now = vibex_core::unix_timestamp_ms();
+        let Some(until) = next_gateway_cooldown_expiry(&self.gateway, now) else {
+            return;
+        };
+        let wait = u64::try_from(until.saturating_sub(now))
+            .unwrap_or(0)
+            .clamp(250, 60_000);
+        let this = cx.entity();
+        self.gateway_refresh_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(wait + 50))
+                .await;
+            this.update(cx, |this, cx| {
+                this.gateway_refresh_task = None;
+                this.reload_gateway_snapshot(cx);
             });
         }));
     }
@@ -11713,10 +11830,67 @@ impl ManagementCenter {
         }
     }
 
+    /// Asks before removing the token ceiling.
+    fn confirm_clear_gateway_token_limit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            dialog
+                .title(management_locale_text(
+                    "Remove the token limit?",
+                    "取消 token 上限？",
+                    "取消 token 上限？",
+                ))
+                .child(management_locale_text(
+                    "The gateway will keep using a Provider past the locally observed ceiling. This is the limit Vibex counts, not the vendor's own quota.",
+                    "网关将不再按本地观测到的 token 上限停用供应商。这是 Vibex 本地计数，不是厂商侧的额度。",
+                    "閘道將不再按本機觀測到的 token 上限停用供應商。這是 Vibex 本機計數，不是廠商側的額度。",
+                ))
+                .footer(
+                    gpui_component::dialog::DialogFooter::new()
+                        .child(gpui_component::dialog::DialogClose::new().child(
+                            Button::new("cancel-gateway-token-limit")
+                                .outline()
+                                .label(management_locale_text("Cancel", "取消", "取消")),
+                        ))
+                        .child(
+                            gpui_component::dialog::DialogAction::new().child(
+                                Button::new("confirm-gateway-token-limit")
+                                    .danger()
+                                    .label(management_locale_text(
+                                        "Remove limit",
+                                        "移除上限",
+                                        "移除上限",
+                                    )),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.clear_gateway_token_limit(cx);
+                    });
+                    true
+                })
+        });
+    }
+
     /// Removes the token ceiling, returning the gateway to unrestricted use.
     fn clear_gateway_token_limit(&mut self, cx: &mut Context<Self>) {
         self.gateway_token_limit_error = None;
         self.update_gateway_settings(|request| request.token_limit = None, cx);
+    }
+
+    /// Allows or refuses one translation direction.
+    fn set_gateway_translation(
+        &mut self,
+        direction: GatewayTranslation,
+        allowed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_gateway_settings(
+            move |request| direction.set(&mut request.translate, allowed),
+            cx,
+        );
     }
 
     /// Turns one Key on or off without touching its Provider or its secret.
@@ -11815,6 +11989,81 @@ impl ManagementCenter {
         );
     }
 
+    /// Asks before changing an Agent's provider mode.
+    ///
+    /// The mode is process configuration, so the Agent restarts when it moves:
+    /// a conversation in progress is interrupted. Saying so before the write is
+    /// the difference between a deliberate switch and a surprise.
+    fn confirm_gateway_agent_switch(
+        &mut self,
+        agent_id: String,
+        display_name: String,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.weak_entity();
+        let active_locale = locale::current_locale();
+        let title = match (active_locale, enabled) {
+            (ResolvedLocale::En, true) => format!("Switch {display_name} to the gateway?"),
+            (ResolvedLocale::ZhCn, true) => format!("将“{display_name}”切到网关？"),
+            (ResolvedLocale::ZhTw, true) => format!("將「{display_name}」切到閘道？"),
+            (ResolvedLocale::En, false) => format!("Switch {display_name} to its own Provider?"),
+            (ResolvedLocale::ZhCn, false) => format!("将“{display_name}”切回自己的供应商？"),
+            (ResolvedLocale::ZhTw, false) => format!("將「{display_name}」切回自己的供應商？"),
+        };
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let agent_id = agent_id.clone();
+            dialog
+                .title(title.clone())
+                .child(if enabled {
+                    management_locale_text_for(
+                        active_locale,
+                        "This rewrites the Agent's provider and restarts its process; a conversation in progress will be interrupted. The Agent will use the shared Providers and their keys.",
+                        "这会改写该 Agent 的供应商配置并重启进程；正在进行的对话会中断。之后它使用共享供应商及其 Key。",
+                        "這會改寫該 Agent 的供應商設定並重新啟動程序；正在進行的對話會中斷。之後它使用共享供應商及其 Key。",
+                    )
+                } else {
+                    management_locale_text_for(
+                        active_locale,
+                        "This restores the Agent's own provider and restarts its process; a conversation in progress will be interrupted.",
+                        "这会恢复该 Agent 自己的供应商配置并重启进程；正在进行的对话会中断。",
+                        "這會還原該 Agent 自己的供應商設定並重新啟動程序；正在進行的對話會中斷。",
+                    )
+                })
+                .footer(
+                    gpui_component::dialog::DialogFooter::new()
+                        .child(gpui_component::dialog::DialogClose::new().child(
+                            Button::new("cancel-gateway-agent-switch").outline().label(
+                                management_locale_text_for(
+                                    active_locale,
+                                    "Cancel",
+                                    "取消",
+                                    "取消",
+                                ),
+                            ),
+                        ))
+                        .child(gpui_component::dialog::DialogAction::new().child(
+                            Button::new("confirm-gateway-agent-switch").primary().label(
+                                management_locale_text_for(
+                                    active_locale,
+                                    "Switch",
+                                    "切换",
+                                    "切換",
+                                ),
+                            ),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.set_gateway_agent(agent_id.clone(), enabled, cx);
+                    });
+                    true
+                })
+        });
+    }
+
     /// Points one Agent at the gateway, or takes it back to a direct Provider.
     fn set_gateway_agent(&mut self, agent_id: String, enabled: bool, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
@@ -11825,6 +12074,7 @@ impl ManagementCenter {
         }
         self.mutation = Some(ManagementMutation::Gateway);
         self.error = None;
+        self.gateway_agent_pending = Some(agent_id.clone());
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = backend
@@ -11838,6 +12088,7 @@ impl ManagementCenter {
                 .await;
             this.update(cx, |this, cx| {
                 this.mutation = None;
+                this.gateway_agent_pending = None;
                 match outcome {
                     Ok(gateway) => {
                         this.gateway = gateway;
@@ -11897,7 +12148,7 @@ impl ManagementCenter {
                             .text_color(cx.theme().muted_foreground)
                             .child(format!(
                                 "{} · {}",
-                                gateway_key_summary_text(upstream),
+                                gateway_key_summary_text(upstream, locale::current_locale()),
                                 management_locale_text("models", "个模型", "個模型")
                             )),
                     ),
@@ -12301,6 +12552,72 @@ impl ManagementCenter {
     }
 
     /// Removes one key from its upstream.
+    /// Asks before removing an upstream's last Key.
+    ///
+    /// Removing any other Key is reversible by adding one back and costs no
+    /// coverage; the last one leaves the Provider unable to answer at all.
+    fn confirm_remove_gateway_key(
+        &mut self,
+        profile: vibex_core::ModelProviderProfileId,
+        credential: vibex_core::RequestId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let remaining = self
+            .gateway
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.model_provider_profile_id == profile)
+            .map(|upstream| upstream.keys.len())
+            .unwrap_or(0);
+        if remaining > 1 {
+            self.remove_gateway_key(profile, credential, cx);
+            return;
+        }
+        let entity = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let profile = profile.clone();
+            let credential = credential.clone();
+            dialog
+                .title(management_locale_text(
+                    "Remove the last key?",
+                    "移除最后一个 Key？",
+                    "移除最後一個 Key？",
+                ))
+                .child(management_locale_text(
+                    "This Provider has no other key. It cannot answer a request until a new key is added.",
+                    "该供应商没有其他 Key，添加新 Key 之前无法发起请求。",
+                    "該供應商沒有其他 Key，新增 Key 之前無法發起請求。",
+                ))
+                .footer(
+                    gpui_component::dialog::DialogFooter::new()
+                        .child(gpui_component::dialog::DialogClose::new().child(
+                            Button::new("cancel-gateway-remove-last-key")
+                                .outline()
+                                .label(management_locale_text("Cancel", "取消", "取消")),
+                        ))
+                        .child(
+                            gpui_component::dialog::DialogAction::new().child(
+                                Button::new("confirm-gateway-remove-last-key")
+                                    .danger()
+                                    .label(management_locale_text("Remove", "移除", "移除")),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.remove_gateway_key(
+                            profile.clone(),
+                            credential.clone(),
+                            cx,
+                        );
+                    });
+                    true
+                })
+        });
+    }
+
     fn remove_gateway_key(
         &mut self,
         profile: vibex_core::ModelProviderProfileId,
@@ -12337,6 +12654,148 @@ impl ManagementCenter {
                 }
             });
         }));
+    }
+
+    /// Replaces one Key's stored value, keeping its name, limits and place.
+    ///
+    /// Replacing is not remove-then-add: the credential id, display name and
+    /// per-Key limits survive, and the account state is cleared by the same
+    /// write so an authentication-failed Key becomes usable again.
+    fn replace_gateway_key(
+        &mut self,
+        profile: vibex_core::ModelProviderProfileId,
+        credential: vibex_core::RequestId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.gateway_key_replace_input.clone() else {
+            return;
+        };
+        let value = input.read(cx).value().trim().to_string();
+        if value.is_empty() {
+            self.gateway_key_replace_error =
+                Some(management_locale_text("Enter a key", "请输入 Key", "請輸入 Key").to_string());
+            cx.notify();
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::Gateway);
+        self.error = None;
+        self.gateway_key_replace_error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .mutate_provider_credential_secret(vibex_backend::MutationRequest::new(
+                    vibex_core::ProviderCredentialSecretMutationRequest {
+                        model_provider_profile_id: profile,
+                        credential_id: credential,
+                        touched: true,
+                        clear: false,
+                        value: Some(value),
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(_) => {
+                        this.gateway_key_replace_target = None;
+                        this.gateway_key_replace_input = None;
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.gateway_key_replace_error =
+                            Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    /// The inline replacement field for the Key the user chose, if any.
+    fn render_gateway_key_replace(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfileId,
+        key: &vibex_core::GatewayKeySummary,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active =
+            self.gateway_key_replace_target
+                .as_ref()
+                .is_some_and(|(target_profile, credential)| {
+                    target_profile == profile && credential == &key.credential_id
+                });
+        if !active {
+            return div().into_any_element();
+        }
+        let input = self
+            .gateway_key_replace_input
+            .get_or_insert_with(|| {
+                cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .masked(true)
+                        .placeholder(management_locale_text("New key", "新的 Key", "新的 Key"))
+                })
+            })
+            .clone();
+        let pending = self.mutation.is_some();
+        let profile = profile.clone();
+        let credential = key.credential_id.clone();
+        let error = self.gateway_key_replace_error.clone();
+        v_flex()
+            .w_full()
+            .gap_1()
+            .pl_3()
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&input).small().w_full()),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-gateway-replace-save-{}",
+                            key.credential_id.as_str()
+                        )))
+                        .xsmall()
+                        .primary()
+                        .label(management_locale_text("Save", "保存", "儲存"))
+                        .disabled(pending)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.replace_gateway_key(profile.clone(), credential.clone(), cx)
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-gateway-replace-cancel-{}",
+                            key.credential_id.as_str()
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text("Cancel", "取消", "取消"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.gateway_key_replace_target = None;
+                            this.gateway_key_replace_input = None;
+                            this.gateway_key_replace_error = None;
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .children(
+                error.map(|message| div().text_xs().text_color(cx.theme().danger).child(message)),
+            )
+            .into_any_element()
     }
 
     /// The two limit fields for one Key, with its current values.
@@ -12477,6 +12936,7 @@ impl ManagementCenter {
     }
 
     fn render_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.schedule_gateway_cooldown_refresh(cx);
         let snapshot = self.gateway.clone();
         let pending = self.mutation.is_some();
         let status = &snapshot.runtime;
@@ -12526,8 +12986,12 @@ impl ManagementCenter {
                                 .small()
                                 .checked(snapshot.settings.policy.enabled)
                                 .disabled(pending)
-                                .on_click(cx.listener(|this, checked, _, cx| {
-                                    this.set_gateway_enabled(*checked, cx)
+                                .on_click(cx.listener(|this, checked, window, cx| {
+                                    if *checked {
+                                        this.set_gateway_enabled(true, cx);
+                                    } else {
+                                        this.confirm_disable_gateway(window, cx);
+                                    }
                                 })),
                         )
                         .child(gateway_status_badge(status, cx)),
@@ -12702,82 +13166,81 @@ impl ManagementCenter {
             );
         }
         let limit_error = self.gateway_token_limit_error.clone();
-        policy_rows =
-            policy_rows.child(
-                v_flex()
-                    .w_full()
-                    .gap_1()
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(management_field_label(management_locale_text(
-                                "Token limit",
-                                "token 上限",
-                                "token 上限",
-                            )))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(match stored_limit {
-                                        Some(limit) => format!(
-                                            "{} / {}",
-                                            gateway_token_count(limit.tokens),
-                                            gateway_token_window_label(limit.window)
-                                        ),
-                                        None => management_locale_text(
-                                            "not limited",
-                                            "不限制",
-                                            "不限制",
-                                        )
-                                        .to_string(),
-                                    }),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .gap_2()
-                            .child(limit_window_row)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(Input::new(&limit_input).small().w_full()),
-                            )
-                            .child(
-                                Button::new("management-gateway-token-limit-save")
-                                    .xsmall()
-                                    .primary()
-                                    .label(management_locale_text("Save", "保存", "儲存"))
-                                    .disabled(pending)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.save_gateway_token_limit(cx)
-                                    })),
-                            )
-                            .children(stored_limit.map(|_| {
-                                Button::new("management-gateway-token-limit-clear")
-                                    .xsmall()
-                                    .ghost()
-                                    .label(management_locale_text(
-                                        "Remove limit",
-                                        "移除上限",
-                                        "移除上限",
-                                    ))
-                                    .disabled(pending)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.clear_gateway_token_limit(cx)
-                                    }))
-                            })),
-                    )
-                    .children(limit_error.map(|message| {
+        policy_rows = policy_rows.child(
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(management_field_label(management_locale_text(
+                            "Token limit",
+                            "token 上限",
+                            "token 上限",
+                        )))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(match stored_limit {
+                                    Some(limit) => format!(
+                                        "{} / {}",
+                                        gateway_token_count(limit.tokens),
+                                        gateway_token_window_label(limit.window)
+                                    ),
+                                    None => {
+                                        management_locale_text("not limited", "不限制", "不限制")
+                                            .to_string()
+                                    }
+                                }),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_2()
+                        .child(limit_window_row)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Input::new(&limit_input).small().w_full()),
+                        )
+                        .child(
+                            Button::new("management-gateway-token-limit-save")
+                                .xsmall()
+                                .primary()
+                                .label(management_locale_text("Save", "保存", "儲存"))
+                                .disabled(pending)
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.save_gateway_token_limit(cx)),
+                                ),
+                        )
+                        .children(stored_limit.map(|_| {
+                            Button::new("management-gateway-token-limit-clear")
+                                .xsmall()
+                                .ghost()
+                                .label(management_locale_text(
+                                    "Remove limit",
+                                    "移除上限",
+                                    "移除上限",
+                                ))
+                                .disabled(pending)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_clear_gateway_token_limit(window, cx)
+                                }))
+                        })),
+                )
+                .children(
+                    limit_error.map(|message| {
                         div().text_xs().text_color(cx.theme().danger).child(message)
-                    })),
-            );
+                    }),
+                ),
+        );
         policy_rows = policy_rows.child(
             div()
                 .text_xs()
@@ -12797,6 +13260,58 @@ impl ManagementCenter {
             ),
             "icons/vibex/file-cog.svg",
             policy_rows.into_any_element(),
+            cx,
+        ));
+
+        // Translation is the one policy most users never touch, so it sits
+        // after routing and before the upstream list: visible when needed,
+        // out of the way when not.
+        let translate = snapshot.settings.policy.translate;
+        let mut translate_rows = v_flex().w_full().gap_2();
+        for direction in GatewayTranslation::ALL {
+            translate_rows = translate_rows.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .child(direction.label()),
+                    )
+                    .child(
+                        Switch::new(SharedString::from(format!(
+                            "management-gateway-translate-{}",
+                            direction.id()
+                        )))
+                        .small()
+                        .checked(direction.allowed(&translate))
+                        .disabled(pending)
+                        .on_click(cx.listener(
+                            move |this, checked, _, cx| {
+                                this.set_gateway_translation(direction, *checked, cx)
+                            },
+                        )),
+                    ),
+            );
+        }
+        body = body.child(management_card_with_icon(
+            management_locale_text(
+                "Protocol translation",
+                "协议翻译",
+                "協定翻譯",
+            ),
+            management_locale_text(
+                "The gateway translates only when the Agent and the upstream speak different protocols. A direction turned off refuses the requests that need it with a 400 instead of sending them mangled.",
+                "只有 Agent 与上游使用不同协议时网关才翻译。关闭一个方向后，需要它的请求会直接返回 400，而不是被翻译坏了继续发送。",
+                "只有 Agent 與上游使用不同協定時閘道才翻譯。關閉一個方向後，需要它的請求會直接回傳 400，而不是被翻譯壞了繼續傳送。",
+            ),
+            "icons/vibex/file-cog.svg",
+            translate_rows.into_any_element(),
             cx,
         ));
 
@@ -12911,6 +13426,36 @@ impl ManagementCenter {
                                         }
                                     })),
                                 )
+                                .children((key.state == vibex_core::GatewayKeyState::Invalid).then(
+                                    || {
+                                        Button::new(SharedString::from(format!(
+                                            "management-gateway-replace-key-{}-{}",
+                                            id.as_str(),
+                                            key.credential_id.as_str()
+                                        )))
+                                        .xsmall()
+                                        .outline()
+                                        .label(management_locale_text(
+                                            "Replace key",
+                                            "更换 Key",
+                                            "更換 Key",
+                                        ))
+                                        .disabled(pending)
+                                        .on_click(
+                                            cx.listener({
+                                                let profile = id.clone();
+                                                let credential = key.credential_id.clone();
+                                                move |this, _, _, cx| {
+                                                    this.gateway_key_replace_target =
+                                                        Some((profile.clone(), credential.clone()));
+                                                    this.gateway_key_replace_input = None;
+                                                    this.gateway_key_replace_error = None;
+                                                    cx.notify();
+                                                }
+                                            }),
+                                        )
+                                    },
+                                ))
                                 .child(
                                     Button::new(SharedString::from(format!(
                                         "management-gateway-remove-key-{}-{}",
@@ -12924,10 +13469,11 @@ impl ManagementCenter {
                                     .on_click(cx.listener({
                                         let profile = id.clone();
                                         let credential = key.credential_id.clone();
-                                        move |this, _, _, cx| {
-                                            this.remove_gateway_key(
+                                        move |this, _, window, cx| {
+                                            this.confirm_remove_gateway_key(
                                                 profile.clone(),
                                                 credential.clone(),
+                                                window,
                                                 cx,
                                             )
                                         }
@@ -12939,6 +13485,7 @@ impl ManagementCenter {
                 // can be busy without being broken, and the only place a user
                 // can tell the gateway so is beside the Key it applies to.
                 key_rows = key_rows.child(self.render_gateway_key_limits(key, window, cx));
+                key_rows = key_rows.child(self.render_gateway_key_replace(&id, key, window, cx));
             }
             if upstream.keys.is_empty() {
                 key_rows = key_rows.child(div().text_xs().text_color(cx.theme().warning).child(
@@ -13111,6 +13658,7 @@ impl ManagementCenter {
         let mut agent_rows = v_flex().w_full().gap_1();
         for agent in &snapshot.agents {
             let agent_id = agent.agent_id.clone();
+            let switching = self.gateway_agent_pending.as_deref() == Some(agent.agent_id.as_str());
             agent_rows = agent_rows.child(
                 h_flex()
                     .w_full()
@@ -13127,7 +13675,9 @@ impl ManagementCenter {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if agent.enabled {
+                                    .child(if switching {
+                                        management_locale_text("Switching…", "切换中…", "切換中…")
+                                    } else if agent.enabled {
                                         management_locale_text(
                                             "Uses the gateway",
                                             "走网关",
@@ -13149,12 +13699,20 @@ impl ManagementCenter {
                         )))
                         .small()
                         .checked(agent.enabled)
-                        .disabled(pending)
-                        .on_click(cx.listener(
-                            move |this, checked, _, cx| {
-                                this.set_gateway_agent(agent_id.clone(), *checked, cx)
-                            },
-                        )),
+                        .disabled(pending || switching)
+                        .on_click(cx.listener({
+                            let agent_id = agent_id.clone();
+                            let display_name = agent.display_name.clone();
+                            move |this, checked, window, cx| {
+                                this.confirm_gateway_agent_switch(
+                                    agent_id.clone(),
+                                    display_name.clone(),
+                                    *checked,
+                                    window,
+                                    cx,
+                                )
+                            }
+                        })),
                     ),
             );
         }
@@ -20030,6 +20588,39 @@ impl ManagementCenter {
             profile_rows = profile_rows.child(row);
         }
 
+        // The one line that answers "is this Agent on the gateway right
+        // now?", before any Provider row is read. It is computed from the
+        // snapshot the switches write, so it changes with them.
+        let agent_gateway_mode = {
+            let binding = self
+                .gateway
+                .agents
+                .iter()
+                .find(|agent| agent.agent_id == selected_id);
+            let configurable = vibex_core::model_provider_configurable_agent_ids()
+                .map(|agents| agents.iter().any(|id| id.as_str() == selected_id))
+                .unwrap_or(false);
+            let direct_provider = self
+                .agent_profile_states
+                .iter()
+                .find(|state| state.agent_id == selected_id && state.is_default)
+                .and_then(|state| {
+                    self.snapshot
+                        .profiles
+                        .iter()
+                        .find(|profile| profile.id.as_str() == state.profile_id)
+                })
+                .map(|profile| profile.display_name.clone());
+            agent_gateway_mode(
+                binding,
+                self.gateway.is_routable(),
+                &self.gateway.settings.display_name,
+                direct_provider.as_deref(),
+                configurable,
+                locale::current_locale(),
+            )
+        };
+
         let installation = self.render_agent_installation_card(&selected_agent, window, cx);
         let provider_configuration = if profiles.is_empty() {
             EmptyState::new()
@@ -20136,6 +20727,16 @@ impl ManagementCenter {
                 )
                 .child(profile_rows)
                 .into_any_element()
+        };
+        let provider_card = provider_configuration;
+        let provider_configuration = match agent_gateway_mode {
+            Some(mode) => v_flex()
+                .w_full()
+                .gap_3()
+                .child(render_agent_gateway_mode(&mode, cx))
+                .child(provider_card)
+                .into_any_element(),
+            None => provider_card,
         };
         let provider_configuration = management_card_with_icon(
             copy.provider_configuration,
@@ -25574,7 +26175,197 @@ fn gateway_runtime_text(state: &vibex_core::ModelGatewayRuntimeState) -> String 
     }
 }
 
-fn gateway_key_summary_text(upstream: &vibex_core::GatewayUpstreamSummary) -> String {
+/// The soonest future cooldown deadline across every upstream Key.
+fn next_gateway_cooldown_expiry(
+    snapshot: &vibex_core::GatewaySnapshot,
+    now_ms: i64,
+) -> Option<i64> {
+    snapshot
+        .upstreams
+        .iter()
+        .flat_map(|upstream| upstream.keys.iter())
+        .filter_map(|key| match key.state {
+            vibex_core::GatewayKeyState::Cooling { until_ms, .. } => until_ms,
+            _ => None,
+        })
+        .filter(|until| *until > now_ms)
+        .min()
+}
+
+/// One protocol direction the gateway may translate into.
+///
+/// These are switches rather than a free-form policy: a direction is either
+/// allowed or refused, and refusing is the safe answer when a deployment is
+/// known not to need it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayTranslation {
+    ChatCompletions,
+    Responses,
+    AnthropicMessages,
+    Gemini,
+}
+
+impl GatewayTranslation {
+    const ALL: [Self; 4] = [
+        Self::ChatCompletions,
+        Self::Responses,
+        Self::AnthropicMessages,
+        Self::Gemini,
+    ];
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "openai-chat",
+            Self::Responses => "openai-responses",
+            Self::AnthropicMessages => "anthropic-messages",
+            Self::Gemini => "google-gemini",
+        }
+    }
+
+    /// The protocol's name, which is a proper noun and reads the same in every
+    /// locale.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "OpenAI Chat Completions",
+            Self::Responses => "OpenAI Responses",
+            Self::AnthropicMessages => "Anthropic Messages",
+            Self::Gemini => "Google Gemini",
+        }
+    }
+
+    const fn allowed(self, policy: &vibex_core::GatewayTranslatePolicy) -> bool {
+        match self {
+            Self::ChatCompletions => policy.openai_chat_completions,
+            Self::Responses => policy.openai_responses,
+            Self::AnthropicMessages => policy.anthropic_messages,
+            Self::Gemini => policy.google_generative_ai,
+        }
+    }
+
+    fn set(self, policy: &mut vibex_core::GatewayTranslatePolicy, allowed: bool) {
+        match self {
+            Self::ChatCompletions => policy.openai_chat_completions = allowed,
+            Self::Responses => policy.openai_responses = allowed,
+            Self::AnthropicMessages => policy.anthropic_messages = allowed,
+            Self::Gemini => policy.google_generative_ai = allowed,
+        }
+    }
+}
+
+/// How an Agent is reaching its models right now, and whether that is a
+/// healthy answer or one the user has to act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentGatewayModeTone {
+    Normal,
+    Warning,
+    Muted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentGatewayMode {
+    text: String,
+    tone: AgentGatewayModeTone,
+}
+
+/// The mode line at the top of an Agent's provider card.
+///
+/// `None` means the gateway snapshot has not loaded yet: saying "direct" then
+/// would be a guess that flips a moment later. `configurable` separates an
+/// Agent that genuinely manages its own provider from one the snapshot merely
+/// has not reported yet.
+fn agent_gateway_mode(
+    binding: Option<&vibex_core::GatewayAgentBinding>,
+    routable: bool,
+    gateway_name: &str,
+    direct_provider: Option<&str>,
+    configurable: bool,
+    locale: ResolvedLocale,
+) -> Option<AgentGatewayMode> {
+    match binding {
+        Some(binding) if binding.enabled => Some(AgentGatewayMode {
+            tone: if routable {
+                AgentGatewayModeTone::Normal
+            } else {
+                AgentGatewayModeTone::Warning
+            },
+            text: if routable {
+                match locale {
+                    ResolvedLocale::En => format!("Current mode: gateway ({gateway_name})"),
+                    ResolvedLocale::ZhCn => format!("当前模式：走网关（{gateway_name}）"),
+                    ResolvedLocale::ZhTw => format!("目前模式：走閘道（{gateway_name}）"),
+                }
+            } else {
+                management_locale_text_for(
+                    locale,
+                    "Current mode: gateway unavailable, using the direct connection",
+                    "当前模式：网关不可用，已回退直连",
+                    "目前模式：閘道無法使用，已退回直連",
+                )
+                .to_string()
+            },
+        }),
+        Some(_) => {
+            let provider = direct_provider.unwrap_or_else(|| {
+                management_locale_text_for(
+                    locale,
+                    "its own Provider",
+                    "自己的供应商",
+                    "自己的供應商",
+                )
+            });
+            Some(AgentGatewayMode {
+                tone: AgentGatewayModeTone::Normal,
+                text: match locale {
+                    ResolvedLocale::En => format!("Current mode: direct ({provider})"),
+                    ResolvedLocale::ZhCn => format!("当前模式：直连（{provider}）"),
+                    ResolvedLocale::ZhTw => format!("目前模式：直連（{provider}）"),
+                },
+            })
+        }
+        None if !configurable => Some(AgentGatewayMode {
+            tone: AgentGatewayModeTone::Muted,
+            text: management_locale_text_for(
+                locale,
+                "Current mode: direct (this Agent manages its own provider)",
+                "当前模式：直连（该 Agent 自己管理供应商）",
+                "目前模式：直連（該 Agent 自己管理供應商）",
+            )
+            .to_string(),
+        }),
+        None => None,
+    }
+}
+
+/// The mode line, in the colour its answer deserves.
+fn render_agent_gateway_mode(mode: &AgentGatewayMode, cx: &App) -> AnyElement {
+    let color = match mode.tone {
+        AgentGatewayModeTone::Normal => cx.theme().foreground,
+        AgentGatewayModeTone::Warning => cx.theme().warning,
+        AgentGatewayModeTone::Muted => cx.theme().muted_foreground,
+    };
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_2()
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(cx.theme().border)
+        .px_3()
+        .py_2()
+        .child(
+            div()
+                .text_xs()
+                .font_medium()
+                .text_color(color)
+                .child(mode.text.clone()),
+        )
+        .into_any_element()
+}
+
+fn gateway_key_summary_text(
+    upstream: &vibex_core::GatewayUpstreamSummary,
+    locale: ResolvedLocale,
+) -> String {
     let cooling = upstream
         .keys
         .iter()
@@ -25595,14 +26386,20 @@ fn gateway_key_summary_text(upstream: &vibex_core::GatewayUpstreamSummary) -> St
         .iter()
         .filter(|key| key.state == vibex_core::GatewayKeyState::Invalid)
         .count();
-    let mut parts = vec![format!("{} keys", upstream.keys.len())];
+    let keys = match locale {
+        ResolvedLocale::En => format!("{} keys", upstream.keys.len()),
+        ResolvedLocale::ZhCn => format!("{} 个 Key", upstream.keys.len()),
+        ResolvedLocale::ZhTw => format!("{} 個 Key", upstream.keys.len()),
+    };
+    let mut parts = vec![keys];
     if cooling > 0 {
         // Keep the count, and add the soonest deadline when one is known: the
         // reader needs both "how many" and "until when".
-        let cooling_text = format!(
-            "{cooling} {}",
-            management_locale_text("cooling", "冷却中", "冷卻中")
-        );
+        let cooling_text = match locale {
+            ResolvedLocale::En => format!("{cooling} cooling"),
+            ResolvedLocale::ZhCn => format!("{cooling} 个冷却中"),
+            ResolvedLocale::ZhTw => format!("{cooling} 個冷卻中"),
+        };
         parts.push(
             match soonest_recovery.and_then(|until_ms| {
                 let remaining = until_ms.saturating_sub(vibex_core::unix_timestamp_ms());
@@ -25611,16 +26408,44 @@ fn gateway_key_summary_text(upstream: &vibex_core::GatewayUpstreamSummary) -> St
                 Some(remaining_ms) => format!(
                     "{cooling_text} · {}{}",
                     remaining_ms.saturating_add(59_999) / 60_000,
-                    management_locale_text("m", " 分钟", " 分鐘")
+                    management_locale_text_for(locale, "m", " 分钟", " 分鐘")
                 ),
                 None => cooling_text,
             },
         );
     }
     if invalid > 0 {
-        parts.push(format!("{invalid} invalid"));
+        parts.push(match locale {
+            ResolvedLocale::En => format!("{invalid} invalid"),
+            ResolvedLocale::ZhCn => format!("{invalid} 个已失效"),
+            ResolvedLocale::ZhTw => format!("{invalid} 個已失效"),
+        });
     }
     parts.join(" · ")
+}
+
+/// The Key line on the global Providers list.
+///
+/// A Provider that is one of the gateway's upstreams borrows the gateway's
+/// richer summary (cooling, invalid, soonest recovery); every other Provider
+/// only knows how many Keys it has.
+fn shared_provider_key_summary(
+    profile: &vibex_core::ModelProviderProfile,
+    upstreams: &[vibex_core::GatewayUpstreamSummary],
+    locale: ResolvedLocale,
+) -> String {
+    if let Some(upstream) = upstreams
+        .iter()
+        .find(|upstream| upstream.model_provider_profile_id == profile.id)
+    {
+        return gateway_key_summary_text(upstream, locale);
+    }
+    let count = profile.credentials.len();
+    match locale {
+        ResolvedLocale::En => format!("{count} keys"),
+        ResolvedLocale::ZhCn => format!("{count} 个 Key"),
+        ResolvedLocale::ZhTw => format!("{count} 個 Key"),
+    }
 }
 
 /// One Key's state, labelled so colour is never the only signal.
@@ -33719,6 +34544,151 @@ mod gateway_surface_tests {
         }
     }
 
+    /// The wake-up targets the soonest future deadline, not a past one.
+    #[test]
+    fn the_cooldown_wakeup_targets_the_soonest_future_deadline() {
+        let key = |state| vibex_core::GatewayKeySummary {
+            credential_id: vibex_core::RequestId::new(),
+            display_name: "Key".to_string(),
+            state,
+            used_tokens: 0,
+            limits: None,
+        };
+        let mut snapshot = vibex_core::GatewaySnapshot::default();
+        snapshot.upstreams.push(vibex_core::GatewayUpstreamSummary {
+            model_provider_profile_id: vibex_core::ModelProviderProfileId::new(),
+            display_name: "DeepSeek".to_string(),
+            model_count: 1,
+            keys: vec![
+                key(vibex_core::GatewayKeyState::Cooling {
+                    kind: vibex_core::GatewayFailureKind::Rate,
+                    until_ms: Some(5_000),
+                }),
+                key(vibex_core::GatewayKeyState::Cooling {
+                    kind: vibex_core::GatewayFailureKind::Credit,
+                    until_ms: Some(2_000),
+                }),
+                key(vibex_core::GatewayKeyState::Invalid),
+                // A deadline already in the past must not schedule a wake-up.
+                key(vibex_core::GatewayKeyState::Cooling {
+                    kind: vibex_core::GatewayFailureKind::Rate,
+                    until_ms: Some(500),
+                }),
+            ],
+        });
+        assert_eq!(
+            next_gateway_cooldown_expiry(&snapshot, 1_000),
+            Some(2_000),
+            "the soonest deadline still ahead wins"
+        );
+        snapshot.upstreams.clear();
+        assert_eq!(next_gateway_cooldown_expiry(&snapshot, 1_000), None);
+    }
+
+    /// The global Providers list borrows the gateway's Key summary.
+    #[test]
+    fn a_provider_row_summary_names_cooling_and_invalid_keys() {
+        let profile = vibex_core::ModelProviderProfile {
+            id: vibex_core::ModelProviderProfileId::new(),
+            display_name: "DeepSeek".to_string(),
+            ..Default::default()
+        };
+        let key = |state| vibex_core::GatewayKeySummary {
+            credential_id: vibex_core::RequestId::new(),
+            display_name: "Key".to_string(),
+            state,
+            used_tokens: 0,
+            limits: None,
+        };
+        let upstream = vibex_core::GatewayUpstreamSummary {
+            model_provider_profile_id: profile.id.clone(),
+            display_name: profile.display_name.clone(),
+            model_count: 1,
+            keys: vec![
+                key(vibex_core::GatewayKeyState::Ready),
+                key(vibex_core::GatewayKeyState::Cooling {
+                    kind: vibex_core::GatewayFailureKind::Rate,
+                    until_ms: Some(vibex_core::unix_timestamp_ms() + 60_000),
+                }),
+                key(vibex_core::GatewayKeyState::Invalid),
+            ],
+        };
+        let chinese = shared_provider_key_summary(
+            &profile,
+            std::slice::from_ref(&upstream),
+            ResolvedLocale::ZhCn,
+        );
+        assert!(chinese.contains("3 个 Key"), "{chinese}");
+        assert!(chinese.contains("1 个冷却中"), "{chinese}");
+        assert!(chinese.contains("1 个已失效"), "{chinese}");
+        let english = shared_provider_key_summary(
+            &profile,
+            std::slice::from_ref(&upstream),
+            ResolvedLocale::En,
+        );
+        assert!(english.contains("3 keys"), "{english}");
+        assert!(english.contains("1 cooling"), "{english}");
+        assert!(english.contains("1 invalid"), "{english}");
+
+        // A Provider that is not an upstream only knows its Key count.
+        assert_eq!(
+            shared_provider_key_summary(&profile, &[], ResolvedLocale::ZhCn),
+            format!("{} 个 Key", profile.credentials.len())
+        );
+    }
+
+    /// The gateway page arms the cooldown wake-up, once at a time.
+    #[test]
+    fn the_gateway_page_wakes_once_for_a_cooling_key() {
+        let source = include_str!("management.rs");
+        assert!(source.contains("self.schedule_gateway_cooldown_refresh(cx);"));
+        let schedule = source
+            .split_once("    fn schedule_gateway_cooldown_refresh(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_gateway_routing("))
+            .map(|(body, _)| body)
+            .expect("the cooldown scheduler should remain inspectable");
+        assert!(schedule.contains("if self.gateway_refresh_task.is_some()"));
+        assert!(schedule.contains("next_gateway_cooldown_expiry"));
+        assert!(schedule.contains("reload_gateway_snapshot(cx)"));
+    }
+
+    /// Each translation switch reads and writes exactly its own field.
+    #[test]
+    fn translation_switches_map_to_their_policy_fields() {
+        let mut policy = vibex_core::GatewayTranslatePolicy {
+            openai_chat_completions: false,
+            ..vibex_core::GatewayTranslatePolicy::default()
+        };
+        assert!(!GatewayTranslation::ChatCompletions.allowed(&policy));
+        assert!(GatewayTranslation::Responses.allowed(&policy));
+
+        for direction in GatewayTranslation::ALL {
+            direction.set(&mut policy, false);
+        }
+        for direction in GatewayTranslation::ALL {
+            assert!(!direction.allowed(&policy), "{direction:?}");
+        }
+
+        GatewayTranslation::Gemini.set(&mut policy, true);
+        assert!(GatewayTranslation::Gemini.allowed(&policy));
+        assert!(!GatewayTranslation::ChatCompletions.allowed(&policy));
+    }
+
+    /// The translation card is drawn and its switches are wired.
+    #[test]
+    fn the_translation_switches_are_wired_to_the_settings_write() {
+        let source = include_str!("management.rs");
+        let card = source
+            .split_once("        // Translation is the one policy most users never touch")
+            .and_then(|(_, tail)| tail.split_once("\n        // Upstreams, with their keys."))
+            .map(|(body, _)| body)
+            .expect("the translation card should remain inspectable");
+        assert!(card.contains("GatewayTranslation::ALL"));
+        assert!(card.contains("management-gateway-translate-"));
+        assert!(card.contains("direction.id()"));
+        assert!(card.contains("set_gateway_translation(direction, *checked, cx)"));
+    }
+
     /// Every unrelated gateway edit carries the stored limits forward.
     ///
     /// The settings write replaces the whole limit map, so a routing change made
@@ -33737,6 +34707,10 @@ mod gateway_surface_tests {
         );
         let policy = vibex_core::GatewayPolicy {
             account_limits: limits.clone(),
+            translate: vibex_core::GatewayTranslatePolicy {
+                anthropic_messages: false,
+                ..vibex_core::GatewayTranslatePolicy::default()
+            },
             ..vibex_core::GatewayPolicy::default()
         };
         let request = vibex_core::GatewaySettingsUpdateRequest {
@@ -33746,6 +34720,7 @@ mod gateway_surface_tests {
             token_limit: None,
             upstreams: Vec::new(),
             account_limits: policy.account_limits.clone(),
+            translate: policy.translate,
             account_updates: Vec::new(),
             expected_revision: 1,
         };
@@ -33756,6 +34731,10 @@ mod gateway_surface_tests {
                 max_rpm: Some(30),
                 ..vibex_core::GatewayAccountLimits::default()
             })
+        );
+        assert!(
+            !request.translate.anthropic_messages,
+            "a routing edit must not re-enable a direction the user turned off"
         );
     }
 
@@ -33846,7 +34825,7 @@ mod gateway_surface_tests {
                 },
             ],
         };
-        let summary = gateway_key_summary_text(&upstream);
+        let summary = gateway_key_summary_text(&upstream, ResolvedLocale::En);
         assert!(summary.contains("3 keys"), "{summary}");
         assert!(summary.contains("1 cooling"), "{summary}");
         assert!(summary.contains("1 invalid"), "{summary}");
@@ -34320,8 +35299,198 @@ mod gateway_surface_tests {
             .expect("the token ceiling editor should remain inspectable");
         assert!(editor.contains("management-gateway-token-window-"));
         assert!(editor.contains("save_gateway_token_limit(cx)"));
-        assert!(editor.contains("clear_gateway_token_limit(cx)"));
+        assert!(editor.contains("confirm_clear_gateway_token_limit(window, cx)"));
         assert!(editor.contains("Input::new(&limit_input)"));
+    }
+
+    /// The mode line names all four relationships, and only warns when the
+    /// gateway actually cannot serve.
+    #[test]
+    fn an_agent_mode_line_covers_gateway_direct_and_agent_managed() {
+        let binding = |enabled| vibex_core::GatewayAgentBinding {
+            agent_id: "claude".to_string(),
+            display_name: "Claude Code".to_string(),
+            enabled,
+            unsupported: false,
+            wire_protocol_id: String::new(),
+        };
+
+        let serving = agent_gateway_mode(
+            Some(&binding(true)),
+            true,
+            "Vibex Gateway",
+            Some("DeepSeek"),
+            true,
+            ResolvedLocale::En,
+        )
+        .unwrap();
+        assert_eq!(serving.tone, AgentGatewayModeTone::Normal);
+        assert!(serving.text.contains("Vibex Gateway"), "{}", serving.text);
+
+        // Configured for the gateway, but the gateway cannot route (disabled,
+        // no upstream, or no ready Key): say what is actually happening.
+        let falling_back = agent_gateway_mode(
+            Some(&binding(true)),
+            false,
+            "Vibex Gateway",
+            Some("DeepSeek"),
+            true,
+            ResolvedLocale::ZhCn,
+        )
+        .unwrap();
+        assert_eq!(falling_back.tone, AgentGatewayModeTone::Warning);
+        assert!(
+            falling_back.text.contains("不可用") && falling_back.text.contains("直连"),
+            "{}",
+            falling_back.text
+        );
+
+        let direct = agent_gateway_mode(
+            Some(&binding(false)),
+            true,
+            "Vibex Gateway",
+            Some("DeepSeek"),
+            true,
+            ResolvedLocale::En,
+        )
+        .unwrap();
+        assert_eq!(direct.tone, AgentGatewayModeTone::Normal);
+        assert!(direct.text.contains("DeepSeek"), "{}", direct.text);
+
+        // An Agent that manages its own provider gets an explanation, not a
+        // gateway row that silently refuses to work.
+        let managed = agent_gateway_mode(
+            None,
+            true,
+            "Vibex Gateway",
+            Some("DeepSeek"),
+            false,
+            ResolvedLocale::En,
+        )
+        .unwrap();
+        assert_eq!(managed.tone, AgentGatewayModeTone::Muted);
+        assert!(
+            managed.text.contains("manages its own provider"),
+            "{}",
+            managed.text
+        );
+
+        // A configurable Agent the snapshot has not reported yet is loading,
+        // not "direct": guessing would flip under the reader a moment later.
+        assert!(
+            agent_gateway_mode(
+                None,
+                true,
+                "Vibex Gateway",
+                Some("DeepSeek"),
+                true,
+                ResolvedLocale::En
+            )
+            .is_none()
+        );
+    }
+
+    /// Changing an Agent's mode goes through the confirmation, and says why.
+    ///
+    /// The switch used to write directly; the mode is process configuration,
+    /// so that write restarts the Agent and interrupts its conversation.
+    #[test]
+    fn an_agent_gateway_switch_asks_before_restarting() {
+        let source = include_str!("management.rs");
+        let row = source
+            .split_once("        for agent in &snapshot.agents {")
+            .and_then(|(_, tail)| tail.split_once("\n        if snapshot.agents.is_empty()"))
+            .map(|(body, _)| body)
+            .expect("the gateway Agent row should remain inspectable");
+        assert!(row.contains("confirm_gateway_agent_switch("));
+        assert!(
+            !row.contains("this.set_gateway_agent(agent_id.clone(), *checked, cx)"),
+            "the switch must not write before the confirmation"
+        );
+        assert!(row.contains("gateway_agent_pending"));
+        assert!(row.contains("Switching"));
+
+        let confirm = source
+            .split_once("    fn confirm_gateway_agent_switch(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Points one Agent at the gateway"))
+            .map(|(body, _)| body)
+            .expect("the confirmation should remain inspectable");
+        assert!(confirm.contains("restarts its process"));
+        assert!(confirm.contains("interrupted"));
+        assert!(confirm.contains("set_gateway_agent(agent_id.clone(), enabled, cx)"));
+    }
+
+    /// The three destructive gateway actions ask first, and the harmless
+    /// direction does not.
+    #[test]
+    fn destructive_gateway_actions_ask_before_they_write() {
+        let source = include_str!("management.rs");
+        let body = |name: &str, next: &str| {
+            source
+                .split_once(name)
+                .and_then(|(_, tail)| tail.split_once(next))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{name} should remain inspectable"))
+        };
+
+        let disable = body(
+            "    fn confirm_disable_gateway(",
+            "\n    /// Turns automatic routing on or off.",
+        );
+        assert!(disable.contains("window.open_dialog"));
+        assert!(disable.contains("set_gateway_enabled(false, cx)"));
+
+        let clear = body(
+            "    fn confirm_clear_gateway_token_limit(",
+            "\n    /// Removes the token ceiling",
+        );
+        assert!(clear.contains("window.open_dialog"));
+        assert!(clear.contains("clear_gateway_token_limit(cx)"));
+
+        let remove = body(
+            "    fn confirm_remove_gateway_key(",
+            "\n    /// The two limit fields for one Key",
+        );
+        assert!(remove.contains("if remaining > 1"));
+        assert!(remove.contains("self.remove_gateway_key(profile, credential, cx);"));
+        assert!(remove.contains("window.open_dialog"));
+
+        // The switches and buttons go through those confirmations, not past
+        // them.
+        assert!(source.contains("this.confirm_disable_gateway(window, cx)"));
+        assert!(source.contains("this.confirm_clear_gateway_token_limit(window, cx)"));
+        assert!(source.contains("this.confirm_remove_gateway_key("));
+        // Turning automatic routing on is immediate: it restores service.
+        assert!(source.contains("this.set_gateway_enabled(true, cx)"));
+    }
+
+    /// A Key rejected for authentication can be replaced in place.
+    ///
+    /// Removing and re-adding would lose the Key's name, limits and place,
+    /// and the old value would be deleted before the new one exists.
+    #[test]
+    fn a_rejected_key_is_replaced_through_the_secret_mutation() {
+        let source = include_str!("management.rs");
+        let row = source
+            .split_once("            for key in &upstream.keys {")
+            .and_then(|(_, tail)| tail.split_once("\n            if upstream.keys.is_empty()"))
+            .map(|(body, _)| body)
+            .expect("the Key row should remain inspectable");
+        assert!(row.contains("Replace key"));
+        assert!(row.contains("GatewayKeyState::Invalid"));
+        assert!(row.contains("gateway_key_replace_target"));
+
+        let replace = source
+            .split_once("    fn replace_gateway_key(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The inline replacement field for the Key")
+            })
+            .map(|(body, _)| body)
+            .expect("the replacement command should remain inspectable");
+        assert!(replace.contains("mutate_provider_credential_secret"));
+        assert!(replace.contains("touched: true"));
+        assert!(replace.contains("clear: false"));
+        assert!(replace.contains("if value.is_empty()"));
     }
 
     /// The Key row's controls are wired, not merely drawn.

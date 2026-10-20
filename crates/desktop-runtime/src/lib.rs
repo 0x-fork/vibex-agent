@@ -1608,6 +1608,7 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
         policy.pin = request.pin;
         policy.token_limit = request.token_limit;
         policy.account_limits = request.account_limits;
+        policy.translate = request.translate;
         for update in &request.account_updates {
             match update.preferred {
                 Some(true) => {

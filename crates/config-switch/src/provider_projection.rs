@@ -1154,6 +1154,16 @@ impl ProviderConfigService {
         profile.revision = profile.revision.saturating_add(1);
         profile.updated_at_ms = unix_timestamp_ms().max(profile.updated_at_ms.saturating_add(1));
         let updated = ModelProviderProfileRepository::update(&conn, &profile, expected_revision)?;
+        // A new value is a new chance: an authentication failure never expires
+        // on its own, so replacing the secret has to clear the state that keeps
+        // the Key out of rotation. Clearing the value does not revive it.
+        if !request.clear && next_value.is_some() {
+            vibex_db::ModelProviderAccountStateRepository::clear_cooldown(
+                &conn,
+                &updated.id,
+                &request.credential_id,
+            )?;
+        }
         self.refresh_bindings_for_model_provider(&conn, &updated.id)?;
         Ok(updated)
     }

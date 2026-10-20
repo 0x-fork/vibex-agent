@@ -461,6 +461,80 @@ mod tests {
         AgentId::parse(id).unwrap()
     }
 
+    /// Replacing a Key's secret revives it; clearing the secret does not.
+    ///
+    /// An authentication failure has no expiry, so the only way back for a
+    /// rejected Key is a new value. The same write that stores it has to clear
+    /// the state that keeps the Key out of rotation.
+    #[test]
+    fn replacing_a_key_clears_its_gateway_cooldown() {
+        let (path, service) = service();
+        let profile = vibex_core::ModelProviderProfile {
+            display_name: "DeepSeek".to_string(),
+            status: vibex_core::ModelProviderProfileStatus::Enabled,
+            ..Default::default()
+        };
+        {
+            let conn = test_connection(&path).unwrap();
+            vibex_db::ModelProviderProfileRepository::insert(&conn, &profile).unwrap();
+        }
+        let added = service
+            .add_model_provider_credential(vibex_core::AddModelProviderCredentialRequest {
+                model_provider_profile_id: profile.id.clone(),
+                display_name: Some("Primary".to_string()),
+                value: "sk-original".to_string(),
+            })
+            .unwrap();
+        let credential = added.credentials[0].id.clone();
+        let conn = test_connection(&path).unwrap();
+        let mut state =
+            vibex_core::ModelProviderAccountState::ready(profile.id.clone(), credential.clone());
+        state.cooldown_reason = Some(vibex_core::GatewayFailureKind::Auth);
+        state.consecutive_failures = 1;
+        vibex_db::ModelProviderAccountStateRepository::upsert(&conn, &state).unwrap();
+
+        service
+            .mutate_provider_credential_secret(
+                vibex_core::ProviderCredentialSecretMutationRequest {
+                    model_provider_profile_id: profile.id.clone(),
+                    credential_id: credential.clone(),
+                    touched: true,
+                    clear: false,
+                    value: Some("sk-replacement".to_string()),
+                },
+            )
+            .unwrap();
+        let states =
+            vibex_db::ModelProviderAccountStateRepository::list(&conn, &profile.id).unwrap();
+        assert!(
+            states[0].is_ready_at(vibex_core::unix_timestamp_ms()),
+            "a replaced Key must be tried again: {:?}",
+            states[0]
+        );
+
+        // Clearing is not a replacement: a Key with no value should not look
+        // ready just because the cooldown was reset.
+        let mut state =
+            vibex_core::ModelProviderAccountState::ready(profile.id.clone(), credential.clone());
+        state.cooldown_reason = Some(vibex_core::GatewayFailureKind::Auth);
+        vibex_db::ModelProviderAccountStateRepository::upsert(&conn, &state).unwrap();
+        service
+            .mutate_provider_credential_secret(
+                vibex_core::ProviderCredentialSecretMutationRequest {
+                    model_provider_profile_id: profile.id.clone(),
+                    credential_id: credential.clone(),
+                    touched: true,
+                    clear: true,
+                    value: None,
+                },
+            )
+            .unwrap();
+        let states =
+            vibex_db::ModelProviderAccountStateRepository::list(&conn, &profile.id).unwrap();
+        assert!(!states[0].is_ready_at(vibex_core::unix_timestamp_ms()));
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn enabling_creates_one_hidden_profile_and_makes_it_the_default() {
         let (path, service) = service();

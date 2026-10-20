@@ -1118,6 +1118,13 @@ pub struct GatewaySettingsUpdateRequest {
     /// Key unlimited, and the whole map replaces the stored one.
     #[serde(default)]
     pub account_limits: BTreeMap<RequestId, GatewayAccountLimits>,
+    /// Which protocol directions the gateway may translate.
+    ///
+    /// The write replaces the whole policy, like `account_limits`: an older
+    /// client that omits the field sends the default, where every direction is
+    /// allowed.
+    #[serde(default)]
+    pub translate: GatewayTranslatePolicy,
     /// Routing-state changes submitted with this write.
     ///
     /// These are commands, not a snapshot: only the Keys named here are

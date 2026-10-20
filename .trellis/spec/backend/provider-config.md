@@ -5037,6 +5037,37 @@ ProviderConfigService::{
   edits policy, so it is carried by the settings write and appears in the
   snapshot; the router puts it first, then applies rotation or usage to the rest
   of the pool. Clearing it returns the Provider to its configured Key order.
+- **An Agent's mode is stated before its Providers.** The provider card opens
+  with one line: gateway (named), gateway unavailable and falling back to
+  direct, direct (named Provider), or direct because the Agent manages its own
+  provider. A configurable Agent the snapshot has not reported yet shows no
+  line rather than guessing. Changing the mode rewrites process configuration,
+  so the switch asks first and names the restart and the interrupted
+  conversation; the row says `Switching…` until the authority answers. Turning
+  the gateway on needs no confirmation, because it restores service.
+- **Translation directions are user policy.** The gateway page lists the four
+  protocol directions with switches. The settings write replaces the policy, so
+  every unrelated edit carries it forward; turning a direction off makes a
+  request that needs it a `400 model_gateway_translation_disabled` rather than
+  a mangled request.
+- **Cooling is visible in the Providers list, and expires without a reload.**
+  The global list borrows the gateway Key summary for upstreams (total, cooling,
+  invalid, soonest recovery). A wake-up is armed for the soonest future cooldown
+  (at most a minute apart, so the countdown ticks) and re-reads only the gateway
+  snapshot, so the countdown disappears when the Key comes back instead of
+  waiting for a page change.
+- **Replacing a secret keeps the Key.** The inline replacement writes the same
+  credential id, name, limits, and position. The write clears the failure
+  cooldown because an authentication failure never expires on its own; removing
+  and re-adding is not equivalent, and clearing the value does not revive it.
+- **Destructive gateway actions are confirmed.** Removing the last Key, clearing
+  the token ceiling, and turning automatic routing off ask first. Removing a
+  non-last Key, switching one Key off, and turning automatic routing on do not:
+  they are reversible or restore service.
+- **The TUI's Provider columns are the gateway's vocabulary.** Upstreams, Keys,
+  State, and Agents: a direct Provider shows one upstream, its single secret as
+  0 or 1 Keys, ready/off, and its Agent; the gateway shows its counts and bound
+  Agents. The old Agent/Kind/Model/Credential facts remain in the row detail.
 - **Concurrency and rate limits are per Key.** A lane bounds in-flight requests
   and a rolling minute bounds request starts. A request that cannot start within
   its own queue deadline is refused with `429` instead of waiting forever, and a
@@ -5204,6 +5235,12 @@ ProviderConfigService::{
   ordered, round-robin, and least-used strategies.
 - `cargo test -p vibex-desktop gateway` covers the token-ceiling editor's parsing
   and the Key row's switch/preference wiring.
+- The same desktop suite covers the Agent mode line and its restart
+  confirmation, the four translation switches, the cooldown wake-up target, the
+  Provider-list Key summary, the in-place Key replacement, and the destructive
+  confirmations.
+- `cargo test -p vibex-tui --test config_center` covers the Upstreams/Keys/
+  State/Agents Provider headings and the gateway row's ready/off wording.
 - `cargo test -p vibex-model-gateway --test gateway` drives a real listener
   against a mock upstream: passthrough, translation, gathering, cooling, auth
   invalidation, the token ceiling, pinning, an unknown model, `file_id` refusal,

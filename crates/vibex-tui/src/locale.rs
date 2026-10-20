@@ -901,6 +901,8 @@ strings! {
     config_col_transport => { "Transport", "传输", "傳輸" },
     config_col_scope => { "Scope", "范围", "範圍" },
     config_col_agents => { "Agents", "Agent", "Agent" },
+    config_col_upstreams => { "Upstreams", "上游", "上游" },
+    config_col_keys => { "Keys", "Key", "Key" },
     config_col_tags => { "Tags", "标签", "標籤" },
     config_col_updated => { "Updated", "更新时间", "更新時間" },
     config_col_version => { "Version", "版本", "版本" },
