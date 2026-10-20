@@ -243,6 +243,11 @@ pub const PROVIDER_PRESET_ZHIPU_GLM: &str = "zhipu-glm";
 pub const PROVIDER_PRESET_OPENROUTER: &str = "openrouter";
 pub const PROVIDER_PRESET_OLLAMA: &str = "ollama";
 
+/// Third-party plans that resell open coding models.
+pub const PROVIDER_PRESET_OPENCODE_GO: &str = "opencode-go";
+pub const PROVIDER_PRESET_CLINEPASS: &str = "clinepass";
+pub const PROVIDER_PRESET_COMMANDCODE: &str = "commandcode";
+
 fn endpoints(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
     entries
         .iter()
@@ -394,6 +399,76 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 &[],
             )
         },
+        // Plans that resell open coding models rather than serving their own.
+        // They are last because they are the exception: everything above is a
+        // vendor's own API. A plan's limits are part of the preset, because
+        // they decide whether the model list can be trusted at all — the one
+        // thing an address and a protocol cannot express.
+        ProviderPreset {
+            plan_note: Some("$10/month".to_string()),
+            website: Some("https://opencode.ai/docs/go".to_string()),
+            keys_url: Some("https://opencode.ai/auth".to_string()),
+            ..preset(
+                PROVIDER_PRESET_OPENCODE_GO,
+                "OpenCode Go",
+                &[
+                    (chat, "https://opencode.ai/zen/go/v1"),
+                    (responses, "https://opencode.ai/zen/go/v1"),
+                    (messages, "https://opencode.ai/zen/go"),
+                ],
+                &[],
+            )
+        },
+        ProviderPreset {
+            plan_note: Some("$9.99/month".to_string()),
+            website: Some("https://docs.cline.bot/getting-started/clinepass".to_string()),
+            keys_url: Some("https://app.cline.bot".to_string()),
+            // The vendor's own model list answers with its metered models only,
+            // never the plan's, so the plan's list is written here and `only`
+            // keeps a metered model from being mistaken for a covered one. A
+            // fetch that returns none of them therefore falls back to this
+            // list instead of reporting that the account has no models.
+            only: Some("cline-pass/".to_string()),
+            caveats: vec![ProviderPresetCaveat::ModelListExcludesPlan],
+            ..preset(
+                PROVIDER_PRESET_CLINEPASS,
+                "ClinePass",
+                &[(chat, "https://api.cline.bot/api/v1")],
+                &[
+                    "cline-pass/glm-5.3",
+                    "cline-pass/glm-5.3-flash",
+                    "cline-pass/kimi-k3",
+                    "cline-pass/deepseek-v4-pro",
+                    "cline-pass/deepseek-v4.1-flash",
+                    "cline-pass/mimo-v2.5",
+                    "cline-pass/mimo-v2.5-pro",
+                    "cline-pass/minimax-m3",
+                    "cline-pass/muse-spark-1.3-contributor",
+                    "cline-pass/qwen3.8-max",
+                    "cline-pass/qwen3.7-max",
+                    "cline-pass/qwen3.7-plus",
+                ],
+            )
+        },
+        ProviderPreset {
+            website: Some("https://commandcode.ai/docs/provider".to_string()),
+            keys_url: Some("https://commandcode.ai/settings/keys".to_string()),
+            // One account, two protocol families: the Claude models answer the
+            // Messages API alone, everything else the OpenAI ones. Which
+            // address a model calls is decided by the protocol it was added
+            // with, so the preset has to carry all three.
+            caveats: vec![ProviderPresetCaveat::ProtocolPerModel],
+            ..preset(
+                PROVIDER_PRESET_COMMANDCODE,
+                "Command Code",
+                &[
+                    (chat, "https://api.commandcode.ai/provider/v1"),
+                    (responses, "https://api.commandcode.ai/provider/v1"),
+                    (messages, "https://api.commandcode.ai/provider"),
+                ],
+                &[],
+            )
+        },
     ];
     presets.retain(|preset| {
         preset
@@ -500,5 +575,76 @@ mod tests {
             assert!(!lower.contains("\"price\""));
             assert!(!lower.contains("\"currency\""));
         }
+    }
+
+    /// A preset's id is the only handle a surface has on it, so the lookup has
+    /// to return that same preset — which also catches two presets sharing an id,
+    /// because the second one would never come back.
+    #[test]
+    fn every_preset_is_addressable_by_its_own_id() {
+        for preset in provider_presets() {
+            assert_eq!(
+                provider_preset(&preset.id).as_ref(),
+                Some(&preset),
+                "{} is not addressable by its own id",
+                preset.id
+            );
+        }
+    }
+
+    /// A plan that resells models says what its vendor's list cannot.
+    #[test]
+    fn a_plan_preset_carries_what_its_vendor_list_omits() {
+        let cline = provider_preset(PROVIDER_PRESET_CLINEPASS).unwrap();
+        assert_eq!(cline.only.as_deref(), Some("cline-pass/"));
+        assert!(cline.models.len() > 1);
+        assert_eq!(
+            cline.caveats,
+            vec![ProviderPresetCaveat::ModelListExcludesPlan]
+        );
+        // The vendor's list answers with metered models only, so the plan's own
+        // list is what the editor must start from rather than an empty one.
+        assert_eq!(
+            cline.offered_models(&["gpt-5".to_string(), "claude-sonnet-5".to_string()]),
+            cline.models
+        );
+        // A list that does mention plan models keeps them, adds the rest.
+        let offered = cline.offered_models(&["cline-pass/glm-5.3".to_string()]);
+        assert_eq!(
+            offered.first().map(String::as_str),
+            Some("cline-pass/glm-5.3")
+        );
+        assert_eq!(offered.len(), cline.models.len());
+
+        let command = provider_preset(PROVIDER_PRESET_COMMANDCODE).unwrap();
+        assert_eq!(
+            command.caveats,
+            vec![ProviderPresetCaveat::ProtocolPerModel]
+        );
+        // One account, two protocol families: the Messages address is not the
+        // OpenAI one, which is exactly why the preset carries both.
+        assert_eq!(
+            command.endpoint_for(ProviderModelWireApi::AnthropicMessages),
+            Some("https://api.commandcode.ai/provider")
+        );
+        assert_eq!(
+            command.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions),
+            Some("https://api.commandcode.ai/provider/v1")
+        );
+
+        let go = provider_preset(PROVIDER_PRESET_OPENCODE_GO).unwrap();
+        assert!(go.plan_note.is_some());
+        assert!(go.keys_url.is_some());
+        assert!(go.caveats.is_empty(), "a plain plan needs no warning");
+        // Three protocols are served by two addresses, which is the shape the
+        // plan shares with a vendor that offers both API families.
+        assert_eq!(
+            go.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions),
+            go.endpoint_for(ProviderModelWireApi::OpenaiResponses)
+        );
+        assert_ne!(
+            go.endpoint_for(ProviderModelWireApi::AnthropicMessages),
+            go.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions)
+        );
     }
 }
