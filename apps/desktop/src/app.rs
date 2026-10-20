@@ -51123,7 +51123,11 @@ impl VibexWorkbench {
                     .overflow_y_scroll()
                     .vertical_scrollbar(&provider_scroll)
                     .when(visible_groups.is_empty(), |this| {
-                        this.child(runtime_menu_empty_state(favorites_view, cx))
+                        this.child(if query.is_empty() {
+                            runtime_menu_empty_state(favorites_view, cx)
+                        } else {
+                            runtime_menu_search_empty_state(&query, cx)
+                        })
                     })
                     .children(visible_groups),
             )
@@ -72823,6 +72827,16 @@ fn runtime_provider_groups_for_query(
             .iter()
             .any(|favorite| &favorite.agent_id == agent_id && favorite.model_key == model_key)
     };
+    // The remembered list is most-recent-last and already capped, so it is the
+    // recency list. A model the user chose before is what they are most likely
+    // to choose again, and it belongs above the rest of its group rather than
+    // wherever the Provider happened to list it.
+    let is_recent = |selection: &SessionRuntimeSelection| {
+        remembered
+            .iter()
+            .rev()
+            .any(|recent| runtime_selection_identity_matches(recent, selection))
+    };
     let mut groups = Vec::new();
     for agent_id in agent_ids {
         let mut sources = runtime_auth_sources_for_agent(catalog, agent_id);
@@ -72856,16 +72870,21 @@ fn runtime_provider_groups_for_query(
                     )
                 };
                 if let Some(rank) = rank {
-                    // Stars float to the top of their group; input order
-                    // breaks the remaining ties.
-                    ranked.push((rank, !favorite, input_index, choice));
+                    // Stars float to the top of their group, then recently used
+                    // models; input order breaks the remaining ties. A search
+                    // term outranks all three, so recency never displaces a
+                    // better match.
+                    let recent = is_recent(&choice.selection);
+                    ranked.push((rank, !favorite, !recent, input_index, choice));
                 }
                 input_index += 1;
             }
-            ranked.sort_by_key(|(rank, unstarred, index, _)| (*rank, *unstarred, *index));
+            ranked.sort_by_key(|(rank, unstarred, unrecent, index, _)| {
+                (*rank, *unstarred, *unrecent, *index)
+            });
             let choices = ranked
                 .into_iter()
-                .map(|(_, _, _, choice)| choice)
+                .map(|(_, _, _, _, choice)| choice)
                 .collect::<Vec<_>>();
             // An Agent account group stays visible with no models so its
             // sign-in affordance remains reachable; provider profiles and the
@@ -73184,6 +73203,50 @@ fn scroll_chip_into_view(handle: &ScrollHandle, chip_bounds: Bounds<Pixels>, win
     let target = point((offset.x + delta_x).clamp(-max_offset.x, px(0.0)), offset.y);
     let handle = handle.clone();
     window.on_next_frame(move |_, _| handle.set_offset(target));
+}
+
+/// The words an empty search shows: the query echoed back, and the next step.
+///
+/// The list is filtered across Providers, so "the Provider is missing" and "the
+/// spelling is off" look the same from inside an empty panel; naming both is
+/// what makes the panel a dead end only for the user who stops reading.
+fn runtime_menu_search_empty_copy(query: &str) -> (String, &'static str) {
+    (
+        format!(
+            "{} \u{201c}{query}\u{201d}",
+            locale::text("No match for", "没有匹配", "沒有符合")
+        ),
+        locale::text(
+            "Try a Provider name, or check whether that Provider has been added.",
+            "试试供应商名，或检查是否已添加该供应商。",
+            "試試供應商名稱，或檢查是否已新增該供應商。",
+        ),
+    )
+}
+
+/// What the grouped model list shows when a search matched nothing.
+fn runtime_menu_search_empty_state(query: &str, cx: &App) -> AnyElement {
+    let (title, hint) = runtime_menu_search_empty_copy(query);
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .px_3()
+        .child(
+            div()
+                .text_size(type_scale::menu_body())
+                .text_color(cx.theme().foreground.opacity(0.8))
+                .child(title),
+        )
+        .child(
+            div()
+                .text_center()
+                .text_size(type_scale::menu_subline())
+                .text_color(cx.theme().muted_foreground.opacity(0.8))
+                .child(hint),
+        )
+        .into_any_element()
 }
 
 fn runtime_menu_empty_state(favorites_view: bool, cx: &App) -> AnyElement {
@@ -94222,6 +94285,88 @@ mod tests {
             "",
             ["OpenAI Provider", "Claude Sonnet"]
         ));
+    }
+
+    /// A model the user already chose sits at the top of its group until a
+    /// search term says otherwise.
+    ///
+    /// The remembered list is the only recency signal this surface has, and a
+    /// list that re-sorted itself out from under the user on every reopen is
+    /// exactly what it exists to prevent.
+    #[test]
+    fn a_remembered_model_floats_to_the_top_of_its_group() {
+        let first = new_session_runtime_option("codex", "Codex");
+        let mut second = first.clone();
+        second.selection.model = RuntimeModelSelection::explicit("codex_model_mini");
+        second.model_label = "Codex mini".into();
+        let agent_id = first.selection.agent_id.clone();
+        let auth_source = RuntimeAuthSourceSummary {
+            source: first.selection.auth_source.clone(),
+            auth_source_revision: 1,
+            agent_id: agent_id.clone(),
+            label: "Codex profile".into(),
+            kind: RuntimeAuthSourceKind::ProviderProfile,
+            availability: RuntimeAuthSourceAvailability::Available,
+            account_hint: None,
+            model_catalog_status: vibex_core::AgentAuthModelCatalogStatus::Available,
+            supported_actions: Vec::new(),
+        };
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: vec![auth_source],
+            options: vec![first.clone(), second.clone()],
+        };
+
+        let models = |remembered: &[SessionRuntimeSelection]| {
+            runtime_provider_groups_for_query(
+                &catalog,
+                std::slice::from_ref(&agent_id),
+                "",
+                false,
+                &[],
+                None,
+                remembered,
+            )
+            .into_iter()
+            .flat_map(|group| {
+                group
+                    .choices
+                    .into_iter()
+                    .map(|choice| runtime_model_selection_key(&choice.selection.model))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            models(&[]),
+            vec![
+                "model:codex_model".to_string(),
+                "model:codex_model_mini".to_string()
+            ]
+        );
+        assert_eq!(
+            models(std::slice::from_ref(&second.selection)),
+            vec![
+                "model:codex_model_mini".to_string(),
+                "model:codex_model".to_string()
+            ],
+            "the remembered model must lead its group"
+        );
+    }
+
+    /// An empty search says what was searched for and what to try instead.
+    ///
+    /// Without the query echoed back, a filtered list that matched nothing is
+    /// indistinguishable from a Provider that was never added.
+    #[test]
+    fn an_empty_model_search_echoes_the_query_and_names_the_next_step() {
+        let (title, hint) = runtime_menu_search_empty_copy("deepsek");
+        // The query is echoed verbatim, so this holds in every locale: the copy
+        // around it is translated, the term the user typed is not.
+        assert!(title.contains("deepsek"), "{title}");
+        assert!(!hint.trim().is_empty());
     }
 
     #[test]
