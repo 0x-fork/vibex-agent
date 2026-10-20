@@ -5759,9 +5759,17 @@ fn render_config_table(
         ]));
     }
     // The heading row is the columns, measured against the same widths the
-    // cells use so a heading sits over its own column.
-    let columns =
+    // cells use so a heading sits over its own column. A narrow terminal drops
+    // whole columns rather than squeezing every one of them past readability;
+    // the status column is never among the dropped.
+    let all_columns =
         crate::config_center::columns(app.config_center.module, app.config_center.section, strings);
+    let visible_columns =
+        visible_column_indices(app.config_center.section, area.width, all_columns.len());
+    let columns = visible_columns
+        .iter()
+        .filter_map(|index| all_columns.get(*index).copied())
+        .collect::<Vec<_>>();
     let layout = column_widths(area.width, &columns);
     if lines.len() < usize::from(area.height) {
         // The heading style is shared by every column, including the two the
@@ -5981,8 +5989,11 @@ fn render_config_table(
                 chip_style(row.tone, theme).patch(base),
             ),
         ];
-        for (column, cell) in row.cells.iter().enumerate() {
-            let width = layout.cell(column);
+        for (position, column) in visible_columns.iter().enumerate() {
+            let Some(cell) = row.cells.get(*column) else {
+                continue;
+            };
+            let width = layout.cell(position);
             spans.push(Span::styled(config_cell(cell, width), base));
         }
         lines.push(Line::from(spans));
@@ -6221,6 +6232,31 @@ const TABLE_PREFIX: usize = 3;
 /// Share the row out: the title takes a third of what is left, and every named
 /// column takes an equal share of the rest, so no column is squeezed to the
 /// point where its heading is the only thing that fits.
+/// Which declared columns a Provider table can still show at this width.
+///
+/// The design drops `AGENTS` below 100 columns and everything except `STATE`
+/// below 80. Other sections keep their columns: their headings are already the
+/// shortest name for the fact, and dropping one would hide the page's subject
+/// rather than a detail.
+pub(crate) fn visible_column_indices(
+    section: crate::config_center::ConfigSection,
+    width: u16,
+    total: usize,
+) -> Vec<usize> {
+    use crate::config_center::ConfigSection;
+    if section != ConfigSection::Providers {
+        return (0..total).collect();
+    }
+    if width < 80 {
+        // Upstreams / Keys / State / Agents: keep the state column.
+        return (2 < total).then_some(2).into_iter().collect();
+    }
+    if width < 100 {
+        return (0..total.saturating_sub(1)).collect();
+    }
+    (0..total).collect()
+}
+
 fn column_widths(width: u16, columns: &[&'static str]) -> TableLayout {
     let total = usize::from(width);
     let available = total.saturating_sub(TABLE_PREFIX + CHIP_COLUMN);
@@ -11906,6 +11942,31 @@ mod tests {
 
     fn strings() -> Strings {
         Strings::for_locale(crate::locale::Locale::En)
+    }
+
+    /// A narrow Provider table drops whole columns but never the state one.
+    #[test]
+    fn narrow_provider_tables_drop_columns_and_keep_state() {
+        use crate::config_center::ConfigSection;
+        assert_eq!(
+            visible_column_indices(ConfigSection::Providers, 120, 4),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            visible_column_indices(ConfigSection::Providers, 99, 4),
+            vec![0, 1, 2],
+            "below 100 columns the Agent column goes first"
+        );
+        assert_eq!(
+            visible_column_indices(ConfigSection::Providers, 79, 4),
+            vec![2],
+            "below 80 columns only the state column survives"
+        );
+        assert_eq!(
+            visible_column_indices(ConfigSection::Agents, 60, 5),
+            vec![0, 1, 2, 3, 4],
+            "other sections keep the columns their headings name"
+        );
     }
 
     /// One session, for the row builders that need something to describe.
