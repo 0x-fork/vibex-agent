@@ -129,13 +129,19 @@ pnpm build:mobile:ios
   rendering. Credentials are validated, atomically persisted, and redacted from
   diagnostics; the PC remains the state authority.
 - Native typography is the platform's own: the interface names GPUI's virtual
-  `.SystemUIFont` (SF on iOS, Roboto on Android) and code surfaces name
-  `monospace`, so the phone carries every system weight and the platform's CJK
-  cascade (PingFang, Noto Sans CJK) without bundling a face. Mobile embeds no
-  font payload; the WenQuanYi TTC under `apps/mobile/assets/fonts` is desktop
-  input only and stays registered in the license gate. Naming a family the
-  build does not carry is a defect: GPUI falls through to its own cascade and
-  lands on the proportional UI face, which silently breaks the terminal grid.
+  `.SystemUIFont` (SF on iOS, Roboto on Android) and code surfaces name the
+  platform's monospace family (`Droid Sans Mono` on Android, `Menlo` on iOS), so
+  the phone carries every system weight and the platform's CJK cascade
+  (PingFang, Noto Sans CJK) without bundling a UI face. The one bundled payload
+  is the Android emoji fallback: Noto Color Emoji in its CBDT build at
+  `apps/mobile/android/app/src/main/assets/fonts/NotoColorEmoji.ttf`, which
+  `gpui-mobile` reads when the system emoji font is COLR v1 (Android 13+) and
+  swash cannot rasterize it; dropping the asset leaves every emoji on those
+  devices at `.notdef`. The WenQuanYi TTC under `apps/mobile/assets/fonts` is
+  desktop input only. Both stay registered in the license gate. Naming a family
+  the build does not carry is a defect: GPUI falls through to its own cascade
+  and lands on the proportional UI face, which silently breaks the terminal
+  grid.
 - `Window::insets()` is the only safe-area/IME geometry source. GPUI refreshes
   the window when platform insets change, and the root composition applies the
   effective top/right/bottom/left padding.

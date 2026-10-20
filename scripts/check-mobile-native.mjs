@@ -26,6 +26,12 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "crates/vibex-remote-client/Cargo.toml",
     "crates/vibex-remote-client/src/transport.rs",
     "apps/mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc",
+    // gpui-mobile reads this exact APK asset path when the Android system
+    // emoji font is COLR v1, which swash cannot rasterize. Dropping it leaves
+    // every emoji on Android 13+ falling back to .notdef, so the checker pins
+    // both the font and the license text that must travel beside it.
+    "apps/mobile/android/app/src/main/assets/fonts/NotoColorEmoji.ttf",
+    "apps/mobile/android/app/src/main/assets/fonts/OFL.txt",
     "apps/mobile/android/app/src/main/AndroidManifest.xml",
     "apps/mobile/android/settings.gradle",
     "apps/mobile/android/app/build.gradle",
@@ -430,6 +436,10 @@ function runSelfTest() {
     ["crates/app-update/src/install.rs", source("crates/app-update/src/install.rs")],
     ["crates/app-update/src/source.rs", source("crates/app-update/src/source.rs")],
     ["apps/mobile/android/app/src/main/AndroidManifest.xml", source("apps/mobile/android/app/src/main/AndroidManifest.xml")],
+    // The contract only needs the font's presence; its bytes are pinned by the
+    // license tree digest, so the self-test stands in an empty payload.
+    ["apps/mobile/android/app/src/main/assets/fonts/NotoColorEmoji.ttf", ""],
+    ["apps/mobile/android/app/src/main/assets/fonts/OFL.txt", source("apps/mobile/android/app/src/main/assets/fonts/OFL.txt")],
     ["apps/mobile/android/settings.gradle", source("apps/mobile/android/settings.gradle")],
     ["apps/mobile/android/app/build.gradle", source("apps/mobile/android/app/build.gradle")],
     ["apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java", source("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiHostActivity.java")],

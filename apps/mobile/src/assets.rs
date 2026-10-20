@@ -150,19 +150,22 @@ const ICONS: &[&str] = &[
 
 pub struct MobileAssets;
 
-/// The phone draws entirely in the platform's own faces.
+/// The phone draws in the platform's own faces, with one face delivered
+/// outside this crate.
 ///
-/// No face is bundled: the interface resolves through GPUI's `.SystemUIFont`,
-/// which is SF on iOS and Roboto on Android, and CJK text falls to the same
-/// system cascade those fonts already carry (PingFang on iOS, Noto Sans CJK on
-/// Android). The platform ships every weight and script the app asks for, which
-/// a two-face bundle could not, so the interface renders at the weight it
-/// declares instead of a synthesized one.
+/// No face is registered from Rust: the interface resolves through GPUI's
+/// `.SystemUIFont`, which is SF on iOS and Roboto on Android, and CJK text
+/// falls to the same system cascade those fonts already carry (PingFang on
+/// iOS, Noto Sans CJK on Android). The one bundled face is an APK asset, not a
+/// Rust payload: `gpui-mobile`'s Android platform reads a CBDT
+/// `assets/fonts/NotoColorEmoji.ttf` when the system emoji font is COLR v1
+/// (Android 13+), which swash cannot rasterize. See
+/// `apps/mobile/android/app/src/main/assets/fonts/`.
 ///
 /// The platform registers its system families before `open_root_window`, so
 /// there is nothing to add here. The call stays as the one place the mobile
-/// client is written down as loading no bundled face, and the contract check
-/// keeps it from disappearing.
+/// client is written down as registering no face from Rust, and the contract
+/// check keeps it from disappearing.
 pub fn load_fonts(cx: &mut App) -> Result<()> {
     let _ = cx;
     Ok(())

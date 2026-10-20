@@ -39517,6 +39517,47 @@
       ]
     },
     {
+      "type": "file",
+      "bom-ref": "font:vibex-mobile-android-emoji:f1b204593bacbc43",
+      "name": "Noto Color Emoji CBDT bitmap font for the native Android client",
+      "version": "2.042",
+      "licenses": [
+        {
+          "expression": "OFL-1.1"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f1b204593bacbc43ebea2d8d065434d120392be3abf45f705955f8396b6a8d5e"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/googlefonts/noto-emoji"
+        }
+      ],
+      "properties": [
+        {
+          "name": "vibex:input-kind",
+          "value": "font"
+        },
+        {
+          "name": "vibex:asset-root",
+          "value": "apps/mobile/android/app/src/main/assets/fonts"
+        },
+        {
+          "name": "vibex:file-count",
+          "value": "2"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "OFL-1.1"
+        }
+      ]
+    },
+    {
       "type": "application",
       "bom-ref": "native:pdfium-7881-linux-x86-64:1470e21b8b4a3b4a",
       "name": "PDFium native runtime",
@@ -47474,7 +47515,8 @@
         "cargo:vibex-backend@0.1.0-rc.8:14559522eff35735",
         "cargo:vibex-core@0.1.0-rc.8:a1f32ad3e304847a",
         "cargo:vibex-desktop-model@0.1.0-rc.8:3eccb8226f5ee757",
-        "cargo:vibex-terminal-ui@0.1.0-rc.8:81e25774d4aead5f"
+        "cargo:vibex-terminal-ui@0.1.0-rc.8:81e25774d4aead5f",
+        "font:vibex-mobile-android-emoji:f1b204593bacbc43"
       ]
     },
     {
@@ -48897,6 +48939,10 @@
     },
     {
       "ref": "font:vibex-desktop-wqy-microhei:a3f978f28b2b2efa",
+      "dependsOn": []
+    },
+    {
+      "ref": "font:vibex-mobile-android-emoji:f1b204593bacbc43",
       "dependsOn": []
     },
     {
