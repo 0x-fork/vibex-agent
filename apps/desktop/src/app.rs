@@ -9373,6 +9373,14 @@ pub struct VibexWorkbench {
     new_session_runtime_menu_auth_source: Option<RuntimeAuthSource>,
     new_session_runtime_search: Entity<InputState>,
     new_session_composer_geometry: ComposerGeometry,
+    /// Whether the new-session Composer fills the home page as one input.
+    ///
+    /// The same expansion the session Composer offers: the surface takes the
+    /// page's remaining height and the textarea with it, so a first message
+    /// that runs long is written in a box that keeps up. The page keeps its
+    /// own flag because it is a different surface — opening a new session
+    /// always starts from the compact shape.
+    new_session_expanded: bool,
     new_session_workspace: NewSessionWorkspaceState,
     new_session_workspace_mode_menu_open: bool,
     new_session_worktree_input_syncing: bool,
@@ -10944,6 +10952,7 @@ impl VibexWorkbench {
             new_session_runtime_menu_auth_source: None,
             new_session_runtime_search,
             new_session_composer_geometry: ComposerGeometry::default(),
+            new_session_expanded: false,
             new_session_workspace,
             new_session_workspace_mode_menu_open: false,
             new_session_worktree_input_syncing: false,
@@ -33740,6 +33749,10 @@ impl VibexWorkbench {
         }
         let initialize_draft = !self.new_session_draft_initialized;
         self.new_session_open = true;
+        // The page is a fresh start every time it is opened, so the input
+        // arrives in its compact shape rather than in the reading shape the
+        // previous draft left behind.
+        self.new_session_expanded = false;
         // A draft that is re-opened starts unowned again; only a folder row's
         // new-chat action re-aims it, and it does so after this call.
         self.new_session_folder_id = None;
@@ -52644,6 +52657,9 @@ impl VibexWorkbench {
                             .w_full()
                             .min_w_0()
                             .flex_none()
+                            .when(self.new_session_expanded, |this| {
+                                this.flex_1().min_h_0()
+                            })
                             .gap_3()
                             .child(
                                 h_flex()
@@ -52691,6 +52707,9 @@ impl VibexWorkbench {
                                     .w_full()
                                     .min_w_0()
                                     .overflow_hidden()
+                                    .when(self.new_session_expanded, |this| {
+                                        this.flex_1().min_h(px(240.0))
+                                    })
                                     .rounded(px(20.0))
                                     .border_1()
                                     .border_color(cx.theme().border.opacity(0.72))
@@ -52715,6 +52734,7 @@ impl VibexWorkbench {
                                             .min_h(px(112.0))
                                             .min_w_0()
                                             .items_start()
+                                            .when(self.new_session_expanded, |this| this.flex_1())
                                             .gap_2()
                                             .p_4()
                                             .pb_2()
@@ -52724,6 +52744,10 @@ impl VibexWorkbench {
                                                     .flex_1()
                                                     .min_w_0()
                                                     .h_full()
+                                                    .when(
+                                                        self.new_session_expanded,
+                                                        |this| this.self_stretch(),
+                                                    )
                                                     .on_prepaint(move |bounds, _, cx| {
                                                         let _ = input_geometry_entity.update(
                                                             cx,
@@ -52891,11 +52915,47 @@ impl VibexWorkbench {
                                                             )),
                                                     )
                                             )
-                                            .child(self.render_message_schedule_button(
-                                                MessageScheduleTarget::NewSession,
-                                                !creation_pending,
-                                                cx,
-                                            ))
+                                            .child(
+                                                v_flex()
+                                                    .flex_none()
+                                                    .items_center()
+                                                    .gap_1()
+                                                    .child(
+                                                        Button::new("new-session-toggle-expanded")
+                                                            .xsmall()
+                                                            .ghost()
+                                                            .compact()
+                                                            .size(px(30.0))
+                                                            .icon(if self.new_session_expanded {
+                                                                IconName::Minimize
+                                                            } else {
+                                                                IconName::Maximize
+                                                            })
+                                                            .tooltip(if self.new_session_expanded {
+                                                                locale::text(
+                                                                    "Collapse input",
+                                                                    "收起输入框",
+                                                                    "收合輸入框",
+                                                                )
+                                                            } else {
+                                                                locale::text(
+                                                                    "Expand input",
+                                                                    "展开输入框",
+                                                                    "展開輸入框",
+                                                                )
+                                                            })
+                                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                                this.new_session_expanded =
+                                                                    !this.new_session_expanded;
+                                                                cx.notify();
+                                                            })),
+                                                    )
+                                                    .child(self.render_message_schedule_button(
+                                                        MessageScheduleTarget::NewSession,
+                                                        !creation_pending,
+                                                        cx,
+                                                    )),
+                                            )
                                     )
                             .when_some(self.new_session_schedule, |this, schedule| {
                                 this.child(self.render_message_schedule_draft_hint(schedule, cx))
@@ -100109,6 +100169,50 @@ mod tests {
         assert!(
             panel.contains("&& self.new_session_draft_has_content(cx)"),
             "the create button must stay disabled while the draft is empty"
+        );
+    }
+
+    /// The home Composer wears the same top-right pair as a session Composer:
+    /// the fullscreen control on top and the clock beneath it, in one centred
+    /// column so the pair lines up with the input's corner.
+    #[test]
+    fn new_session_fullscreen_sits_above_the_schedule_control() {
+        let source = include_str!("app.rs");
+        let panel = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
+            .map(|(body, _)| body)
+            .expect("new-session panel should remain inspectable");
+        let fullscreen = panel
+            .find("Button::new(\"new-session-toggle-expanded\")")
+            .expect("the home Composer should offer the fullscreen input");
+        let schedule = panel
+            .find("self.render_message_schedule_button(")
+            .expect("the home Composer should keep its schedule control");
+        assert!(
+            fullscreen < schedule,
+            "the fullscreen control belongs above the clock"
+        );
+        let normalized = panel.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains(
+                "v_flex() .flex_none() .items_center() .gap_1() .child( Button::new(\"new-session-toggle-expanded\")"
+            ),
+            "the pair is one centred column at the input's top-right"
+        );
+        // The control only expands anything if the page's height chain hands
+        // the surface and the textarea the space it is given.
+        assert!(normalized.contains("this.new_session_expanded = !this.new_session_expanded;"));
+        assert!(panel.contains("this.flex_1().min_h_0()"));
+        assert!(panel.contains("this.self_stretch()"));
+        let open = source
+            .split_once("    fn open_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn clear_submitted_new_session_draft("))
+            .map(|(body, _)| body)
+            .expect("new-session navigation should remain inspectable");
+        assert!(
+            open.contains("self.new_session_expanded = false;"),
+            "a page opened again starts from the compact shape"
         );
     }
 
