@@ -5119,6 +5119,13 @@ ProviderConfigService::{
   chosen. "Custom provider" sits at the foot of the list and resets the draft the
   way a fresh dialog does, so a preset that was looked at and left behind cannot
   leave its addresses in a form the user asked to start empty.
+- **The TUI's Providers table offers exactly one write on the gateway: its
+  switch.** The gateway row advertises `Toggle` and the table honours it; a
+  direct Provider row is chosen, not switched, so no Provider row advertises the
+  verb. The press flips the row's state before the authority answers, like every
+  other switch in that table, and the address is dropped with the state because
+  only the authority knows which port comes back. Upstream and Key management
+  stay on the desktop, which is the source of interaction truth.
 - **The composer's model menu leads with the model the user already chose.** The
   remembered selections — most-recent-last, already capped — break ties inside a
   group after stars; a search term outranks both, so recency never displaces a
@@ -5228,7 +5235,10 @@ ProviderConfigService::{
   leaves the gateway-bound Agent's launch revision unchanged, while moving the
   gateway's address moves it.
 - `cargo test -p vibex-tui --test config_center` asserts a preset-created
-  Provider keeps the preset's protocol and per-protocol addresses.
+  Provider keeps the preset's protocol and per-protocol addresses, that the
+  gateway's switch answers the press and files the write, that a gateway nobody
+  has read cannot be switched, and that the effect reaches
+  `set_model_gateway_enabled` and draws the snapshot it returns.
 - `cargo test -p vibex-tui --test config_center` asserts the gateway leads the
   Providers table with its Key and Agent summary, and that a missing gateway
   leaves the direct Providers readable.
