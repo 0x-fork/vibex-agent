@@ -35,8 +35,8 @@ use vibex_terminal_ui::{
     TerminalSearchMatch,
 };
 use vibex_ui::{
-    FileWorkflowController, GitWorkflowController, ShellKind, TerminalInput, TerminalKey,
-    TerminalKeyModifiers, TerminalWorkflowCapabilities, TerminalWorkflowController,
+    AsyncPhase, FileWorkflowController, GitWorkflowController, ShellKind, TerminalInput,
+    TerminalKey, TerminalKeyModifiers, TerminalWorkflowCapabilities, TerminalWorkflowController,
 };
 
 use crate::bottom_sheet::{
@@ -65,6 +65,16 @@ const GIT_DIFF_PAGE_LINES: usize = 800;
 /// number, and the shared workflow clamps anything above its own ceiling, so a
 /// query answered here lists exactly what the desktop would list.
 const FILE_SEARCH_RESULT_LIMIT: u32 = 200;
+/// The pause after the last keystroke before the file search runs.
+///
+/// A phone keyboard commits a word one character at a time, and a request per
+/// character would flood the wire with queries nobody asked for. The pause is
+/// what makes the field feel live without reading as a search per letter; the
+/// desktop debounces its own field for the same reason.
+const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
+/// The same pause for the commit query. It is a little longer because the
+/// authority scans history for it rather than walking the file tree.
+const GIT_HISTORY_SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 /// How many lines of a commit's patch the detail screen paints. A commit that
 /// changes more than this is read in the desktop's own preview pane, which
 /// pages the same way; the phone draws the head of it rather than a scroll
@@ -578,6 +588,12 @@ pub struct MobileWorkbench {
     file_search_input: Option<Entity<InputState>>,
     /// Installed on first paint so the keyboard's action key submits a search.
     file_search_subscription: Option<gpui::Subscription>,
+    /// The pause after the last keystroke before a typed query runs. Held so
+    /// the next keystroke can drop the timer it supersedes.
+    file_search_debounce_task: Option<Task<()>>,
+    /// Which file search request an answer belongs to. A reply to an earlier
+    /// query must not paint over the answer to the query in the field.
+    file_search_request_generation: u64,
     file_search_mode: MobileFileSearchMode,
     file_editor_input: Option<Entity<EditorState>>,
     /// A chosen file takes over the whole Files surface as its own screen
@@ -591,6 +607,8 @@ pub struct MobileWorkbench {
     git_history_query_input: Option<Entity<InputState>>,
     /// Installed with the field so the keyboard's action key runs the query.
     git_history_query_subscription: Option<gpui::Subscription>,
+    /// The pause after the last keystroke before the commit query runs.
+    git_history_query_debounce_task: Option<Task<()>>,
     /// The focused sink the software keyboard writes into.
     ///
     /// A hardware keyboard can hand a focused element raw key events, but an
@@ -829,12 +847,15 @@ impl MobileWorkbench {
             terminal,
             file_search_input: None,
             file_search_subscription: None,
+            file_search_debounce_task: None,
+            file_search_request_generation: 0,
             file_search_mode: MobileFileSearchMode::Name,
             file_editor_input: None,
             file_screen_open: false,
             git_commit_input: None,
             git_history_query_input: None,
             git_history_query_subscription: None,
+            git_history_query_debounce_task: None,
             terminal_input: None,
             terminal_sink_subscription: None,
             terminal_sink_previous: String::new(),
@@ -991,6 +1012,11 @@ impl MobileWorkbench {
         self.git_history_loading = false;
         self.git_history_request_generation = self.git_history_request_generation.wrapping_add(1);
         self.git_history_query_clear_pending = true;
+        // A query scheduled against the old workspace must not run against the
+        // new one, and an answer still coming back for it has no workspace.
+        self.file_search_debounce_task = None;
+        self.file_search_request_generation = self.file_search_request_generation.wrapping_add(1);
+        self.git_history_query_debounce_task = None;
         self.stop_terminal_poll();
         self.refresh_all(cx);
     }
@@ -1336,7 +1362,45 @@ impl MobileWorkbench {
         }
     }
 
+    /// Runs the typed file query once the reader pauses.
+    ///
+    /// A phone keyboard has no search button the reader can be asked to press,
+    /// so waiting for Enter left the panel answering the empty query with "No
+    /// matching items" while the reader was still typing. The field is the
+    /// search: every keystroke supersedes the previous timer, and the panel
+    /// enters its searching state at once so the answer on screen is never
+    /// mistaken for an answer to the words now in the field.
+    fn schedule_file_search(&mut self, cx: &mut Context<Self>) {
+        // Whatever request is in flight was asked a different question.
+        self.file_search_request_generation = self.file_search_request_generation.wrapping_add(1);
+        let query = input_value(&self.file_search_input, cx).trim().to_string();
+        if query.is_empty() {
+            self.file_search_debounce_task = None;
+            self.files.state.search.clear();
+            cx.notify();
+            return;
+        }
+        // Loading starts with the keystroke rather than with the request: the
+        // debounce is the beginning of the search, and the rows already on
+        // screen belong to older words.
+        self.files.state.search.begin();
+        cx.notify();
+        self.file_search_debounce_task =
+            Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+                cx.background_executor().timer(FILE_SEARCH_DEBOUNCE).await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.file_search_debounce_task = None;
+                    this.start_file_search(cx);
+                });
+            }));
+    }
+
     fn start_file_search(&mut self, cx: &mut Context<Self>) {
+        // Enter, or the pause landing, runs the query now; the timer that would
+        // have run it later goes with this call.
+        self.file_search_debounce_task = None;
+        self.file_search_request_generation = self.file_search_request_generation.wrapping_add(1);
+        let request_generation = self.file_search_request_generation;
         let query = input_value(&self.file_search_input, cx).trim().to_string();
         if query.is_empty() {
             self.files.state.search.clear();
@@ -1344,6 +1408,10 @@ impl MobileWorkbench {
             return;
         }
         if let Err(error) = self.files.begin_search() {
+            // The keystroke already put the panel into its searching state.
+            // Without an answer for it, the panel would spin forever, so the
+            // failure takes the spinner's place.
+            self.files.state.search.reject(error.clone());
             self.fail(error);
             cx.notify();
             return;
@@ -1372,6 +1440,11 @@ impl MobileWorkbench {
             let outcome = flatten_join(runner.await);
             let failure = outcome.as_ref().err().cloned();
             let _ = entity.update(cx, |this, cx| {
+                // The field has moved on since this query left, so its answer
+                // is not the one the reader is waiting for.
+                if request_generation != this.file_search_request_generation {
+                    return;
+                }
                 // The backend answers one list for both modes: name matches
                 // carry no line and content matches always do. Without this
                 // split a name search listed the same file once per line that
@@ -1464,6 +1537,10 @@ impl MobileWorkbench {
     }
 
     fn clear_file_search(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A timer still waiting for the pause would ask the authority a query
+        // the reader has already taken back.
+        self.file_search_debounce_task = None;
+        self.file_search_request_generation = self.file_search_request_generation.wrapping_add(1);
         if let Some(input) = self.file_search_input.clone() {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
@@ -2367,8 +2444,14 @@ impl MobileWorkbench {
                  event: &InputEvent,
                  _: &mut Window,
                  cx: &mut Context<Self>| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
-                        this.start_file_search(cx);
+                    match event {
+                        // The field is the search. Waiting for Enter made the
+                        // panel answer the empty query with "No matching items"
+                        // while the reader was still typing, because a phone
+                        // keyboard never sent the key it was waiting for.
+                        InputEvent::Change => this.schedule_file_search(cx),
+                        InputEvent::PressEnter { .. } => this.start_file_search(cx),
+                        _ => {}
                     }
                 },
             ));
@@ -2431,8 +2514,14 @@ impl MobileWorkbench {
                      event: &InputEvent,
                      _: &mut Window,
                      cx: &mut Context<Self>| {
-                        if matches!(event, InputEvent::PressEnter { .. }) {
-                            this.start_git_history_search(cx);
+                        match event {
+                            // Typing is the query: the soft keyboard's action
+                            // key is not a button the reader can be asked to
+                            // press, and waiting for Enter meant the commit
+                            // search never ran at all.
+                            InputEvent::Change => this.schedule_git_history_search(cx),
+                            InputEvent::PressEnter { .. } => this.start_git_history_search(cx),
+                            _ => {}
                         }
                     },
                 ));
@@ -2565,17 +2654,45 @@ impl MobileWorkbench {
         }
     }
 
+    /// Runs the commit query once the reader pauses.
+    ///
+    /// The commit search used to wait for the keyboard's action key, which the
+    /// soft keyboard never sent: the field took the words and no query left the
+    /// phone. Typing now schedules the query, and the pause after the last
+    /// keystroke is what spends the request.
+    fn schedule_git_history_search(&mut self, cx: &mut Context<Self>) {
+        self.git_history_query_debounce_task =
+            Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+                cx.background_executor()
+                    .timer(GIT_HISTORY_SEARCH_DEBOUNCE)
+                    .await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.git_history_query_debounce_task = None;
+                    this.start_git_history_search(cx);
+                });
+            }));
+    }
+
     /// Runs the commit-history query as it now stands.
     ///
-    /// Reached from the keyboard's own action key, which is what a phone has
-    /// instead of a search button: the field is the control, and a second
-    /// framed glyph beside it would only repeat what the field already does.
+    /// Reached from the pause after a keystroke, and from the keyboard's own
+    /// action key where the platform sends one: the field is the control, and a
+    /// second framed glyph beside it would only repeat what the field does.
     fn start_git_history_search(&mut self, cx: &mut Context<Self>) {
+        // A timer still waiting for its pause is superseded by this run.
+        self.git_history_query_debounce_task = None;
         let query = input_value(&self.git_history_query_input, cx)
             .trim()
             .to_string();
+        let query = (!query.is_empty()).then_some(query);
+        // The same words do not ask the authority again: Enter after the pause
+        // has already answered them, and re-running would empty the list the
+        // reader is looking at.
+        if self.git.state.model.history_filter.query == query {
+            return;
+        }
         let mut filter = self.git.state.model.history_filter.clone();
-        filter.query = (!query.is_empty()).then_some(query);
+        filter.query = query;
         self.git.state.model.set_history_filter(filter);
         self.refresh_git_history(false, cx);
     }
@@ -2589,6 +2706,9 @@ impl MobileWorkbench {
         if let Some(input) = self.git_history_query_input.clone() {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
+        // A timer still waiting for its pause would run the query the reader
+        // has just taken back.
+        self.git_history_query_debounce_task = None;
         let mut filter = self.git.state.model.history_filter.clone();
         filter.query = None;
         self.git.state.model.set_history_filter(filter);
@@ -5302,7 +5422,13 @@ impl MobileWorkbench {
         let search = view.search.clone();
         let query_present = !input_value(&self.file_search_input, cx).trim().is_empty();
         let search_loading = self.files.state.search.is_loading();
+        let search_failed = self.files.state.search.phase == AsyncPhase::Failed;
         let search_has_results = !search.is_empty();
+        // An answer is only what the panel reports once a request has landed:
+        // while it waits, for the pause or for the authority, the search is
+        // still in progress and neither the old rows nor "No matching items"
+        // describe the words in the field.
+        let search_settled = !search_loading && !search_failed;
 
         div()
             .size_full()
@@ -5469,8 +5595,14 @@ impl MobileWorkbench {
                             locale::common("Searching"),
                         ))
                     })
+                    .when(query_present && !search_loading && search_failed, |body| {
+                        body.child(empty_state(
+                            "icons/triangle-alert.svg",
+                            locale::text("Search failed", "搜索失败", "搜尋失敗"),
+                        ))
+                    })
                     .when(
-                        query_present && !search_loading && !search_has_results,
+                        query_present && search_settled && !search_has_results,
                         |body| {
                             body.child(empty_state(
                                 "icons/search.svg",
@@ -5484,80 +5616,87 @@ impl MobileWorkbench {
                             ))
                         },
                     )
-                    .when(query_present && search_has_results, |body| {
-                        body.child(
-                            div()
-                                .h(px(30.0))
-                                .px(px(theme::SPACING_MD))
-                                .flex()
-                                .items_center()
-                                .border_t_1()
-                                .border_color(theme::border_subtle())
-                                .text_size(theme::font_micro())
-                                .text_color(theme::text_muted())
-                                .child(format!("{} {}", search.len(), locale::common("results"))),
-                        )
-                        .children(search.into_iter().map(|result| {
-                            let path = result.path.clone();
-                            let line = result.line.unwrap_or_default();
-                            let select_path = path.clone();
-                            div()
-                                .id(format!("file-search-result:{path}:{line}"))
-                                .min_h(px(theme::TOUCH_TARGET))
-                                .mx(px(TREE_ROW_INSET))
-                                .px(px(theme::SPACING_XS))
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .flex()
-                                .items_center()
-                                .gap(px(theme::SPACING_SM))
-                                .cursor_pointer()
-                                .active(|style| style.bg(theme::row_pressed_bg()))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.reveal_file_search_result(
-                                            select_path.clone(),
-                                            line,
-                                            cx,
-                                        )
-                                    }),
-                                )
-                                .child(mobile_file_tree_icon(
-                                    file_icon_descriptor(&path, FileEntryKind::File),
-                                    false,
-                                    false,
-                                ))
-                                .child({
-                                    let display_path = if line > 0 {
-                                        format!("{path}:{line}")
-                                    } else {
-                                        path.clone()
-                                    };
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .text_size(theme::font_caption())
-                                        .text_color(theme::text_secondary())
-                                        .child(display_path)
-                                })
-                                .when_some(result.snippet, |row, snippet| {
-                                    row.child(
+                    .when(
+                        query_present && search_has_results && search_settled,
+                        |body| {
+                            body.child(
+                                div()
+                                    .h(px(30.0))
+                                    .px(px(theme::SPACING_MD))
+                                    .flex()
+                                    .items_center()
+                                    .border_t_1()
+                                    .border_color(theme::border_subtle())
+                                    .text_size(theme::font_micro())
+                                    .text_color(theme::text_muted())
+                                    .child(format!(
+                                        "{} {}",
+                                        search.len(),
+                                        locale::common("results")
+                                    )),
+                            )
+                            .children(search.into_iter().map(|result| {
+                                let path = result.path.clone();
+                                let line = result.line.unwrap_or_default();
+                                let select_path = path.clone();
+                                div()
+                                    .id(format!("file-search-result:{path}:{line}"))
+                                    .min_h(px(theme::TOUCH_TARGET))
+                                    .mx(px(TREE_ROW_INSET))
+                                    .px(px(theme::SPACING_XS))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(theme::SPACING_SM))
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.reveal_file_search_result(
+                                                select_path.clone(),
+                                                line,
+                                                cx,
+                                            )
+                                        }),
+                                    )
+                                    .child(mobile_file_tree_icon(
+                                        file_icon_descriptor(&path, FileEntryKind::File),
+                                        false,
+                                        false,
+                                    ))
+                                    .child({
+                                        let display_path = if line > 0 {
+                                            format!("{path}:{line}")
+                                        } else {
+                                            path.clone()
+                                        };
                                         div()
-                                            .max_w(px(120.0))
+                                            .flex_1()
+                                            .min_w_0()
                                             .overflow_hidden()
                                             .text_ellipsis()
                                             .whitespace_nowrap()
-                                            .text_size(theme::font_micro())
-                                            .text_color(theme::text_muted())
-                                            .child(snippet),
-                                    )
-                                })
-                                .into_any_element()
-                        }))
-                    }),
+                                            .text_size(theme::font_caption())
+                                            .text_color(theme::text_secondary())
+                                            .child(display_path)
+                                    })
+                                    .when_some(result.snippet, |row, snippet| {
+                                        row.child(
+                                            div()
+                                                .max_w(px(120.0))
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
+                                                .text_size(theme::font_micro())
+                                                .text_color(theme::text_muted())
+                                                .child(snippet),
+                                        )
+                                    })
+                                    .into_any_element()
+                            }))
+                        },
+                    ),
             )
             .into_any_element()
     }
@@ -5842,29 +5981,42 @@ impl MobileWorkbench {
                     })
                     .when(history_active, |row| {
                         row.child(
-                            search_field(self.git_history_query_input.as_ref()).when(
-                                !input_value(&self.git_history_query_input, cx)
-                                    .trim()
-                                    .is_empty(),
-                                |bar| {
+                            search_field(self.git_history_query_input.as_ref())
+                                // The query runs after the pause and then on the
+                                // wire; the field says so rather than looking
+                                // unchanged while the list is still the old one.
+                                .when(self.git_history_loading, |bar| {
                                     bar.child(
-                                        inline_icon_button(
-                                            "clear-git-history-search",
-                                            "icons/x.svg",
-                                            "Clear commit search",
-                                        )
-                                        // Drawn without a handler, like the
-                                        // file search's own clear glyph: a
-                                        // reader who mistyped a hash had to
-                                        // erase it by hand to get back to
-                                        // the unfiltered list.
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(Self::clear_git_history_search),
-                                        ),
+                                        svg()
+                                            .path("icons/loader-circle.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .flex_shrink_0()
+                                            .text_color(theme::text_primary()),
                                     )
-                                },
-                            ),
+                                })
+                                .when(
+                                    !input_value(&self.git_history_query_input, cx)
+                                        .trim()
+                                        .is_empty(),
+                                    |bar| {
+                                        bar.child(
+                                            inline_icon_button(
+                                                "clear-git-history-search",
+                                                "icons/x.svg",
+                                                "Clear commit search",
+                                            )
+                                            // Drawn without a handler, like the
+                                            // file search's own clear glyph: a
+                                            // reader who mistyped a hash had to
+                                            // erase it by hand to get back to
+                                            // the unfiltered list.
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(Self::clear_git_history_search),
+                                            ),
+                                        )
+                                    },
+                                ),
                         )
                     })
                     // Fetch before pull: the phone has no terminal habit to
@@ -10776,6 +10928,101 @@ index 3333333..4444444 100644
             !toolbar.contains("file_search_mode_sheet_open")
                 && !toolbar.contains("SheetKey::FileSearchMode"),
             "no sheet is raised for a two-state setting"
+        );
+    }
+
+    /// Both rail searches run from the field itself.
+    ///
+    /// They used to wait for `PressEnter`, which a phone's soft keyboard does
+    /// not send: the file panel answered the empty query with "No matching
+    /// items" while the reader typed, and the commit field never ran a query at
+    /// all. Typing is now the query, once the pause after the last keystroke
+    /// has passed.
+    #[test]
+    fn both_rail_searches_run_as_the_reader_types() {
+        let source = include_str!("workbench.rs");
+        let between = |start: &str, end: &str| {
+            source
+                .split_once(start)
+                .and_then(|(_, tail)| tail.split_once(end))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{start} .. {end} should remain inspectable"))
+        };
+
+        let file_subscription = between(
+            "self.file_search_subscription = Some(cx.subscribe_in(",
+            "if self.file_find_input.is_none()",
+        );
+        assert!(
+            file_subscription.contains("InputEvent::Change => this.schedule_file_search(cx)"),
+            "the file field searches while the reader types"
+        );
+        assert!(
+            file_subscription.contains("InputEvent::PressEnter { .. } =>"),
+            "and the action key still runs the query at once"
+        );
+
+        let history_subscription = between(
+            "self.git_history_query_subscription = Some(cx.subscribe_in(",
+            "if self.file_editor_input.is_none()",
+        );
+        assert!(
+            history_subscription
+                .contains("InputEvent::Change => this.schedule_git_history_search(cx)"),
+            "the commit field searches while the reader types"
+        );
+
+        let file_schedule = between("fn schedule_file_search(", "fn start_file_search(");
+        assert!(
+            file_schedule.contains("FILE_SEARCH_DEBOUNCE") && file_schedule.contains("timer("),
+            "a pause, not every letter, spends a file query"
+        );
+        assert!(
+            file_schedule.contains(".search.begin()"),
+            "the panel says it is searching from the first keystroke"
+        );
+
+        let history_schedule = between(
+            "fn schedule_git_history_search(",
+            "fn start_git_history_search(",
+        );
+        assert!(
+            history_schedule.contains("GIT_HISTORY_SEARCH_DEBOUNCE")
+                && history_schedule.contains("timer("),
+            "a pause, not every letter, spends a commit query"
+        );
+
+        let file_apply = between("fn start_file_search(", "fn reveal_file_search_result(");
+        assert!(
+            file_apply.contains("request_generation != this.file_search_request_generation"),
+            "a reply for words the field no longer holds does not paint over it"
+        );
+    }
+
+    /// A query with no answer yet is not an empty result.
+    ///
+    /// "No matching items" is the answer to a finished search. While the field
+    /// is still waiting — for the pause, or for the authority — the panel shows
+    /// the search in progress instead.
+    #[test]
+    fn an_unanswered_file_query_is_not_reported_as_empty() {
+        let source = include_str!("workbench.rs");
+        let panel = source
+            .split_once("fn render_file_tree(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_file_tree_row("))
+            .map(|(body, _)| body)
+            .expect("the file tree panel should remain inspectable");
+        assert!(
+            panel.contains("let search_settled = !search_loading && !search_failed"),
+            "an answer is reported only once the search has settled"
+        );
+        assert!(
+            panel.contains("search_settled && !search_has_results"),
+            "the empty state is only for a finished, successful search"
+        );
+        assert!(
+            panel.contains("search_has_results && search_settled"),
+            "and rows from an older query wait for the new answer"
         );
     }
 
