@@ -449,6 +449,19 @@ impl BottomSheet {
         !self.panels.is_empty()
     }
 
+    /// Drops every panel at once, without a fall.
+    ///
+    /// A page that clears its own flag when a panel lands cannot land a panel
+    /// whose page has already been left — a pairing fallback that was still
+    /// open when the workspace replaced the pairing screen, for instance. That
+    /// panel would keep [`Self::is_up`] true forever, and every page swipe on
+    /// the new screen would stand down for a sheet that is not drawn anywhere.
+    /// A page crossing a boundary that retires its sheets calls this instead,
+    /// so the next first frame has nothing modal in front of it.
+    pub fn clear(&mut self) {
+        self.panels.clear();
+    }
+
     /// Whether a pull of this sheet let go recently enough that the lift it
     /// ended must not be read as a tap on the scrim it landed on.
     pub fn pull_just_released(&self, key: SheetKey) -> bool {

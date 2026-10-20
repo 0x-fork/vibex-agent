@@ -219,6 +219,33 @@ mod tests {
         cx.update(|window, cx| window.notifications(cx).len())
     }
 
+    /// The same message from several producers is one card.
+    ///
+    /// A single failure often has more than one operation behind it — the
+    /// terminal list, the create and the fit can each report the same offline
+    /// backend — and each of those paths calls `fail` independently. The hint's
+    /// text is its identity, so the later pushes have to replace the card
+    /// already on screen rather than stack copies of it.
+    #[gpui::test]
+    fn repeated_identical_hints_replace_instead_of_stacking(cx: &mut TestAppContext) {
+        let cx = rooted_window(cx);
+        cx.update(|window, cx| {
+            for _ in 0..3 {
+                push(
+                    window,
+                    cx,
+                    &Hint::new(Tone::Error, "the authoritative terminal backend is offline"),
+                    None,
+                );
+            }
+        });
+        assert_eq!(
+            mounted_hints(cx),
+            1,
+            "three reports of one failure must read as one hint"
+        );
+    }
+
     /// A hint that carries an undo still leaves on its own.
     ///
     /// The kit clears a notification's autohide as soon as an action is attached,

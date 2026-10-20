@@ -32,24 +32,25 @@ use vibex_backend::{
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandEntry, AgentCommandExecuteRequest,
     AgentCommandExecutionBehavior, AgentCommandSourceKind, AgentCommandTrigger, AgentId,
-    AgentListRequest, AgentSession, AgentSessionState, AgentTimelineDisplaySettings,
-    AgentTimelineReasoningDisplayMode, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationOption,
-    ElicitationRequest, ElicitationResolution, ElicitationResolutionAction,
-    ForkAgentSessionRequest, GitWorktreeCreateRequest, GoalPhase, GoalSnapshot,
-    HumanDelegationRequest, MessageAttachment, OpenWorkspaceRequest, PermissionResolution,
-    PermissionResponseKind, PermissionRiskCategory, PlanStepPayload, PlanStepStatus,
-    RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteServerKind,
+    AgentListRequest, AgentSession, AgentSessionRuntimeSelectionState, AgentSessionSafety,
+    AgentSessionState, AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationField,
+    ElicitationFieldKind, ElicitationOption, ElicitationRequest, ElicitationResolution,
+    ElicitationResolutionAction, ForkAgentSessionRequest, GitWorktreeCreateRequest, GoalPhase,
+    GoalSnapshot, HumanDelegationRequest, MessageAttachment, OpenWorkspaceRequest,
+    PermissionResolution, PermissionResponseKind, PermissionRiskCategory, PlanStepPayload,
+    PlanStepStatus, RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteServerKind,
     RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
     RemoteSidebarOrganizationMutation, RenameAgentSessionRequest, ReplaceUserMessagePayload,
     RequestId, ResolvePermissionRequest, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
     RuntimeAuthSourceSummary, RuntimeModelSelection, RuntimeOptionAvailability,
     RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
     SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TimelineItem, TimelineItemKind,
-    TimelineLiveEvent, TimelinePayload, TimelineRedactionState, TimelineSource,
-    UserMessageDelivery, UserMessagePayload, VibexSessionId, VibexUseMention, VibexUseRef,
-    WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
+    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest,
+    TimelineItem, TimelineItemKind, TimelineLiveEvent, TimelinePayload, TimelineRedactionState,
+    TimelineSource, UserMessageDelivery, UserMessagePayload, VibexSessionId, VibexUseMention,
+    VibexUseRef, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     ActiveGoal, NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice,
@@ -646,6 +647,45 @@ struct PendingMobileUserMessage {
     submitted_at_ms: i64,
     text: String,
     attachments: Vec<MessageAttachment>,
+}
+
+/// A session the new-session page has submitted but the authority has not
+/// created yet.
+///
+/// The page leaves the moment the request leaves the phone, so everything a
+/// failure has to put back — the page's fields, the session it was opened over,
+/// and the draft that named it — is kept here until the authority answers.
+struct PendingNewSessionCreation {
+    session_id: VibexSessionId,
+    previous_session_id: Option<VibexSessionId>,
+    title: String,
+    prompt: String,
+    attachments: Vec<MessageAttachment>,
+    mentions: Vec<VibexUseMention>,
+    armed_command: Option<AgentCommandEntry>,
+    worktree_name: String,
+    worktree_path: String,
+    base_ref: Option<String>,
+    project_id: Option<String>,
+    workspace_id: Option<String>,
+    folder_id: Option<String>,
+    workspace_mode: WorkspaceMode,
+    temporary: bool,
+    runtime: SessionRuntimeSelection,
+    overlay_returns_to_drawer: bool,
+}
+
+/// The first message a created session has to receive.
+///
+/// The creation and the prompt are two tasks, so the prompt crosses from the
+/// submit's update into its own task as one value rather than as five arguments
+/// that always travel together.
+struct FirstSessionPrompt {
+    prompt: String,
+    attachments: Vec<MessageAttachment>,
+    mentions: Vec<VibexUseMention>,
+    armed_command: Option<AgentCommandEntry>,
+    runtime: SessionRuntimeSelection,
 }
 
 /// What is known about one generated picture.
@@ -1738,6 +1778,14 @@ pub struct MobileApp {
     turn_interrupt_in_flight: bool,
     fork_session_busy: bool,
     new_session_busy: bool,
+    /// The session this page submitted, while the authority is still creating
+    /// it. The page has already been replaced by that session's conversation, so
+    /// this is what a failure has to take back.
+    pending_new_session: Option<PendingNewSessionCreation>,
+    /// Sessions whose first prompt is on the wire. A message written while one
+    /// of these runs belongs in the desktop's queue, exactly as it would once
+    /// the session's own live state says it is running.
+    first_prompts_in_flight: BTreeSet<VibexSessionId>,
     new_session_open: bool,
     new_session_project_id: Option<String>,
     new_session_workspace_id: Option<String>,
@@ -3886,6 +3934,8 @@ impl MobileApp {
             turn_interrupt_in_flight: false,
             fork_session_busy: false,
             new_session_busy: false,
+            pending_new_session: None,
+            first_prompts_in_flight: BTreeSet::new(),
             new_session_open: false,
             new_session_project_id: None,
             new_session_workspace_id: None,
@@ -4680,6 +4730,7 @@ impl MobileApp {
                     workbench.update(cx, |workbench, _| workbench.suspend());
                 }
                 self.reset_drawers();
+                self.reset_pairing_surfaces();
                 self.reset_sidebar_ui();
                 self.back_stack.clear();
                 self.workspaces.clear();
@@ -4746,6 +4797,18 @@ impl MobileApp {
     /// surface of its own: nothing is written into a page, so a notice cannot
     /// leave a line behind on a screen it no longer describes.
     fn hint(&mut self, tone: Tone, message: impl Into<String>) {
+        let message = message.into();
+        // One failure is often reported by several paths before the next frame
+        // hands the queue to the toast layer. The layer replaces by message
+        // too, but coalescing here keeps the burst from reaching it at all —
+        // and from ticking the hand once per copy.
+        if self
+            .pending_hints
+            .iter()
+            .any(|hint| hint.tone == tone && hint.message == message)
+        {
+            return;
+        }
         self.announce(tone);
         self.pending_hints.push(Hint::new(tone, message));
     }
@@ -6799,12 +6862,11 @@ impl MobileApp {
         let Some(backend) = self.backend.clone() else {
             return false;
         };
-        let Some((session_id, state)) = self.controller.as_ref().and_then(|controller| {
-            Some((
-                controller.state.selected_session_id.clone()?,
-                controller.state.runtime_selection.value.clone()?,
-            ))
-        }) else {
+        let Some(session_id) = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone())
+        else {
             return false;
         };
 
@@ -6813,19 +6875,37 @@ impl MobileApp {
         self.runtime_switch_busy_generation = Some(generation);
         self.runtime_switch_error = None;
         let requested_session_id = session_id.clone();
-        let request = MutationRequest::new(SetDesiredAgentSessionRuntimeRequest {
-            session_id,
-            idempotency_key: RequestId::new().into_string(),
-            expected_revision: state.session_revision,
-            expected_selection_revision: state.selection_revision,
-            desired,
-            interaction: RuntimeSelectionInteraction::Seamless,
+        // The revisions are read here rather than taken from the selection the
+        // page happens to hold. A remote client only sees the session's row
+        // through snapshots, and its `session_revision` moves with every state
+        // change — a turn starting or settling is enough. A cached revision is
+        // therefore almost always stale by the time a drawer is used, and the
+        // authority refuses the compare-and-set; reasoning effort masked that,
+        // because the next message carries it anyway, while every other option
+        // only exists on this switch. Reading the state immediately before the
+        // write makes the expectation describe the session as it is now, and a
+        // conflict from a change that lands in between is retried once with the
+        // state that won.
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let latest = backend.runtime_selection(session_id.clone()).await?;
+            if latest.desired == desired {
+                return Ok(latest);
+            }
+            let request = runtime_switch_request(session_id.clone(), &latest, desired.clone());
+            match backend.set_desired_runtime(request).await {
+                Ok(state) => Ok(state),
+                Err(error) if runtime_switch_revision_conflict(&error) => {
+                    let latest = backend.runtime_selection(session_id.clone()).await?;
+                    if latest.desired == desired {
+                        return Ok(latest);
+                    }
+                    backend
+                        .set_desired_runtime(runtime_switch_request(session_id, &latest, desired))
+                        .await
+                }
+                Err(error) => Err(error),
+            }
         });
-        let runner =
-            gpui_tokio::Tokio::spawn(
-                cx,
-                async move { backend.set_desired_runtime(request).await },
-            );
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
@@ -7318,7 +7398,12 @@ impl MobileApp {
         cx.notify();
     }
 
-    fn submit_new_session(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn submit_new_session(
+        &mut self,
+        _: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.new_session_busy {
             return;
         }
@@ -7409,7 +7494,6 @@ impl MobileApp {
             .trim()
             .to_string();
         let attachments = self.new_session_attachments.clone();
-        let restore_attachments = attachments.clone();
         // An executable command chosen on this page runs against the session
         // this submission creates: the session does not exist until then, so it
         // is carried here and executed in place of the ordinary first message.
@@ -7433,6 +7517,7 @@ impl MobileApp {
         let Some(backend) = self.backend.clone() else {
             return;
         };
+        let prompt_backend = backend.clone();
         // A session that starts in a new worktree has to have one created for
         // it first: the session request only registers a workspace, it does not
         // make the directory. The name the reader typed is what the worktree's
@@ -7460,7 +7545,7 @@ impl MobileApp {
                 };
                 vibex_core::managed_worktree_name_slug(&fallback)
             } else {
-                worktree_name
+                worktree_name.clone()
             };
             let name = name.trim().to_string();
             if name.is_empty() {
@@ -7510,14 +7595,122 @@ impl MobileApp {
                 branch_name: format!("vibex/{}", vibex_core::managed_worktree_name_slug(&name)),
                 base_ref,
                 name: Some(name),
-                worktree_path: (!worktree_path.is_empty()).then_some(worktree_path),
+                worktree_path: (!worktree_path.is_empty()).then_some(worktree_path.clone()),
                 target_workspace_id: Some(origin_workspace_id),
                 target_branch: None,
             })
         } else {
             None
         };
+        // The page leaves now, under an identity the create will claim. The
+        // desktop reserves its session id the same way: the conversation page,
+        // the first message and the thinking line are already true of what the
+        // reader submitted, and none of them needs the authority to have
+        // answered before they can be shown.
+        let optimistic_session_id = VibexSessionId::new();
+        let optimistic_submitted_at_ms = unix_timestamp_ms();
+        let optimistic_title = if title.is_empty() {
+            vibex_core::normalize_agent_session_title(&vibex_core::user_message_display_text(
+                &prompt,
+                &attachments,
+            ))
+            .unwrap_or_else(|| mobile_agent_session_fallback_title(&runtime.agent_id))
+        } else {
+            title.clone()
+        };
+        let optimistic_project_id = self
+            .new_session_project_id
+            .as_deref()
+            .and_then(|id| vibex_core::ProjectId::parse(id).ok())
+            .or_else(|| {
+                self.workspaces
+                    .iter()
+                    .find(|workspace| workspace.root_path == workspace_root)
+                    .map(|workspace| workspace.project_id.clone())
+            })
+            .unwrap_or_default();
+        let optimistic_workspace_id = self
+            .new_session_workspace_id
+            .as_deref()
+            .and_then(|id| vibex_core::WorkspaceId::parse(id).ok())
+            .or_else(|| {
+                self.workspaces
+                    .iter()
+                    .find(|workspace| workspace.root_path == workspace_root)
+                    .map(|workspace| workspace.id.clone())
+            })
+            .unwrap_or_default();
+        let optimistic_session = AgentSession {
+            id: optimistic_session_id.clone(),
+            title: optimistic_title,
+            project_id: optimistic_project_id,
+            workspace_id: optimistic_workspace_id,
+            workspace_root: workspace_root.clone(),
+            workspace_mode,
+            agent_id: runtime.agent_id.clone(),
+            state: AgentSessionState::Initializing,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: optimistic_submitted_at_ms,
+            updated_at_ms: optimistic_submitted_at_ms,
+            last_message_at_ms: optimistic_submitted_at_ms,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        let optimistic_message = (armed_command.is_none()
+            && (!prompt.is_empty() || !attachments.is_empty()))
+        .then(|| PendingMobileUserMessage {
+            session_id: optimistic_session_id.clone(),
+            item_id: vibex_core::TimelineItemId::new(),
+            after_sequence: 0,
+            submitted_at_ms: optimistic_submitted_at_ms,
+            text: prompt.clone(),
+            attachments: attachments.clone(),
+        });
+        let previous_session_id = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.clone());
+        let overlay_returns_to_drawer = self.overlay_returns_to_drawer;
+        self.pending_new_session = Some(PendingNewSessionCreation {
+            session_id: optimistic_session_id.clone(),
+            previous_session_id,
+            title: title.clone(),
+            prompt: prompt.clone(),
+            attachments: attachments.clone(),
+            mentions: mentions.clone(),
+            armed_command: armed_command.clone(),
+            worktree_name: worktree_name.clone(),
+            worktree_path: worktree_path.clone(),
+            base_ref: self.new_session_base_ref.clone(),
+            project_id: self.new_session_project_id.clone(),
+            workspace_id: self.new_session_workspace_id.clone(),
+            folder_id: self.new_session_folder_id.clone(),
+            workspace_mode,
+            temporary,
+            runtime: runtime.clone(),
+            overlay_returns_to_drawer,
+        });
+        let create_title = (!title.is_empty()).then_some(title);
         self.new_session_busy = true;
+        // The conversation is what the submit asked for, so the page behind the
+        // sheet is the one that opens — not the sessions drawer it was opened
+        // from.
+        self.overlay_returns_to_drawer = false;
+        self.dismiss_overlay(Some(window), cx);
+        self.begin_optimistic_new_session(
+            optimistic_session,
+            runtime.clone(),
+            optimistic_message,
+            cx,
+        );
+        let create_runtime = runtime.clone();
+        let first_prompt = FirstSessionPrompt {
+            prompt,
+            attachments,
+            mentions,
+            armed_command,
+            runtime,
+        };
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             // The worktree first: its workspace is what the session is opened
             // in, so a session is never left pointing at the checkout the
@@ -7539,96 +7732,93 @@ impl MobileApp {
                 None => (workspace_root, workspace_mode),
             };
             let request = MutationRequest::new(CreateAgentSessionRequest {
-                session_id: None,
+                session_id: Some(optimistic_session_id),
                 defer_runtime_materialization: false,
-                runtime: runtime.clone(),
+                runtime: create_runtime,
                 workspace_root,
                 workspace_mode,
-                title: (!title.is_empty()).then_some(title),
+                title: create_title,
                 safety: None,
             });
-            let session = backend.create_session(request).await?;
-            // A chosen provider command runs before any message: `/plan` and
-            // `/permission` change the session's mode, and a first message sent
-            // ahead of them would be answered under the old one. The session is
-            // the one just created, so the execution is addressed to it.
-            let command_result = match armed_command.as_ref() {
-                Some(entry) => {
-                    let (command_name, arguments) =
-                        parse_slash_command_invocation(&prompt).unwrap_or((String::new(), None));
-                    let request = MutationRequest::new(AgentCommandExecuteRequest {
-                        session_id: session.id.clone(),
-                        command_id: Some(entry.id.clone()),
-                        trigger: AgentCommandTrigger::Slash,
-                        source_kind: entry.source_kind,
-                        command_text: prompt.trim().to_string(),
-                        command_name: Some(command_name),
-                        arguments,
-                        prompt_id: entry.prompt_id.clone(),
-                        attachments: Vec::new(),
-                        reasoning_effort: None,
-                        correlation_id: None,
-                    });
-                    Some(backend.execute_agent_command(request).await.map(|_| ()))
-                }
-                None => None,
-            };
-            let prompt_result =
-                if armed_command.is_some() || (prompt.is_empty() && attachments.is_empty()) {
-                    // An executed command is the whole first message; the ordinary
-                    // send is skipped so `/plan` does not also arrive as text.
-                    command_result
-                } else {
-                    Some(
-                        backend
-                            .send_message(MutationRequest::new(SendAgentMessageRequest {
-                                mentions,
-                                session_id: session.id.clone(),
-                                message_idempotency_key: RequestId::new().into_string(),
-                                desired_runtime: runtime.clone(),
-                                text: prompt,
-                                attachments,
-                                reasoning_effort: runtime.reasoning_effort.clone(),
-                                correlation_id: None,
-                                delivery: UserMessageDelivery::Prompt,
-                                prompt_context: None,
-                                provenance: vibex_core::MessageProvenance::HumanInput,
-                            }))
-                            .await
-                            .map(|_| ()),
-                    )
-                };
-            Ok::<_, BackendError>((session, prompt_result))
+            backend.create_session(request).await
         });
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = flatten_join(runner.await);
             let _ = entity.update(cx, |this, cx| {
                 this.new_session_busy = false;
                 match outcome {
-                    Ok((session, prompt_result)) => {
+                    Ok(session) => {
+                        this.pending_new_session = None;
                         this.new_session_open = false;
                         this.new_session_runtime = None;
                         this.new_session_attachments.clear();
                         this.new_session_armed_mentions.clear();
                         this.new_session_armed_command = None;
-                        this.dismiss_overlay(None, cx);
                         this.refresh_sessions(cx);
                         this.file_new_session_in_folder(&session, cx);
+                        let still_selected = this.controller.as_ref().is_some_and(|controller| {
+                            controller.state.selected_session_id.as_ref() == Some(&session.id)
+                        });
+                        if let Some(controller) = this.controller.as_mut()
+                            && still_selected
+                        {
+                            controller.state.active_session.resolve(session.clone());
+                        }
                         // The session exists now, which is the milestone: the
-                        // first prompt either went out with it or reports its
-                        // own failure below.
+                        // first prompt either goes out from below or reports
+                        // its own failure there.
                         crate::platform::haptic(crate::platform::Haptic::Success);
                         let session_id = session.id.clone();
-                        this.open_session(session_id, cx);
-                        if let Some(Err(error)) = prompt_result {
-                            this.fail(error);
+                        if still_selected {
+                            this.open_session(session.id, cx);
                         }
+                        this.spawn_first_session_prompt(
+                            prompt_backend,
+                            session_id,
+                            first_prompt,
+                            cx,
+                        );
                     }
                     Err(error) => {
-                        // A session that was never created keeps its first
-                        // message: the page stays open, with the files and
-                        // references the reader attached to it.
-                        this.new_session_attachments = restore_attachments;
+                        let Some(pending) = this.pending_new_session.take() else {
+                            this.fail(error);
+                            cx.notify();
+                            return;
+                        };
+                        let active = this.controller.as_ref().is_some_and(|controller| {
+                            controller.state.selected_session_id.as_ref()
+                                == Some(&pending.session_id)
+                        });
+                        // The row was never the authority's, so it goes with
+                        // the failure. The conversation the page was opened
+                        // over comes back when this one still had the reader.
+                        if let Some(controller) = this.controller.as_mut() {
+                            if let Some(mut sessions) = controller.state.sessions.value.clone() {
+                                sessions.retain(|session| session.id != pending.session_id);
+                                controller.state.sessions.resolve(sessions);
+                            }
+                            if active {
+                                // Clearing the selection rather than setting
+                                // it back to the session the page opened over
+                                // is what lets `open_session` take the live
+                                // snapshot `select_pending_session` cached.
+                                controller.state.selected_session_id = None;
+                                controller.state.active_session.clear();
+                                controller.state.timeline = TimelineModel::default();
+                                controller.state.timeline_status.clear();
+                                controller.state.runtime_selection.clear();
+                            }
+                        }
+                        if active {
+                            this.pending_user_message = None;
+                            this.timeline_turns = Arc::new(Vec::new());
+                            this.timeline_list.reset(0);
+                            let previous_session_id = pending.previous_session_id.clone();
+                            this.restore_new_session_page(pending, cx);
+                            if let Some(previous_session_id) = previous_session_id {
+                                this.open_session(previous_session_id, cx);
+                            }
+                        }
                         this.fail(error);
                     }
                 }
@@ -7897,6 +8087,202 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// Opens a session the authority has not created yet.
+    ///
+    /// The desktop answers a submit by opening the pending session at once and
+    /// painting the first message as the reader's own before the create
+    /// answers. The phone used to keep the new-session page up until the whole
+    /// first turn had finished, which made a page that said "creating" the only
+    /// thing on screen for the length of a turn. This is the same first frame
+    /// the desktop draws: the reserved identity is selected, its runtime
+    /// selection is the draft the page submitted, and the prompt is projected
+    /// into a running turn so the thinking line follows it.
+    fn begin_optimistic_new_session(
+        &mut self,
+        session: AgentSession,
+        runtime: SessionRuntimeSelection,
+        message: Option<PendingMobileUserMessage>,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = session.id.clone();
+        let Some(controller) = self.controller.as_mut() else {
+            return;
+        };
+        // Reserve the identity the create will use. `select_pending_session`
+        // caches the live conversation and clears the view without reading a
+        // session that does not exist yet, which is exactly what the first
+        // frame after submit needs.
+        controller.select_pending_session(session_id.clone());
+        controller.state.selected_session_id = Some(session_id.clone());
+        if let Some(mut sessions) = controller.state.sessions.value.clone() {
+            sessions.retain(|candidate| candidate.id != session_id);
+            sessions.insert(0, session.clone());
+            controller.state.sessions.resolve(sessions);
+        }
+        controller.state.active_session.resolve(session);
+        controller.state.timeline = TimelineModel {
+            session_id: Some(session_id),
+            ..Default::default()
+        };
+        controller.state.timeline_status.resolve(());
+        controller
+            .state
+            .runtime_selection
+            .resolve(AgentSessionRuntimeSelectionState {
+                desired: runtime.clone(),
+                effective: runtime,
+                status: SessionRuntimeSelectionStatus::Ready,
+                session_revision: 0,
+                selection_revision: 0,
+                current_binding_id: None,
+                activation_generation: 0,
+                pending_switch_id: None,
+                actionable_error: None,
+            });
+        self.pending_user_message = message;
+        self.timeline_cache_timeline = None;
+        self.timeline_metadata_tip = None;
+        self.timeline_follow = true;
+        self.rebuild_timeline_turns();
+        self.timeline_list.scroll_to_end();
+        cx.notify();
+    }
+
+    /// Sends the first message into a session whose creation just answered.
+    ///
+    /// This is a second task on purpose: the create is the milestone that ends
+    /// the "creating" page and frees the phone to start another session, while
+    /// the first turn may run for minutes. The prompt is already on screen
+    /// through [`PendingMobileUserMessage`]; this task only makes it durable on
+    /// the authority and reports a failure that leaves it unconfirmed.
+    fn spawn_first_session_prompt(
+        &mut self,
+        backend: Arc<WebRemoteBackend>,
+        session_id: VibexSessionId,
+        first: FirstSessionPrompt,
+        cx: &mut Context<Self>,
+    ) {
+        let FirstSessionPrompt {
+            prompt,
+            attachments,
+            mentions,
+            armed_command,
+            runtime,
+        } = first;
+        self.first_prompts_in_flight.insert(session_id.clone());
+        let prompt_session_id = session_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            // A chosen provider command runs before any message: `/plan` and
+            // `/permission` change the session's mode, and a first message sent
+            // ahead of them would be answered under the old one.
+            if let Some(entry) = armed_command.as_ref() {
+                let (command_name, arguments) =
+                    parse_slash_command_invocation(&prompt).unwrap_or((String::new(), None));
+                let request = MutationRequest::new(AgentCommandExecuteRequest {
+                    session_id: prompt_session_id.clone(),
+                    command_id: Some(entry.id.clone()),
+                    trigger: AgentCommandTrigger::Slash,
+                    source_kind: entry.source_kind,
+                    command_text: prompt.trim().to_string(),
+                    command_name: Some(command_name),
+                    arguments,
+                    prompt_id: entry.prompt_id.clone(),
+                    attachments: Vec::new(),
+                    reasoning_effort: None,
+                    correlation_id: None,
+                });
+                backend.execute_agent_command(request).await.map(|_| ())
+            } else if prompt.is_empty() && attachments.is_empty() {
+                Ok(())
+            } else {
+                backend
+                    .send_message(MutationRequest::new(SendAgentMessageRequest {
+                        mentions,
+                        session_id: prompt_session_id.clone(),
+                        message_idempotency_key: RequestId::new().into_string(),
+                        desired_runtime: runtime.clone(),
+                        text: prompt,
+                        attachments,
+                        reasoning_effort: runtime.reasoning_effort.clone(),
+                        correlation_id: None,
+                        delivery: UserMessageDelivery::Prompt,
+                        prompt_context: None,
+                        provenance: vibex_core::MessageProvenance::HumanInput,
+                    }))
+                    .await
+                    .map(|_| ())
+            }
+        });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = flatten_join(runner.await);
+            let _ = entity.update(cx, |this, cx| {
+                this.first_prompts_in_flight.remove(&session_id);
+                let selected = this.controller.as_ref().is_some_and(|controller| {
+                    controller.state.selected_session_id.as_ref() == Some(&session_id)
+                });
+                match outcome {
+                    Ok(()) => {
+                        if selected {
+                            // The turn is over, so the authoritative timeline
+                            // is the one to trust from here: this also clears
+                            // the optimistic line once its item is confirmed.
+                            this.reload_selected_session(cx);
+                        }
+                    }
+                    Err(error) => {
+                        if selected {
+                            this.pending_user_message = None;
+                            this.rebuild_timeline_turns();
+                            this.timeline_list.remeasure();
+                        }
+                        this.fail(error);
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+    }
+
+    /// Puts the reader back on the page that submitted a session which the
+    /// authority then refused.
+    ///
+    /// The page left before the answer did, so the fields it carried are put
+    /// back from the snapshot taken at submit. A failure after the reader has
+    /// moved to another conversation only drops the row: it must not take them
+    /// away from where they now are.
+    fn restore_new_session_page(
+        &mut self,
+        pending: PendingNewSessionCreation,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_session_open = true;
+        self.new_session_busy = false;
+        self.new_session_project_id = pending.project_id;
+        self.new_session_workspace_id = pending.workspace_id;
+        self.new_session_folder_id = pending.folder_id;
+        self.new_session_workspace_mode = pending.workspace_mode;
+        self.new_session_temporary = pending.temporary;
+        self.new_session_runtime = Some(pending.runtime);
+        self.new_session_base_ref = pending.base_ref;
+        self.new_session_attachments = pending.attachments;
+        self.new_session_armed_mentions = pending.mentions;
+        self.new_session_armed_command = pending.armed_command;
+        self.pending_input_writes
+            .push((InputField::NewSessionTitle, pending.title));
+        self.pending_input_writes
+            .push((InputField::NewSessionPrompt, pending.prompt));
+        self.pending_input_writes
+            .push((InputField::NewSessionWorktreeName, pending.worktree_name));
+        self.pending_input_writes
+            .push((InputField::NewSessionWorktreePath, pending.worktree_path));
+        self.overlay = Some(MobileOverlay::NewSession);
+        self.overlay_returns_to_drawer = pending.overlay_returns_to_drawer;
+        self.push_back_screen(BackScreen::Overlay(MobileOverlay::NewSession));
+        self.invalidate_composer_commands();
+        cx.notify();
+    }
+
     fn open_session(&mut self, session_id: VibexSessionId, cx: &mut Context<Self>) {
         // The completion has been read by the fact of the row being opened, and
         // the authority is told: the badge is one fact seen from several seats,
@@ -7922,7 +8308,18 @@ impl MobileApp {
         }
         self.team_cancel_confirmation = None;
         self.reset_runtime_options();
-        self.pending_user_message = None;
+        // A prompt this session sent is still unconfirmed until its own
+        // timeline carries it. Reopening the same session — which is what
+        // reconciling a just-created session does — must keep that line on
+        // screen, or the reader watches their own message disappear between
+        // the optimistic page and the authoritative one.
+        if self
+            .pending_user_message
+            .as_ref()
+            .is_some_and(|pending| pending.session_id != session_id)
+        {
+            self.pending_user_message = None;
+        }
         self.timeline_metadata_tip = None;
         self.attachment_preview = None;
         self.attachment_preview_loading = None;
@@ -8069,6 +8466,19 @@ impl MobileApp {
             if let Some(record) = cached_window {
                 self.paint_cached_session_window(record);
             }
+        }
+        // A pending prompt is a page of its own until the authority confirms
+        // it, and it has to survive this reset too: the new-session flow opens
+        // the conversation with that line before the create has even answered,
+        // and a reset that dropped it would show an empty transcript while the
+        // first turn is already running.
+        if self
+            .pending_user_message
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == session_id)
+        {
+            self.rebuild_timeline_turns();
+            self.timeline_list.scroll_to_end();
         }
         if let Some(workspace_id) = restored_workspace_id {
             self.ensure_workbench(workspace_id, cx);
@@ -9742,6 +10152,9 @@ impl MobileApp {
         self.sidebar_name_prompt = None;
         self.workspace_action = None;
         self.workspace_action_busy = false;
+        self.pending_new_session = None;
+        self.first_prompts_in_flight.clear();
+        self.new_session_busy = false;
         self.new_session_open = false;
         self.new_session_project_id = None;
         self.new_session_workspace_id = None;
@@ -11540,7 +11953,10 @@ impl MobileApp {
     /// really does take the field away — a rewrite, a command, a connection, a
     /// runtime switch, a goal change.
     fn composer_busy(&self) -> bool {
-        self.operation_busy
+        // A session the authority is still creating owns the conversation page
+        // but cannot accept a second prompt yet: there is no session row to
+        // send one to until the create answers.
+        self.operation_busy || self.pending_new_session.is_some()
     }
 
     /// Whether the open session has a turn occupying the Agent.
@@ -11553,6 +11969,13 @@ impl MobileApp {
     /// screen is busy" is what made a second prompt unsendable from the phone.
     fn session_turn_live(&self) -> bool {
         if self.turn_submissions_in_flight > 0 {
+            return true;
+        }
+        let selected = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.state.selected_session_id.as_ref());
+        if selected.is_some_and(|session_id| self.first_prompts_in_flight.contains(session_id)) {
             return true;
         }
         self.controller
@@ -12961,6 +13384,25 @@ impl MobileApp {
                 BackScreen::SessionsDrawer | BackScreen::WorkbenchDrawer
             )
         });
+    }
+
+    /// Retires every pairing surface when the workspace takes over.
+    ///
+    /// A pairing fallback is a sheet over the pairing page, and the workspace
+    /// is another page: nothing in it draws that panel, and no landing will
+    /// ever clear it once the page that owned it is gone. Left behind, the
+    /// panel keeps [`BottomSheet::is_up`] true for the life of the connection,
+    /// so both page swipes and the system back gesture stand down for a sheet
+    /// the reader cannot see — only the header buttons still open a drawer,
+    /// and the gesture that closes it is back's rather than the one the reader
+    /// expects. Dropping the panel with the page is what makes the first swipe
+    /// after pairing behave like every swipe after a restart.
+    fn reset_pairing_surfaces(&mut self) {
+        self.pairing_panel = PairingPanel::None;
+        self.pairing_busy = false;
+        self.pairing_action = None;
+        self.stop_nearby_pairing();
+        self.sheet.clear();
     }
 
     fn settled_drawer_target(&self) -> f32 {
@@ -31534,6 +31976,37 @@ fn runtime_selection_is_available(
         .is_some_and(|option| option.availability == RuntimeOptionAvailability::Available)
 }
 
+/// The write that asks the authority for `desired`, using the revisions of the
+/// selection state read immediately before it.
+///
+/// This is a compare-and-set, so the expectation is only valid for the state it
+/// was read with; keeping the construction in one place is what makes every
+/// caller — the first attempt and the retry after a conflict — say the same
+/// thing.
+fn runtime_switch_request(
+    session_id: VibexSessionId,
+    latest: &AgentSessionRuntimeSelectionState,
+    desired: SessionRuntimeSelection,
+) -> MutationRequest<SetDesiredAgentSessionRuntimeRequest> {
+    MutationRequest::new(SetDesiredAgentSessionRuntimeRequest {
+        session_id,
+        idempotency_key: RequestId::new().into_string(),
+        expected_revision: latest.session_revision,
+        expected_selection_revision: latest.selection_revision,
+        desired,
+        interaction: RuntimeSelectionInteraction::Seamless,
+    })
+}
+
+/// Whether a runtime write lost the compare-and-set and can be retried with the
+/// state that won.
+fn runtime_switch_revision_conflict(error: &BackendError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "runtime_switch_revision_conflict" | "desired_selection_revision_conflict"
+    )
+}
+
 fn runtime_section_heading(label: impl Into<String>) -> gpui::Div {
     div()
         .h(px(36.0))
@@ -36439,6 +36912,56 @@ mod tests {
         ));
     }
 
+    /// The runtime write carries the revisions read immediately before it.
+    ///
+    /// The mobile client is a remote reader: its cached selection can be many
+    /// session revisions old by the time a drawer is used, and the authority
+    /// refuses a stale compare-and-set. The request therefore takes the state
+    /// the switch read, not the state the page opened with.
+    #[test]
+    fn a_runtime_switch_is_built_from_the_state_read_just_before_it() {
+        let selection = SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse("codex").unwrap(),
+            vibex_core::ProviderProfileId::new(),
+            "gpt-5",
+        );
+        let mut desired = selection.clone();
+        desired.mode_id = Some("plan".to_string());
+        let latest = AgentSessionRuntimeSelectionState {
+            desired: selection.clone(),
+            effective: selection,
+            status: SessionRuntimeSelectionStatus::Ready,
+            session_revision: 17,
+            selection_revision: 23,
+            current_binding_id: None,
+            activation_generation: 4,
+            pending_switch_id: None,
+            actionable_error: None,
+        };
+
+        let request = runtime_switch_request(VibexSessionId::new(), &latest, desired.clone());
+
+        assert_eq!(request.payload.expected_revision, 17);
+        assert_eq!(request.payload.expected_selection_revision, 23);
+        assert_eq!(request.payload.desired, desired);
+        assert_eq!(
+            request.payload.interaction,
+            RuntimeSelectionInteraction::Seamless
+        );
+        assert!(runtime_switch_revision_conflict(&BackendError::conflict(
+            "runtime_switch_revision_conflict",
+            "session revision changed",
+        )));
+        assert!(runtime_switch_revision_conflict(&BackendError::conflict(
+            "desired_selection_revision_conflict",
+            "selection revision changed",
+        )));
+        assert!(!runtime_switch_revision_conflict(&BackendError::failed(
+            "mobile_runtime_option_unavailable",
+            "no longer available",
+        )));
+    }
+
     #[test]
     fn composer_runtime_string_values_are_bounded_without_trimming() {
         assert_eq!(runtime_string_override("   ".to_string()).unwrap(), None);
@@ -40461,6 +40984,50 @@ mod tests {
         assert!(!tilted.is_horizontal_flick());
     }
 
+    /// A pairing fallback is a sheet over the pairing page, and the workspace
+    /// is another page. Once the workspace replaces it, nothing draws that
+    /// panel and nothing lands it, so it has to be dropped with the page — or
+    /// `is_up` stays true for the life of the connection and neither page
+    /// swipes nor the system back gesture can pull a drawer out.
+    #[gpui::test]
+    fn a_pairing_sheet_does_not_survive_the_workspace(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx)
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.pairing_panel = PairingPanel::Manual;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.sheet.is_up()),
+            "the pairing fallback is a panel while the pairing page is up"
+        );
+
+        app.update(cx, |app, cx| {
+            app.mode = RootMode::Workspace;
+            app.reset_pairing_surfaces();
+            cx.notify();
+        });
+
+        app.update(cx, |app, _| {
+            assert_eq!(app.pairing_panel, PairingPanel::None);
+            assert!(
+                !app.sheet.is_up(),
+                "the page's panel has to go with the page that owned it"
+            );
+            assert!(
+                app.back_gesture_can_pull_a_page(),
+                "a swipe on the new workspace must be able to pull a drawer"
+            );
+        });
+    }
+
     #[test]
     fn push_back_screen_collapses_consecutive_duplicates() {
         let mut stack: Vec<BackScreen> = Vec::new();
@@ -43291,20 +43858,109 @@ fn agent_icon_path(",
     fn a_new_session_command_runs_once_the_session_is_created() {
         let source = include_str!("app.rs");
         let submit = renderer_source(source, "submit_new_session");
+        let prompt = renderer_source(source, "spawn_first_session_prompt");
 
         assert!(
             submit.contains("new_session_armed_command")
-                && submit.contains("execute_agent_command"),
-            "the armed command is executed against the session the page creates"
+                && submit.contains("spawn_first_session_prompt"),
+            "the armed command travels to the session the page creates"
+        );
+        assert!(
+            prompt.contains("execute_agent_command"),
+            "the armed command is executed against that session"
         );
         assert!(
             submit.contains("command_entry_matches_draft(&prompt"),
             "a draft that no longer names the command must not run it"
         );
         assert!(
-            submit.contains("armed_command.is_some()"),
+            prompt.contains("if let Some(entry) = armed_command.as_ref()")
+                && prompt.contains("} else if prompt.is_empty()"),
             "the command replaces the ordinary first message rather than joining it"
         );
+    }
+
+    /// A submitted new session paints before the authority has created it.
+    #[gpui::test]
+    fn a_pending_new_session_paints_its_first_message_and_thinking(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let mut bundle = host_bundle("runtime-a", "studio");
+        bundle.route = Some(crate::pairing::MobileRemoteRouteBundle {
+            local_network: None,
+            direct_candidates: vec![bundle.record.server_url.clone()],
+            relay: None,
+        });
+        let backend = bundle.backend().expect("valid saved runtime");
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app.backend = Some(backend.clone());
+            app.controller = Some(AgentWorkflowController::new(
+                backend.clone(),
+                backend.capability_snapshot().agent,
+            ));
+            app
+        });
+        cx.run_until_parked();
+
+        let session_id = VibexSessionId::new();
+        let runtime = SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse("codex").expect("valid agent id"),
+            vibex_core::ProviderProfileId::new(),
+            "gpt-5",
+        );
+        app.update(cx, |app, cx| {
+            app.begin_optimistic_new_session(
+                AgentSession {
+                    id: session_id.clone(),
+                    title: "hi".to_string(),
+                    project_id: vibex_core::ProjectId::new(),
+                    workspace_id: vibex_core::WorkspaceId::new(),
+                    workspace_root: "/workspace".to_string(),
+                    workspace_mode: WorkspaceMode::CurrentCheckout,
+                    agent_id: runtime.agent_id.clone(),
+                    state: AgentSessionState::Initializing,
+                    safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    last_message_at_ms: 1,
+                    archived_at_ms: None,
+                    deleted_at_ms: None,
+                },
+                runtime.clone(),
+                Some(PendingMobileUserMessage {
+                    session_id: session_id.clone(),
+                    item_id: vibex_core::TimelineItemId::new(),
+                    after_sequence: 0,
+                    submitted_at_ms: 1,
+                    text: "hi".to_string(),
+                    attachments: Vec::new(),
+                }),
+                cx,
+            );
+        });
+
+        app.read_with(cx, |app, _| {
+            let controller = app.controller.as_ref().expect("active controller");
+            assert_eq!(
+                controller.state.selected_session_id.as_ref(),
+                Some(&session_id)
+            );
+            assert_eq!(app.timeline_turns.len(), 1);
+            let turn = &app.timeline_turns[0];
+            assert!(!turn.complete, "the first turn is still running");
+            assert!(
+                turn.user_row
+                    .as_ref()
+                    .is_some_and(|row| row.body.contains("hi")),
+                "the reader's own message is the first row"
+            );
+            assert!(
+                app.pending_user_message.is_some(),
+                "the pending line stays until the timeline confirms it"
+            );
+        });
     }
 
     /// Each tab of a trigger offers its own kind of entry.

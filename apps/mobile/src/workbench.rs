@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -556,6 +556,18 @@ impl WorkbenchSurface {
     }
 }
 
+/// The independent readers whose failures the rail announces.
+///
+/// A success from one must not clear the record of another's failure: the
+/// terminal poll and the file tree settle at different rates, and a shared slot
+/// let a healthy Git read make the next identical terminal failure speak again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FailureSource {
+    Files,
+    Git,
+    Terminal,
+}
+
 pub struct MobileWorkbench {
     backend: Arc<WebRemoteBackend>,
     workspace_id: WorkspaceId,
@@ -771,15 +783,15 @@ pub struct MobileWorkbench {
     /// producers here run inside a task that has only `cx`, so the hint waits
     /// here until [`Self::present_pending_hints`] takes it.
     pending_hints: Vec<Hint>,
-    /// The last failure the rail announced as a hint.
+    /// The last failure each reader announced as a hint.
     ///
     /// A failed read is a light hint like every other result, but the terminal
     /// poll repeats every fraction of a second and the Git poll every few
     /// seconds; a hint per tick would fill the phone's screen with the same
-    /// card. Keeping the message here is what makes the announcement once per
-    /// distinct failure; a read that recovers clears it.
-    last_error: Option<String>,
-    /// The last Git status failure announced, kept apart from `last_error`.
+    /// card. Keeping one message per source is what makes the announcement once
+    /// per distinct failure; a read that recovers clears its own entry.
+    last_failures: BTreeMap<FailureSource, String>,
+    /// The last Git status failure announced, kept apart from `last_failures`.
     ///
     /// The two polls are independent and would otherwise clear each other's
     /// slot, so a Git failure repeated under a healthy terminal would be
@@ -895,7 +907,7 @@ impl MobileWorkbench {
             git_remote_action: None,
             busy: false,
             pending_hints: Vec::new(),
-            last_error: None,
+            last_failures: BTreeMap::new(),
             close_handler: None,
             tasks: Vec::new(),
         };
@@ -968,7 +980,7 @@ impl MobileWorkbench {
         self.git_diff = None;
         self.git_revert_confirmation = None;
         self.git_status_error = None;
-        self.last_error = None;
+        self.last_failures.clear();
         self.git_commit_detail = None;
         self.git_commit_detail_loading = false;
         self.terminal_render_sequence = 0;
@@ -1049,7 +1061,7 @@ impl MobileWorkbench {
             let failure = outcome.as_ref().err().cloned();
             let _ = entity.update(cx, |this, cx| {
                 this.files.apply_tree_load(&ticket, outcome);
-                this.hint_failure(failure);
+                this.hint_failure(FailureSource::Files, failure);
                 cx.notify();
             });
         });
@@ -1089,7 +1101,7 @@ impl MobileWorkbench {
             let failure = outcome.as_ref().err().cloned();
             let _ = entity.update(cx, |this, cx| {
                 this.files.apply_file_read(&ticket, outcome);
-                this.hint_failure(failure);
+                this.hint_failure(FailureSource::Files, failure);
                 if let Some(content) = this.files.state.view().editor_content {
                     this.file_editor_path = Some(ticket.path.clone());
                     this.pending_file_editor_content = Some(content.clone());
@@ -1375,7 +1387,7 @@ impl MobileWorkbench {
                         results
                     }),
                 );
-                this.hint_failure(failure);
+                this.hint_failure(FailureSource::Files, failure);
                 cx.notify();
             });
         });
@@ -1466,6 +1478,18 @@ impl MobileWorkbench {
     /// longer describes. It is handed over once per paint, where the window the
     /// layer needs always exists.
     fn hint(&mut self, tone: Tone, message: impl Into<String>) {
+        let message = message.into();
+        // Several producers can report one failure before the next frame hands
+        // the queue over — the terminal list, the create and the fit all say
+        // the same thing when the backend is offline. The toast layer keys a
+        // card by its message, so coalescing here only spares it the burst.
+        if self
+            .pending_hints
+            .iter()
+            .any(|hint| hint.tone == tone && hint.message == message)
+        {
+            return;
+        }
         self.pending_hints.push(Hint::new(tone, message));
     }
 
@@ -1478,15 +1502,23 @@ impl MobileWorkbench {
     /// status poll — at most once while it stays the same.
     ///
     /// These producers run on a timer, and the same broken read would otherwise
-    /// push the same card on every tick. The message held in `last_error` is
-    /// what makes the announcement once per distinct failure; a read that
-    /// recovers clears the slot so the next failure is announced again.
-    fn hint_failure(&mut self, error: Option<BackendError>) {
+    /// push the same card on every tick. The message held for `source` is what
+    /// makes the announcement once per distinct failure; a read that recovers
+    /// clears its own slot so the next failure is announced again, without the
+    /// other sources' records.
+    fn hint_failure(&mut self, source: FailureSource, error: Option<BackendError>) {
         let message = error.map(|error| error.message);
-        if message == self.last_error {
+        if message.as_ref() == self.last_failures.get(&source) {
             return;
         }
-        self.last_error = message.clone();
+        match &message {
+            Some(message) => {
+                self.last_failures.insert(source, message.clone());
+            }
+            None => {
+                self.last_failures.remove(&source);
+            }
+        }
         if let Some(message) = message {
             self.hint(Tone::Error, message);
         }
@@ -2799,7 +2831,7 @@ impl MobileWorkbench {
                 if opened {
                     this.git_diff_scroll.set_offset(gpui::Point::default());
                 }
-                this.hint_failure(failure);
+                this.hint_failure(FailureSource::Git, failure);
                 cx.notify();
             });
         });
@@ -2984,7 +3016,11 @@ impl MobileWorkbench {
         let ticket = match self.terminal.begin_refresh(self.workspace_id.clone()) {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.fail(error);
+                // A refresh is issued whenever the rail is entered and again
+                // whenever it resumes, so a backend that is offline says the
+                // same thing several times in a row. `hint_failure` keeps that
+                // to one card per distinct failure.
+                self.hint_failure(FailureSource::Terminal, Some(error));
                 cx.notify();
                 return;
             }
@@ -2995,7 +3031,7 @@ impl MobileWorkbench {
             let failure = outcome.as_ref().err().cloned();
             let _ = entity.update(cx, |this, cx| {
                 this.terminal.apply_refresh(&ticket, outcome);
-                this.hint_failure(failure);
+                this.hint_failure(FailureSource::Terminal, failure);
                 if this.terminal.state.active_session.is_none() {
                     // The tab the reader left first, then the head of the live
                     // list. A terminal that has exited or been closed is not a
@@ -3171,9 +3207,9 @@ impl MobileWorkbench {
                     match outcome {
                         Ok(snapshot) => {
                             this.apply_terminal_snapshot(snapshot);
-                            this.hint_failure(None);
+                            this.hint_failure(FailureSource::Terminal, None);
                         }
-                        Err(error) => this.hint_failure(Some(error)),
+                        Err(error) => this.hint_failure(FailureSource::Terminal, Some(error)),
                     }
                     cx.notify();
                     true
@@ -3318,7 +3354,7 @@ impl MobileWorkbench {
                         this.refresh_terminal_search(cx);
                     }
                 }
-                this.hint_failure(failure);
+                this.hint_failure(FailureSource::Terminal, failure);
                 cx.notify();
             });
         });
@@ -3970,7 +4006,7 @@ impl MobileWorkbench {
                 this.terminal.apply_input(&operation, outcome);
                 this.busy = false;
                 if let Some(error) = failure {
-                    this.hint_failure(Some(error));
+                    this.hint_failure(FailureSource::Terminal, Some(error));
                 } else if clear_input {
                     this.terminal_clear_pending = true;
                 }
@@ -4065,7 +4101,7 @@ impl MobileWorkbench {
                         this.stop_terminal_poll();
                         this.open_terminal_when_idle(cx);
                     }
-                    Some(error) => this.hint_failure(Some(error)),
+                    Some(error) => this.hint_failure(FailureSource::Terminal, Some(error)),
                 }
                 cx.notify();
             });
