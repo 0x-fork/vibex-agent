@@ -48990,7 +48990,7 @@ impl VibexWorkbench {
         let branch_toggle_session_id = session_id_string.clone();
         let pin_session_id = session.id.clone();
         let rename_session_id = session.id.clone();
-        let delete_session_id = session.id.clone();
+        let archive_session_id = session.id.clone();
         let context_entity = cx.weak_entity();
         let context_hover_entity = cx.weak_entity();
         let context_menu_session_id = session_id_string.clone();
@@ -49873,21 +49873,17 @@ impl VibexWorkbench {
                                 })),
                         )
                         .child(
-                            Button::new(format!("sidebar-delete-{session_id_string}"))
+                            Button::new(format!("sidebar-archive-{session_id_string}"))
                                 .xsmall()
                                 .ghost()
                                 .compact()
                                 .w(px(24.0))
                                 .h(px(24.0))
-                                .icon(sidebar_icon("icons/vibex/trash-2.svg"))
-                                .tooltip(strings.sidebar_delete)
-                                .disabled(session_deletion_pending)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.confirm_delete_session(
-                                        delete_session_id.clone(),
-                                        window,
-                                        cx,
-                                    )
+                                .icon(sidebar_icon("icons/vibex/package.svg"))
+                                .tooltip(locale::text("Archive", "归档", "封存"))
+                                .disabled(session_archive_pending)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.archive_session(archive_session_id.clone(), cx)
                                 })),
                         ),
                 )
@@ -92339,14 +92335,6 @@ mod tests {
     #[test]
     fn session_delete_controls_use_per_session_pending_state() {
         let source = include_str!("app.rs");
-        let row = source
-            .split_once("Button::new(format!(\"sidebar-delete-{session_id_string}\"))")
-            .and_then(|(_, tail)| tail.split_once(".on_click(cx.listener"))
-            .map(|(body, _)| body)
-            .expect("sidebar session delete button should remain inspectable");
-        assert!(row.contains(".disabled(session_deletion_pending)"));
-        assert!(!row.contains("self.agent_action_pending"));
-
         let session = source
             .split_once("    fn render_sidebar_session(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
@@ -92359,6 +92347,33 @@ mod tests {
             .expect("sidebar session delete menu item should remain inspectable");
         assert!(menu.contains(".disabled(session_deletion_pending)"));
         assert!(!menu.contains("mutation_pending"));
+    }
+
+    /// The row's trailing hover action is archive, not delete: archiving is the
+    /// more frequent of the two and is reversible, so it is the one the pointer
+    /// reveals. Deletion stays in the row menu behind its confirmation.
+    #[test]
+    fn sidebar_session_hover_actions_archive_instead_of_delete() {
+        let source = include_str!("app.rs");
+        let row_actions = source
+            .split_once("format!(\"sidebar-session-actions-{session_id_string}\")")
+            .and_then(|(_, tail)| {
+                tail.split_once("if let (Some(offset), Some(animation_id)) = (reorder_offset")
+            })
+            .map(|(body, _)| body)
+            .expect("sidebar session row actions should remain inspectable");
+
+        assert!(
+            row_actions.contains("format!(\"sidebar-archive-{session_id_string}\")"),
+            "the hover action should archive the row"
+        );
+        assert!(row_actions.contains("icons/vibex/package.svg"));
+        assert!(row_actions.contains(".disabled(session_archive_pending)"));
+        assert!(row_actions.contains("this.archive_session(archive_session_id.clone(), cx)"));
+        assert!(
+            !row_actions.contains("trash-2.svg") && !row_actions.contains("confirm_delete_session"),
+            "deleting from a hover button needs a confirmation and does not belong there"
+        );
     }
 
     /// A sidebar row has no timeline position of its own, so its fork item asks
