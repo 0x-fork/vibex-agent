@@ -8083,6 +8083,8 @@ mod tests {
                         }],
                         features: Vec::new(),
                         availability: RuntimeOptionAvailability::Available,
+                        member_count: 1,
+                        auto_routes: false,
                     }],
                 },
                 calls: AtomicUsize::new(0),
