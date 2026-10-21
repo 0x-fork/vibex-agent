@@ -8443,3 +8443,196 @@ mod v2_authority_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod legacy_edit_projection_tests {
+    use super::*;
+
+    fn create(
+        service: &ProviderConfigService,
+        name: &str,
+        model: &str,
+    ) -> vibex_core::ProviderProfile {
+        service
+            .create_profile(vibex_core::ProviderProfileCreateRequest {
+                agent_id: Some(vibex_core::AgentId::parse("codex").unwrap()),
+                kind: vibex_core::ProviderKind::Codex,
+                display_name: name.to_string(),
+                account_alias: None,
+                base_url: Some("https://api.example.com/v1".to_string()),
+                default_model: Some(model.to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: vec![vibex_core::ProviderConfiguredModel {
+                    id: model.to_string(),
+                    display_name: None,
+                    enabled: true,
+                    wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiResponses),
+                    capabilities: Default::default(),
+                }],
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+                secret_references: Vec::new(),
+            })
+            .unwrap()
+    }
+
+    /// An edit made through the legacy path reaches the shared record.
+    ///
+    /// Recorded because it is the thing that makes reversing the write direction
+    /// safe rather than a migration: the compatibility sync has always carried a
+    /// v1 edit onto v2, so no edit path needs rewriting for the two to agree.
+    /// Creation was the only direction that did not exist, which is what the
+    /// reversal added.
+    #[test]
+    fn a_legacy_edit_reaches_the_shared_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-v2-update-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        let created = create(&service, "Original", "model-a");
+        service
+            .update_profile(vibex_core::ProviderProfileUpdateRequest {
+                provider_profile_id: created.id.clone(),
+                display_name: Some("Renamed".to_string()),
+                status: None,
+                account_alias: None,
+                base_url: None,
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: None,
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+            })
+            .unwrap();
+
+        let conn = service.open_connection().unwrap();
+        let shared =
+            vibex_db::ModelProviderProfileRepository::get_by_legacy_profile(&conn, &created.id)
+                .unwrap()
+                .expect("the shared record must still exist");
+        assert_eq!(
+            shared.display_name, "Renamed",
+            "an edit on the legacy path must reach the record that owns the Provider"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An address change on the legacy path reaches the shared endpoints.
+    #[test]
+    fn an_address_edit_reaches_the_shared_endpoints() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-v2-address-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        let created = create(&service, "Original", "model-a");
+        service
+            .update_profile(vibex_core::ProviderProfileUpdateRequest {
+                provider_profile_id: created.id.clone(),
+                display_name: None,
+                status: None,
+                account_alias: None,
+                base_url: Some("https://moved.example.com/v1".to_string()),
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: None,
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+            })
+            .unwrap();
+
+        let conn = service.open_connection().unwrap();
+        let shared =
+            vibex_db::ModelProviderProfileRepository::get_by_legacy_profile(&conn, &created.id)
+                .unwrap()
+                .expect("the shared record must still exist");
+        assert!(
+            shared
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.url == "https://moved.example.com/v1"),
+            "a new address must reach the shared record: {:?}",
+            shared.endpoints
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A field only the legacy shape holds stays put, and does not clear the
+    /// shared record's own fields.
+    ///
+    /// The protocol pin is the case that matters: an edit that does not mention
+    /// it must not drop it, or the Agent would start calling the Provider with
+    /// the wrong protocol.
+    #[test]
+    fn a_legacy_only_edit_leaves_the_shared_record_intact() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-v2-isolated-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        let created = create(&service, "Original", "model-a");
+        service
+            .update_profile(vibex_core::ProviderProfileUpdateRequest {
+                provider_profile_id: created.id.clone(),
+                display_name: None,
+                status: None,
+                account_alias: None,
+                base_url: None,
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: None,
+                reasoning_effort: Some("high".to_string()),
+                sandbox_defaults: Some(
+                    vibex_core::ProviderSandboxDefaults::workspace_write_ask_on_risk(),
+                ),
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+            })
+            .unwrap();
+
+        let conn = service.open_connection().unwrap();
+        let shared =
+            vibex_db::ModelProviderProfileRepository::get_by_legacy_profile(&conn, &created.id)
+                .unwrap()
+                .expect("the shared record must still exist");
+        assert_eq!(
+            shared.display_name, "Original",
+            "an edit that mentions only legacy fields must not rename the Provider"
+        );
+        assert!(
+            shared
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.url == "https://api.example.com/v1"),
+            "and must not drop the address either"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
