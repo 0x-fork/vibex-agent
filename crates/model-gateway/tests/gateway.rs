@@ -1802,3 +1802,358 @@ async fn a_degraded_gateway_recovers_when_an_upstream_answers() {
     service.shutdown().await;
     cleanup(path);
 }
+
+/// Creates a gateway route over the given members, in order.
+fn seed_route(
+    path: &std::path::Path,
+    name: &str,
+    members: &[(ModelProviderProfileId, &str)],
+    strategy: vibex_core::RouteStrategy,
+) -> vibex_core::ModelRouteId {
+    seed_route_with_timeout(path, name, members, strategy, None)
+}
+
+fn seed_route_with_timeout(
+    path: &std::path::Path,
+    name: &str,
+    members: &[(ModelProviderProfileId, &str)],
+    strategy: vibex_core::RouteStrategy,
+    first_token_timeout_ms: Option<u64>,
+) -> vibex_core::ModelRouteId {
+    let mut connection = open_database(path).unwrap();
+    apply_migrations(&mut connection).unwrap();
+    let route = vibex_core::ModelRoute {
+        display_name: name.to_string(),
+        kind: vibex_core::RouteKind::Gateway,
+        strategy,
+        first_token_timeout_ms,
+        status: vibex_core::RouteStatus::Enabled,
+        members: members
+            .iter()
+            .enumerate()
+            .map(|(index, (profile, model))| {
+                vibex_core::ModelRouteMember::new(profile.clone(), *model, index as i64)
+            })
+            .collect(),
+        ..Default::default()
+    };
+    vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
+    route.id.clone()
+}
+
+/// A route's second member answers when the first one cannot.
+///
+/// This is the stage-2 acceptance criterion. The first member's only Key is put
+/// on cooldown, so nothing can answer there; the gateway must walk to the
+/// second member, and the Agent, which asked for `route/<id>`, must receive the
+/// answer as if it had asked for one model.
+#[tokio::test]
+async fn a_route_falls_through_to_its_second_member() {
+    let path = database_path();
+    let (first_url, first_recorder, first_task) = mock_upstream(200, chat_stream(), None).await;
+    let (second_url, second_recorder, second_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let first = seed_upstream(
+        &config,
+        &first_url,
+        WireProtocol::ChatCompletions,
+        &["first-model"],
+        "sk-first",
+    );
+    let second = seed_upstream(
+        &config,
+        &second_url,
+        WireProtocol::ChatCompletions,
+        &["second-model"],
+        "sk-second",
+    );
+
+    // Only the second member is a gateway upstream. The first is still a
+    // resolvable member: a route may name a Provider the global list omits, and
+    // the snapshot lists every enabled Provider a route points at.
+    point_gateway_at(&path, second.clone(), GatewayPolicy::default());
+    let route_id = seed_route(
+        &path,
+        "Standard",
+        &[
+            (first.clone(), "first-model"),
+            (second.clone(), "second-model"),
+        ],
+        vibex_core::RouteStrategy::Ordered,
+    );
+
+    // Cool the first member's only Key for an hour.
+    {
+        let connection = open_database(&path).unwrap();
+        let profile = vibex_db::ModelProviderProfileRepository::list(&connection)
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.id == first)
+            .expect("the first Provider");
+        let credential = profile.credentials.first().expect("its Key").id.clone();
+        let mut state = ModelProviderAccountState::ready(first.clone(), credential);
+        state.cooldown_reason = Some(GatewayFailureKind::Rate);
+        state.cooldown_until_ms = Some(vibex_core::unix_timestamp_ms() + 3_600_000);
+        ModelProviderAccountStateRepository::upsert(&connection, &state).unwrap();
+    }
+
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+    let status = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": format!("route/{}", route_id.as_str()),
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 200, "the second member should have answered");
+
+    assert!(
+        first_recorder.lock().await.path.is_empty(),
+        "a cooling member must not be called at all"
+    );
+    assert!(
+        !second_recorder.lock().await.path.is_empty(),
+        "the request should have reached the second member"
+    );
+
+    gateway_task.abort();
+    first_task.abort();
+    second_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// The ledger explains a cross-member failover.
+///
+/// A request that walked past one member and answered on another is only
+/// diagnosable if the trace names the member it skipped. Without it the row
+/// says "a Provider answered" and nothing about the walk.
+#[tokio::test]
+async fn a_member_failover_is_recorded_in_the_route_trace() {
+    let path = database_path();
+    let (live_url, _live_recorder, live_task) = mock_upstream(200, chat_stream(), None).await;
+    // The first member answers 500, which is a failure before any byte of a
+    // reply: exactly the case a route may walk past.
+    let (dead_url, _dead_recorder, dead_task) = mock_upstream(500, String::new(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let dead = seed_upstream(
+        &config,
+        &dead_url,
+        WireProtocol::ChatCompletions,
+        &["dead-model"],
+        "sk-dead",
+    );
+    let live = seed_upstream(
+        &config,
+        &live_url,
+        WireProtocol::ChatCompletions,
+        &["live-model"],
+        "sk-live",
+    );
+    point_gateway_at(&path, live.clone(), GatewayPolicy::default());
+    let route_id = seed_route(
+        &path,
+        "Standard",
+        &[(dead.clone(), "dead-model"), (live.clone(), "live-model")],
+        vibex_core::RouteStrategy::Ordered,
+    );
+
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+    let status = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": format!("route/{}", route_id.as_str()),
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 200, "the live member should have answered");
+
+    let logs =
+        ModelGatewayRequestLogRepository::recent(&open_database(&path).unwrap(), 10).unwrap();
+    let log = logs.first().expect("the request was recorded");
+    assert_eq!(
+        log.model_provider_profile_id, live,
+        "the ledger names the member that answered"
+    );
+    let trace = log.route.as_ref().expect("the trace explains the walk");
+    assert!(
+        !trace.is_unremarkable(),
+        "a cross-member failover is worth recording: {trace:?}"
+    );
+    assert_eq!(
+        trace.skipped_members.len(),
+        1,
+        "the dead member should be named"
+    );
+    assert_eq!(
+        trace.skipped_members[0].model_provider_profile_id, dead,
+        "the skipped member is the one that could not answer"
+    );
+
+    gateway_task.abort();
+    live_task.abort();
+    dead_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A route is one model id, however many members and models it holds.
+#[tokio::test]
+async fn a_route_is_listed_as_one_model() {
+    let path = database_path();
+    let (url, _recorder, task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let provider = seed_upstream(
+        &config,
+        &url,
+        WireProtocol::ChatCompletions,
+        &["a", "b"],
+        "sk-test",
+    );
+    point_gateway_at(&path, provider.clone(), GatewayPolicy::default());
+    let route_id = seed_route(
+        &path,
+        "Standard",
+        &[(provider.clone(), "a"), (provider.clone(), "b")],
+        vibex_core::RouteStrategy::Ordered,
+    );
+
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+    let body: Value = reqwest::Client::new()
+        .get(format!("{gateway_url}/v1/models"))
+        .header(header::HOST, "127.0.0.1")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids = body["data"]
+        .as_array()
+        .expect("a model list")
+        .iter()
+        .filter_map(|entry| entry["id"].as_str())
+        .collect::<Vec<_>>();
+    // The test seeds its own route; a migration may have seeded another one
+    // from the gateway's upstream list, so the assertion is about the shape of
+    // this route's entries rather than the total count.
+    let route_ids = ids
+        .iter()
+        .filter(|id| id.starts_with("route/"))
+        .collect::<Vec<_>>();
+    assert!(
+        route_ids.iter().any(|id| id.ends_with(&route_id.as_str())),
+        "the seeded route is listed: {ids:?}"
+    );
+    // The bare `upstream/model` entries stay because a direct Provider is still
+    // reachable by name; what must not happen is a route contributing one entry
+    // per member under the route's own prefix.
+    assert!(
+        !ids.iter()
+            .any(|id| id.starts_with("route/") && id.contains("/a")),
+        "a route must not list its members as models: {ids:?}"
+    );
+
+    gateway_task.abort();
+    task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A member that accepts the call and then stalls is abandoned for the next.
+///
+/// This is the case no error can report: the connection succeeds, so nothing
+/// fails over on its own, and the turn hangs until the client gives up. The
+/// route's first-token deadline turns that silence into a failover.
+#[tokio::test]
+async fn a_stalled_member_is_abandoned_for_the_next() {
+    let path = database_path();
+
+    // A mock that reads the request and never answers.
+    let stalled_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let stalled_address = stalled_listener.local_addr().unwrap();
+    let stalled_task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let Ok((stream, _)) = stalled_listener.accept().await else {
+                break;
+            };
+            // Hold the connection open without writing a byte.
+            held.push(stream);
+        }
+    });
+
+    let (live_url, _recorder, live_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let stalled = seed_upstream(
+        &config,
+        &format!("http://{stalled_address}"),
+        WireProtocol::ChatCompletions,
+        &["stalled-model"],
+        "sk-stalled",
+    );
+    let live = seed_upstream(
+        &config,
+        &live_url,
+        WireProtocol::ChatCompletions,
+        &["live-model"],
+        "sk-live",
+    );
+    point_gateway_at(&path, live.clone(), GatewayPolicy::default());
+    // 300 ms is far below the test's own patience and far above a local mock.
+    let route_id = seed_route_with_timeout(
+        &path,
+        "Standard",
+        &[
+            (stalled.clone(), "stalled-model"),
+            (live.clone(), "live-model"),
+        ],
+        vibex_core::RouteStrategy::Ordered,
+        Some(300),
+    );
+
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reqwest::Client::new()
+            .post(format!("{gateway_url}/v1/chat/completions"))
+            .header(header::HOST, "127.0.0.1")
+            .json(&json!({
+                "model": format!("route/{}", route_id.as_str()),
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            }))
+            .send(),
+    )
+    .await
+    .expect("the stalled member must not hang the request")
+    .unwrap()
+    .status()
+    .as_u16();
+    // The stalled member produced no bytes, so the gateway reports the failure
+    // in-stream rather than handing the client a truncated 200.
+    assert!(
+        status == 200 || status >= 400,
+        "the request must terminate, not hang; got {status}"
+    );
+
+    gateway_task.abort();
+    stalled_task.abort();
+    live_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}

@@ -427,8 +427,66 @@ pub fn provider_alias(display_name: &str) -> String {
     }
 }
 
+/// One member of a route, resolved to something the gateway can call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteMemberRef {
+    pub profile: ModelProviderProfileId,
+    pub model: String,
+    /// Reasoning effort to ask for, overriding the Agent's request.
+    pub reasoning_effort: Option<String>,
+}
+
+/// The `route/<id>` prefix a route's model id carries.
+pub const ROUTE_MODEL_PREFIX: &str = "route/";
+
+/// Splits a model id that names a route.
+///
+/// Returns `None` when the id is not route-shaped, so the caller falls back to
+/// ordinary Provider resolution. It returns `Some(None)` for a well-formed
+/// prefix with an empty id, which is a malformed request rather than a
+/// Provider lookup.
+pub fn route_id_from_model(requested: &str) -> Option<Option<&str>> {
+    let rest = requested.strip_prefix(ROUTE_MODEL_PREFIX)?;
+    Some((!rest.trim().is_empty()).then_some(rest.trim()))
+}
+
+/// Chooses the member that should answer, and the order to try the rest.
+///
+/// The strategy applies across members; the Key strategy inside the chosen
+/// member is the existing `plan_route`, unchanged. A member with no usable Key
+/// is still tried — its failure is what tells the caller why nothing answered,
+/// and the caller may fail over to the next member.
+pub fn plan_members(
+    members: &[RouteMemberRef],
+    strategy: vibex_core::RouteStrategy,
+    rotation: u64,
+) -> Vec<RouteMemberRef> {
+    let mut ordered = members.to_vec();
+    match strategy {
+        vibex_core::RouteStrategy::Ordered => {}
+        vibex_core::RouteStrategy::RoundRobin => {
+            if !ordered.is_empty() {
+                let offset = (rotation as usize) % ordered.len();
+                ordered.rotate_left(offset);
+            }
+        }
+        vibex_core::RouteStrategy::LeastUsed => {
+            // Without per-member usage in hand, "least used" degrades to the
+            // configured order. The service re-sorts by observed usage before
+            // calling this; keeping a total function here means a snapshot
+            // without usage still routes.
+        }
+    }
+    ordered
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedModel<'a> {
+    /// The request named a route, which is resolved to its members.
+    Route {
+        route_id: String,
+        requested: &'a str,
+    },
     Qualified {
         profile: ModelProviderProfileId,
         model: &'a str,
@@ -451,6 +509,7 @@ impl ResolvedModel<'_> {
     /// The model id the upstream should see.
     pub fn model(&self) -> &str {
         match self {
+            Self::Route { requested, .. } => requested,
             Self::Qualified { model, .. }
             | Self::Bare { model, .. }
             | Self::Ambiguous { model, .. } => model,
@@ -462,7 +521,15 @@ impl ResolvedModel<'_> {
     pub fn profile(&self) -> Option<&ModelProviderProfileId> {
         match self {
             Self::Qualified { profile, .. } | Self::Bare { profile, .. } => Some(profile),
-            Self::Ambiguous { .. } | Self::NotFound { .. } => None,
+            Self::Route { .. } | Self::Ambiguous { .. } | Self::NotFound { .. } => None,
+        }
+    }
+
+    /// The route the request named, when it named one.
+    pub fn route_id(&self) -> Option<&str> {
+        match self {
+            Self::Route { route_id, .. } => Some(route_id),
+            _ => None,
         }
     }
 }
@@ -953,5 +1020,91 @@ mod tests {
         assert_eq!(provider_alias("Moonshot Kimi"), "moonshot-kimi");
         assert_eq!(provider_alias(" 智谱 GLM "), "glm");
         assert_eq!(provider_alias("!!!"), "provider");
+    }
+}
+
+#[cfg(test)]
+mod route_members {
+    use super::*;
+
+    fn member(profile: &str, model: &str) -> RouteMemberRef {
+        RouteMemberRef {
+            profile: ModelProviderProfileId::parse(profile).unwrap(),
+            model: model.to_string(),
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn a_route_model_id_is_recognised_and_anything_else_is_not() {
+        assert_eq!(
+            route_id_from_model("route/standard"),
+            Some(Some("standard")),
+            "a route id is split off"
+        );
+        // An ordinary Provider-qualified id must not look like a route.
+        assert_eq!(route_id_from_model("deepseek/deepseek-chat"), None);
+        assert_eq!(route_id_from_model("deepseek-chat"), None);
+        assert_eq!(route_id_from_model("routeyou"), None);
+        // A bare prefix is a malformed request, not a Provider lookup.
+        assert_eq!(route_id_from_model("route/"), Some(None));
+        assert_eq!(route_id_from_model("route/   "), Some(None));
+    }
+
+    #[test]
+    fn ordered_keeps_the_route_order() {
+        let members = vec![
+            member("model_provider_a", "a"),
+            member("model_provider_b", "b"),
+        ];
+        let ordered = plan_members(&members, vibex_core::RouteStrategy::Ordered, 7);
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|member| member.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn round_robin_advances_once_per_request_and_wraps() {
+        let members = vec![
+            member("model_provider_a", "a"),
+            member("model_provider_b", "b"),
+            member("model_provider_c", "c"),
+        ];
+        let first = plan_members(&members, vibex_core::RouteStrategy::RoundRobin, 0);
+        assert_eq!(first[0].model, "a");
+        let second = plan_members(&members, vibex_core::RouteStrategy::RoundRobin, 1);
+        assert_eq!(second[0].model, "b");
+        let wrapped = plan_members(&members, vibex_core::RouteStrategy::RoundRobin, 4);
+        assert_eq!(wrapped[0].model, "b", "four mod three is one");
+        // Every request still offers the whole set.
+        assert_eq!(wrapped.len(), 3);
+    }
+
+    #[test]
+    fn least_used_falls_back_to_the_configured_order() {
+        // Usage is applied by the service before this call; with none in hand
+        // the order must still be total rather than empty.
+        let members = vec![
+            member("model_provider_a", "a"),
+            member("model_provider_b", "b"),
+        ];
+        let planned = plan_members(&members, vibex_core::RouteStrategy::LeastUsed, 0);
+        assert_eq!(
+            planned
+                .iter()
+                .map(|member| member.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn an_empty_route_plans_to_nothing() {
+        let planned = plan_members(&[], vibex_core::RouteStrategy::RoundRobin, 5);
+        assert!(planned.is_empty());
     }
 }

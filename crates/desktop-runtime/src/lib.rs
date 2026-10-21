@@ -1392,12 +1392,17 @@ fn assemble_gateway_snapshot(
         });
     }
     for model in catalog {
+        // A route has no single Provider or protocol: those belong to its
+        // members, and naming one here would misreport what answers.
         models.push(vibex_core::GatewayModelSummary {
-            model_provider_profile_id: model.provider.clone(),
-            provider_name: model.provider_name.clone(),
+            model_provider_profile_id: vibex_core::ModelProviderProfileId::new(),
+            provider_name: model.display_name.clone(),
             model_id: model.model.clone(),
             display_id: model.display_id(),
             wire_protocol_id: String::new(),
+            route_id: model.route_id.clone(),
+            source_count: model.source_count,
+            model_count: model.model_count,
         });
     }
     let candidates = profiles

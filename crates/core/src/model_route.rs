@@ -187,6 +187,14 @@ pub struct ModelRoute {
     /// Members in attempt order.
     pub members: Vec<ModelRouteMember>,
     pub strategy: RouteStrategy,
+    /// How long a member may take to produce its first token before the next
+    /// one is asked instead.
+    ///
+    /// This exists because a vendor can accept a connection and then stall: the
+    /// request never fails, so no error-based failover ever fires, and the turn
+    /// hangs. `None` waits as long as it takes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_timeout_ms: Option<u64>,
     /// An explicit context window, overriding the default "smallest member"
     /// rule. Only meaningful for a gateway route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -237,6 +245,7 @@ impl Default for ModelRoute {
             kind: RouteKind::Gateway,
             members: Vec::new(),
             strategy: RouteStrategy::Ordered,
+            first_token_timeout_ms: None,
             context_tokens: None,
             status: RouteStatus::Disabled,
             revision: 1,
@@ -339,6 +348,12 @@ impl ModelRoute {
                 ));
             }
             seen_orders.push(order);
+        }
+        if self.first_token_timeout_ms == Some(0) {
+            return Err(VibexError::validation(
+                "route_first_token_timeout_invalid",
+                "a first-token timeout must be greater than zero",
+            ));
         }
         if self.context_tokens == Some(0) {
             return Err(VibexError::validation(

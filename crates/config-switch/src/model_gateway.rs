@@ -13,11 +13,11 @@
 use std::collections::BTreeSet;
 
 use vibex_core::{
-    AgentId, GatewayRoutingStrategy, ModelProviderProfileId, ModelProviderProfileStatus,
-    ProviderConfiguredModel, ProviderKind, ProviderModelCapabilities, ProviderModelWireApi,
-    ProviderOptions, ProviderProfile, ProviderProfileCreateRequest, ProviderProfileId,
-    ProviderProfileStatus, ProviderSecretBackend, ProviderSecretKind,
-    ProviderSecretReferenceCreateRequest, ProviderSecretSetupState, VibexError, VibexResult,
+    AgentId, GatewayRoutingStrategy, ModelProviderProfileStatus, ProviderConfiguredModel,
+    ProviderKind, ProviderModelCapabilities, ProviderModelWireApi, ProviderOptions,
+    ProviderProfile, ProviderProfileCreateRequest, ProviderProfileId, ProviderProfileStatus,
+    ProviderSecretBackend, ProviderSecretKind, ProviderSecretReferenceCreateRequest,
+    ProviderSecretSetupState, VibexError, VibexResult,
 };
 use vibex_db::{
     AgentDefaultModelProviderProfileRepository, ModelGatewayAgentRepository,
@@ -316,47 +316,69 @@ impl ProviderConfigService {
     }
 
     /// The Models the gateway currently exposes, for the Config Center.
+    ///
+    /// One entry per route, not per member: a route is one selectable model, so
+    /// an Agent must see one id for it. The members are what the gateway
+    /// decides between, and listing them here would ask the Agent to choose a
+    /// source the route is supposed to choose for it.
     pub fn gateway_model_catalog(&self) -> VibexResult<Vec<GatewayCatalogModel>> {
         let conn = self.open_connection()?;
-        let settings = vibex_db::ModelGatewaySettingsRepository::get_or_create(&conn)?;
         let profiles = ModelProviderProfileRepository::list(&conn)?;
+        let routes = vibex_db::ModelRouteRepository::list_enabled(&conn)?;
         let mut catalog = Vec::new();
-        for upstream_id in &settings.upstreams {
-            let Some(profile) = profiles.iter().find(|profile| &profile.id == upstream_id) else {
-                continue;
-            };
-            if profile.status != ModelProviderProfileStatus::Enabled {
+        for route in routes {
+            // A route whose members all point at Providers that no longer exist
+            // has nothing to serve, so it is not offered.
+            let served = route
+                .enabled_members()
+                .filter(|member| {
+                    profiles.iter().any(|profile| {
+                        profile.id == member.model_provider_profile_id
+                            && profile.status == ModelProviderProfileStatus::Enabled
+                    })
+                })
+                .count();
+            if served == 0 {
                 continue;
             }
-            for model in profile
-                .configured_models
-                .iter()
-                .filter(|model| model.enabled)
-            {
-                catalog.push(GatewayCatalogModel {
-                    provider: upstream_id.clone(),
-                    provider_name: profile.display_name.clone(),
-                    model: model.id.clone(),
-                });
-            }
+            catalog.push(GatewayCatalogModel {
+                route_id: Some(route.id.as_str().to_string()),
+                display_name: route.display_name.clone(),
+                model: route.model_id(),
+                kind: route.kind,
+                source_count: served,
+                model_count: route.distinct_models().len(),
+            });
         }
         Ok(catalog)
     }
 }
 
-/// One model the gateway serves.
+/// One model the gateway serves: a route, or a single upstream.
+///
+/// The id an Agent asks for is `model`; `display_name` is what a picker groups
+/// it under. A route never carries a Provider name in `model`, because the
+/// Provider is the route's business, not the Agent's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayCatalogModel {
-    pub provider: ModelProviderProfileId,
-    pub provider_name: String,
+    /// Present for a route; absent for a legacy single-upstream entry.
+    pub route_id: Option<String>,
+    pub display_name: String,
     pub model: String,
+    pub kind: vibex_core::RouteKind,
+    /// How many members can answer.
+    pub source_count: usize,
+    /// How many distinct model names the route offers.
+    pub model_count: usize,
 }
 
 impl GatewayCatalogModel {
-    /// The id an Agent's model list shows: the upstream's short name and the
-    /// model id.
+    /// The id an Agent's model list shows.
+    ///
+    /// A route's id is already `route/<id>`; it must not gain a Provider
+    /// prefix, or the Agent would appear to have picked a vendor.
     pub fn display_id(&self) -> String {
-        format!("{}/{}", self.provider_name, self.model)
+        self.model.clone()
     }
 }
 
@@ -786,7 +808,10 @@ mod fingerprint_tests {
     }
 
     /// Creates a shared upstream with one stored Key and returns its id.
-    fn upstream(service: &ProviderConfigService, display_name: &str) -> ModelProviderProfileId {
+    fn upstream(
+        service: &ProviderConfigService,
+        display_name: &str,
+    ) -> vibex_core::ModelProviderProfileId {
         let lookup_key = format!("vibex-test-secret-{}", RequestId::new().as_str());
         crate::secrets::store_provider_secret(&lookup_key, "sk-test").unwrap();
         service
@@ -944,7 +969,7 @@ mod credential_tests {
         (path, service)
     }
 
-    fn profile_id(service: &ProviderConfigService) -> ModelProviderProfileId {
+    fn profile_id(service: &ProviderConfigService) -> vibex_core::ModelProviderProfileId {
         service
             .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
                 display_name: "DeepSeek".to_string(),

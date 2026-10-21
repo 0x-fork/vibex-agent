@@ -1302,6 +1302,7 @@ mod tests {
                     credential_id: RequestId::new(),
                     failure: GatewayFailureKind::Quota,
                 }],
+                skipped_members: Vec::new(),
             }),
             created_at_ms: now,
         };

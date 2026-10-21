@@ -715,6 +715,25 @@ pub struct GatewayRouteTrace {
     /// Keys tried, in order, that did not answer.
     #[serde(default)]
     pub failed_attempts: Vec<GatewayRouteAttempt>,
+    /// Members this request walked past before one answered.
+    ///
+    /// A route may fail over across Providers as well as across Keys, and the
+    /// two mean different things: a Key cooled down, while a whole member was
+    /// unavailable. Keeping them in one list would make "which Provider did it
+    /// try" unreadable.
+    #[serde(default)]
+    pub skipped_members: Vec<GatewaySkippedMember>,
+}
+
+/// One route member that did not answer, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewaySkippedMember {
+    pub model_provider_profile_id: ModelProviderProfileId,
+    /// The protocol the member would have been called with.
+    #[serde(default)]
+    pub wire_protocol_id: String,
+    pub failure: GatewayFailureKind,
 }
 
 impl GatewayRouteTrace {
@@ -725,12 +744,16 @@ impl GatewayRouteTrace {
             skipped_cooling: u32::try_from(skipped_cooling).unwrap_or(u32::MAX),
             skipped_over_limit: u32::try_from(skipped_over_limit).unwrap_or(u32::MAX),
             failed_attempts: Vec::new(),
+            skipped_members: Vec::new(),
         }
     }
 
     /// Whether the trace says anything beyond "the first Key answered".
     pub fn is_unremarkable(&self) -> bool {
-        self.skipped_cooling == 0 && self.skipped_over_limit == 0 && self.failed_attempts.is_empty()
+        self.skipped_cooling == 0
+            && self.skipped_over_limit == 0
+            && self.failed_attempts.is_empty()
+            && self.skipped_members.is_empty()
     }
 
     /// Whether a reader can interpret this payload.
@@ -918,6 +941,19 @@ pub struct GatewayModelSummary {
     /// The id an Agent's model picker shows.
     pub display_id: String,
     pub wire_protocol_id: String,
+    /// Present when this entry is a route rather than one upstream's model.
+    ///
+    /// The Config Center shows the two differently: a route names a saved
+    /// composition and has no single Provider or protocol, while an upstream
+    /// entry belongs to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_id: Option<String>,
+    /// How many members can answer a route.
+    #[serde(default)]
+    pub source_count: usize,
+    /// How many distinct model names a route offers.
+    #[serde(default)]
+    pub model_count: usize,
 }
 
 /// The whole Config Center read for the gateway.

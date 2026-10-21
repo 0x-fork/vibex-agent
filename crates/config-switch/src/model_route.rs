@@ -645,3 +645,117 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 }
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::super::*;
+    use vibex_core::{
+        ModelProviderCatalogEntry, ModelProviderProfileId, ModelProviderProfileStatus, ModelRoute,
+        ModelRouteMember, RouteKind, RouteStatus, RouteStrategy,
+    };
+
+    fn service() -> (std::path::PathBuf, ProviderConfigService) {
+        let path = std::env::temp_dir().join(format!(
+            "vibex-route-catalog-{}.db",
+            vibex_core::RequestId::new().as_str()
+        ));
+        let service = ProviderConfigService::new(&path);
+        (path, service)
+    }
+
+    fn provider(
+        service: &ProviderConfigService,
+        name: &str,
+        models: &[&str],
+    ) -> ModelProviderProfileId {
+        service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: name.to_string(),
+                vendor_hint: None,
+                endpoints: Vec::new(),
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: models
+                    .iter()
+                    .map(|model| ModelProviderCatalogEntry {
+                        id: (*model).to_string(),
+                        display_name: None,
+                        enabled: true,
+                        metadata: Vec::new(),
+                        capabilities: Default::default(),
+                    })
+                    .collect(),
+                default_model_id: models.first().map(|model| (*model).to_string()),
+                headers: Vec::new(),
+                status: ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap()
+            .id
+    }
+
+    /// The catalog lists one entry per route, and an entry's id carries no
+    /// Provider prefix: the choice of Provider belongs to the route.
+    #[test]
+    fn the_catalog_lists_one_entry_per_route_without_a_provider_name() {
+        let (path, service) = service();
+        let first = provider(&service, "DeepSeek", &["flash"]);
+        let second = provider(&service, "OpenRouter", &["flash"]);
+        service
+            .create_model_route(ModelRoute {
+                display_name: "Standard".to_string(),
+                kind: RouteKind::Gateway,
+                strategy: RouteStrategy::Ordered,
+                status: RouteStatus::Enabled,
+                members: vec![
+                    ModelRouteMember::new(first.clone(), "flash", 0),
+                    ModelRouteMember::new(second.clone(), "flash", 1),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let catalog = service.gateway_model_catalog().unwrap();
+        let entry = catalog
+            .iter()
+            .find(|entry| entry.display_name == "Standard")
+            .expect("the route is listed");
+        assert_eq!(entry.source_count, 2, "two sources back it");
+        assert_eq!(entry.model_count, 1, "but only one distinct model name");
+        assert!(
+            entry.display_id().starts_with("route/"),
+            "a route id is not a Provider-qualified model: {}",
+            entry.display_id()
+        );
+        assert!(
+            !entry.display_id().contains("DeepSeek") && !entry.display_id().contains("OpenRouter"),
+            "the id must not name either Provider: {}",
+            entry.display_id()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A disabled route is not offered, and a route whose Providers are gone is
+    /// dropped rather than listed as a model nothing can serve.
+    #[test]
+    fn a_disabled_route_is_not_listed() {
+        let (path, service) = service();
+        let provider_id = provider(&service, "DeepSeek", &["flash"]);
+        service
+            .create_model_route(ModelRoute {
+                display_name: "Off".to_string(),
+                kind: RouteKind::Gateway,
+                strategy: RouteStrategy::Ordered,
+                status: RouteStatus::Disabled,
+                members: vec![ModelRouteMember::new(provider_id, "flash", 0)],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let catalog = service.gateway_model_catalog().unwrap();
+        assert!(
+            !catalog.iter().any(|entry| entry.display_name == "Off"),
+            "a disabled route must not be offered"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+}

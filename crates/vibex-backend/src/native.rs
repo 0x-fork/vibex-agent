@@ -1166,6 +1166,10 @@ fn read_gateway_snapshot(
                 // published entry keeps the model's declared capability
                 // namespace empty rather than inventing one.
                 wire_protocol_id: String::new(),
+                // This path lists one upstream's own models, not a route.
+                route_id: None,
+                source_count: 1,
+                model_count: 1,
             });
         }
     }

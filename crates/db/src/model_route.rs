@@ -42,8 +42,8 @@ impl ModelRouteRepository {
             .query_row(
                 "
                 SELECT model_route_id, display_name, description, kind, strategy,
-                    context_tokens, status, revision, created_at_ms, updated_at_ms,
-                    deleted_at_ms
+                    first_token_timeout_ms, context_tokens, status, revision,
+                    created_at_ms, updated_at_ms, deleted_at_ms
                 FROM model_routes
                 WHERE model_route_id = ?1 AND deleted_at_ms IS NULL
                 ",
@@ -102,12 +102,13 @@ impl ModelRouteRepository {
                     description = ?3,
                     kind = ?4,
                     strategy = ?5,
-                    context_tokens = ?6,
-                    status = ?7,
+                    first_token_timeout_ms = ?6,
+                    context_tokens = ?7,
+                    status = ?8,
                     revision = revision + 1,
-                    updated_at_ms = ?8
+                    updated_at_ms = ?9
                 WHERE model_route_id = ?1
-                    AND revision = ?9
+                    AND revision = ?10
                     AND deleted_at_ms IS NULL
                 ",
                 params![
@@ -116,6 +117,7 @@ impl ModelRouteRepository {
                     route.description.as_deref().map(str::trim),
                     enum_to_db(&route.kind)?,
                     enum_to_db(&route.strategy)?,
+                    route.first_token_timeout_ms,
                     route.context_tokens,
                     enum_to_db(&route.status)?,
                     next_stamp(conn, route)?,
@@ -484,10 +486,10 @@ fn insert_route(conn: &Connection, route: &ModelRoute) -> VibexResult<()> {
         "
         INSERT INTO model_routes (
             model_route_id, display_name, description, kind, strategy,
-            context_tokens, status, revision, created_at_ms, updated_at_ms,
-            deleted_at_ms
+            first_token_timeout_ms, context_tokens, status, revision,
+            created_at_ms, updated_at_ms, deleted_at_ms
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ",
         params![
             route.id.as_str(),
@@ -495,6 +497,7 @@ fn insert_route(conn: &Connection, route: &ModelRoute) -> VibexResult<()> {
             route.description.as_deref().map(str::trim),
             enum_to_db(&route.kind)?,
             enum_to_db(&route.strategy)?,
+            route.first_token_timeout_ms,
             route.context_tokens,
             enum_to_db(&route.status)?,
             route.revision.max(1),
@@ -578,8 +581,8 @@ fn list_where(conn: &Connection, predicate: &str, order: &str) -> VibexResult<Ve
     let sql = format!(
         "
         SELECT model_route_id, display_name, description, kind, strategy,
-            context_tokens, status, revision, created_at_ms, updated_at_ms,
-            deleted_at_ms
+            first_token_timeout_ms, context_tokens, status, revision,
+            created_at_ms, updated_at_ms, deleted_at_ms
         FROM model_routes
         WHERE {predicate}
         {order}
@@ -603,7 +606,7 @@ fn list_where(conn: &Connection, predicate: &str, order: &str) -> VibexResult<Ve
 fn map_route(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRoute> {
     let kind: RouteKind = enum_from_db_sql(row.get(3)?)?;
     let strategy: RouteStrategy = enum_from_db_sql(row.get(4)?)?;
-    let status: RouteStatus = enum_from_db_sql(row.get(6)?)?;
+    let status: RouteStatus = enum_from_db_sql(row.get(7)?)?;
     Ok(ModelRoute {
         id: parse_id_sql(row.get(0)?, ModelRouteId::parse)?,
         display_name: row.get(1)?,
@@ -611,14 +614,17 @@ fn map_route(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRoute> {
         kind,
         members: Vec::new(),
         strategy,
-        context_tokens: row
+        first_token_timeout_ms: row
             .get::<_, Option<i64>>(5)?
+            .and_then(|value| u64::try_from(value).ok().filter(|value| *value > 0)),
+        context_tokens: row
+            .get::<_, Option<i64>>(6)?
             .and_then(|value| u32::try_from(value).ok().filter(|value| *value > 0)),
         status,
-        revision: row.get(7)?,
-        created_at_ms: row.get(8)?,
-        updated_at_ms: row.get(9)?,
-        deleted_at_ms: row.get(10)?,
+        revision: row.get(8)?,
+        created_at_ms: row.get(9)?,
+        updated_at_ms: row.get(10)?,
+        deleted_at_ms: row.get(11)?,
     })
 }
 

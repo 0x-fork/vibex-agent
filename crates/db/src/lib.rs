@@ -12486,6 +12486,8 @@ fn apply_model_routes(conn: &mut Connection, applied: &mut Vec<String>) -> Vibex
             description TEXT NULL,
             kind TEXT NOT NULL,
             strategy TEXT NOT NULL,
+            first_token_timeout_ms INTEGER NULL
+                CHECK(first_token_timeout_ms IS NULL OR first_token_timeout_ms > 0),
             context_tokens INTEGER NULL CHECK(context_tokens IS NULL OR context_tokens > 0),
             status TEXT NOT NULL,
             revision INTEGER NOT NULL CHECK(revision > 0),

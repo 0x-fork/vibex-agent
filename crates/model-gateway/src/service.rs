@@ -33,7 +33,7 @@ use vibex_db::{
 };
 
 use crate::error::{GatewayError, GatewayResult};
-use crate::ir::{CanonicalEvent, CanonicalRequest, CanonicalUsage};
+use crate::ir::{CanonicalEvent, CanonicalRequest, CanonicalUsage, ReasoningRequest};
 use crate::route::{
     CandidateKey, KeyHealth, ResolvedModel, RouteRequest, classify_failure, conversation_key,
     plan_route, resolve_model,
@@ -92,9 +92,37 @@ pub struct GatewaySnapshot {
     pub settings: ModelGatewaySettings,
     pub upstreams: Vec<GatewayUpstream>,
     pub gateway_used_tokens: u64,
+    /// Enabled routes, by id. A request that names `route/<id>` resolves here.
+    pub routes: BTreeMap<String, GatewayRoute>,
+}
+
+/// One route as the gateway serves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayRoute {
+    pub route_id: String,
+    pub display_name: String,
+    pub strategy: vibex_core::RouteStrategy,
+    pub first_token_timeout_ms: Option<u64>,
+    /// Members in attempt order, already filtered to enabled ones.
+    pub members: Vec<crate::route::RouteMemberRef>,
+}
+
+impl GatewayRoute {
+    /// The route's model id, as an Agent asks for it.
+    pub fn model_id(&self) -> String {
+        format!("{}{}", crate::route::ROUTE_MODEL_PREFIX, self.route_id)
+    }
 }
 
 impl GatewaySnapshot {
+    pub fn route(&self, route_id: &str) -> Option<&GatewayRoute> {
+        self.routes.get(route_id)
+    }
+
+    pub fn route_ids(&self) -> Vec<String> {
+        self.routes.keys().cloned().collect()
+    }
+
     pub fn upstream(&self, profile: &ModelProviderProfileId) -> Option<&GatewayUpstream> {
         self.upstreams
             .iter()
@@ -107,10 +135,24 @@ impl GatewaySnapshot {
             .unwrap_or_default()
     }
 
-    /// Every model the gateway can serve, as `prefix/model` ids.
+    /// Every model the gateway can serve.
+    ///
+    /// Routes come first, one entry each: a route is one selectable model, so
+    /// listing its members would show an Agent a choice the route exists to
+    /// make for it. The upstream entries stay because a direct Provider is
+    /// still reachable by name.
     pub fn model_catalog(&self) -> Vec<GatewayModelEntry> {
+        let mut entries = self
+            .routes
+            .values()
+            .map(|route| GatewayModelEntry {
+                id: route.model_id(),
+                model: route.model_id(),
+                provider: ModelProviderProfileId::new(),
+                provider_name: route.display_name.clone(),
+            })
+            .collect::<Vec<_>>();
         let namespaces = self.model_namespaces();
-        let mut entries = Vec::new();
         for upstream in &self.upstreams {
             let Some(namespace) = namespaces
                 .iter()
@@ -358,9 +400,22 @@ impl ModelGatewayService {
             .token_limit
             .map(|limit| limit.window)
             .unwrap_or(GatewayTokenWindow::Day);
+        // A route's members must be resolvable even when they are not also on
+        // the global upstream list. Requiring both would make the user add a
+        // Provider twice — once as an upstream, once as a member — and the
+        // second one would be invisible in the gateway's own configuration.
+        let mut referenced = settings.upstreams.clone();
+        for route in vibex_db::ModelRouteRepository::list_enabled(&connection)? {
+            for member in route.enabled_members() {
+                if !referenced.contains(&member.model_provider_profile_id) {
+                    referenced.push(member.model_provider_profile_id.clone());
+                }
+            }
+        }
+
         let mut gateway_used_tokens = 0;
-        let mut upstreams = Vec::with_capacity(settings.upstreams.len());
-        for profile_id in &settings.upstreams {
+        let mut upstreams = Vec::with_capacity(referenced.len());
+        for profile_id in &referenced {
             let Some(profile) = profiles.get(profile_id) else {
                 continue;
             };
@@ -408,10 +463,46 @@ impl ModelGatewayService {
                 keys,
             });
         }
+        // Enabled routes are what an Agent may name. A route that points at a
+        // Provider no longer in the snapshot keeps its members out: a member
+        // whose upstream is gone cannot be called, and pretending otherwise
+        // would fail deep inside `prepare_member`.
+        let routes = vibex_db::ModelRouteRepository::list_enabled(&connection)?
+            .into_iter()
+            .filter_map(|route| {
+                let members = route
+                    .enabled_members()
+                    .filter(|member| {
+                        profiles.contains_key(&member.model_provider_profile_id)
+                            && route.enabled_members().any(|_| true)
+                    })
+                    .map(|member| crate::route::RouteMemberRef {
+                        profile: member.model_provider_profile_id.clone(),
+                        model: member.model_id.clone(),
+                        reasoning_effort: member.reasoning_effort.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                if members.is_empty() {
+                    return None;
+                }
+                Some((
+                    route.id.as_str().to_string(),
+                    GatewayRoute {
+                        route_id: route.id.as_str().to_string(),
+                        display_name: route.display_name.clone(),
+                        strategy: route.strategy,
+                        first_token_timeout_ms: route.first_token_timeout_ms,
+                        members,
+                    },
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+
         Ok(GatewaySnapshot {
             settings,
             upstreams,
             gateway_used_tokens,
+            routes,
         })
     }
 
@@ -736,59 +827,25 @@ impl ModelGatewayService {
             });
         }
 
-        let namespaces = snapshot.model_namespaces();
-        let resolved = resolve_model(&request.model, &namespaces);
-        let (profile_id, requested_model) = match resolved {
-            ResolvedModel::Qualified { profile, model }
-            | ResolvedModel::Bare { profile, model } => (profile, model.to_string()),
-            ResolvedModel::Ambiguous { candidates, model } => {
-                // A bare id served by several upstreams resolves to the first
-                // one in the user's order; the ledger records which one.
-                let first =
-                    candidates
-                        .first()
-                        .cloned()
-                        .ok_or_else(|| GatewayError::ModelNotFound {
-                            model: model.to_string(),
-                            closest: Vec::new(),
-                        })?;
-                (first, model.to_string())
-            }
-            ResolvedModel::NotFound { requested, closest } => {
-                return Err(GatewayError::ModelNotFound {
-                    model: requested,
-                    closest,
-                });
-            }
-        };
-        let upstream =
-            snapshot
-                .upstream(&profile_id)
-                .cloned()
-                .ok_or_else(|| GatewayError::ModelNotFound {
-                    model: request.model.clone(),
-                    closest: Vec::new(),
-                })?;
-
-        if request.has_vendor_file_image() && !upstream.supports(WireProtocol::Responses) {
-            return Err(GatewayError::UnsupportedImageReference);
+        // Resolve the request into the list of upstreams it may call. A route
+        // expands to its members; anything else is a one-member list. Both then
+        // take the same path, which is what keeps a direct Provider and a
+        // route from growing two sets of routing rules.
+        let resolved_members = self.resolve_members(&snapshot, &request)?;
+        if resolved_members.is_empty() {
+            return Err(GatewayError::ModelNotFound {
+                model: request.model.clone(),
+                closest: snapshot
+                    .model_catalog()
+                    .into_iter()
+                    .map(|entry| entry.id)
+                    .collect(),
+            });
         }
-        let (target, passthrough) = choose_target(inbound, &upstream, &snapshot.settings.policy)?;
-        let endpoint = upstream
-            .endpoint_for(target.wire_protocol_id())
-            .cloned()
-            .ok_or_else(|| GatewayError::TranslationDisabled {
-                wire_protocol_id: target.wire_protocol_id().to_string(),
-            })?;
 
         let policy = &snapshot.settings.policy;
         let now = vibex_core::unix_timestamp_ms();
         let connection = self.connection()?;
-        let states = ModelProviderAccountStateRepository::list(&connection, &profile_id)?;
-        let state_by_key = states
-            .into_iter()
-            .map(|state| (state.credential_id.clone(), state))
-            .collect::<BTreeMap<_, _>>();
         let agent_id = agent_id_from_headers(headers);
         let header_pairs = headers
             .iter()
@@ -811,6 +868,160 @@ impl ModelGatewayService {
             })
             .filter(|pin| pin.is_live_at(now))
             .map(|pin| (pin.model_provider_profile_id, pin.credential_id));
+
+        let mut members = Vec::new();
+        let mut last_error: Option<GatewayError> = None;
+        for resolved in resolved_members {
+            match self.prepare_member(
+                &snapshot,
+                &request,
+                inbound,
+                &resolved,
+                &connection,
+                pinned.as_ref(),
+                now,
+            ) {
+                Ok(member) => members.push(member),
+                // A member that cannot be called at all is skipped so the next
+                // one can answer. Its reason is kept in case none can, so the
+                // caller reads the real cause instead of a bare 404.
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if members.is_empty() {
+            return Err(last_error.unwrap_or_else(|| GatewayError::ModelNotFound {
+                model: request.model.clone(),
+                closest: Vec::new(),
+            }));
+        }
+
+        let prepared = PreparedCall {
+            inbound,
+            requested_model: request.model.clone(),
+            members,
+            agent_id,
+            conversation,
+            stream: request.stream,
+            route_id: resolved_model_route_id(&request.model),
+            probe: probe.armed,
+        };
+        // The slot now belongs to the caller of `open_attempt`.
+        probe.armed = false;
+        Ok(prepared)
+    }
+
+    /// Expands the request into the upstreams it may call, in attempt order.
+    ///
+    /// A `route/<id>` request becomes the route's enabled members, ordered by
+    /// the route's strategy. Anything else resolves to one upstream, so the
+    /// caller needs no special case.
+    fn resolve_members(
+        &self,
+        snapshot: &GatewaySnapshot,
+        request: &CanonicalRequest,
+    ) -> GatewayResult<Vec<ResolvedMember>> {
+        if let Some(route_id) = resolved_model_route_id(&request.model) {
+            let Some(route) = snapshot.route(&route_id) else {
+                return Err(GatewayError::ModelNotFound {
+                    model: request.model.clone(),
+                    closest: snapshot
+                        .route_ids()
+                        .into_iter()
+                        .map(|id| format!("{}{}", crate::route::ROUTE_MODEL_PREFIX, id))
+                        .collect(),
+                });
+            };
+            let strategy = crate::route::plan_members(
+                &route.members,
+                route.strategy,
+                self.rotation.fetch_add(1, Ordering::Relaxed),
+            );
+            return Ok(strategy
+                .into_iter()
+                .map(|member| ResolvedMember {
+                    profile: member.profile,
+                    model: member.model,
+                    reasoning_effort: member.reasoning_effort,
+                    first_token_timeout_ms: route.first_token_timeout_ms,
+                })
+                .collect());
+        }
+
+        let namespaces = snapshot.model_namespaces();
+        let resolved = resolve_model(&request.model, &namespaces);
+        let (profile_id, model) = match resolved {
+            ResolvedModel::Qualified { profile, model }
+            | ResolvedModel::Bare { profile, model } => (profile, model.to_string()),
+            ResolvedModel::Ambiguous { candidates, model } => {
+                // A bare id served by several upstreams resolves to the first
+                // one in the user's order; the ledger records which one.
+                let first =
+                    candidates
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| GatewayError::ModelNotFound {
+                            model: model.to_string(),
+                            closest: Vec::new(),
+                        })?;
+                (first, model.to_string())
+            }
+            ResolvedModel::Route { .. } => unreachable!("a route id returns above"),
+            ResolvedModel::NotFound { requested, closest } => {
+                return Err(GatewayError::ModelNotFound {
+                    model: requested,
+                    closest,
+                });
+            }
+        };
+        Ok(vec![ResolvedMember {
+            profile: profile_id,
+            model,
+            reasoning_effort: None,
+            // A direct Provider has no route to set a deadline; the Agent's own
+            // client timeout is the only bound.
+            first_token_timeout_ms: None,
+        }])
+    }
+
+    /// Resolves one member into everything needed to call it.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_member(
+        &self,
+        snapshot: &GatewaySnapshot,
+        request: &CanonicalRequest,
+        inbound: WireProtocol,
+        resolved: &ResolvedMember,
+        connection: &DbConnection,
+        pinned: Option<&(ModelProviderProfileId, RequestId)>,
+        now: i64,
+    ) -> GatewayResult<PreparedMember> {
+        let profile_id = resolved.profile.clone();
+        let upstream =
+            snapshot
+                .upstream(&profile_id)
+                .cloned()
+                .ok_or_else(|| GatewayError::ModelNotFound {
+                    model: request.model.clone(),
+                    closest: Vec::new(),
+                })?;
+
+        if request.has_vendor_file_image() && !upstream.supports(WireProtocol::Responses) {
+            return Err(GatewayError::UnsupportedImageReference);
+        }
+        let (target, passthrough) = choose_target(inbound, &upstream, &snapshot.settings.policy)?;
+        let endpoint = upstream
+            .endpoint_for(target.wire_protocol_id())
+            .cloned()
+            .ok_or_else(|| GatewayError::TranslationDisabled {
+                wire_protocol_id: target.wire_protocol_id().to_string(),
+            })?;
+
+        let policy = &snapshot.settings.policy;
+        let states = ModelProviderAccountStateRepository::list(connection, &profile_id)?;
+        let state_by_key = states
+            .into_iter()
+            .map(|state| (state.credential_id.clone(), state))
+            .collect::<BTreeMap<_, _>>();
 
         let mut candidates = Vec::new();
         let preferred = policy.preferred_keys.get(&profile_id);
@@ -848,6 +1059,12 @@ impl ModelGatewayService {
             )));
         }
 
+        // A pin only applies to the Provider it names. Another member of the
+        // same route must not inherit it, or a conversation would land on a Key
+        // that belongs to a different vendor.
+        let member_pin = pinned
+            .filter(|(profile, _)| profile == &profile_id)
+            .cloned();
         let plan = plan_route(RouteRequest {
             candidates: candidates
                 .iter()
@@ -855,7 +1072,7 @@ impl ModelGatewayService {
                 .collect(),
             strategy: policy.routing,
             rotation: self.rotation.fetch_add(1, Ordering::Relaxed),
-            pinned: pinned.clone(),
+            pinned: member_pin,
         });
         if plan.attemptable().count() == 0 {
             return Err(GatewayError::AllKeysCooling {
@@ -874,32 +1091,39 @@ impl ModelGatewayService {
             .collect::<Vec<_>>();
 
         let upstream_stream = request.stream || !passthrough;
-        let body = build_upstream_request(target, &request, &requested_model, upstream_stream)?;
-        let prepared = PreparedCall {
-            inbound,
+        // A member may pin the reasoning effort, in which case it replaces what
+        // the Agent asked for rather than adding to it.
+        let member_request = match resolved.reasoning_effort.as_deref() {
+            Some(effort) => {
+                let mut member_request = request.clone();
+                member_request.reasoning = ReasoningRequest {
+                    disabled: effort.eq_ignore_ascii_case("off"),
+                    effort: Some(effort.to_string()),
+                };
+                member_request
+            }
+            None => request.clone(),
+        };
+        let body =
+            build_upstream_request(target, &member_request, &resolved.model, upstream_stream)?;
+        Ok(PreparedMember {
             profile_id,
             provider_name: upstream.display_name.clone(),
-            requested_model: request.model.clone(),
-            model: requested_model,
+            model: resolved.model.clone(),
             target,
             passthrough,
             endpoint,
             body,
             keys,
-            agent_id,
-            conversation,
-            stream: request.stream,
             limits: policy.account_limits.clone(),
             // The ledger keeps this much of the routing decision even when the
             // first attempt answers: "the gateway had to step over a cooling
             // Key" is exactly what a later failover investigation asks for.
             skipped_cooling: plan.skipped_cooling,
             skipped_over_limit: plan.skipped_over_limit,
-            probe: probe.armed,
-        };
-        // The slot now belongs to the caller of `open_attempt`.
-        probe.armed = false;
-        Ok(prepared)
+            reasoning_effort: resolved.reasoning_effort.clone(),
+            first_token_timeout_ms: resolved.first_token_timeout_ms,
+        })
     }
 
     /// Sends one attempt, trying the prepared candidates in order until one
@@ -920,28 +1144,92 @@ impl ModelGatewayService {
         // This is what the ledger's route trace is built from, so it records
         // the decision rather than a formatted sentence about it.
         let mut failed_attempts: Vec<GatewayRouteAttempt> = Vec::new();
-        for (candidate, credential) in prepared.keys.iter() {
+        let mut skipped_members: Vec<vibex_core::GatewaySkippedMember> = Vec::new();
+        // Members are tried in the order the route (or the single upstream)
+        // gave them. A member that fails before any byte reaches the client
+        // hands over to the next one; once a stream has started, the caller
+        // decides and this loop never retries.
+        for (index, member) in prepared.members.iter().enumerate() {
+            match self
+                .open_member_attempt(prepared, member, &mut failed_attempts, &mut skipped_members)
+                .await
+            {
+                Ok((response, target, passthrough, credential)) => {
+                    self.note_success();
+                    self.clear_failure(&member.profile_id, &credential);
+                    return Ok((
+                        UpstreamAttempt {
+                            response,
+                            target,
+                            passthrough,
+                            profile_id: member.profile_id.clone(),
+                            failed_attempts: failed_attempts.clone(),
+                            skipped_members: skipped_members.clone(),
+                        },
+                        KeyReference { id: credential },
+                    ));
+                }
+                Err(error) => {
+                    // A member that could not answer is recorded so the ledger
+                    // can explain the walk. Only a failure before the reply
+                    // started may fail over, which is what `open_attempt`'s
+                    // caller enforces; here every error is pre-reply.
+                    skipped_members.push(vibex_core::GatewaySkippedMember {
+                        model_provider_profile_id: member.profile_id.clone(),
+                        wire_protocol_id: member.target.wire_protocol_id().to_string(),
+                        failure: member_failure_kind(&error),
+                    });
+                    let can_try_next = prepared.may_try_next(index);
+                    if !can_try_next {
+                        last_error = Some(error);
+                        break;
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+        self.finish_attempt(prepared.probe);
+        Err(last_error.unwrap_or_else(|| GatewayError::AllKeysCooling {
+            model: prepared.requested_model.clone(),
+            retry_after_ms: None,
+        }))
+    }
+
+    /// Tries every Key of one member until one answers.
+    ///
+    /// Returns the response and the credential that produced it. The caller
+    /// owns the decision to move to another member, so this function never
+    /// retries across members itself.
+    async fn open_member_attempt(
+        &self,
+        prepared: &PreparedCall,
+        member: &PreparedMember,
+        attempts: &mut Vec<GatewayRouteAttempt>,
+        _members: &mut Vec<vibex_core::GatewaySkippedMember>,
+    ) -> GatewayResult<(reqwest::Response, WireProtocol, bool, RequestId)> {
+        let mut last_error: Option<GatewayError> = None;
+        for (candidate, credential) in member.keys.iter() {
             let secret = match resolve_key_secret(credential) {
                 Ok(Some(secret)) => secret,
                 Ok(None) => {
-                    failed_attempts.push(GatewayRouteAttempt {
+                    attempts.push(GatewayRouteAttempt {
                         credential_id: candidate.credential.clone(),
                         failure: GatewayFailureKind::Auth,
                     });
                     last_error = Some(GatewayError::NotConfigured(format!(
                         "`{}` has no usable Key",
-                        prepared.provider_name
+                        member.provider_name
                     )));
                     continue;
                 }
                 Err(error) => {
-                    failed_attempts.push(GatewayRouteAttempt {
+                    attempts.push(GatewayRouteAttempt {
                         credential_id: candidate.credential.clone(),
                         failure: GatewayFailureKind::Auth,
                     });
                     last_error = Some(GatewayError::NotConfigured(format!(
                         "`{}` has no usable Key: {}",
-                        prepared.provider_name, error.code
+                        member.provider_name, error.code
                     )));
                     continue;
                 }
@@ -949,7 +1237,7 @@ impl ModelGatewayService {
             // Hold this account's slot for the whole attempt, and take its
             // minute before anything leaves. A permit is released on drop, so a
             // cancelled or failed request cannot leak capacity.
-            let limits = prepared
+            let limits = member
                 .limits
                 .get(&candidate.credential)
                 .copied()
@@ -967,7 +1255,7 @@ impl ModelGatewayService {
             {
                 Ok(permit) => permit,
                 Err(error) => {
-                    failed_attempts.push(GatewayRouteAttempt {
+                    attempts.push(GatewayRouteAttempt {
                         credential_id: candidate.credential.clone(),
                         failure: GatewayFailureKind::Rate,
                     });
@@ -984,7 +1272,7 @@ impl ModelGatewayService {
                 )
                 .await
             {
-                failed_attempts.push(GatewayRouteAttempt {
+                attempts.push(GatewayRouteAttempt {
                     credential_id: candidate.credential.clone(),
                     failure: GatewayFailureKind::Rate,
                 });
@@ -992,20 +1280,48 @@ impl ModelGatewayService {
                 continue;
             }
             let url = endpoint_url(
-                &prepared.endpoint.url,
-                prepared.target,
-                &prepared.model,
+                &member.endpoint.url,
+                member.target,
+                &member.model,
                 prepared.stream,
             )?;
             let mut wire = apply_auth(
-                self.client.post(&url).json(&prepared.body),
-                prepared.target,
+                self.client.post(&url).json(&member.body),
+                member.target,
                 &secret,
             );
-            if let Some(beta) = beta_header(&prepared.target, &prepared.body) {
+            if let Some(beta) = beta_header(&member.target, &member.body) {
                 wire = wire.header("anthropic-beta", beta);
             }
-            let response = match wire.send().await {
+            // A stalled vendor may not answer the response headers at all. The
+            // route's deadline has to bound that wait too, or the deadline only
+            // covers the stream and the request hangs before it starts.
+            let sent = match member.first_token_timeout_ms {
+                Some(timeout) => match tokio::time::timeout(
+                    std::time::Duration::from_millis(timeout),
+                    wire.send(),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        attempts.push(GatewayRouteAttempt {
+                            credential_id: candidate.credential.clone(),
+                            failure: GatewayFailureKind::Upstream,
+                        });
+                        last_error = Some(GatewayError::Upstream {
+                            status: 504,
+                            message: format!(
+                                "{} did not answer within {} ms",
+                                member.provider_name, timeout
+                            ),
+                        });
+                        continue;
+                    }
+                },
+                None => wire.send().await,
+            };
+            let response = match sent {
                 Ok(response) => response,
                 Err(error) => {
                     let kind = if error.is_timeout() {
@@ -1013,42 +1329,31 @@ impl ModelGatewayService {
                     } else {
                         GatewayFailureKind::Proxy
                     };
-                    self.mark_failure(&prepared.profile_id, &candidate.credential, kind);
-                    failed_attempts.push(GatewayRouteAttempt {
+                    self.mark_failure(&member.profile_id, &candidate.credential, kind);
+                    attempts.push(GatewayRouteAttempt {
                         credential_id: candidate.credential.clone(),
                         failure: kind,
                     });
                     last_error = Some(GatewayError::Upstream {
                         status: 502,
-                        message: format!(
-                            "{}: {}",
-                            prepared.provider_name,
-                            redact_transport(&error)
-                        ),
+                        message: format!("{}: {}", member.provider_name, redact_transport(&error)),
                     });
                     continue;
                 }
             };
             if response.status().is_success() {
-                self.note_success();
-                self.clear_failure(&prepared.profile_id, &candidate.credential);
                 return Ok((
-                    UpstreamAttempt {
-                        response,
-                        target: prepared.target,
-                        passthrough: prepared.passthrough,
-                        failed_attempts,
-                    },
-                    KeyReference {
-                        id: candidate.credential.clone(),
-                    },
+                    response,
+                    member.target,
+                    member.passthrough,
+                    candidate.credential.clone(),
                 ));
             }
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
             let kind = classify_failure(status, &body);
-            self.mark_failure(&prepared.profile_id, &candidate.credential, kind);
-            failed_attempts.push(GatewayRouteAttempt {
+            self.mark_failure(&member.profile_id, &candidate.credential, kind);
+            attempts.push(GatewayRouteAttempt {
                 credential_id: candidate.credential.clone(),
                 failure: kind,
             });
@@ -1060,7 +1365,6 @@ impl ModelGatewayService {
                 break;
             }
         }
-        self.finish_attempt(prepared.probe);
         Err(last_error.unwrap_or_else(|| GatewayError::AllKeysCooling {
             model: prepared.requested_model.clone(),
             retry_after_ms: None,
@@ -1123,15 +1427,34 @@ impl ModelGatewayService {
             return;
         };
         let now = vibex_core::unix_timestamp_ms();
+        // A request that answered names the member that did; one that never
+        // reached an upstream records the first member it would have tried, so
+        // the row is still attributable to something the user can find.
+        let answered = outcome.profile_id.clone().or_else(|| {
+            prepared
+                .first_member()
+                .map(|member| member.profile_id.clone())
+        });
+        let wire_out = outcome
+            .target
+            .or_else(|| prepared.first_member().map(|member| member.target));
         let log = ModelGatewayRequestLog {
             request_id: RequestId::new(),
             agent_id: prepared.agent_id.clone(),
-            model_provider_profile_id: prepared.profile_id.clone(),
+            model_provider_profile_id: answered.clone().unwrap_or_else(|| {
+                // A request that matched no member at all has no Provider to
+                // blame; the ledger requires one, so the requested model stands
+                // in as an unreadable id.
+                ModelProviderProfileId::new()
+            }),
             credential_id: outcome.credential.clone(),
             model_requested: prepared.requested_model.clone(),
             model_served: outcome.served.clone(),
             wire_in: prepared.inbound.wire_protocol_id().to_string(),
-            wire_out: prepared.target.wire_protocol_id().to_string(),
+            wire_out: wire_out
+                .unwrap_or(WireProtocol::ChatCompletions)
+                .wire_protocol_id()
+                .to_string(),
             status: outcome.status,
             input_tokens: outcome.usage.input_tokens,
             output_tokens: outcome.usage.output_tokens,
@@ -1142,18 +1465,20 @@ impl ModelGatewayService {
             outcome: outcome.kind,
             route: Some(GatewayRouteTrace {
                 failed_attempts: outcome.failed_attempts.clone(),
-                ..GatewayRouteTrace::new(prepared.skipped_cooling, prepared.skipped_over_limit)
+                skipped_members: outcome.skipped_members.clone(),
+                ..GatewayRouteTrace::new(outcome.skipped_cooling, outcome.skipped_over_limit)
             }),
             created_at_ms: now,
         };
         let _ = ModelGatewayRequestLogRepository::insert(&connection, &log);
         if outcome.usage.total() > 0
+            && let Some(profile_id) = answered.as_ref()
             && let Ok(settings) = ModelGatewaySettingsRepository::get_or_create(&connection)
             && let Some(limit) = settings.policy.token_limit
         {
             let _ = GatewayTokenWindowRepository::record(
                 &connection,
-                &prepared.profile_id,
+                profile_id,
                 limit.window,
                 outcome.usage.total(),
                 now,
@@ -1263,13 +1588,51 @@ impl Drop for ProbeGuard<'_> {
     }
 }
 
+/// One upstream the request may call, before its Keys are planned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedMember {
+    profile: ModelProviderProfileId,
+    model: String,
+    reasoning_effort: Option<String>,
+    first_token_timeout_ms: Option<u64>,
+}
+
+/// The route id a model id names, if it names one.
+fn resolved_model_route_id(model: &str) -> Option<String> {
+    crate::route::route_id_from_model(model)
+        .flatten()
+        .map(str::to_string)
+}
+
 /// A request that has been resolved but not yet sent.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PreparedCall {
     pub inbound: WireProtocol,
+    pub requested_model: String,
+    /// The members to try, in attempt order. A direct Provider is a one-member
+    /// list; a route may hold several. Everything downstream walks this list,
+    /// so a route and a direct Provider take the same path.
+    pub members: Vec<PreparedMember>,
+    pub agent_id: Option<String>,
+    pub conversation: Option<String>,
+    pub stream: bool,
+    /// The route that produced this call, when the request named one.
+    pub route_id: Option<String>,
+    /// This request holds a degraded gateway's single probe slot and must
+    /// release it once an upstream has answered or refused.
+    pub probe: bool,
+}
+
+/// One upstream this request may call, with everything needed to call it.
+///
+/// Each member is resolved independently: it has its own endpoint, its own
+/// protocol pair, and its own Key order. Two members of one route may speak
+/// different protocols to different vendors, so nothing here can be shared.
+#[derive(Debug, Clone)]
+pub struct PreparedMember {
     pub profile_id: ModelProviderProfileId,
     pub provider_name: String,
-    pub requested_model: String,
+    /// The model id this member's upstream is asked for.
     pub model: String,
     pub target: WireProtocol,
     pub passthrough: bool,
@@ -1277,22 +1640,60 @@ pub struct PreparedCall {
     pub body: Value,
     /// Ordered attempts: the candidate and the credential record it uses.
     pub keys: Vec<(CandidateKey, ModelProviderCredentialReference)>,
-    pub agent_id: Option<String>,
-    pub conversation: Option<String>,
-    pub stream: bool,
     /// Per-credential concurrency and rate limits.
     pub limits: BTreeMap<RequestId, vibex_core::GatewayAccountLimits>,
-    /// Keys the route plan set aside before the first attempt, and why.
+    /// Keys the plan set aside before the first attempt, and why.
     pub skipped_cooling: usize,
     pub skipped_over_limit: usize,
-    /// This request holds a degraded gateway's single probe slot and must
-    /// release it once an upstream has answered or refused.
-    pub probe: bool,
+    /// Reasoning effort this member asks for, overriding the Agent's request.
+    pub reasoning_effort: Option<String>,
+    /// How long this attempt may take to produce its first token.
+    pub first_token_timeout_ms: Option<u64>,
+}
+
+impl PreparedCall {
+    /// The member that should answer first.
+    pub fn first_member(&self) -> Option<&PreparedMember> {
+        self.members.first()
+    }
+
+    /// Whether a failure on this member may move to the next one.
+    pub fn may_try_next(&self, index: usize) -> bool {
+        index + 1 < self.members.len()
+    }
+
+    /// The member belonging to a Provider, once one has answered.
+    pub fn member(&self, profile: &ModelProviderProfileId) -> Option<&PreparedMember> {
+        self.members
+            .iter()
+            .find(|member| &member.profile_id == profile)
+    }
+}
+
+impl std::fmt::Debug for PreparedCall {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedCall")
+            .field("inbound", &self.inbound)
+            .field("requested_model", &self.requested_model)
+            .field("members", &self.members.len())
+            .field("agent_id", &self.agent_id)
+            .field("route_id", &self.route_id)
+            .field("stream", &self.stream)
+            .finish()
+    }
 }
 
 /// What one finished request produced, as the ledger records it.
 pub(crate) struct RequestOutcome {
     pub kind: GatewayRequestOutcome,
+    /// The Provider that answered. Empty when nothing answered.
+    pub profile_id: Option<ModelProviderProfileId>,
+    /// The protocol the answering member was called with.
+    pub target: Option<WireProtocol>,
+    /// Keys set aside before the first attempt of the answering member.
+    pub skipped_cooling: usize,
+    pub skipped_over_limit: usize,
     pub credential: Option<RequestId>,
     pub status: Option<u16>,
     pub usage: CanonicalUsage,
@@ -1301,6 +1702,8 @@ pub(crate) struct RequestOutcome {
     pub served: Option<String>,
     /// Keys tried before the answering one, in order.
     pub failed_attempts: Vec<GatewayRouteAttempt>,
+    /// Members walked past before one answered.
+    pub skipped_members: Vec<vibex_core::GatewaySkippedMember>,
 }
 
 /// The credential a request authenticates with.
@@ -1315,8 +1718,12 @@ pub(crate) struct UpstreamAttempt {
     pub response: reqwest::Response,
     pub target: WireProtocol,
     pub passthrough: bool,
+    /// The member that answered.
+    pub profile_id: ModelProviderProfileId,
     /// Keys that did not answer before this one did.
     pub failed_attempts: Vec<GatewayRouteAttempt>,
+    /// Members walked past before this one answered.
+    pub skipped_members: Vec<vibex_core::GatewaySkippedMember>,
 }
 
 /// Chooses the protocol the upstream is called with.
@@ -1348,6 +1755,24 @@ fn choose_target(
     Err(GatewayError::TranslationDisabled {
         wire_protocol_id: inbound.wire_protocol_id().to_string(),
     })
+}
+
+/// How a member-level failure should be described in the route trace.
+///
+/// The distinction the ledger needs is "was this the Key or the whole source".
+/// An upstream error keeps its classified kind so the trace still says "rate
+/// limited" rather than a generic failure.
+fn member_failure_kind(error: &GatewayError) -> GatewayFailureKind {
+    match error {
+        GatewayError::Upstream { status, message } => classify_failure(*status, message),
+        GatewayError::AllKeysCooling { .. } => GatewayFailureKind::Rate,
+        GatewayError::TokenCeilingReached { .. } => GatewayFailureKind::Quota,
+        GatewayError::NotConfigured(_) => GatewayFailureKind::Auth,
+        GatewayError::TranslationDisabled { .. }
+        | GatewayError::UnsupportedImageReference
+        | GatewayError::MalformedRequest(_) => GatewayFailureKind::Other,
+        GatewayError::ModelNotFound { .. } | GatewayError::Internal(_) => GatewayFailureKind::Other,
+    }
 }
 
 fn agent_id_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -1487,29 +1912,65 @@ pub(crate) async fn forward(
         response,
         target,
         passthrough,
+        profile_id,
         failed_attempts,
+        skipped_members,
     } = attempt;
-    if let (Some(conversation), Some((_, credential))) =
-        (prepared.conversation.as_deref(), prepared.keys.first())
-    {
-        service.pin_conversation(conversation, &prepared.profile_id, &credential.id);
+    // The pin follows the member that actually answered, not the first one the
+    // plan preferred: a conversation that failed over must keep using the Key
+    // that worked.
+    if let (Some(conversation), Some(key)) = (prepared.conversation.as_deref(), Some(&key.id)) {
+        service.pin_conversation(conversation, &profile_id, key);
     }
+    let answered_model = prepared
+        .member(&profile_id)
+        .map(|member| member.model.clone())
+        .unwrap_or_else(|| prepared.requested_model.clone());
     let started = std::time::Instant::now();
     let mut sniffer = UsageSniffer::new(target);
     let mut buffer = SseBuffer::default();
-    let request_for_encoder = CanonicalRequest::for_model(prepared.model.clone());
+    let request_for_encoder = CanonicalRequest::for_model(answered_model.clone());
     let mut encoder: Option<Box<dyn StreamEncoder>> =
         (!passthrough).then(|| encoder(prepared.inbound, &request_for_encoder));
     let mut accumulator = ReplyAccumulator::default();
     let mut stream = response.bytes_stream();
     let mut failed = false;
     let mut last_output = std::time::Instant::now();
+    // A vendor may accept the connection and then say nothing. No error arrives,
+    // so the error-based failover never fires and the turn hangs. The first
+    // token is the deadline this route set; afterwards a slow reply is the
+    // model thinking, which is legitimate and must not be cut.
+    let first_token_deadline = prepared
+        .member(&profile_id)
+        .and_then(|member| member.first_token_timeout_ms)
+        .map(|timeout| started + std::time::Duration::from_millis(timeout));
+    let mut first_token_seen = false;
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = match first_token_deadline.filter(|_| !first_token_seen) {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(remaining, stream.next()).await {
+                    Ok(chunk) => chunk,
+                    Err(_) => {
+                        // Nothing streamed in time. The client has already
+                        // received nothing, so this is an in-stream error
+                        // rather than a silent stall.
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            None => stream.next().await,
+        };
+        let Some(chunk) = next else {
+            break;
+        };
         let Ok(chunk) = chunk else {
             failed = true;
             break;
         };
+        first_token_seen = true;
         if passthrough {
             sniffer.observe(&buffer.push(&chunk));
             if sender.send(Ok(chunk)).await.is_err() {
@@ -1645,10 +2106,21 @@ pub(crate) async fn forward(
             },
             credential: Some(key.id.clone()),
             status: Some(if failed { 502 } else { 200 }),
+            profile_id: Some(profile_id.clone()),
+            target: Some(target),
+            skipped_cooling: prepared
+                .member(&profile_id)
+                .map(|member| member.skipped_cooling)
+                .unwrap_or(0),
+            skipped_over_limit: prepared
+                .member(&profile_id)
+                .map(|member| member.skipped_over_limit)
+                .unwrap_or(0),
             usage,
             latency_ms: Some(started.elapsed().as_millis() as i64),
             served: None,
             failed_attempts,
+            skipped_members,
         },
     );
 }
@@ -1664,7 +2136,9 @@ pub(crate) async fn gather(
         response,
         target,
         passthrough,
+        profile_id,
         failed_attempts,
+        skipped_members,
     } = attempt;
     let started = std::time::Instant::now();
     let bytes = match response.bytes().await {
@@ -1677,12 +2151,17 @@ pub(crate) async fn gather(
                 prepared,
                 &RequestOutcome {
                     kind: GatewayRequestOutcome::Failed,
+                    profile_id: Some(profile_id.clone()),
+                    target: Some(target),
+                    skipped_cooling: 0,
+                    skipped_over_limit: 0,
                     credential: Some(key.id.clone()),
                     status: Some(502),
                     usage: CanonicalUsage::default(),
                     latency_ms: Some(started.elapsed().as_millis() as i64),
                     served: None,
                     failed_attempts,
+                    skipped_members,
                 },
             );
             return Err(GatewayError::Upstream {
@@ -1732,7 +2211,7 @@ pub(crate) async fn gather(
     };
     let rendered = render_response(prepared.inbound, &response)?;
     if let Some(conversation) = prepared.conversation.as_deref() {
-        service.pin_conversation(conversation, &prepared.profile_id, &key.id);
+        service.pin_conversation(conversation, &profile_id, &key.id);
     }
     service.record(
         prepared,
@@ -1744,10 +2223,21 @@ pub(crate) async fn gather(
             },
             credential: Some(key.id.clone()),
             status: Some(200),
+            profile_id: Some(profile_id.clone()),
+            target: Some(target),
+            skipped_cooling: prepared
+                .member(&profile_id)
+                .map(|member| member.skipped_cooling)
+                .unwrap_or(0),
+            skipped_over_limit: prepared
+                .member(&profile_id)
+                .map(|member| member.skipped_over_limit)
+                .unwrap_or(0),
             usage,
             latency_ms: Some(started.elapsed().as_millis() as i64),
             served: (!response.model.is_empty()).then(|| response.model.clone()),
             failed_attempts,
+            skipped_members,
         },
     );
     Ok(rendered)
@@ -1992,6 +2482,7 @@ mod tests {
             settings: ModelGatewaySettings::default(),
             upstreams: vec![left, right],
             gateway_used_tokens: 0,
+            routes: BTreeMap::new(),
         };
         let catalog = snapshot.model_catalog();
         assert_eq!(catalog.len(), 2);
