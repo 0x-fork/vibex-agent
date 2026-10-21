@@ -1284,6 +1284,55 @@ pub fn build_runtime_option_catalog(
 /// Adds the one default account owned by an Agent to an existing Provider
 /// catalog. Account sources remain visible while signed out; executable model
 /// options are emitted only from evidence for the current context revision.
+/// Adds one option per Agent-bound route that the gateway does not serve.
+///
+/// A gateway route already reaches the catalogue as a `route/<id>` entry in the
+/// gateway Profile's model list, because the Agent calls the gateway for it. A
+/// direct route does not: its whole point is bypassing the gateway, so it has no
+/// gateway model id to travel under, and it is appended here instead.
+///
+/// Without this a direct route would be visible in the route graph and selectable
+/// nowhere — the Agent could be given one but never choose it.
+pub fn append_direct_route_runtime_options(
+    catalog: &mut SessionRuntimeOptionCatalog,
+    agents: &[AgentSnapshotEntry],
+    routes: &BTreeMap<vibex_core::ModelRouteId, RuntimeRouteFacts>,
+) {
+    let agents_by_id = agents
+        .iter()
+        .filter(|agent| agent.added && agent.enabled)
+        .map(|agent| (agent.id.clone(), agent))
+        .collect::<BTreeMap<_, _>>();
+    for (route_id, facts) in routes {
+        if facts.via_gateway {
+            continue;
+        }
+        for agent_id in &facts.agent_ids {
+            let Some(agent) = agents_by_id.get(agent_id) else {
+                continue;
+            };
+            let selection =
+                SessionRuntimeSelection::model_route(agent.id.clone(), route_id.clone());
+            catalog.options.push(SessionRuntimeOption {
+                selection,
+                agent_label: bounded_catalog_label(&agent.label),
+                auth_source_label: bounded_catalog_label(&facts.display_name),
+                model_label: if facts.models.is_empty() {
+                    bounded_catalog_label(&facts.display_name)
+                } else {
+                    bounded_catalog_label(&facts.models.join(" \u{b7} "))
+                },
+                reasoning_efforts: Vec::new(),
+                modes: Vec::new(),
+                features: Vec::new(),
+                availability: RuntimeOptionAvailability::Available,
+                member_count: facts.member_count,
+                auto_routes: facts.member_count > 1,
+            });
+        }
+    }
+}
+
 pub fn append_agent_account_runtime_options(
     catalog: &mut SessionRuntimeOptionCatalog,
     agent: &AgentSnapshotEntry,
@@ -3569,5 +3618,227 @@ mod route_catalog_tests {
         let facts = route_facts("codex", "Only one", 1);
         assert_eq!(facts.member_count, 1);
         assert!(facts.member_count <= 1);
+    }
+}
+
+#[cfg(test)]
+mod selector_route_priority_tests {
+    use super::*;
+    use vibex_core::{ProviderConfiguredModel, builtin_agent_definitions};
+
+    fn agent(id: &str) -> AgentSnapshotEntry {
+        let definition = builtin_agent_definitions()
+            .into_iter()
+            .find(|definition| definition.id.as_str() == id)
+            .unwrap();
+        let mut agent = AgentSnapshotEntry::from_definition(&definition, None, None);
+        agent.added = true;
+        agent.enabled = true;
+        agent.installed = true;
+        agent.configured = true;
+        agent.config_status = AgentConfigStatus::Configured;
+        agent.runtime_status = AgentRuntimeStatus::Ready;
+        agent
+    }
+
+    fn acp_profile(agent_id: &str, models: &[&str]) -> ProviderProfileSummary {
+        ProviderProfileSummary {
+            id: vibex_core::ProviderProfileId::new(),
+            agent_id: AgentId::parse(agent_id).unwrap(),
+            kind: ProviderKind::Acp,
+            display_name: "Configured".to_string(),
+            status: ProviderProfileStatus::Enabled,
+            account_alias: None,
+            default_model: models.first().map(|model| (*model).to_string()),
+            configured_models: models
+                .iter()
+                .map(|model| ProviderConfiguredModel {
+                    id: (*model).to_string(),
+                    display_name: None,
+                    enabled: true,
+                    wire_api: None,
+                    capabilities: Default::default(),
+                })
+                .collect(),
+            secret_setup_state: vibex_core::ProviderSecretSetupState::Available,
+            launch_revision: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    /// A `route/<id>` entry becomes a route selection, not a Provider one.
+    ///
+    /// This is the priority rule: when a model id names a route, the session
+    /// selects the route. Selecting the gateway Profile instead would record a
+    /// source the reader never chose.
+    #[test]
+    fn a_route_model_id_selects_the_route() {
+        let route_id = vibex_core::ModelRouteId::new();
+        let mut profile = acp_profile("codex", &[]);
+        profile.configured_models = vec![ProviderConfiguredModel {
+            id: format!("route/{}", route_id.as_str()),
+            display_name: None,
+            enabled: true,
+            wire_api: None,
+            capabilities: Default::default(),
+        }];
+        let routes = [(
+            route_id.clone(),
+            RuntimeRouteFacts {
+                display_name: "Standard".to_string(),
+                agent_ids: vec![AgentId::parse("codex").unwrap()],
+                member_count: 2,
+                models: vec!["m".to_string()],
+                via_gateway: true,
+            },
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        // The per-Agent builder owns the option loop; the single-Agent variant
+        // only assembles summaries.
+        let catalog = build_runtime_option_catalog_for_agents(
+            &[agent("codex")],
+            &[profile],
+            &BTreeMap::new(),
+            &routes,
+        );
+        let option = catalog
+            .options
+            .first()
+            .expect("the route entry must produce an option");
+        assert_eq!(
+            option.selection.auth_source.model_route_id(),
+            Some(&route_id),
+            "a route model id must select the route"
+        );
+        assert!(option.selection.auth_source.provider_profile_id().is_none());
+        assert_eq!(option.auth_source_label, "Standard");
+    }
+
+    /// An ordinary ACP Profile keeps a Provider selection.
+    ///
+    /// This is the compatibility fallback: a Profile with no route — one with no
+    /// address, or written before routes existed — must stay selectable, or its
+    /// owner loses the configuration they can still launch.
+    #[test]
+    fn a_plain_acp_profile_keeps_a_provider_selection() {
+        let profile = acp_profile("codex", &["deepseek-chat"]);
+        let catalog = build_runtime_option_catalog_for_agents(
+            &[agent("codex")],
+            &[profile],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        let option = catalog
+            .options
+            .first()
+            .expect("a plain Profile must still produce an option");
+        assert!(
+            option.selection.auth_source.provider_profile_id().is_some(),
+            "a Profile with no route must not lose its selection"
+        );
+        assert!(option.selection.auth_source.model_route_id().is_none());
+    }
+}
+
+#[cfg(test)]
+mod direct_route_option_tests {
+    use super::*;
+    use vibex_core::builtin_agent_definitions;
+
+    fn agent(id: &str) -> AgentSnapshotEntry {
+        let definition = builtin_agent_definitions()
+            .into_iter()
+            .find(|definition| definition.id.as_str() == id)
+            .unwrap();
+        let mut agent = AgentSnapshotEntry::from_definition(&definition, None, None);
+        agent.added = true;
+        agent.enabled = true;
+        agent.installed = true;
+        agent.configured = true;
+        agent.config_status = AgentConfigStatus::Configured;
+        agent.runtime_status = AgentRuntimeStatus::Ready;
+        agent
+    }
+
+    fn facts(agent_id: &str, name: &str, via_gateway: bool) -> RuntimeRouteFacts {
+        RuntimeRouteFacts {
+            display_name: name.to_string(),
+            agent_ids: vec![AgentId::parse(agent_id).unwrap()],
+            member_count: 1,
+            models: vec!["m".to_string()],
+            via_gateway,
+        }
+    }
+
+    /// A direct route becomes a selectable option.
+    ///
+    /// It has no gateway model id to travel under, so without an explicit
+    /// append it would be drawn in the route graph and selectable nowhere.
+    #[test]
+    fn a_direct_route_is_selectable() {
+        let routes = [(
+            vibex_core::ModelRouteId::new(),
+            facts("codex", "Direct", false),
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let mut catalog =
+            build_runtime_option_catalog(&[agent("codex")], &[], &BTreeMap::new(), &routes);
+        append_direct_route_runtime_options(&mut catalog, &[agent("codex")], &routes);
+
+        let selected = catalog
+            .options
+            .iter()
+            .find(|option| option.selection.auth_source.model_route_id().is_some())
+            .expect("a direct route must be selectable");
+        assert_eq!(selected.selection.agent_id.as_str(), "codex");
+        assert_eq!(selected.model_label, "m");
+        assert!(
+            !selected.auto_routes,
+            "one source cannot fail over, and the subtitle must not claim it does"
+        );
+    }
+
+    /// A gateway route is not appended twice.
+    ///
+    /// It already arrives as a `route/<id>` entry in the gateway Profile's model
+    /// list; appending it again would show the same route as two options.
+    #[test]
+    fn a_gateway_route_is_not_duplicated() {
+        let routes = [(
+            vibex_core::ModelRouteId::new(),
+            facts("codex", "Standard", true),
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let mut catalog =
+            build_runtime_option_catalog(&[agent("codex")], &[], &BTreeMap::new(), &routes);
+        append_direct_route_runtime_options(&mut catalog, &[agent("codex")], &routes);
+        assert!(
+            catalog.options.is_empty(),
+            "a gateway route belongs to the gateway catalogue, not here"
+        );
+    }
+
+    /// A route is only offered to the Agents bound to it.
+    #[test]
+    fn a_direct_route_is_offered_only_to_its_agents() {
+        let routes = [(
+            vibex_core::ModelRouteId::new(),
+            facts("codex", "Direct", false),
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let agents = vec![agent("codex"), agent("claude")];
+        let mut catalog = build_runtime_option_catalog(&agents, &[], &BTreeMap::new(), &routes);
+        append_direct_route_runtime_options(&mut catalog, &agents, &routes);
+        let agents_with_options = catalog
+            .options
+            .iter()
+            .map(|option| option.selection.agent_id.as_str().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(agents_with_options, vec!["codex"]);
     }
 }

@@ -191,6 +191,14 @@ impl RuntimeOptionCatalogService {
             &evidence_by_profile,
             &route_facts,
         );
+        // A direct route never enters the gateway's model list, so it would be
+        // selectable nowhere without this. A gateway route is already in the
+        // catalogue under its `route/<id>` entry.
+        vibex_agent_acp::append_direct_route_runtime_options(
+            &mut catalog,
+            &agents.agents,
+            &route_facts,
+        );
         let account_fingerprints =
             self.merge_agent_account_sources(&mut catalog, &agents.agents)?;
         let agent_rank = self.agent_rank(&agents.agents);

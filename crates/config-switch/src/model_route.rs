@@ -76,6 +76,31 @@ impl ProviderConfigService {
         AgentModelRouteBindingRepository::list_for_agent(&conn, agent_id)
     }
 
+    /// Every route an Agent may select, gateway or direct.
+    ///
+    /// Separate from `gateway_model_catalog` on purpose. That one answers "what
+    /// can the gateway serve", and a direct route must never appear in it: its
+    /// whole point is not going through the gateway. This one answers "what can
+    /// this Agent pick", where both kinds belong, because both resolve to a
+    /// launchable Profile.
+    pub fn selectable_routes(
+        &self,
+        agent_id: &AgentId,
+    ) -> VibexResult<Vec<vibex_core::ModelRoute>> {
+        let conn = self.open_connection()?;
+        let bound = AgentModelRouteBindingRepository::list_for_agent(&conn, agent_id)?;
+        Ok(bound
+            .into_iter()
+            .filter_map(|binding| {
+                ModelRouteRepository::get(&conn, &binding.model_route_id)
+                    .ok()
+                    .flatten()
+            })
+            .filter(|route| route.status == vibex_core::RouteStatus::Enabled)
+            .filter(|route| !route.enabled_members().collect::<Vec<_>>().is_empty())
+            .collect())
+    }
+
     /// The legacy Profile an Agent launches through for one route.
     ///
     /// A route is not a launch contract; it describes which sources to try. The
