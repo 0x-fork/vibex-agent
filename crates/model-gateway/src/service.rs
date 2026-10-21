@@ -235,6 +235,13 @@ pub struct ModelGatewayService {
     /// When the last failure happened, so a stale count does not degrade a
     /// gateway that has simply been idle.
     last_failure_at_ms: AtomicU64,
+    /// Set while one request is being let through a degraded gateway.
+    ///
+    /// A degraded gateway is not closed: it still forwards one request at a
+    /// time so a recovered upstream can prove itself. Without that, the refusal
+    /// path could never reach an upstream, no success could be recorded, and
+    /// the state would only clear on a restart.
+    probe_in_flight: std::sync::atomic::AtomicBool,
 }
 
 struct ListenerHandle {
@@ -294,6 +301,7 @@ impl ModelGatewayService {
             shutting_down: RwLock::new(false),
             consecutive_failures: AtomicU64::new(0),
             last_failure_at_ms: AtomicU64::new(0),
+            probe_in_flight: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -596,6 +604,11 @@ impl ModelGatewayService {
     /// dead upstream cools its only Key, and every later request is refused
     /// before it can attempt anything. Counting attempts would never reach the
     /// threshold in exactly the case that matters.
+    ///
+    /// A failure observed while the gateway is already degraded only advances
+    /// the record; it never re-degrades or rewrites the notice, because
+    /// [`Self::begin_attempt`] is what decides whether an upstream is even
+    /// consulted.
     pub(crate) fn note_failure(&self) {
         let now = vibex_core::unix_timestamp_ms();
         let previous = self.last_failure_at_ms.swap(now as u64, Ordering::Relaxed) as i64;
@@ -616,7 +629,7 @@ impl ModelGatewayService {
         }
         state.status = ModelGatewayStatus::Degraded;
         state.notice = Some(
-            "Repeated upstream failures: Agents have fallen back to their direct Provider configuration."
+            "Repeated upstream failures: only one request at a time is let through until an upstream answers again."
                 .to_string(),
         );
         state.updated_at_ms = now;
@@ -627,6 +640,43 @@ impl ModelGatewayService {
     pub fn is_degraded(&self) -> bool {
         self.runtime_state().status == ModelGatewayStatus::Degraded
     }
+
+    /// Decides whether this request may consult an upstream, and claims the
+    /// probe slot when it is the one a degraded gateway lets through.
+    ///
+    /// A degraded gateway is not closed. It admits exactly one request at a
+    /// time: if that request reaches an upstream and succeeds,
+    /// [`Self::note_success`] clears the state; if it fails, the refusal keeps
+    /// every other caller on their direct Provider instead of queueing them
+    /// behind a broken upstream.
+    ///
+    /// Returns `true` when this request claimed the probe slot and must release
+    /// it with [`Self::finish_attempt`], including on every error path.
+    pub(crate) fn begin_attempt(&self) -> GatewayResult<bool> {
+        if !self.is_degraded() {
+            return Ok(false);
+        }
+        if self
+            .probe_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(GatewayError::NotConfigured(Self::STEPPED_ASIDE.to_string()));
+        }
+        Ok(true)
+    }
+
+    /// Releases the slot [`Self::begin_attempt`] may have claimed.
+    pub(crate) fn finish_attempt(&self, probe: bool) {
+        if probe {
+            self.probe_in_flight.store(false, Ordering::Release);
+        }
+    }
+
+    /// The notice and error text a degraded gateway returns to callers it is
+    /// not currently letting through. Kept in one place so the server can
+    /// recognise its own refusal and never count it as an upstream failure.
+    pub(crate) const STEPPED_ASIDE: &'static str = "the gateway stepped aside after repeated upstream failures; let one request through at a time until an upstream answers, or use the direct Provider";
 
     pub fn publish(&self, state: ModelGatewayRuntimeState) {
         if let Ok(mut guard) = self.runtime.write() {
@@ -668,12 +718,16 @@ impl ModelGatewayService {
             GatewayError::MalformedRequest("the body is not valid JSON".to_string())
         })?;
         let snapshot = self.cached_snapshot()?;
-        if self.is_degraded() {
-            return Err(GatewayError::NotConfigured(
-                "the gateway stepped aside after repeated upstream failures; use the direct Provider or retry shortly"
-                    .to_string(),
-            ));
-        }
+        // A degraded gateway still prepares and forwards one request at a time:
+        // that probe is the only way an upstream can prove it recovered, since
+        // the success that clears the breaker can only be observed upstream.
+        // The claim is held by a guard, so every early return below releases
+        // it. It is handed to `PreparedCall` only once the request is ready to
+        // be sent.
+        let mut probe = ProbeGuard {
+            service: self,
+            armed: self.begin_attempt()?,
+        };
         if let Some(limit) = snapshot.settings.policy.token_limit
             && snapshot.gateway_used_tokens >= limit.tokens
         {
@@ -821,7 +875,7 @@ impl ModelGatewayService {
 
         let upstream_stream = request.stream || !passthrough;
         let body = build_upstream_request(target, &request, &requested_model, upstream_stream)?;
-        Ok(PreparedCall {
+        let prepared = PreparedCall {
             inbound,
             profile_id,
             provider_name: upstream.display_name.clone(),
@@ -841,7 +895,11 @@ impl ModelGatewayService {
             // Key" is exactly what a later failover investigation asks for.
             skipped_cooling: plan.skipped_cooling,
             skipped_over_limit: plan.skipped_over_limit,
-        })
+            probe: probe.armed,
+        };
+        // The slot now belongs to the caller of `open_attempt`.
+        probe.armed = false;
+        Ok(prepared)
     }
 
     /// Sends one attempt, trying the prepared candidates in order until one
@@ -852,6 +910,7 @@ impl ModelGatewayService {
         prepared: &PreparedCall,
     ) -> GatewayResult<(UpstreamAttempt, KeyReference)> {
         if self.shutting_down.read().map(|flag| *flag).unwrap_or(false) {
+            self.finish_attempt(prepared.probe);
             return Err(GatewayError::NotConfigured(
                 "the gateway is shutting down".to_string(),
             ));
@@ -1001,6 +1060,7 @@ impl ModelGatewayService {
                 break;
             }
         }
+        self.finish_attempt(prepared.probe);
         Err(last_error.unwrap_or_else(|| GatewayError::AllKeysCooling {
             model: prepared.requested_model.clone(),
             retry_after_ms: None,
@@ -1055,6 +1115,10 @@ impl ModelGatewayService {
 
     /// Records one finished request in the ledger and in the token window.
     pub(crate) fn record(&self, prepared: &PreparedCall, outcome: &RequestOutcome) {
+        // Every finished request lands here, including the ones whose reply was
+        // cut. Releasing the probe first keeps a ledger write failure from
+        // wedging the one slot a degraded gateway has.
+        self.finish_attempt(prepared.probe);
         let Ok(connection) = self.connection() else {
             return;
         };
@@ -1182,6 +1246,23 @@ impl ModelGatewayService {
     }
 }
 
+/// Releases a degraded gateway's probe slot unless the request is handed on.
+///
+/// `prepare` can leave through a dozen early returns. Holding the slot in a
+/// value that releases on drop means none of them has to remember to do it.
+struct ProbeGuard<'a> {
+    service: &'a ModelGatewayService,
+    armed: bool,
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.service.finish_attempt(true);
+        }
+    }
+}
+
 /// A request that has been resolved but not yet sent.
 #[derive(Debug, Clone)]
 pub struct PreparedCall {
@@ -1204,6 +1285,9 @@ pub struct PreparedCall {
     /// Keys the route plan set aside before the first attempt, and why.
     pub skipped_cooling: usize,
     pub skipped_over_limit: usize,
+    /// This request holds a degraded gateway's single probe slot and must
+    /// release it once an upstream has answered or refused.
+    pub probe: bool,
 }
 
 /// What one finished request produced, as the ledger records it.
@@ -1719,6 +1803,73 @@ mod tests {
         assert_eq!(service.runtime_state().status, ModelGatewayStatus::Running);
         assert!(service.runtime_state().notice.is_none());
         assert_eq!(service.consecutive_failures.load(Ordering::Relaxed), 0);
+    }
+
+    /// A degraded gateway admits exactly one request at a time.
+    ///
+    /// This is what makes recovery possible at all: the single probe is the
+    /// only request that can reach an upstream and produce the success
+    /// `note_success` needs. A second caller is refused rather than queued, so
+    /// it stays on its direct Provider instead of waiting behind a broken one.
+    #[test]
+    fn a_degraded_gateway_admits_one_probe_at_a_time() {
+        let service = ModelGatewayService::new(
+            std::env::temp_dir().join("vibex-breaker-probe.db"),
+            ProviderConfigService::new(std::env::temp_dir().join("vibex-breaker-probe-db.db")),
+            GatewayLimits::default(),
+        );
+        service.publish(ModelGatewayRuntimeState::running(3425, 1));
+        for _ in 0..ModelGatewayService::DEGRADE_AFTER_FAILURES {
+            service.note_failure();
+        }
+        assert!(service.is_degraded());
+
+        // While running, every request goes through and claims nothing.
+        let running = ModelGatewayService::new(
+            std::env::temp_dir().join("vibex-breaker-running.db"),
+            ProviderConfigService::new(std::env::temp_dir().join("vibex-breaker-running-db.db")),
+            GatewayLimits::default(),
+        );
+        running.publish(ModelGatewayRuntimeState::running(3425, 1));
+        assert!(!running.begin_attempt().unwrap());
+
+        // The first caller through a degraded gateway holds the slot.
+        assert!(service.begin_attempt().unwrap());
+        // A second one is refused with the message the server must not count.
+        let refused = service.begin_attempt().unwrap_err();
+        assert!(
+            matches!(&refused, GatewayError::NotConfigured(message)
+                if message == ModelGatewayService::STEPPED_ASIDE),
+            "the refusal must be recognisable as the gateway's own, got {refused:?}"
+        );
+
+        // Releasing lets the next request probe.
+        service.finish_attempt(true);
+        assert!(service.begin_attempt().unwrap());
+        service.finish_attempt(true);
+    }
+
+    /// A probe that reaches an upstream and answers clears the state.
+    #[test]
+    fn a_successful_probe_leaves_the_degraded_state() {
+        let service = ModelGatewayService::new(
+            std::env::temp_dir().join("vibex-breaker-heal.db"),
+            ProviderConfigService::new(std::env::temp_dir().join("vibex-breaker-heal-db.db")),
+            GatewayLimits::default(),
+        );
+        service.publish(ModelGatewayRuntimeState::running(3425, 1));
+        for _ in 0..ModelGatewayService::DEGRADE_AFTER_FAILURES {
+            service.note_failure();
+        }
+        assert!(service.is_degraded());
+
+        assert!(service.begin_attempt().unwrap());
+        service.note_success();
+
+        assert!(!service.is_degraded());
+        assert_eq!(service.runtime_state().status, ModelGatewayStatus::Running);
+        // The next request is ordinary again, not a probe.
+        assert!(!service.begin_attempt().unwrap());
     }
 
     /// A failure from an unrelated outage starts the count over.

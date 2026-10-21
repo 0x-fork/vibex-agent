@@ -135,15 +135,16 @@ async fn serve(
             // what lets a dead upstream reach the threshold even after its only
             // Key has cooled.
             //
-            // The degraded refusal itself is excluded: counting it would keep
-            // the gateway degraded forever with no upstream ever consulted.
+            // The gateway's own refusals are excluded. A degraded gateway
+            // refusing a request because another one holds the probe slot never
+            // consulted an upstream, so counting it would keep the count topped
+            // up and the state would never clear.
             let refuse_means_failure = matches!(
                 error,
                 GatewayError::AllKeysCooling { .. }
                     | GatewayError::TokenCeilingReached { .. }
                     | GatewayError::Upstream { .. }
-            ) || matches!(&error, GatewayError::NotConfigured(message)
-                    if !message.contains("stepped aside"));
+            );
             if refuse_means_failure {
                 service.note_failure();
             }

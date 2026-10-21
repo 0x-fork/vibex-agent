@@ -1654,14 +1654,15 @@ async fn an_exhausted_minute_is_a_429_before_the_upstream_is_called() {
     cleanup(path);
 }
 
-/// Three consecutive unreachable upstreams degrade the gateway, and a success
-/// brings it back.
+/// Three consecutive unreachable upstreams degrade the gateway; a recovered
+/// upstream then clears the state through a single probe.
 ///
-/// A degraded gateway refuses fast with an explainable error instead of making
-/// every Agent wait out the same failure. Reporting the state is what stops a
-/// silent fallback from looking like automatic routing is still working.
+/// The contract has two halves. While degraded, the gateway admits one request
+/// at a time instead of refusing everything, because the only signal that can
+/// recover it is an upstream success. If nothing is admitted, no success can be
+/// observed and the state could only clear on a restart.
 #[tokio::test]
-async fn repeated_failures_degrade_the_gateway_and_a_success_recovers_it() {
+async fn repeated_failures_degrade_the_gateway_and_one_probe_recovers_it() {
     let path = database_path();
     // A port nothing listens on: every attempt fails to connect.
     let dead_url = {
@@ -1717,14 +1718,87 @@ async fn repeated_failures_degrade_the_gateway_and_a_success_recovers_it() {
         "a degraded gateway must say why"
     );
 
-    // A degraded gateway refuses before trying an upstream at all.
-    let refused = call(client.clone(), format!("{gateway_url}/v1/chat/completions")).await;
-    assert_eq!(
-        refused, 503,
-        "a degraded gateway must refuse rather than retry"
+    // A degraded gateway still lets exactly one request through. The upstream
+    // is dead, so that probe fails — but it is the probe that keeps recovery
+    // possible.
+    let probe = call(client.clone(), format!("{gateway_url}/v1/chat/completions")).await;
+    assert!(
+        probe >= 400,
+        "a probe against a dead upstream must fail, got {probe}"
+    );
+    assert!(
+        service.is_degraded(),
+        "a failed probe must leave the gateway degraded"
     );
 
+    // A second concurrent request cannot claim the slot the first one holds.
+    // Without an upstream to talk to, both fail; the point is that the gateway
+    // never leaves degraded on a failure.
+    let again = call(client.clone(), format!("{gateway_url}/v1/chat/completions")).await;
+    assert!(again >= 400, "the gateway must not answer from nothing");
+    assert!(service.is_degraded());
+
     gateway_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A degraded gateway recovers as soon as an upstream answers again, without a
+/// restart.
+///
+/// This is the regression the probe exists for: refusing every request while
+/// degraded meant `note_success` could never run, so the state was terminal.
+#[tokio::test]
+async fn a_degraded_gateway_recovers_when_an_upstream_answers() {
+    let path = database_path();
+    let (upstream_url, _recorder, upstream_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-test",
+    );
+    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    // Put the gateway into `Degraded` directly: the failure counting itself is
+    // covered above, and driving three dead upstreams here would only repeat it.
+    service.publish(vibex_core::ModelGatewayRuntimeState {
+        status: vibex_core::ModelGatewayStatus::Degraded,
+        notice: Some("degraded for the test".to_string()),
+        ..vibex_core::ModelGatewayRuntimeState::running(1, 1)
+    });
+    assert!(service.is_degraded());
+
+    let client = reqwest::Client::new();
+    let status = client
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": "deepseek/deepseek-chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 200, "the probe should have reached the upstream");
+    assert!(
+        !service.is_degraded(),
+        "one good answer must clear the degraded state without a restart"
+    );
+    assert_eq!(
+        service.runtime_state().status,
+        vibex_core::ModelGatewayStatus::Running
+    );
+    assert!(service.runtime_state().notice.is_none());
+
+    gateway_task.abort();
+    upstream_task.abort();
     service.shutdown().await;
     cleanup(path);
 }
