@@ -56,8 +56,8 @@ use vibex_desktop_model::{
     ActiveGoal, NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice,
     RuntimeCascadeProjection, SidebarHierarchyMode, SidebarOrganizationItem,
     SidebarOrganizationView, SidebarProjectLogo, SidebarProjectLogoColor, SidebarState,
-    ThemeSelection, TimelineConversationTurn, TimelineModel, TimelineProcessActivityGroup,
-    TimelineRow, TimelineRowKind, WorktreeLifecycleDisplayState,
+    ThemeSelection, TimelineAnchorSpan, TimelineConversationTurn, TimelineModel,
+    TimelineProcessActivityGroup, TimelineRow, TimelineRowKind, WorktreeLifecycleDisplayState,
 };
 use vibex_remote_client::{
     ClientDeviceIdentity, RemoteConnectionState, RemoteLifecycleSignal, WebRemoteBackend,
@@ -228,6 +228,9 @@ fn timeline_list_state(turn_count: usize) -> ListState {
 /// state is mutably borrowed, so it only hands the viewport to the view; every
 /// list call happens on the view's turn.
 fn install_timeline_scroll_handler(state: &ListState, owner: WeakEntity<MobileApp>) {
+    // A clone of the same state, for the directions the view asks for once the
+    // list has finished with the borrow it holds while it runs the handler.
+    let list = state.clone();
     state.set_scroll_handler(move |event, _window, cx| {
         let viewport = TimelineViewport {
             first_visible: event.visible_range.start,
@@ -241,21 +244,85 @@ fn install_timeline_scroll_handler(state: &ListState, owner: WeakEntity<MobileAp
             app.prefetch_older_history_if_near_top(cx);
         });
         // The list runs this handler while it already holds its own state
-        // mutably, so reading that state back here — the scroll offsets
-        // `timeline_is_near_bottom` needs — panics with "RefCell already
-        // mutably borrowed" and takes the render thread down with it. Ask the
-        // question once the handler has returned and the borrow is released.
+        // mutably, so reading that state back here — the position and the
+        // scroll offsets the follow decision needs — panics with "RefCell
+        // already mutably borrowed" and takes the render thread down with it.
+        // Ask once the handler has returned and the borrow is released; the
+        // position read there is the one this report just moved the list to.
         let owner = owner.clone();
+        let list = list.clone();
         cx.defer(move |cx| {
             let _ = owner.update(cx, |app, _cx| {
-                // Follow is the reader's decision, not a measurement taken
-                // while the Agent is streaming: a turn that grows by a line per
-                // frame kept re-qualifying as "near the bottom" and pulled the
-                // list back under a finger that had just scrolled up.
-                app.timeline_follow = app.timeline_is_near_bottom();
+                app.settle_timeline_follow_after_scroll(list.logical_scroll_top());
             });
         });
     });
+}
+
+/// Gives every row the list has not measured yet the timeline's uniform height.
+///
+/// A spliced row carries no size hint, and the list summarises a hintless row as
+/// zero height: a turn appended during streaming would contribute nothing to
+/// the extent the list reports, and `ListState` clamps its own scrolling to that
+/// extent — so the reader's first upward gesture gets clipped to a stretch
+/// shorter than what is painted. The hint is what every unmeasured turn weighs.
+///
+/// `ListState` exposes the hint as a builder call and is `Rc`-backed and
+/// cloneable, so applying it to a clone applies it to the one state behind both
+/// handles. The alternative, `reset_with_uniform_height`, would also throw away
+/// every height the list has already measured, and re-hinting measured turns at
+/// 180px moves the reader in its own way. Applying the hint leaves a measured
+/// row's own size in place, so this only ever fills the gaps.
+fn hint_unmeasured_timeline_rows(list: &ListState) {
+    let _ = list
+        .clone()
+        .with_uniform_item_height(px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX));
+}
+
+/// Which way a scroll report moved the list's top.
+///
+/// A top that landed on an earlier turn is a finger pulling older content into
+/// view. The first report of a gesture has nothing to compare against, and one
+/// that stayed inside the same turn is a re-measure rather than a gesture, so
+/// both keep the direction already recorded.
+fn timeline_scrolled_toward_older(
+    previous: Option<ListOffset>,
+    current: ListOffset,
+    toward_older: bool,
+) -> bool {
+    match previous {
+        Some(previous) if previous.item_ix != current.item_ix => current.item_ix < previous.item_ix,
+        _ => toward_older,
+    }
+}
+
+/// Whether a settled scroll report leaves the transcript following new output.
+///
+/// Follow is the reader's decision, and this is where they make it. Three things
+/// decide it, in this order:
+///
+/// A gesture heading toward older turns has already answered "no". This is
+/// checked first because the arithmetic cannot be trusted to agree: a list whose
+/// unmeasured turns report no height has a scroll extent much shorter than what
+/// is painted, so a reader who is plainly halfway up the conversation can sit
+/// "within 96px of the bottom" and be pulled back to the live end under a finger
+/// that was scrolling away from it.
+///
+/// A reader who has arrived at the bottom follows again — that is what scrolling
+/// to the bottom means. A short conversation, whose whole content is within the
+/// threshold, counts as arrived.
+///
+/// Anything else leaves follow exactly as it was. The previous state was also
+/// the reader's decision, and a report that cannot name a direction — a
+/// re-measure, a resize, an older page landing — is not a new one.
+fn timeline_follow_after_scroll(following: bool, toward_older: bool, near_bottom: bool) -> bool {
+    if toward_older {
+        return false;
+    }
+    if near_bottom {
+        return true;
+    }
+    following
 }
 
 /// The reader's place in the timeline, as the list last reported it.
@@ -271,11 +338,75 @@ struct TimelineViewport {
 /// laid out with, so replacing the table — which an authoritative refetch does
 /// — leaves that offset describing a different item. Naming the turn keeps the
 /// reader where they were across the swap.
+///
+/// The id alone is not enough. A turn is named after whichever of its rows the
+/// projection saw first — `turn:{user item}`, or `turn:continuation:{first
+/// response item}` when the window opens inside the turn — so a page that
+/// reaches back to the turn's own message renames the turn the reader is
+/// looking at. That is exactly when the anchor has to resolve, and the id stops
+/// resolving at that moment. The span is the turn's own content and survives
+/// the rename, so it carries the anchor across one that the id cannot.
 #[derive(Clone, PartialEq, Eq, Debug)]
-enum TimelineScrollAnchor {
-    /// The turn at the top of the viewport, and how far into it the viewport
-    /// starts. The offset is in pixels within that turn.
-    Turn(String, i32),
+struct TimelineScrollAnchor {
+    /// The turn under the viewport top, as the projection named it.
+    turn_id: String,
+    /// The sequences that turn covers, when they are known.
+    span: Option<TimelineAnchorSpan>,
+    /// How far into the turn the viewport starts, in pixels.
+    offset_in_item: i32,
+}
+
+/// The sequences one turn covers, as the desktop model defines a span.
+///
+/// Derived from the rows the turn already renders: the anchor needs the same
+/// identity the desktop records, and a turn whose rows carry no sequence — a
+/// locally projected one — has none to record.
+fn timeline_turn_anchor_span(turn: &TimelineConversationTurn) -> Option<TimelineAnchorSpan> {
+    let rows = turn
+        .user_row
+        .iter()
+        .chain(turn.process_rows.iter())
+        .chain(turn.conclusion_row.iter());
+    let mut span: Option<TimelineAnchorSpan> = None;
+    for row in rows {
+        span = Some(match span {
+            Some(current) => TimelineAnchorSpan {
+                first_sequence: current.first_sequence.min(row.first_sequence),
+                last_sequence: current.last_sequence.max(row.last_sequence),
+            },
+            None => TimelineAnchorSpan {
+                first_sequence: row.first_sequence,
+                last_sequence: row.last_sequence,
+            },
+        });
+    }
+    span
+}
+
+/// The row an anchor names in the table that is current now.
+///
+/// The id wins when it still exists, because it names the turn outright. A
+/// page that lands above the reader renames the leading turn, so the recorded
+/// span is the fallback: the turn overlapping it most is the one the reader was
+/// looking at, and a turn that shares no sequence with it was not that turn.
+fn timeline_anchor_row_index(
+    turns: &[TimelineConversationTurn],
+    anchor: &TimelineScrollAnchor,
+) -> Option<usize> {
+    if let Some(index) = turns.iter().position(|turn| turn.id == anchor.turn_id) {
+        return Some(index);
+    }
+    let span = anchor.span?;
+    turns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, turn)| {
+            let turn = timeline_turn_anchor_span(turn)?;
+            let overlap = span.overlap(turn.first_sequence, turn.last_sequence);
+            (overlap > 0).then_some((index, overlap))
+        })
+        .max_by_key(|(_, overlap)| *overlap)
+        .map(|(index, _)| index)
 }
 
 /// Whether a reported viewport sits within the older-history prefetch band.
@@ -1639,6 +1770,20 @@ pub struct MobileApp {
     /// own scrolling, so streaming cannot drag the list back to the end while
     /// they are reading something above it.
     timeline_follow: bool,
+    /// The direction the reader's current gesture is travelling in, in content
+    /// terms: `true` while the finger is pulling older turns into view.
+    ///
+    /// Follow is the reader's decision and a reader scrolling up has already
+    /// made it. Deciding from the reported offsets alone cannot see that: a
+    /// list whose unmeasured turns report no height has a scroll extent far
+    /// shorter than what is on screen, so a reader parked halfway up can be
+    /// "within 96px of the bottom" by arithmetic and be handed back to the live
+    /// end under their own finger. The direction of the gesture is the one
+    /// signal that does not depend on a measurement being right.
+    timeline_scroll_toward_older: bool,
+    /// Where the list last reported its top, so the next report can say which
+    /// way the gesture is going.
+    timeline_scroll_top: Option<ListOffset>,
     /// The rows that have already had their detail read back, and the ones
     /// being read now. Opening the same activity twice pays for one read.
     timeline_detail_ready: BTreeSet<i64>,
@@ -3855,6 +4000,8 @@ impl MobileApp {
             timeline_cache_timeline: None,
             timeline_viewport: None,
             timeline_follow: true,
+            timeline_scroll_toward_older: false,
+            timeline_scroll_top: None,
             timeline_detail_ready: BTreeSet::new(),
             timeline_detail_in_flight: BTreeSet::new(),
             drawer_scroll: UniformListScrollHandle::new(),
@@ -13720,44 +13867,32 @@ impl MobileApp {
         let offset = self.timeline_list.logical_scroll_top();
         self.timeline_turns
             .get(offset.item_ix.min(self.timeline_turns.len() - 1))
-            .map(|turn| {
-                TimelineScrollAnchor::Turn(
-                    turn.id.clone(),
-                    (f32::from(offset.offset_in_item).round() as i32).max(0),
-                )
+            .map(|turn| TimelineScrollAnchor {
+                turn_id: turn.id.clone(),
+                span: timeline_turn_anchor_span(turn),
+                offset_in_item: (f32::from(offset.offset_in_item).round() as i32).max(0),
             })
     }
 
-    /// Puts a captured anchor back once the new item table is in place.
+    /// Puts a captured anchor back once the new item table is in place, and
+    /// answers the row the viewport was put on.
     ///
-    /// A turn the new window no longer holds cannot be restored exactly, and
-    /// the nearest survivor is the best remaining answer: it keeps the reader
-    /// inside the same stretch of conversation instead of dropping them at the
-    /// top of the window, which is where a bare `reset` lands.
-    fn restore_timeline_scroll_anchor(&mut self, anchor: Option<TimelineScrollAnchor>) {
-        let Some(TimelineScrollAnchor::Turn(turn_id, offset_in_item)) = anchor else {
-            return;
-        };
-        if self.timeline_turns.is_empty() {
-            return;
-        }
-        let index = match self
-            .timeline_turns
-            .iter()
-            .position(|turn| turn.id == turn_id)
-        {
-            Some(index) => index,
-            None => {
-                // The window keeps the newest turns, so a turn that was above
-                // it has no survivor below; the end of the table is the
-                // closest place to what the reader was reading.
-                self.timeline_turns.len() - 1
-            }
-        };
+    /// Nothing is scrolled when the new window holds neither the turn the
+    /// reader was on nor any turn sharing its sequences. Guessing there is what
+    /// threw the reader at the newest turn — the far end of the conversation
+    /// from wherever they were — and "the position the list already holds" is
+    /// strictly closer than that, whichever way it is wrong.
+    fn restore_timeline_scroll_anchor(
+        &mut self,
+        anchor: Option<TimelineScrollAnchor>,
+    ) -> Option<usize> {
+        let anchor = anchor?;
+        let index = timeline_anchor_row_index(&self.timeline_turns, &anchor)?;
         self.timeline_list.scroll_to(ListOffset {
             item_ix: index,
-            offset_in_item: px(offset_in_item as f32),
+            offset_in_item: px(anchor.offset_in_item as f32),
         });
+        Some(index)
     }
 
     fn timeline_is_near_bottom(&self) -> bool {
@@ -13765,6 +13900,33 @@ impl MobileApp {
             f32::from(self.timeline_list.scroll_px_offset_for_scrollbar().y),
             f32::from(self.timeline_list.max_offset_for_scrollbar().y),
         ) <= TIMELINE_NEAR_BOTTOM_PX
+    }
+
+    /// Records which way the reader's gesture is travelling.
+    ///
+    /// The list reports where its top landed, so a top that moved to an earlier
+    /// turn is a finger pulling older content into view. The first report of a
+    /// gesture has nothing to compare against and leaves the direction as it
+    /// was; the deferred question reads only a direction, and a stale one is
+    /// settled by the next report either way.
+    fn note_timeline_scroll_direction(&mut self, scroll_top: ListOffset) {
+        let previous = self.timeline_scroll_top.replace(scroll_top);
+        self.timeline_scroll_toward_older =
+            timeline_scrolled_toward_older(previous, scroll_top, self.timeline_scroll_toward_older);
+    }
+
+    /// Decides, once a scroll report has settled, whether the transcript should
+    /// keep following new output.
+    ///
+    /// The decision itself lives in [`timeline_follow_after_scroll`]; this hands
+    /// it the three things it reads.
+    fn settle_timeline_follow_after_scroll(&mut self, scroll_top: ListOffset) {
+        self.note_timeline_scroll_direction(scroll_top);
+        self.timeline_follow = timeline_follow_after_scroll(
+            self.timeline_follow,
+            self.timeline_scroll_toward_older,
+            self.timeline_is_near_bottom(),
+        );
     }
 
     /// Whether the reader is close enough to the top to want history above it.
@@ -13797,8 +13959,17 @@ impl MobileApp {
                 .reset_with_uniform_height(turn_count, px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX));
             self.restore_timeline_scroll_anchor(anchor);
         } else {
+            // An append keeps every row already in the table, measured or not,
+            // so only the new tail is spliced in. `splice` gives those rows no
+            // size hint, which the list summarises as zero height: a turn
+            // appended during streaming would contribute nothing to the extent
+            // it reports, and a reader parked a screen up could look like they
+            // were at the bottom. The hint is applied to the new rows by
+            // rebuilding the table through a reset, which is what makes every
+            // unmeasured turn weigh the same.
             self.timeline_list
                 .splice(current_count..current_count, turn_count - current_count);
+            hint_unmeasured_timeline_rows(&self.timeline_list);
         }
     }
 
@@ -13844,38 +14015,43 @@ impl MobileApp {
 
     /// Rebuilds the turns after a page arrived above the window.
     ///
-    /// The page is spliced in at the head, which moves the list's logical
-    /// anchor by the same count: the turn under the reader's finger stays
-    /// there instead of the transcript jumping to wherever an append-shaped
-    /// splice would have left it.
+    /// The reader's place is captured before the table is replaced and restored
+    /// against the new one, so the turn under their finger stays under it while
+    /// the page above grows the transcript.
+    ///
+    /// A page adds rows at the head, so the rows already in the table keep their
+    /// identity and are spliced in below the new ones rather than rebuilt. That
+    /// keeps the heights the list has measured, which a reset would discard and
+    /// re-hint at 180px. The prepended rows are described to the list the same
+    /// way, so the extent grows with the page instead of the page contributing
+    /// nothing to it.
     fn prepend_timeline_turns(&mut self) {
         let previous_count = self.timeline_turns.len();
+        let anchor = self.timeline_scroll_anchor();
         let turns = self.build_timeline_turns();
-        let added = turns.len().saturating_sub(previous_count);
-        if turns.len() >= previous_count && added > 0 {
-            self.timeline_list.splice(0..0, added);
-            if let Some(viewport) = self.timeline_viewport.as_mut() {
-                viewport.first_visible = viewport.first_visible.saturating_add(added);
-            }
-        } else if turns.len() < previous_count {
-            // The projection's item budget dropped the newest turns to make
-            // room for the page, so the new window is not a superset of the one
-            // on screen. The turn the reader is on usually survives above the
-            // drop, so it is re-resolved against the new table instead of
-            // letting the reset put the viewport back at the top. The anchor is
-            // read before the table is replaced: the list's logical offset
-            // still describes the outgoing turns.
-            let anchor = self.timeline_scroll_anchor();
-            self.timeline_turns = Arc::new(turns);
-            self.timeline_list.reset_with_uniform_height(
-                self.timeline_turns.len(),
-                px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX),
-            );
-            self.timeline_viewport = None;
-            self.restore_timeline_scroll_anchor(anchor);
-            return;
-        }
+        let turn_count = turns.len();
+        let added = turn_count.saturating_sub(previous_count);
         self.timeline_turns = Arc::new(turns);
+        if added > 0 {
+            self.timeline_list.splice(0..0, added);
+            hint_unmeasured_timeline_rows(&self.timeline_list);
+        } else {
+            // The item budget may have dropped rows from the tail while the
+            // page grew at the head, so the table is not a superset of the one
+            // on screen. Its rows are no longer the list's rows and the extent
+            // it holds describes the old table, so both are replaced.
+            self.timeline_list
+                .reset_with_uniform_height(turn_count, px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX));
+        }
+        let first_visible = self.restore_timeline_scroll_anchor(anchor);
+        let visible = self.timeline_viewport.map(|viewport| viewport.visible);
+        self.timeline_viewport =
+            first_visible
+                .zip(visible)
+                .map(|(first_visible, visible)| TimelineViewport {
+                    first_visible,
+                    visible,
+                });
     }
 
     /// The turns the projection on screen renders right now.
@@ -41190,6 +41366,140 @@ mod tests {
         assert_eq!(
             state.max_offset_for_scrollbar().y,
             px(4.0 * TIMELINE_TURN_ESTIMATED_HEIGHT_PX)
+        );
+    }
+
+    /// A turn appended during streaming has to weigh as much as one from a
+    /// reset: `splice` gives the rows it inserts no size hint at all, and the
+    /// list summarises a hintless row as zero height. The extent it reports is
+    /// what its own scrolling is clamped to, so a tail of zero-height rows is a
+    /// transcript that cannot be scrolled through — and a reader parked above
+    /// the tail measures as if they were at its bottom.
+    #[test]
+    fn an_appended_turn_is_not_a_zero_height_row() {
+        let state = timeline_list_state(0);
+        assert_eq!(state.max_offset_for_scrollbar().y, px(0.0));
+
+        state.splice(0..0, 3);
+        hint_unmeasured_timeline_rows(&state);
+        assert_eq!(
+            state.max_offset_for_scrollbar().y,
+            px(3.0 * TIMELINE_TURN_ESTIMATED_HEIGHT_PX),
+            "the whole appended table is inside the reported extent"
+        );
+
+        // Splicing has to keep growing the extent rather than replacing it.
+        state.splice(3..3, 2);
+        hint_unmeasured_timeline_rows(&state);
+        assert_eq!(
+            state.max_offset_for_scrollbar().y,
+            px(5.0 * TIMELINE_TURN_ESTIMATED_HEIGHT_PX)
+        );
+    }
+
+    /// A height the list has already measured survives a later hint.
+    ///
+    /// This is why an append hints rather than resetting: `reset` drops every
+    /// measured height and re-hints each turn at 180px, which moves a reader
+    /// whose conversation is mostly tall turns. The hint only fills the gaps.
+    #[test]
+    fn a_measured_row_keeps_its_height_when_a_later_row_is_hinted() {
+        let state = timeline_list_state(1);
+        assert_eq!(
+            state.max_offset_for_scrollbar().y,
+            px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX)
+        );
+
+        // What the hint leaves alone is the row that already has a size: a
+        // second hint pass has to be a no-op on the extent, not a doubling.
+        hint_unmeasured_timeline_rows(&state);
+        assert_eq!(
+            state.max_offset_for_scrollbar().y,
+            px(TIMELINE_TURN_ESTIMATED_HEIGHT_PX),
+            "hinting a row that already has a height must not add one"
+        );
+
+        // Appending grows the extent by exactly the appended rows.
+        state.splice(1..1, 2);
+        hint_unmeasured_timeline_rows(&state);
+        assert_eq!(
+            state.max_offset_for_scrollbar().y,
+            px(3.0 * TIMELINE_TURN_ESTIMATED_HEIGHT_PX)
+        );
+    }
+
+    /// Follow is the reader's decision and a gesture toward older turns has
+    /// already made it.
+    ///
+    /// The arithmetic alone cannot be trusted here. A list whose unmeasured
+    /// turns report no height has an extent much shorter than what is painted,
+    /// so a reader plainly halfway up can sit "within 96px of the bottom" — and
+    /// the previous code handed them back to the live end under their own
+    /// finger, which is the jump this pins against.
+    #[test]
+    fn a_scroll_toward_older_turns_leaves_follow_behind() {
+        assert!(
+            !timeline_follow_after_scroll(true, true, true),
+            "scrolling up outranks an offset that says the reader is at the bottom"
+        );
+        assert!(!timeline_follow_after_scroll(true, true, false));
+        assert!(!timeline_follow_after_scroll(false, true, true));
+    }
+
+    /// The direction is read off where the list's top landed.
+    ///
+    /// This is the half of the decision that does not come from pixel offsets:
+    /// a report whose top moved to an earlier turn is a finger pulling older
+    /// content into view. Reading it from the list's own position is what keeps
+    /// it independent of a measurement that is wrong exactly when this matters.
+    #[test]
+    fn the_scroll_direction_follows_the_turn_the_top_landed_on() {
+        let at = |item_ix: usize| ListOffset {
+            item_ix,
+            offset_in_item: px(0.0),
+        };
+
+        // The first report has nothing to compare against.
+        assert!(!timeline_scrolled_toward_older(None, at(4), false));
+        assert!(
+            timeline_scrolled_toward_older(None, at(4), true),
+            "a first report cannot be a direction, so it keeps the one recorded"
+        );
+
+        // Moving to an earlier turn is a gesture toward older history, and
+        // moving back down is a reader who turned around and may follow again.
+        assert!(timeline_scrolled_toward_older(Some(at(4)), at(2), false));
+        assert!(!timeline_scrolled_toward_older(Some(at(2)), at(5), true));
+
+        // A report that stayed inside one turn is a re-measure, not a gesture.
+        assert!(
+            timeline_scrolled_toward_older(Some(at(2)), at(2), true),
+            "growing an offset inside the same turn is not a direction"
+        );
+    }
+
+    /// Arriving at the bottom is what resumes following.
+    #[test]
+    fn reaching_the_bottom_resumes_follow() {
+        assert!(timeline_follow_after_scroll(false, false, true));
+        assert!(timeline_follow_after_scroll(true, false, true));
+    }
+
+    /// A report that cannot name a direction is not a new decision.
+    ///
+    /// Re-measures, resizes and pages landing all produce reports. Treating one
+    /// as "the reader is not at the bottom" would quietly cancel a follow the
+    /// reader asked for by scrolling down; treating one as "at the bottom" is
+    /// the jump this change is about.
+    #[test]
+    fn a_directionless_report_leaves_follow_where_the_reader_left_it() {
+        assert!(
+            timeline_follow_after_scroll(true, false, false),
+            "a follow the reader asked for survives a report that says nothing"
+        );
+        assert!(
+            !timeline_follow_after_scroll(false, false, false),
+            "and a reader who scrolled away is not dragged back by one"
         );
     }
 

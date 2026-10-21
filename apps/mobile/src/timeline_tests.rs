@@ -786,9 +786,9 @@ fn the_open_window_is_written_for_the_runtime_that_produced_it(cx: &mut TestAppC
     });
 }
 
-/// Older history arrives above the window: the turns are spliced in at the
-/// head so the list's anchor moves with them and the reader keeps their place,
-/// and the prefetch band moves with the reader.
+/// Older history arrives above the window: the turn the reader is on stays
+/// under the viewport, and the prefetch band is derived from where that landed
+/// rather than from a count of rows pushed in at the head.
 #[gpui::test]
 fn an_older_page_prepends_without_moving_the_reader(cx: &mut TestAppContext) {
     let data_dir = tempfile::tempdir().unwrap();
@@ -836,10 +836,306 @@ fn an_older_page_prepends_without_moving_the_reader(cx: &mut TestAppContext) {
         app.prepend_timeline_turns();
         assert_eq!(app.timeline_turns.len(), 2);
         assert_eq!(app.timeline_list.item_count(), 2);
+        // The reader was on the loaded turn, which the page pushed down by one:
+        // the restore names that turn, and the band is read back from where the
+        // restore landed rather than from a count of rows added at the head.
         assert_eq!(
             app.timeline_viewport.unwrap().first_visible,
-            first_visible_before + 1,
-            "the viewport follows the content under the reader"
+            1,
+            "the viewport stays on the turn the reader was reading"
+        );
+        assert_eq!(
+            app.timeline_viewport.unwrap().visible,
+            4,
+            "the band keeps the height the list last reported"
+        );
+        cx.notify();
+    });
+    draw(cx);
+}
+
+/// A page landing above the reader renames the turn they are on, and the
+/// anchor has to survive it.
+///
+/// A turn is named after whichever of its rows the window saw first:
+/// `turn:continuation:{first response item}` while the window opens inside the
+/// turn, `turn:{user item}` once a page reaches back to the turn's own message.
+/// The rename happens exactly when older history lands, which is when the anchor
+/// is being re-resolved — so an anchor keyed only by id stops resolving at the
+/// one moment it is needed. The sequence span is the turn's own content and
+/// carries the anchor across the rename.
+#[gpui::test]
+fn an_older_page_that_renames_the_leading_turn_keeps_the_reader_on_it(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (app, _, cx) = open_timeline(cx, data_dir.path(), vec![]);
+    app.update(cx, |app, cx| {
+        let session_id = app
+            .controller
+            .as_ref()
+            .unwrap()
+            .state
+            .timeline
+            .session_id
+            .clone()
+            .unwrap();
+
+        // A window that opens inside a turn: its own message is above the cut,
+        // so the turn is named after its first response row.
+        let tail_only = vec![
+            item(
+                2,
+                TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                    text: "the answer so far".into(),
+                    is_final: false,
+                }),
+            ),
+            item(
+                3,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "a later question".into(),
+                    ..Default::default()
+                }),
+            ),
+        ];
+        app.controller
+            .as_mut()
+            .unwrap()
+            .state
+            .timeline
+            .replace_authoritative(session_id.clone(), tail_only);
+        app.rebuild_timeline_turns();
+        let renamed_from = app.timeline_turns[0].id.clone();
+        assert!(
+            renamed_from.starts_with("turn:continuation:"),
+            "the fixture has to start with the turn named after its first response row: {renamed_from}"
+        );
+
+        // The reader parks inside that turn, which is the turn a page landing
+        // above is about to rename.
+        let anchor = TimelineScrollAnchor {
+            turn_id: renamed_from.clone(),
+            span: timeline_turn_anchor_span(&app.timeline_turns[0]),
+            offset_in_item: 120,
+        };
+        assert_eq!(anchor.span.map(|span| span.first_sequence), Some(2));
+
+        // The page reaches back to the turn's own message, so the projection can
+        // finally name the turn after it.
+        let framed = vec![
+            item(
+                1,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "the original question".into(),
+                    ..Default::default()
+                }),
+            ),
+            item(
+                2,
+                TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                    text: "the answer so far".into(),
+                    is_final: false,
+                }),
+            ),
+            item(
+                3,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "a later question".into(),
+                    ..Default::default()
+                }),
+            ),
+        ];
+        app.controller
+            .as_mut()
+            .unwrap()
+            .state
+            .timeline
+            .replace_authoritative(session_id, framed);
+        app.timeline_turns = std::sync::Arc::new(app.build_timeline_turns());
+        let renamed_to = app.timeline_turns[0].id.clone();
+        assert_ne!(
+            renamed_to, renamed_from,
+            "the page has to rename the turn for this test to mean anything"
+        );
+
+        // The id alone no longer resolves; the span still does.
+        assert!(
+            app.timeline_turns
+                .iter()
+                .all(|turn| turn.id != renamed_from)
+        );
+        assert_eq!(
+            timeline_anchor_row_index(&app.timeline_turns, &anchor),
+            Some(0),
+            "the renamed turn is found by the sequences it covers"
+        );
+
+        app.timeline_list
+            .reset_with_uniform_height(app.timeline_turns.len(), px(180.0));
+        assert_eq!(
+            app.restore_timeline_scroll_anchor(Some(anchor)),
+            Some(0),
+            "the reader is put back on the turn they were reading"
+        );
+        cx.notify();
+    });
+    draw(cx);
+}
+
+/// An anchor no turn accounts for leaves the list where it is.
+///
+/// The window keeps the newest turns, so a turn the reader was on can be gone
+/// from it entirely. Jumping to the newest turn there is the far end of the
+/// conversation from where they were; leaving the position alone is strictly
+/// closer to it, whichever way it turns out to be wrong.
+#[gpui::test]
+fn an_unresolvable_anchor_does_not_jump_to_the_newest_turn(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (app, _, cx) = open_timeline(cx, data_dir.path(), vec![]);
+    app.update(cx, |app, cx| {
+        app.timeline_list
+            .reset_with_uniform_height(app.timeline_turns.len(), px(180.0));
+        app.timeline_list.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(0.0),
+        });
+        let before = app.timeline_list.logical_scroll_top().item_ix;
+
+        let gone = TimelineScrollAnchor {
+            turn_id: "turn:a-turn-the-window-dropped".into(),
+            span: Some(vibex_desktop_model::TimelineAnchorSpan {
+                first_sequence: 900,
+                last_sequence: 905,
+            }),
+            offset_in_item: 42,
+        };
+        assert_eq!(app.restore_timeline_scroll_anchor(Some(gone)), None);
+        assert_eq!(
+            app.timeline_list.logical_scroll_top().item_ix,
+            before,
+            "nothing is scrolled when the anchor names a turn the window lost"
+        );
+        cx.notify();
+    });
+    draw(cx);
+}
+
+/// A turn appended while the conversation runs still has a height.
+///
+/// `splice` inserts rows with no size hint, which the list summarises as zero
+/// height, so a turn that arrived during streaming used to leave the reported
+/// extent exactly as short as it was. The extent is what the list clamps its own
+/// scrolling to, and it is what the follow decision measures against, so a tail
+/// of heightless rows is a transcript that measures as if it ended early.
+#[gpui::test]
+fn a_turn_appended_during_a_run_grows_the_reported_extent(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (app, _, cx) = open_timeline(cx, data_dir.path(), vec![]);
+    app.update(cx, |app, cx| {
+        let before = app.timeline_list.max_offset_for_scrollbar().y;
+        let turns_before = app.timeline_list.item_count();
+
+        let session_id = app
+            .controller
+            .as_ref()
+            .unwrap()
+            .state
+            .timeline
+            .session_id
+            .clone()
+            .unwrap();
+        let mut items = app
+            .controller
+            .as_ref()
+            .unwrap()
+            .state
+            .timeline
+            .items
+            .clone();
+        // Two more turns, each opened by its own message.
+        for n in 0..2 {
+            items.push(item(
+                items.len() as i64 + 1,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: format!("later question {n}"),
+                    ..Default::default()
+                }),
+            ));
+        }
+        app.controller
+            .as_mut()
+            .unwrap()
+            .state
+            .timeline
+            .replace_authoritative(session_id, items);
+        app.rebuild_timeline_turns();
+
+        let turns_after = app.timeline_list.item_count();
+        assert!(turns_after > turns_before);
+        let added = (turns_after - turns_before) as f32;
+        assert_eq!(
+            app.timeline_list.max_offset_for_scrollbar().y,
+            before + px(added * TIMELINE_TURN_ESTIMATED_HEIGHT_PX),
+            "each appended turn has to weigh its estimate in the extent"
+        );
+        cx.notify();
+    });
+    draw(cx);
+}
+
+/// A reader dragging upward is not handed back to the live end.
+///
+/// The degenerate case this pins is the one the phone actually produces: a
+/// table whose rows carry no height reports an extent of zero, so every offset
+/// in it is "within 96px of the bottom" by arithmetic. The reader is at the top
+/// of a long conversation and the offsets say they are at the end of a short
+/// one; deciding follow from those offsets alone put them back at the live end
+/// under their own finger, which is the jump this change is about. The
+/// direction of the gesture is what tells the two apart.
+#[gpui::test]
+fn scrolling_up_does_not_resume_following_the_live_end(cx: &mut TestAppContext) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (app, _, cx) = open_timeline(
+        cx,
+        data_dir.path(),
+        (0..5)
+            .map(|n| {
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: format!("question {n}"),
+                    ..Default::default()
+                })
+            })
+            .collect(),
+    );
+    app.update(cx, |app, cx| {
+        // A table of rows with no height hint, which is what `splice` used to
+        // leave behind: the extent it reports is shorter than what is painted.
+        app.timeline_list.reset(6);
+        assert_eq!(
+            app.timeline_list.max_offset_for_scrollbar().y,
+            px(0.0),
+            "the fixture has to reproduce the extent the bug needs"
+        );
+        assert!(
+            app.timeline_is_near_bottom(),
+            "and with that extent every offset reads as the bottom"
+        );
+
+        // The reader drags upward: down the table, then back toward its head.
+        app.timeline_follow = true;
+        app.timeline_list.scroll_to(ListOffset {
+            item_ix: 4,
+            offset_in_item: px(0.0),
+        });
+        app.settle_timeline_follow_after_scroll(app.timeline_list.logical_scroll_top());
+        app.timeline_list.scroll_to(ListOffset {
+            item_ix: 1,
+            offset_in_item: px(0.0),
+        });
+        app.settle_timeline_follow_after_scroll(app.timeline_list.logical_scroll_top());
+
+        assert!(
+            !app.timeline_follow,
+            "a gesture toward older turns outranks an offset that says the bottom"
         );
         cx.notify();
     });
