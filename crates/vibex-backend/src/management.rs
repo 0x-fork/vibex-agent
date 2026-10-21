@@ -155,6 +155,44 @@ pub trait ManagementBackend: BackendBound {
 
     fn list_model_provider_profiles(&self) -> BackendFuture<'_, Vec<ModelProviderProfile>>;
 
+    /// Every reusable route.
+    fn list_model_routes(&self) -> BackendFuture<'_, Vec<vibex_core::ModelRoute>>;
+
+    /// Every Agent's route bindings, for a page that renders them all.
+    fn list_all_agent_model_route_bindings(
+        &self,
+    ) -> BackendFuture<'_, Vec<vibex_core::AgentModelRouteBinding>>;
+
+    fn create_model_route(
+        &self,
+        request: MutationRequest<vibex_core::ModelRoute>,
+    ) -> BackendFuture<'_, vibex_core::ModelRoute>;
+
+    fn update_model_route(
+        &self,
+        request: MutationRequest<vibex_core::ModelRouteUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelRoute>;
+
+    fn delete_model_route(
+        &self,
+        request: MutationRequest<vibex_core::ModelRouteDeleteRequest>,
+    ) -> BackendFuture<'_, bool>;
+
+    fn bind_agent_model_route(
+        &self,
+        request: MutationRequest<vibex_core::AgentModelRouteBindRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentModelRouteBinding>;
+
+    fn unbind_agent_model_route(
+        &self,
+        request: MutationRequest<vibex_core::AgentModelRouteUnbindRequest>,
+    ) -> BackendFuture<'_, bool>;
+
+    fn set_agent_default_model_route(
+        &self,
+        request: MutationRequest<vibex_core::AgentModelRouteDefaultRequest>,
+    ) -> BackendFuture<'_, ()>;
+
     /// The catalogue's suggestion for one model, when a catalogue is cached.
     ///
     /// This never blocks on the network: a missing or stale catalogue answers

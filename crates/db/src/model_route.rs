@@ -328,6 +328,32 @@ impl AgentModelRouteBindingRepository {
         collect_rows(rows, "agent_model_route_binding_list_failed")
     }
 
+    /// Every live binding, for a bundle that renders every Agent at once.
+    ///
+    /// One query instead of one per Agent: the Config Center groups them in
+    /// memory, and the page needs the whole set anyway.
+    pub fn list_all(conn: &Connection) -> VibexResult<Vec<AgentModelRouteBinding>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT agent_model_route_binding_id, agent_id, model_route_id, is_default,
+                    revision, created_at_ms, updated_at_ms, deleted_at_ms
+                FROM agent_model_route_bindings
+                WHERE deleted_at_ms IS NULL
+                ORDER BY agent_id ASC, is_default DESC, created_at_ms ASC
+                ",
+            )
+            .map_err(storage_err(
+                "agent_model_route_binding_list_failed",
+                "failed to list every Agent route binding",
+            ))?;
+        let rows = stmt.query_map([], map_binding).map_err(storage_err(
+            "agent_model_route_binding_list_failed",
+            "failed to list every Agent route binding",
+        ))?;
+        collect_rows(rows, "agent_model_route_binding_list_failed")
+    }
+
     /// The Agents that reference this route, for the "used by" line.
     pub fn list_for_route(
         conn: &Connection,

@@ -4368,6 +4368,15 @@ pub struct RemoteProviderManagementSnapshot {
     /// Every Agent binding, for the "used by these Agents" reverse lookup.
     #[serde(default)]
     pub agent_model_provider_bindings: Vec<crate::AgentModelProviderBinding>,
+    /// Every reusable route, with its members in attempt order.
+    ///
+    /// The Agent route graph reads this: one gateway serves all of them, so the
+    /// page draws one node and lists these beneath it.
+    #[serde(default)]
+    pub model_routes: Vec<crate::ModelRoute>,
+    /// Which routes each Agent may use, default first.
+    #[serde(default)]
+    pub agent_model_route_bindings: Vec<crate::AgentModelRouteBinding>,
     pub native_import_preview: Option<ProviderNativeImportPreview>,
     pub acp_configs: Vec<RemoteAcpProfileConfigEntry>,
     pub agent_details: Vec<RemoteManagementAgentDetail>,

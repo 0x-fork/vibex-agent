@@ -127,6 +127,16 @@ impl ProviderManagementFacade {
         self.service.list_model_provider_profiles()
     }
 
+    pub fn list_model_routes(&self) -> VibexResult<Vec<vibex_core::ModelRoute>> {
+        self.service.list_model_routes()
+    }
+
+    pub fn list_all_agent_model_route_bindings(
+        &self,
+    ) -> VibexResult<Vec<vibex_core::AgentModelRouteBinding>> {
+        self.service.list_all_agent_model_route_bindings()
+    }
+
     pub fn create_model_provider_profile(
         &self,
         request: vibex_core::ModelProviderProfileCreateRequest,

@@ -14,8 +14,9 @@ use crate::typography::code_font_weight;
 use gpui::{
     AccessibleAction, Anchor, AnyElement, App, ClickEvent, Context, DragMoveEvent, Empty, Entity,
     EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    Orientation, Rems, Render, Role, ScrollHandle, SharedString, StatefulInteractiveElement as _,
-    Subscription, Task, WeakEntity, Window, div, prelude::*, px, rems,
+    Orientation, PathBuilder, Rems, Render, Role, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Subscription, Task, WeakEntity, Window, canvas, div, point,
+    prelude::*, px, rems,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size,
@@ -558,6 +559,10 @@ struct ManagementSnapshot {
     provider_profiles: Vec<vibex_core::ProviderProfile>,
     providers: Vec<vibex_core::ModelProviderProfile>,
     provider_bindings: Vec<vibex_core::AgentModelProviderBinding>,
+    /// Every reusable route, members in attempt order.
+    model_routes: Vec<vibex_core::ModelRoute>,
+    /// Which routes each Agent may use, default first.
+    agent_model_route_bindings: Vec<vibex_core::AgentModelRouteBinding>,
     model_provider_agent_ids: BTreeSet<String>,
     acp_configs: Vec<(String, vibex_core::AcpProviderConfig)>,
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
@@ -700,13 +705,22 @@ struct AgentProviderProjectionState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ManagementMutation {
     Gateway,
+    /// Updating a route, or moving its members.
+    RouteUpdate(String),
+    RouteDelete(String),
+    /// Binding a route to the Agent, or choosing which one is its default.
+    RouteBind(String),
+    RouteDefault(String),
     ProfileCreate,
     ProfileUpdate(String),
     ProfileDelete(String),
     ProviderBind(String),
     AcpConfig(String),
     ProviderProbe(String),
-    AgentAuth { agent_id: String, action: String },
+    AgentAuth {
+        agent_id: String,
+        action: String,
+    },
     ProviderPreview(String),
     ProviderDisplayOrder(String),
     AgentToggle(String),
@@ -847,6 +861,10 @@ impl ManagementMutation {
     fn key(&self) -> String {
         match self {
             Self::Gateway => "gateway".into(),
+            Self::RouteUpdate(id) => format!("route:update:{id}"),
+            Self::RouteDelete(id) => format!("route:delete:{id}"),
+            Self::RouteBind(id) => format!("route:bind:{id}"),
+            Self::RouteDefault(id) => format!("route:default:{id}"),
             Self::ProfileCreate => "profile:create".into(),
             Self::ProfileUpdate(id) => format!("profile:update:{id}"),
             Self::ProfileDelete(id) => format!("profile:delete:{id}"),
@@ -957,6 +975,16 @@ pub struct ManagementCenter {
     providers: Vec<vibex_core::ModelProviderProfile>,
     /// Every Agent binding, for the "used by" reverse lookup.
     provider_bindings: Vec<vibex_core::AgentModelProviderBinding>,
+    /// Every reusable route, for the Agent route graph.
+    model_routes: Vec<vibex_core::ModelRoute>,
+    /// Which routes each Agent may use.
+    agent_model_route_bindings: Vec<vibex_core::AgentModelRouteBinding>,
+    /// The route whose members the graph's right column shows.
+    ///
+    /// Selection is by route, not by node: clicking the gateway says nothing
+    /// about which of its routes to expand, so the gateway node itself is not
+    /// selectable.
+    selected_route_graph_route: Option<String>,
     /// Which shared Provider the global Providers page has selected.
     selected_global_provider_id: Option<String>,
     /// The gateway's most recent requests, as the authority recorded them.
@@ -2039,6 +2067,9 @@ impl ManagementCenter {
             gateway: vibex_core::GatewaySnapshot::default(),
             providers: Vec::new(),
             provider_bindings: Vec::new(),
+            model_routes: Vec::new(),
+            agent_model_route_bindings: Vec::new(),
+            selected_route_graph_route: None,
             gateway_requests: Vec::new(),
             gateway_request_detail: None,
             gateway_limit_inputs: BTreeMap::new(),
@@ -4478,6 +4509,8 @@ impl ManagementCenter {
         self.gateway = snapshot.gateway;
         self.providers = snapshot.providers;
         self.provider_bindings = snapshot.provider_bindings;
+        self.model_routes = snapshot.model_routes;
+        self.agent_model_route_bindings = snapshot.agent_model_route_bindings;
         self.provider_profiles = snapshot.provider_profiles;
         self.provider_display_order = snapshot.provider_display_order;
         self.provider_display_order_drag_state = None;
@@ -12617,6 +12650,375 @@ impl ManagementCenter {
         }));
     }
 
+    /// Makes a route the Agent's default.
+    ///
+    /// This is the one route edit that changes what the next session uses, so
+    /// it is also the one that can require a restart: another route of the same
+    /// kind keeps the same `base_url`, a direct one does not.
+    fn set_route_graph_default(&mut self, route_id: String, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(agent_id) = self.selected_agent_id.clone() else {
+            return;
+        };
+        let Some(route_id) = vibex_core::ModelRouteId::parse(route_id).ok() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::RouteDefault(
+            route_id.as_str().to_string(),
+        ));
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let parsed_agent = match vibex_core::AgentId::parse(agent_id.clone()) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.mutation = None;
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let outcome = backend
+                .management()
+                .set_agent_default_model_route(vibex_backend::MutationRequest::new(
+                    vibex_core::AgentModelRouteDefaultRequest {
+                        agent_id: parsed_agent,
+                        model_route_id: route_id,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(()) => {
+                        this.selected_route_graph_route = None;
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    /// Binds a route to the Agent, so the graph lists it.
+    fn bind_route_graph_route(&mut self, route_id: String, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(agent_id) = self.selected_agent_id.clone() else {
+            return;
+        };
+        let Some(route_id) = vibex_core::ModelRouteId::parse(route_id).ok() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::RouteBind(route_id.as_str().to_string()));
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let parsed_agent = match vibex_core::AgentId::parse(agent_id.clone()) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.mutation = None;
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let outcome = backend
+                .management()
+                .bind_agent_model_route(vibex_backend::MutationRequest::new(
+                    vibex_core::AgentModelRouteBindRequest {
+                        agent_id: parsed_agent,
+                        model_route_id: route_id,
+                        make_default: false,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(_) => this.refresh(cx),
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    /// Removes a route from the Agent's graph. The route itself stays, because
+    /// another Agent may be using it.
+    fn unbind_route_graph_route(&mut self, route_id: String, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(agent_id) = self.selected_agent_id.clone() else {
+            return;
+        };
+        let Some(route_id) = vibex_core::ModelRouteId::parse(route_id).ok() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::RouteDelete(
+            route_id.as_str().to_string(),
+        ));
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let parsed_agent = match vibex_core::AgentId::parse(agent_id.clone()) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.mutation = None;
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let outcome = backend
+                .management()
+                .unbind_agent_model_route(vibex_backend::MutationRequest::new(
+                    vibex_core::AgentModelRouteUnbindRequest {
+                        agent_id: parsed_agent,
+                        model_route_id: route_id,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(_) => {
+                        this.selected_route_graph_route = None;
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    /// Moves one member of a route up or down.
+    ///
+    /// Reordering rewrites the whole member list, because the repository
+    /// replaces it wholesale: an order is a property of the list, not of a row.
+    fn move_route_graph_member(
+        &mut self,
+        route_id: String,
+        member_id: String,
+        up: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(route) = self
+            .model_routes
+            .iter()
+            .find(|route| route.id.as_str() == route_id)
+            .cloned()
+        else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let Some(index) = route
+            .members
+            .iter()
+            .position(|member| member.id.as_str() == member_id)
+        else {
+            return;
+        };
+        let target = if up {
+            index.checked_sub(1)
+        } else {
+            (index + 1 < route.members.len()).then_some(index + 1)
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let mut next = route.clone();
+        next.members.swap(index, target);
+        for (order, member) in next.members.iter_mut().enumerate() {
+            member.order_index = order as i64;
+        }
+        let expected_revision = route.revision;
+        let route_id_for_clear = route.id.as_str().to_string();
+        self.mutation = Some(ManagementMutation::RouteUpdate(route_id_for_clear));
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .update_model_route(vibex_backend::MutationRequest::new(
+                    vibex_core::ModelRouteUpdateRequest {
+                        route: next,
+                        expected_revision,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(_) => this.refresh(cx),
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    /// Removes one member from a route.
+    ///
+    /// A route must keep at least one member, so the last one is refused here
+    /// rather than at the service: the reader gets the reason beside the row
+    /// instead of a failed save.
+    fn remove_route_graph_member(
+        &mut self,
+        route_id: String,
+        member_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(route) = self
+            .model_routes
+            .iter()
+            .find(|route| route.id.as_str() == route_id)
+            .cloned()
+        else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        if route.members.len() <= 1 {
+            self.error = Some(
+                management_locale_text(
+                    "A route needs at least one model. Delete the route instead.",
+                    "路由至少要保留一个模型。要移除它就删掉整份路由。",
+                    "路由至少要保留一個模型。要移除它就刪掉整份路由。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let mut next = route.clone();
+        next.members
+            .retain(|member| member.id.as_str() != member_id);
+        for (order, member) in next.members.iter_mut().enumerate() {
+            member.order_index = order as i64;
+        }
+        let expected_revision = route.revision;
+        self.mutation = Some(ManagementMutation::RouteUpdate(route_id));
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .update_model_route(vibex_backend::MutationRequest::new(
+                    vibex_core::ModelRouteUpdateRequest {
+                        route: next,
+                        expected_revision,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(_) => this.refresh(cx),
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    /// Turns one member on or off without removing it.
+    fn toggle_route_graph_member(
+        &mut self,
+        route_id: String,
+        member_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(route) = self
+            .model_routes
+            .iter()
+            .find(|route| route.id.as_str() == route_id)
+            .cloned()
+        else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let mut next = route.clone();
+        let Some(member) = next
+            .members
+            .iter_mut()
+            .find(|member| member.id.as_str() == member_id)
+        else {
+            return;
+        };
+        member.enabled = !member.enabled;
+        let expected_revision = route.revision;
+        self.mutation = Some(ManagementMutation::RouteUpdate(route_id));
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .update_model_route(vibex_backend::MutationRequest::new(
+                    vibex_core::ModelRouteUpdateRequest {
+                        route: next,
+                        expected_revision,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(_) => this.refresh(cx),
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
     fn set_gateway_routing(
         &mut self,
         routing: vibex_core::GatewayRoutingStrategy,
@@ -19788,6 +20190,701 @@ impl ManagementCenter {
         }
     }
 
+    /// The Agent's route graph: every way this Agent can reach a model, on one
+    /// page.
+    ///
+    /// The middle column is the whole point. A Provider list says what exists;
+    /// this says what *this* Agent may use, in the order it would try them, and
+    /// what state each source is in right now. The gateway is one node because
+    /// there is one listener, and its routes are listed beneath it — drawing a
+    /// node per route would suggest they could be started independently.
+    fn render_agent_route_graph(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(agent_id) = self.selected_agent_id.clone() else {
+            return div().into_any_element();
+        };
+        let account = self.agent_auth_context.clone();
+        let nodes = route_graph_nodes(
+            &agent_id,
+            &self.model_routes,
+            &self.agent_model_route_bindings,
+            &self.providers,
+            &self.gateway,
+            account.as_ref(),
+        );
+        let selected = self.selected_route_graph_route.clone();
+        // The right column follows the selected route. Nothing selected yet
+        // means the Agent's default is the honest thing to show: it is what the
+        // next session would use.
+        let shown_route = selected
+            .as_deref()
+            .and_then(|id| {
+                nodes.iter().find_map(|node| match node {
+                    RouteGraphNode::Gateway { routes, .. } => {
+                        routes.iter().find(|route| route.id() == id)
+                    }
+                    RouteGraphNode::Direct(route) if route.id() == id => Some(route),
+                    _ => None,
+                })
+            })
+            .or_else(|| {
+                nodes.iter().find_map(|node| match node {
+                    RouteGraphNode::Gateway { routes, .. } => {
+                        routes.iter().find(|route| route.is_default)
+                    }
+                    RouteGraphNode::Direct(route) if route.is_default => Some(route),
+                    _ => None,
+                })
+            })
+            .cloned();
+
+        let copy_agent = management_locale_text("Agent", "Agent", "Agent");
+        let copy_path = management_locale_text("Routing", "通路", "通路");
+        let copy_target = management_locale_text("Models", "模型", "模型");
+
+        let mut middle = v_flex().w_full().min_w_0().gap_2();
+        if nodes.is_empty() {
+            middle = middle.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "This Agent has no route yet. Add one to choose which models it may use.",
+                        "这个 Agent 还没有路由。添加一份，才能选择它可以用哪些模型。",
+                        "這個 Agent 還沒有路由。新增一份，才能選擇它可以用哪些模型。",
+                    )),
+            );
+        }
+        for node in &nodes {
+            match node {
+                RouteGraphNode::Gateway {
+                    display_name,
+                    port,
+                    routes,
+                } => {
+                    let address =
+                        port.map(|port| format!("127.0.0.1:{port}"))
+                            .unwrap_or_else(|| {
+                                management_locale_text("not running", "未运行", "未執行")
+                                    .to_string()
+                            });
+                    middle = middle.child(
+                        v_flex()
+                            .id("route-graph-gateway")
+                            .w_full()
+                            .min_w_0()
+                            .gap_1()
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .p_2()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        Icon::default().path("icons/vibex/git-branch.svg").small(),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .child(display_name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(management_route_count_label(routes.len())),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(address),
+                            )
+                            .children(self.render_route_graph_entries(routes, &selected, cx)),
+                    );
+                }
+                RouteGraphNode::Direct(route) => {
+                    middle = middle.child(self.render_route_graph_direct_row(route, &selected, cx));
+                }
+                RouteGraphNode::Account {
+                    label,
+                    account_hint,
+                } => {
+                    middle = middle.child(
+                        h_flex()
+                            .id("route-graph-account")
+                            .w_full()
+                            .min_w_0()
+                            .gap_2()
+                            .items_center()
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .px_2()
+                            .py_1p5()
+                            .child(Icon::new(IconName::User).size(px(14.0)))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_sm()
+                                    .child(label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(account_hint.clone().unwrap_or_else(|| {
+                                        management_locale_text("signed out", "未登录", "未登入")
+                                            .to_string()
+                                    })),
+                            ),
+                    );
+                }
+            }
+        }
+
+        // Routes that exist but are not bound to this Agent. Listing them here
+        // is what makes a route reusable: without it, "share a route between
+        // Agents" has no surface.
+        let unbound = self.model_routes.iter().filter(|route| {
+            route.status == vibex_core::RouteStatus::Enabled
+                && !self.agent_model_route_bindings.iter().any(|binding| {
+                    binding.agent_id.as_str() == agent_id
+                        && binding.model_route_id == route.id
+                        && binding.deleted_at_ms.is_none()
+                })
+        });
+        let mut add_row = h_flex().w_full().flex_wrap().items_center().gap_1();
+        let mut unbound_count = 0usize;
+        for route in unbound {
+            unbound_count += 1;
+            if unbound_count > 4 {
+                break;
+            }
+            let id = route.id.as_str().to_string();
+            let name = route.display_name.clone();
+            add_row = add_row.child(
+                Button::new(SharedString::from(format!("route-graph-add-{id}")))
+                    .xsmall()
+                    .secondary()
+                    .label(SharedString::from(format!("+ {name}")))
+                    .disabled(self.mutation.is_some())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.bind_route_graph_route(id.clone(), cx)
+                    })),
+            );
+        }
+        if unbound_count > 0 {
+            middle = middle.child(
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .pt_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Add a route this Agent does not use yet",
+                                "添加这个 Agent 尚未使用的路由",
+                                "新增這個 Agent 尚未使用的路由",
+                            )),
+                    )
+                    .child(add_row),
+            );
+        }
+
+        let target = self.render_route_graph_target(shown_route.as_ref(), cx);
+        let agent_row = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .p_2()
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .font_semibold()
+                    .child(management_agent_label(&agent_id, &self.snapshot.agents)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_route_graph_mode_label(&nodes, cx)),
+            );
+
+        // One curve from the Agent to the paths column. It is drawn as a
+        // connector rather than as three lines, because the Agent has exactly
+        // one relationship with its routes: it picks one of them.
+        let connector_color = cx.theme().border;
+        let connector = canvas(
+            |_, _, _| (),
+            move |bounds: gpui::Bounds<gpui::Pixels>, _, window: &mut Window, _| {
+                let height = f32::from(bounds.size.height);
+                if height <= 0.0 {
+                    return;
+                }
+                let mut path = PathBuilder::stroke(px(1.0));
+                path.move_to(point(bounds.origin.x, bounds.origin.y));
+                path.cubic_bezier_to(
+                    point(
+                        bounds.origin.x + bounds.size.width,
+                        bounds.origin.y + px(height / 2.0),
+                    ),
+                    point(bounds.origin.x, bounds.origin.y + px(height / 2.0)),
+                    point(
+                        bounds.origin.x + bounds.size.width,
+                        bounds.origin.y + bounds.size.height,
+                    ),
+                );
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, connector_color);
+                }
+            },
+        )
+        .w(px(24.0))
+        .flex_none()
+        .h(px(72.0));
+
+        let body = h_flex()
+            .w_full()
+            .min_w_0()
+            .items_start()
+            .gap_2()
+            .child(
+                v_flex()
+                    .w(px(180.0))
+                    .flex_none()
+                    .gap_2()
+                    .child(management_route_column_header(copy_agent, cx))
+                    .child(agent_row),
+            )
+            .child(connector)
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .gap_2()
+                    .child(management_route_column_header(copy_path, cx))
+                    .child(middle),
+            )
+            .child(
+                v_flex()
+                    .w(px(280.0))
+                    .flex_none()
+                    .gap_2()
+                    .child(management_route_column_header(copy_target, cx))
+                    .child(target),
+            );
+
+        management_card_with_icon(
+            management_locale_text("Routing", "路由", "路由"),
+            management_locale_text(
+                "Every way this Agent can reach a model, in the order it tries them",
+                "这个 Agent 拿到模型的全部方式，以及尝试顺序",
+                "這個 Agent 拿到模型的全部方式，以及嘗試順序",
+            ),
+            "icons/vibex/git-branch.svg",
+            body.into_any_element(),
+            cx,
+        )
+    }
+
+    /// The routes under the gateway node.
+    fn render_route_graph_entries(
+        &mut self,
+        routes: &[RouteGraphRoute],
+        selected: &Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let visible = routes.len().min(ROUTE_GRAPH_VISIBLE_ROUTES);
+        let mut rows = routes[..visible]
+            .iter()
+            .map(|route| self.render_route_graph_entry(route, selected, false, cx))
+            .collect::<Vec<_>>();
+        if routes.len() > visible {
+            rows.push(
+                div()
+                    .pl(px(22.0))
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_route_overflow_label(routes.len() - visible))
+                    .into_any_element(),
+            );
+        }
+        rows
+    }
+
+    /// One route, as a row the graph can select.
+    fn render_route_graph_entry(
+        &mut self,
+        route: &RouteGraphRoute,
+        selected: &Option<String>,
+        direct: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = route.id().to_string();
+        let is_selected = selected.as_deref() == Some(id.as_str());
+        let default_badge = route.is_default.then(|| {
+            div()
+                .flex_none()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text("default", "默认", "預設"))
+        });
+        let member_summary = management_route_member_summary(route);
+        Button::new(SharedString::from(format!("route-graph-{id}")))
+            .small()
+            .ghost()
+            .w_full()
+            .px_1()
+            .justify_start()
+            .selected(is_selected)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.selected_route_graph_route = Some(id.clone());
+                cx.notify();
+            }))
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .when(direct, |this| {
+                        this.child(
+                            Icon::default()
+                                .path("icons/vibex/plug-zap.svg")
+                                .size(px(14.0)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_sm()
+                            .child(route.route.display_name.clone()),
+                    )
+                    .children(default_badge)
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(member_summary),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// A member's own controls: enable, and move within the order.
+    ///
+    /// Moving is two buttons rather than a drag: the member list is short, the
+    /// order is the whole point of the list, and a drag inside a two-column
+    /// layout competes with selecting the route.
+    fn render_route_graph_member_actions(
+        &mut self,
+        route: &RouteGraphRoute,
+        member: &RouteGraphMember,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let member_id = member.member_id.clone();
+        let enabled = member.enabled;
+        let pending = self.mutation.is_some();
+        let route_up = route.id().to_string();
+        let route_down = route.id().to_string();
+        let route_toggle = route.id().to_string();
+        let id_up = member_id.clone();
+        let id_down = member_id.clone();
+        let id_toggle = member_id.clone();
+        let mut actions = Vec::new();
+        actions.push(
+            Button::new(SharedString::from(format!(
+                "route-graph-toggle-{member_id}"
+            )))
+            .xsmall()
+            .ghost()
+            .compact()
+            .icon(IconName::Check)
+            .selected(enabled)
+            .tooltip(management_locale_text("Enabled", "已启用", "已啟用"))
+            .disabled(pending)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_route_graph_member(route_toggle.clone(), id_toggle.clone(), cx)
+            }))
+            .into_any_element(),
+        );
+        let route_remove = route.id().to_string();
+        let id_remove = member_id.clone();
+        actions.push(
+            Button::new(SharedString::from(format!(
+                "route-graph-remove-{member_id}"
+            )))
+            .xsmall()
+            .ghost()
+            .compact()
+            .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+            .tooltip(management_locale_text(
+                "Remove this model",
+                "移除这个模型",
+                "移除這個模型",
+            ))
+            .disabled(pending || route.source_count() <= 1)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.remove_route_graph_member(route_remove.clone(), id_remove.clone(), cx)
+            }))
+            .into_any_element(),
+        );
+        for (up, route_id, id, tooltip) in [
+            (
+                true,
+                route_up,
+                id_up,
+                management_locale_text("Move up", "上移", "上移"),
+            ),
+            (
+                false,
+                route_down,
+                id_down,
+                management_locale_text("Move down", "下移", "下移"),
+            ),
+        ] {
+            actions.push(
+                Button::new(SharedString::from(format!(
+                    "route-graph-move-{}{id}",
+                    if up { "up-" } else { "down-" }
+                )))
+                .xsmall()
+                .ghost()
+                .compact()
+                .icon(IconName::ArrowUp)
+                .tooltip(tooltip)
+                .disabled(pending)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.move_route_graph_member(route_id.clone(), id.clone(), up, cx)
+                }))
+                .into_any_element(),
+            );
+        }
+        actions
+    }
+
+    /// The per-route actions the graph offers beside a selected route.
+    ///
+    /// They are shown only for the selected route: a row of buttons on every
+    /// route would turn a choice into a toolbar, and the thing the reader is
+    /// doing is choosing.
+    fn render_route_graph_actions(
+        &mut self,
+        route: &RouteGraphRoute,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let id_for_default = route.id().to_string();
+        let id_for_unbind = route.id().to_string();
+        let is_default = route.is_default;
+        h_flex()
+            .w_full()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .pt_1()
+            .when(!is_default, |this| {
+                this.child(
+                    Button::new(SharedString::from(format!(
+                        "route-graph-default-{}",
+                        route.id()
+                    )))
+                    .xsmall()
+                    .ghost()
+                    .label(management_locale_text(
+                        "Make default",
+                        "设为默认",
+                        "設為預設",
+                    ))
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_route_graph_default(id_for_default.clone(), cx)
+                    })),
+                )
+            })
+            .child(
+                Button::new(SharedString::from(format!(
+                    "route-graph-unbind-{}",
+                    route.id()
+                )))
+                .xsmall()
+                .ghost()
+                .label(management_locale_text(
+                    "Remove from this Agent",
+                    "从这个 Agent 移除",
+                    "從這個 Agent 移除",
+                ))
+                .disabled(pending)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.unbind_route_graph_route(id_for_unbind.clone(), cx)
+                })),
+            )
+            .into_any_element()
+    }
+
+    /// A direct route, drawn at the same level as the gateway rather than under
+    /// it: it never passes through the gateway, so nesting it would be a lie.
+    fn render_route_graph_direct_row(
+        &mut self,
+        route: &RouteGraphRoute,
+        selected: &Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_route_graph_entry(route, selected, true, cx)
+    }
+
+    /// The right column: the members of the selected route.
+    fn render_route_graph_target(
+        &mut self,
+        route: Option<&RouteGraphRoute>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(route) = route else {
+            return div()
+                .w_full()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text(
+                    "Select a route to see its models",
+                    "选择一份路由，查看它的模型",
+                    "選擇一份路由，查看它的模型",
+                ))
+                .into_any_element();
+        };
+        let mut rows = v_flex().w_full().min_w_0().gap_1();
+        let visible = route.members.len().min(ROUTE_GRAPH_VISIBLE_MEMBERS);
+        for member in &route.members[..visible] {
+            let (state_text, state_color) = match member.state() {
+                RouteGraphMemberState::Ready => (
+                    management_locale_text("ready", "就绪", "就緒").to_string(),
+                    cx.theme().success,
+                ),
+                RouteGraphMemberState::Cooling(count) => {
+                    (management_route_cooling_label(count), cx.theme().warning)
+                }
+                RouteGraphMemberState::Invalid(count) => {
+                    (management_route_invalid_label(count), cx.theme().danger)
+                }
+                RouteGraphMemberState::NoKeys => (
+                    management_locale_text("no key", "没有 Key", "沒有 Key").to_string(),
+                    cx.theme().muted_foreground,
+                ),
+            };
+            rows = rows.child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(cx.theme().border.opacity(0.7))
+                    .px_2()
+                    .py_1()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .child(member.model_id.clone()),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(member.provider_name.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(state_color)
+                            .child(state_text),
+                    )
+                    .children(self.render_route_graph_member_actions(route, member, cx)),
+            );
+        }
+        if route.members.len() > visible {
+            rows = rows.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_route_member_overflow_label(
+                        route.members.len() - visible,
+                    )),
+            );
+        }
+        if route.members.len() > 1 {
+            rows = rows.child(
+                div()
+                    .pt_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_route_strategy_label(route.route.strategy)),
+            );
+        }
+        // Switching between gateway routes keeps the same loopback address, so
+        // the Agent keeps running. Switching to or from a direct route changes
+        // the address it launches with, which restarts it — the reader needs to
+        // know that before clicking, not after the conversation drops.
+        let restart_cost = route.route.kind == vibex_core::RouteKind::Direct;
+        rows = rows.child(
+            div()
+                .pt_1()
+                .text_xs()
+                .text_color(if restart_cost {
+                    cx.theme().warning
+                } else {
+                    cx.theme().muted_foreground
+                })
+                .child(if restart_cost {
+                    management_locale_text(
+                        "Switching to or from a direct route restarts this Agent.",
+                        "切换到或切离直连路由会重启这个 Agent。",
+                        "切換到或切離直連路由會重新啟動這個 Agent。",
+                    )
+                    .to_string()
+                } else {
+                    management_locale_text(
+                        "Switching between gateway routes does not restart the Agent.",
+                        "在网关路由之间切换不会重启 Agent。",
+                        "在閘道路由之間切換不會重新啟動 Agent。",
+                    )
+                    .to_string()
+                }),
+        );
+        rows = rows.child(self.render_route_graph_actions(route, cx));
+        rows.into_any_element()
+    }
+
     fn render_agent_authentication(
         &mut self,
         window: &mut Window,
@@ -21818,6 +22915,7 @@ impl ManagementCenter {
             provider_configuration,
             cx,
         );
+        let route_graph = self.render_agent_route_graph(cx);
         let authentication = self.render_agent_authentication(window, cx);
 
         v_flex()
@@ -21826,6 +22924,10 @@ impl ManagementCenter {
             .gap_4()
             .child(agent_header)
             .child(installation)
+            // Routing sits before the Provider card: the question this page is
+            // usually opened for is "which model will this Agent use", and that
+            // is a routing answer, not a Provider-listing one.
+            .child(route_graph)
             .child(authentication)
             .child(provider_configuration)
             .into_any_element()
@@ -27114,6 +28216,377 @@ fn parse_optional_limit(value: &str) -> Result<Option<u32>, &'static str> {
 /// never collide with one.
 const GATEWAY_ROW_ID: &str = "gateway";
 
+/// One node in an Agent's route graph.
+///
+/// The graph has three kinds of node and only two of them are records. A
+/// gateway is a single listener every gateway route shares; a direct route is
+/// one Provider; an account is the Agent's own sign-in, which has no route row
+/// because its destination is an auth context, not a Provider.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum RouteGraphNode {
+    /// The one gateway, with the routes it serves.
+    Gateway {
+        display_name: String,
+        /// Absent when the listener is not running.
+        port: Option<u16>,
+        routes: Vec<RouteGraphRoute>,
+    },
+    /// A route that names one Provider and skips the gateway.
+    Direct(RouteGraphRoute),
+    /// The Agent's own account.
+    Account {
+        label: String,
+        /// The account name the Agent reported, when it reported one.
+        account_hint: Option<String>,
+    },
+}
+
+/// One route as the graph draws it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct RouteGraphRoute {
+    route: vibex_core::ModelRoute,
+    /// The members that can still answer, in attempt order.
+    members: Vec<RouteGraphMember>,
+    /// The models this route offers, deduplicated.
+    models: Vec<String>,
+    /// Whether this route is the Agent's default.
+    is_default: bool,
+}
+
+impl RouteGraphRoute {
+    fn id(&self) -> &str {
+        self.route.id.as_str()
+    }
+
+    /// How many sources back this route.
+    fn source_count(&self) -> usize {
+        self.members.len()
+    }
+}
+
+/// One member of a route, with what the graph says about it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct RouteGraphMember {
+    provider_name: String,
+    model_id: String,
+    /// Whether the route still routes to this member.
+    enabled: bool,
+    /// The route member row this describes, so an action addresses it directly.
+    member_id: String,
+    /// The Key states that can still answer.
+    ready_keys: usize,
+    cooling_keys: usize,
+    invalid_keys: usize,
+}
+
+impl RouteGraphMember {
+    /// The one-line state the graph appends to a member.
+    fn state(&self) -> RouteGraphMemberState {
+        if self.ready_keys > 0 {
+            RouteGraphMemberState::Ready
+        } else if self.cooling_keys > 0 {
+            RouteGraphMemberState::Cooling(self.cooling_keys)
+        } else if self.invalid_keys > 0 {
+            RouteGraphMemberState::Invalid(self.invalid_keys)
+        } else {
+            RouteGraphMemberState::NoKeys
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RouteGraphMemberState {
+    Ready,
+    Cooling(usize),
+    Invalid(usize),
+    NoKeys,
+}
+
+/// How many routes the graph lists before folding the rest away.
+///
+/// The middle column answers "which one do I pick", so it stays short; a route
+/// list long enough to scroll is a list, and reading it is what the Providers
+/// page is for.
+const ROUTE_GRAPH_VISIBLE_ROUTES: usize = 5;
+/// How many members a route draws before folding the rest away.
+const ROUTE_GRAPH_VISIBLE_MEMBERS: usize = 8;
+
+/// Builds the nodes an Agent's route graph draws, in reading order.
+///
+/// The order is fixed: the gateway first because it is shared machinery, then
+/// the direct routes, then the account. A node the Agent cannot use is still
+/// returned — the graph explains why it is unavailable rather than hiding it,
+/// because "there is nothing else" and "the other thing is broken" are
+/// different answers.
+fn route_graph_nodes(
+    agent_id: &str,
+    routes: &[vibex_core::ModelRoute],
+    bindings: &[vibex_core::AgentModelRouteBinding],
+    providers: &[vibex_core::ModelProviderProfile],
+    gateway: &vibex_core::GatewaySnapshot,
+    account: Option<&vibex_core::AgentAuthContext>,
+) -> Vec<RouteGraphNode> {
+    let bound = bindings
+        .iter()
+        .filter(|binding| binding.agent_id.as_str() == agent_id && binding.deleted_at_ms.is_none())
+        .collect::<Vec<_>>();
+    let bound_route = |route_id: &vibex_core::ModelRouteId| {
+        bound
+            .iter()
+            .find(|binding| &binding.model_route_id == route_id)
+            .copied()
+    };
+
+    let to_graph = |route: &vibex_core::ModelRoute| RouteGraphRoute {
+        route: route.clone(),
+        members: route
+            .enabled_members()
+            .filter_map(|member| {
+                let profile = providers.iter().find(|profile| {
+                    profile.id == member.model_provider_profile_id
+                        && profile.status == vibex_core::ModelProviderProfileStatus::Enabled
+                })?;
+                let keys = gateway
+                    .upstreams
+                    .iter()
+                    .find(|upstream| upstream.model_provider_profile_id == profile.id)
+                    .map(|upstream| upstream.keys.as_slice())
+                    .unwrap_or(&[]);
+                Some(RouteGraphMember {
+                    provider_name: profile.display_name.clone(),
+                    model_id: member.model_id.clone(),
+                    enabled: member.enabled,
+                    member_id: member.id.as_str().to_string(),
+                    ready_keys: keys.iter().filter(|key| key.state.is_ready()).count(),
+                    cooling_keys: keys
+                        .iter()
+                        .filter(|key| {
+                            matches!(key.state, vibex_core::GatewayKeyState::Cooling { .. })
+                        })
+                        .count(),
+                    invalid_keys: keys
+                        .iter()
+                        .filter(|key| key.state == vibex_core::GatewayKeyState::Invalid)
+                        .count(),
+                })
+            })
+            .collect(),
+        models: route
+            .distinct_models()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        is_default: bound_route(&route.id).is_some_and(|binding| binding.is_default),
+    };
+
+    let mut nodes = Vec::new();
+    // The gateway holds every gateway route this Agent may use, whether or not
+    // it is running: a stopped listener still has routes, and the graph says so
+    // instead of making them vanish.
+    let gateway_routes = bound
+        .iter()
+        .filter_map(|binding| {
+            routes.iter().find(|route| {
+                route.id == binding.model_route_id
+                    && route.status == vibex_core::RouteStatus::Enabled
+                    && route.kind == vibex_core::RouteKind::Gateway
+            })
+        })
+        .map(&to_graph)
+        .collect::<Vec<_>>();
+    if !gateway_routes.is_empty() {
+        nodes.push(RouteGraphNode::Gateway {
+            display_name: gateway.settings.display_name.clone(),
+            port: gateway.runtime.port,
+            routes: gateway_routes,
+        });
+    }
+
+    let direct = bound
+        .iter()
+        .filter_map(|binding| {
+            routes.iter().find(|route| {
+                route.id == binding.model_route_id
+                    && route.status == vibex_core::RouteStatus::Enabled
+                    && route.kind == vibex_core::RouteKind::Direct
+            })
+        })
+        .map(&to_graph)
+        .collect::<Vec<_>>();
+    nodes.extend(direct.into_iter().map(RouteGraphNode::Direct));
+
+    if let Some(account) = account {
+        nodes.push(RouteGraphNode::Account {
+            label: vibex_core::AGENT_ACCOUNT_LABEL.to_string(),
+            account_hint: account.account_hint.clone(),
+        });
+    }
+    nodes
+}
+
+/// A graph column's heading.
+fn management_route_column_header(
+    label: &'static str,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    div()
+        .text_xs()
+        .font_semibold()
+        .text_color(cx.theme().muted_foreground)
+        .child(label)
+        .into_any_element()
+}
+
+/// `s` for anything but one, so a count reads as a sentence.
+fn management_route_plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+/// The Agent's own label, falling back to its id when the roster has no row.
+fn management_agent_label(agent_id: &str, agents: &[vibex_core::AgentSnapshotEntry]) -> String {
+    agents
+        .iter()
+        .find(|agent| agent.id.as_str() == agent_id)
+        .map(|agent| agent.label.clone())
+        .unwrap_or_else(|| agent_id.to_string())
+}
+
+/// How many routes the gateway node serves.
+fn management_route_count_label(count: usize) -> String {
+    match locale::current_locale() {
+        ResolvedLocale::ZhCn => format!("{count} 份路由"),
+        ResolvedLocale::ZhTw => format!("{count} 份路由"),
+        ResolvedLocale::En => format!("{count} route{}", management_route_plural(count)),
+    }
+}
+
+/// "3 sources · 2 models", or just the sources when they agree.
+///
+/// A member is a `(Provider, model)` pair, so one model at three Providers is
+/// three sources and one model. Saying which is which stops the reader from
+/// thinking they have three models.
+fn management_route_member_summary(route: &RouteGraphRoute) -> String {
+    let sources = route.source_count();
+    let models = route.models.len();
+    match locale::current_locale() {
+        ResolvedLocale::ZhCn | ResolvedLocale::ZhTw => {
+            if sources == models {
+                format!("{sources} 个来源")
+            } else {
+                format!("{sources} 个来源 · {models} 个模型")
+            }
+        }
+        ResolvedLocale::En => {
+            if sources == models {
+                format!("{sources} source{}", management_route_plural(sources))
+            } else {
+                format!(
+                    "{sources} source{} · {models} model{}",
+                    management_route_plural(sources),
+                    management_route_plural(models)
+                )
+            }
+        }
+    }
+}
+
+fn management_route_cooling_label(count: usize) -> String {
+    match locale::current_locale() {
+        ResolvedLocale::ZhCn => format!("{count} 个冷却中"),
+        ResolvedLocale::ZhTw => format!("{count} 個冷卻中"),
+        ResolvedLocale::En => format!("{count} cooling"),
+    }
+}
+
+fn management_route_invalid_label(count: usize) -> String {
+    match locale::current_locale() {
+        ResolvedLocale::ZhCn => format!("{count} 个已失效"),
+        ResolvedLocale::ZhTw => format!("{count} 個已失效"),
+        ResolvedLocale::En => format!("{count} invalid"),
+    }
+}
+
+fn management_route_overflow_label(hidden: usize) -> String {
+    match locale::current_locale() {
+        ResolvedLocale::ZhCn => format!("还有 {hidden} 份路由"),
+        ResolvedLocale::ZhTw => format!("還有 {hidden} 份路由"),
+        ResolvedLocale::En => format!("{hidden} more route{}", management_route_plural(hidden)),
+    }
+}
+
+fn management_route_member_overflow_label(hidden: usize) -> String {
+    match locale::current_locale() {
+        ResolvedLocale::ZhCn => format!("还有 {hidden} 个成员"),
+        ResolvedLocale::ZhTw => format!("還有 {hidden} 個成員"),
+        ResolvedLocale::En => format!("{hidden} more member{}", management_route_plural(hidden)),
+    }
+}
+
+fn management_route_strategy_label(strategy: vibex_core::RouteStrategy) -> String {
+    let label = match (strategy, locale::current_locale()) {
+        (vibex_core::RouteStrategy::Ordered, ResolvedLocale::En) => "in order",
+        (vibex_core::RouteStrategy::Ordered, ResolvedLocale::ZhCn) => "按顺序",
+        (vibex_core::RouteStrategy::Ordered, ResolvedLocale::ZhTw) => "按順序",
+        (vibex_core::RouteStrategy::RoundRobin, ResolvedLocale::En) => "rotate",
+        (vibex_core::RouteStrategy::RoundRobin, ResolvedLocale::ZhCn) => "轮换",
+        (vibex_core::RouteStrategy::RoundRobin, ResolvedLocale::ZhTw) => "輪換",
+        (vibex_core::RouteStrategy::LeastUsed, ResolvedLocale::En) => "least used",
+        (vibex_core::RouteStrategy::LeastUsed, ResolvedLocale::ZhCn) => "用得最少",
+        (vibex_core::RouteStrategy::LeastUsed, ResolvedLocale::ZhTw) => "用得最少",
+    };
+    label.to_string()
+}
+
+/// The one line that says how this Agent reaches a model.
+///
+/// The graph shows every path, so the line names the one in effect rather than
+/// repeating the whole set: "gateway" when a gateway route is the default, the
+/// route's own name when a direct one is.
+fn management_route_graph_mode_label(
+    nodes: &[RouteGraphNode],
+    cx: &mut Context<ManagementCenter>,
+) -> String {
+    let _ = cx;
+    for node in nodes {
+        match node {
+            RouteGraphNode::Gateway {
+                display_name,
+                routes,
+                ..
+            } => {
+                if let Some(route) = routes.iter().find(|route| route.is_default) {
+                    return match locale::current_locale() {
+                        ResolvedLocale::ZhCn => {
+                            format!("当前：{}（走网关）", route.route.display_name)
+                        }
+                        ResolvedLocale::ZhTw => {
+                            format!("目前：{}（走閘道）", route.route.display_name)
+                        }
+                        ResolvedLocale::En => {
+                            format!("Current: {} (via {display_name})", route.route.display_name)
+                        }
+                    };
+                }
+            }
+            RouteGraphNode::Direct(route) if route.is_default => {
+                return match locale::current_locale() {
+                    ResolvedLocale::ZhCn => format!("当前：{}（直连）", route.route.display_name),
+                    ResolvedLocale::ZhTw => format!("目前：{}（直連）", route.route.display_name),
+                    ResolvedLocale::En => {
+                        format!("Current: {} (direct)", route.route.display_name)
+                    }
+                };
+            }
+            _ => {}
+        }
+    }
+    match locale::current_locale() {
+        ResolvedLocale::ZhCn => "当前：没有路由".to_string(),
+        ResolvedLocale::ZhTw => "目前：沒有路由".to_string(),
+        ResolvedLocale::En => "Current: no route".to_string(),
+    }
+}
+
 /// One row of the global Providers page.
 #[derive(Clone)]
 struct SharedProviderRow {
@@ -31370,6 +32843,8 @@ async fn load_snapshot(
         .unwrap_or_else(unreported_gateway_snapshot);
     let shared_providers = bundle.model_provider_profiles;
     let provider_bindings = bundle.agent_model_provider_bindings;
+    let model_routes = bundle.model_routes;
+    let agent_model_route_bindings = bundle.agent_model_route_bindings;
     let native_import_preview = bundle.native_import_preview;
     let acp_configs = bundle
         .acp_configs
@@ -31458,6 +32933,8 @@ async fn load_snapshot(
         gateway,
         providers: shared_providers,
         provider_bindings,
+        model_routes,
+        agent_model_route_bindings,
     })
 }
 
@@ -37106,5 +38583,330 @@ mod gateway_surface_tests {
         // The detail is a reading of one row; it must not offer a mutation.
         assert!(!detail.contains("Button::new"));
         assert!(!detail.contains("on_click"));
+    }
+}
+
+#[cfg(test)]
+mod route_graph_tests {
+    use super::*;
+
+    fn route(name: &str, kind: vibex_core::RouteKind, models: &[&str]) -> vibex_core::ModelRoute {
+        let provider = vibex_core::ModelProviderProfileId::new();
+        vibex_core::ModelRoute {
+            display_name: name.to_string(),
+            kind,
+            status: vibex_core::RouteStatus::Enabled,
+            members: models
+                .iter()
+                .enumerate()
+                .map(|(index, model)| {
+                    vibex_core::ModelRouteMember::new(provider.clone(), *model, index as i64)
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn bound(
+        agent: &str,
+        route: &vibex_core::ModelRoute,
+        is_default: bool,
+    ) -> vibex_core::AgentModelRouteBinding {
+        let mut binding = vibex_core::AgentModelRouteBinding::new(
+            vibex_core::AgentId::parse(agent).unwrap(),
+            route.id.clone(),
+        );
+        binding.is_default = is_default;
+        binding
+    }
+
+    fn provider_for(route: &vibex_core::ModelRoute) -> Vec<vibex_core::ModelProviderProfile> {
+        route
+            .members
+            .iter()
+            .map(|member| vibex_core::ModelProviderProfile {
+                id: member.model_provider_profile_id.clone(),
+                display_name: "DeepSeek".to_string(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: member.model_id.clone(),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities: Default::default(),
+                }],
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn gateway(port: Option<u16>) -> vibex_core::GatewaySnapshot {
+        vibex_core::GatewaySnapshot {
+            settings: vibex_core::ModelGatewaySettings {
+                display_name: "Vibex Gateway".to_string(),
+                ..Default::default()
+            },
+            runtime: match port {
+                Some(port) => vibex_core::ModelGatewayRuntimeState::running(port, 1),
+                None => vibex_core::ModelGatewayRuntimeState::default(),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Three routes under one gateway draw as one node with three entries.
+    ///
+    /// This is the shape the design asks for: one listener serves every
+    /// gateway route, so a node per route would claim an independence the
+    /// runtime does not have.
+    #[test]
+    fn three_gateway_routes_are_one_node_with_three_entries() {
+        let routes = vec![
+            route("Standard", vibex_core::RouteKind::Gateway, &["m"]),
+            route("Long context", vibex_core::RouteKind::Gateway, &["m"]),
+            route("Cheap", vibex_core::RouteKind::Gateway, &["m"]),
+        ];
+        let bindings = routes
+            .iter()
+            .map(|route| bound("codex", route, false))
+            .collect::<Vec<_>>();
+        let providers = routes.iter().flat_map(provider_for).collect::<Vec<_>>();
+
+        let nodes = route_graph_nodes(
+            "codex",
+            &routes,
+            &bindings,
+            &providers,
+            &gateway(Some(3425)),
+            None,
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| matches!(node, RouteGraphNode::Gateway { .. }))
+                .count(),
+            1,
+            "one gateway, however many routes it serves"
+        );
+        match &nodes[0] {
+            RouteGraphNode::Gateway { routes, port, .. } => {
+                assert_eq!(routes.len(), 3, "all three are listed under it");
+                assert_eq!(*port, Some(3425));
+            }
+            other => panic!("expected the gateway node first, got {other:?}"),
+        }
+    }
+
+    /// A direct route is a sibling of the gateway, not a child of it.
+    #[test]
+    fn a_direct_route_is_not_nested_under_the_gateway() {
+        let gateway_route = route("Standard", vibex_core::RouteKind::Gateway, &["m"]);
+        let direct_route = route("Direct", vibex_core::RouteKind::Direct, &["m"]);
+        let bindings = vec![
+            bound("codex", &gateway_route, true),
+            bound("codex", &direct_route, false),
+        ];
+        let providers = provider_for(&gateway_route)
+            .into_iter()
+            .chain(provider_for(&direct_route))
+            .collect::<Vec<_>>();
+
+        let nodes = route_graph_nodes(
+            "codex",
+            &[gateway_route, direct_route],
+            &bindings,
+            &providers,
+            &gateway(Some(3425)),
+            None,
+        );
+        assert_eq!(nodes.len(), 2);
+        assert!(matches!(nodes[0], RouteGraphNode::Gateway { .. }));
+        assert!(
+            matches!(nodes[1], RouteGraphNode::Direct(_)),
+            "a direct route sits beside the gateway, because it never enters it"
+        );
+    }
+
+    /// The account is drawn last, and only when the Agent has one.
+    #[test]
+    fn an_account_is_drawn_after_the_routes() {
+        let only = route("Standard", vibex_core::RouteKind::Gateway, &["m"]);
+        let bindings = vec![bound("codex", &only, true)];
+        let providers = provider_for(&only);
+        let account = vibex_core::AgentAuthContext {
+            id: vibex_core::AgentAuthContextId::new(),
+            agent_id: vibex_core::AgentId::parse("codex").unwrap(),
+            status: vibex_core::AgentAuthContextStatus::Authenticated,
+            account_hint: Some("pro@example.test".to_string()),
+            authenticated_via_method: None,
+            revision: 1,
+            last_verified_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+
+        let nodes = route_graph_nodes(
+            "codex",
+            std::slice::from_ref(&only),
+            &bindings,
+            &providers,
+            &gateway(Some(3425)),
+            Some(&account),
+        );
+        assert_eq!(nodes.len(), 2);
+        match nodes.last() {
+            Some(RouteGraphNode::Account { account_hint, .. }) => {
+                assert_eq!(
+                    account_hint.as_deref(),
+                    Some("pro@example.test"),
+                    "the graph names the account, not a generic label"
+                );
+            }
+            other => panic!("expected the account last, got {other:?}"),
+        }
+
+        // Without an account the node is absent rather than empty.
+        let nodes = route_graph_nodes(
+            "codex",
+            std::slice::from_ref(&only),
+            &bindings,
+            &providers,
+            &gateway(Some(3425)),
+            None,
+        );
+        assert_eq!(nodes.len(), 1);
+    }
+
+    /// A route bound to another Agent does not appear.
+    #[test]
+    fn only_this_agents_routes_are_drawn() {
+        let mine = route("Mine", vibex_core::RouteKind::Gateway, &["m"]);
+        let theirs = route("Theirs", vibex_core::RouteKind::Gateway, &["m"]);
+        let bindings = vec![bound("codex", &mine, true), bound("claude", &theirs, true)];
+        let providers = provider_for(&mine)
+            .into_iter()
+            .chain(provider_for(&theirs))
+            .collect::<Vec<_>>();
+
+        let nodes = route_graph_nodes(
+            "codex",
+            &[mine, theirs],
+            &bindings,
+            &providers,
+            &gateway(Some(3425)),
+            None,
+        );
+        match &nodes[0] {
+            RouteGraphNode::Gateway { routes, .. } => {
+                assert_eq!(routes.len(), 1);
+                assert_eq!(routes[0].route.display_name, "Mine");
+            }
+            other => panic!("expected the gateway, got {other:?}"),
+        }
+    }
+
+    /// A stopped listener still has routes, and the node says it is not running.
+    #[test]
+    fn a_stopped_gateway_still_lists_its_routes() {
+        let only = route("Standard", vibex_core::RouteKind::Gateway, &["m"]);
+        let bindings = vec![bound("codex", &only, true)];
+        let providers = provider_for(&only);
+
+        let nodes = route_graph_nodes(
+            "codex",
+            std::slice::from_ref(&only),
+            &bindings,
+            &providers,
+            &gateway(None),
+            None,
+        );
+        match &nodes[0] {
+            RouteGraphNode::Gateway { routes, port, .. } => {
+                assert_eq!(*port, None);
+                assert_eq!(
+                    routes.len(),
+                    1,
+                    "hiding the routes of a stopped gateway would look like deleting them"
+                );
+            }
+            other => panic!("expected the gateway, got {other:?}"),
+        }
+    }
+
+    /// A disabled route is not offered, because the gateway would not serve it.
+    #[test]
+    fn a_disabled_route_is_not_drawn() {
+        let mut only = route("Standard", vibex_core::RouteKind::Gateway, &["m"]);
+        only.status = vibex_core::RouteStatus::Disabled;
+        let bindings = vec![bound("codex", &only, true)];
+        let providers = provider_for(&only);
+        let nodes = route_graph_nodes(
+            "codex",
+            std::slice::from_ref(&only),
+            &bindings,
+            &providers,
+            &gateway(Some(3425)),
+            None,
+        );
+        assert!(nodes.is_empty());
+    }
+
+    /// A member with no ready Key reports the state that explains it.
+    #[test]
+    fn a_member_reports_why_it_cannot_answer() {
+        let member = RouteGraphMember {
+            provider_name: "DeepSeek".to_string(),
+            model_id: "m".to_string(),
+            enabled: true,
+            member_id: "model_route_member_test".to_string(),
+            ready_keys: 0,
+            cooling_keys: 2,
+            invalid_keys: 0,
+        };
+        assert_eq!(member.state(), RouteGraphMemberState::Cooling(2));
+
+        let member = RouteGraphMember {
+            ready_keys: 1,
+            cooling_keys: 2,
+            ..member
+        };
+        assert_eq!(
+            member.state(),
+            RouteGraphMemberState::Ready,
+            "one ready Key is enough to answer"
+        );
+    }
+
+    /// The summary distinguishes sources from models.
+    #[test]
+    fn a_route_summary_separates_sources_from_models() {
+        let mut route = route(
+            "Standard",
+            vibex_core::RouteKind::Gateway,
+            &["m", "m", "other"],
+        );
+        let providers = provider_for(&route);
+        let bindings = vec![bound("codex", &route, true)];
+        let nodes = route_graph_nodes(
+            "codex",
+            std::slice::from_ref(&route),
+            &bindings,
+            &providers,
+            &gateway(Some(3425)),
+            None,
+        );
+        let drawn = match &nodes[0] {
+            RouteGraphNode::Gateway { routes, .. } => routes[0].clone(),
+            other => panic!("expected the gateway, got {other:?}"),
+        };
+        assert_eq!(drawn.source_count(), 3, "three members");
+        assert_eq!(drawn.models.len(), 2, "but two distinct model names");
+        assert!(
+            management_route_member_summary(&drawn).contains('2')
+                && management_route_member_summary(&drawn).contains('3'),
+            "the summary names both numbers: {}",
+            management_route_member_summary(&drawn)
+        );
+        route.members.clear();
     }
 }

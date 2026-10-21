@@ -76,6 +76,12 @@ impl ProviderConfigService {
         AgentModelRouteBindingRepository::list_for_agent(&conn, agent_id)
     }
 
+    /// Every live route binding, for a bundle that renders every Agent.
+    pub fn list_all_agent_model_route_bindings(&self) -> VibexResult<Vec<AgentModelRouteBinding>> {
+        let conn = self.open_connection()?;
+        AgentModelRouteBindingRepository::list_all(&conn)
+    }
+
     /// The Agents that reference this route.
     pub fn list_agent_model_route_users(
         &self,

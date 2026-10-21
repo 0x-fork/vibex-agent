@@ -460,6 +460,48 @@ fn intersect_reasoning_efforts(
     Some(crate::ProviderModelReasoningEfforts(levels))
 }
 
+/// Replaces a route, including its member order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRouteUpdateRequest {
+    pub route: ModelRoute,
+    pub expected_revision: i64,
+}
+
+/// Removes a route and every binding that pointed at it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRouteDeleteRequest {
+    pub model_route_id: ModelRouteId,
+}
+
+/// Lets one Agent use a route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelRouteBindRequest {
+    pub agent_id: AgentId,
+    pub model_route_id: ModelRouteId,
+    /// Make this the route a new session starts on.
+    #[serde(default)]
+    pub make_default: bool,
+}
+
+/// Stops one Agent from using a route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelRouteUnbindRequest {
+    pub agent_id: AgentId,
+    pub model_route_id: ModelRouteId,
+}
+
+/// Chooses which of an Agent's routes a new session starts on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelRouteDefaultRequest {
+    pub agent_id: AgentId,
+    pub model_route_id: ModelRouteId,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

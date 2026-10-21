@@ -4140,6 +4140,85 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn list_model_routes(&self) -> BackendFuture<'_, Vec<vibex_core::ModelRoute>> {
+        // The remote protocol carries Providers, not routes yet. Saying so is
+        // better than returning an empty list, which a client would read as
+        // "this runtime has no routes".
+        self.unsupported(
+            "model_routes_remote_unsupported",
+            "this runtime does not serve routes over the remote protocol yet",
+        )
+    }
+
+    fn list_all_agent_model_route_bindings(
+        &self,
+    ) -> BackendFuture<'_, Vec<vibex_core::AgentModelRouteBinding>> {
+        self.unsupported(
+            "model_routes_remote_unsupported",
+            "this runtime does not serve routes over the remote protocol yet",
+        )
+    }
+
+    fn create_model_route(
+        &self,
+        _request: MutationRequest<vibex_core::ModelRoute>,
+    ) -> BackendFuture<'_, vibex_core::ModelRoute> {
+        self.unsupported(
+            "model_routes_remote_unsupported",
+            "this runtime does not serve routes over the remote protocol yet",
+        )
+    }
+
+    fn update_model_route(
+        &self,
+        _request: MutationRequest<vibex_core::ModelRouteUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelRoute> {
+        self.unsupported(
+            "model_routes_remote_unsupported",
+            "this runtime does not serve routes over the remote protocol yet",
+        )
+    }
+
+    fn delete_model_route(
+        &self,
+        _request: MutationRequest<vibex_core::ModelRouteDeleteRequest>,
+    ) -> BackendFuture<'_, bool> {
+        self.unsupported(
+            "model_routes_remote_unsupported",
+            "this runtime does not serve routes over the remote protocol yet",
+        )
+    }
+
+    fn bind_agent_model_route(
+        &self,
+        _request: MutationRequest<vibex_core::AgentModelRouteBindRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentModelRouteBinding> {
+        self.unsupported(
+            "model_routes_remote_unsupported",
+            "this runtime does not serve routes over the remote protocol yet",
+        )
+    }
+
+    fn unbind_agent_model_route(
+        &self,
+        _request: MutationRequest<vibex_core::AgentModelRouteUnbindRequest>,
+    ) -> BackendFuture<'_, bool> {
+        self.unsupported(
+            "model_routes_remote_unsupported",
+            "this runtime does not serve routes over the remote protocol yet",
+        )
+    }
+
+    fn set_agent_default_model_route(
+        &self,
+        _request: MutationRequest<vibex_core::AgentModelRouteDefaultRequest>,
+    ) -> BackendFuture<'_, ()> {
+        self.unsupported(
+            "model_routes_remote_unsupported",
+            "this runtime does not serve routes over the remote protocol yet",
+        )
+    }
+
     fn create_model_provider_profile(
         &self,
         request: MutationRequest<vibex_core::ModelProviderProfileCreateRequest>,

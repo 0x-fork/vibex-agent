@@ -813,6 +813,58 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn list_model_routes(&self) -> BackendFuture<'_, Vec<vibex_core::ModelRoute>> {
+        disconnected_future!()
+    }
+
+    fn list_all_agent_model_route_bindings(
+        &self,
+    ) -> BackendFuture<'_, Vec<vibex_core::AgentModelRouteBinding>> {
+        disconnected_future!()
+    }
+
+    fn create_model_route(
+        &self,
+        _request: MutationRequest<vibex_core::ModelRoute>,
+    ) -> BackendFuture<'_, vibex_core::ModelRoute> {
+        disconnected_future!()
+    }
+
+    fn update_model_route(
+        &self,
+        _request: MutationRequest<vibex_core::ModelRouteUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelRoute> {
+        disconnected_future!()
+    }
+
+    fn delete_model_route(
+        &self,
+        _request: MutationRequest<vibex_core::ModelRouteDeleteRequest>,
+    ) -> BackendFuture<'_, bool> {
+        disconnected_future!()
+    }
+
+    fn bind_agent_model_route(
+        &self,
+        _request: MutationRequest<vibex_core::AgentModelRouteBindRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentModelRouteBinding> {
+        disconnected_future!()
+    }
+
+    fn unbind_agent_model_route(
+        &self,
+        _request: MutationRequest<vibex_core::AgentModelRouteUnbindRequest>,
+    ) -> BackendFuture<'_, bool> {
+        disconnected_future!()
+    }
+
+    fn set_agent_default_model_route(
+        &self,
+        _request: MutationRequest<vibex_core::AgentModelRouteDefaultRequest>,
+    ) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
     fn model_capability_suggestion(
         &self,
         _request: vibex_core::ModelCapabilitySuggestionRequest,

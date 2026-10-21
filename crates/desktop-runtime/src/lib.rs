@@ -1124,6 +1124,11 @@ pub async fn assemble_management_snapshot(
     // bundle costs one binding query instead of one per configured Agent.
     let model_provider_profiles = provider.list_model_provider_profiles()?;
     let agent_model_provider_bindings = provider.list_all_agent_model_provider_bindings()?;
+    // Routes and their bindings are read once for the whole bundle, like the
+    // Provider lists above: the Agent page renders every route its Agent may
+    // use, and one query is cheaper than one per Agent.
+    let model_routes = provider.list_model_routes()?;
+    let agent_model_route_bindings = provider.list_all_agent_model_route_bindings()?;
     let native_import_preview = provider
         .preview_native_import(vibex_core::ProviderNativeImportPreviewRequest {
             sources: vec![
@@ -1311,6 +1316,8 @@ pub async fn assemble_management_snapshot(
         profiles,
         model_provider_profiles,
         agent_model_provider_bindings,
+        model_routes,
+        agent_model_route_bindings,
         native_import_preview,
         acp_configs,
         agent_details,

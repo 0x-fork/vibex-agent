@@ -2810,6 +2810,153 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn list_model_routes(&self) -> BackendFuture<'_, Vec<vibex_core::ModelRoute>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .service()
+                .list_model_routes()
+                .map_err(Into::into)
+        })
+    }
+
+    fn list_all_agent_model_route_bindings(
+        &self,
+    ) -> BackendFuture<'_, Vec<vibex_core::AgentModelRouteBinding>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .service()
+                .list_all_agent_model_route_bindings()
+                .map_err(Into::into)
+        })
+    }
+
+    fn create_model_route(
+        &self,
+        request: MutationRequest<vibex_core::ModelRoute>,
+    ) -> BackendFuture<'_, vibex_core::ModelRoute> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .service()
+                .create_model_route(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn update_model_route(
+        &self,
+        request: MutationRequest<vibex_core::ModelRouteUpdateRequest>,
+    ) -> BackendFuture<'_, vibex_core::ModelRoute> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            let vibex_core::ModelRouteUpdateRequest {
+                route,
+                expected_revision,
+            } = request.payload;
+            runtime
+                .management()
+                .providers()
+                .service()
+                .update_model_route(route, expected_revision)
+                .map_err(Into::into)
+        })
+    }
+
+    fn delete_model_route(
+        &self,
+        request: MutationRequest<vibex_core::ModelRouteDeleteRequest>,
+    ) -> BackendFuture<'_, bool> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .service()
+                .delete_model_route(&request.payload.model_route_id)
+                .map_err(Into::into)
+        })
+    }
+
+    fn bind_agent_model_route(
+        &self,
+        request: MutationRequest<vibex_core::AgentModelRouteBindRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentModelRouteBinding> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            let vibex_core::AgentModelRouteBindRequest {
+                agent_id,
+                model_route_id,
+                make_default,
+            } = request.payload;
+            runtime
+                .management()
+                .providers()
+                .service()
+                .bind_model_route(&agent_id, &model_route_id, make_default)
+                .map_err(Into::into)
+        })
+    }
+
+    fn unbind_agent_model_route(
+        &self,
+        request: MutationRequest<vibex_core::AgentModelRouteUnbindRequest>,
+    ) -> BackendFuture<'_, bool> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            let vibex_core::AgentModelRouteUnbindRequest {
+                agent_id,
+                model_route_id,
+            } = request.payload;
+            runtime
+                .management()
+                .providers()
+                .service()
+                .unbind_model_route(&agent_id, &model_route_id)
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_agent_default_model_route(
+        &self,
+        request: MutationRequest<vibex_core::AgentModelRouteDefaultRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            let vibex_core::AgentModelRouteDefaultRequest {
+                agent_id,
+                model_route_id,
+            } = request.payload;
+            runtime
+                .management()
+                .providers()
+                .service()
+                .set_agent_default_model_route(&agent_id, &model_route_id)
+                .map_err(Into::into)
+        })
+    }
+
     fn model_capability_suggestion(
         &self,
         request: ModelCapabilitySuggestionRequest,
