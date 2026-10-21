@@ -11563,12 +11563,27 @@ impl ManagementCenter {
         shared_provider_rows(&self.providers, &self.provider_bindings)
     }
 
-    /// The global Providers sidebar: one row per shared Provider.
+    /// The global Providers sidebar: the gateway section, then one row per
+    /// shared Provider.
+    ///
+    /// These are two groups, not one list. The gateway is a single piece of
+    /// Vibex machinery the page always has, while the rows under it are the
+    /// records the user creates, renames, enables and deletes. Without a
+    /// heading and a rule between them the pinned gateway read as the first
+    /// Provider — the same shape, the same card — and "which one of these do I
+    /// add to?" had no visible answer.
     fn render_provider_page_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         self.schedule_gateway_cooldown_refresh(cx);
         let rows = self.shared_providers();
         let selected = self.selected_global_provider_id.clone();
         let locale = locale::current_locale();
+        let mut gateway_section = v_flex().w_full().min_w_0().flex_none().gap_2().child(
+            management_resource_sidebar_actions(
+                management_locale_text("Gateway", "网关", "閘道"),
+                Vec::new(),
+                cx,
+            ),
+        );
         let mut list = v_flex().w_full().gap_1();
 
         // The gateway is a Provider row, pinned above the Providers it consumes.
@@ -11638,7 +11653,7 @@ impl ManagementCenter {
         } else {
             cx.theme().muted_foreground
         };
-        list = list.child(
+        gateway_section = gateway_section.child(
             v_flex()
                 .id("management-global-provider-row-gateway")
                 .w_full()
@@ -11651,6 +11666,7 @@ impl ManagementCenter {
                 } else {
                     cx.theme().border
                 })
+                .bg(cx.theme().muted.opacity(0.25))
                 .p_2()
                 .cursor_pointer()
                 .child(
@@ -11792,6 +11808,10 @@ impl ManagementCenter {
                 cx,
             ));
         }
+        // The two groups are separated by a rule as well as by their headings:
+        // the gateway card sits on the sidebar's own surface and the Provider
+        // rows on cards, so without the rule the boundary between "the machine
+        // Vibex runs" and "the records I keep" was only a gap in a list.
         v_flex()
             .id("management-provider-page-sidebar")
             .w_full()
@@ -11799,34 +11819,54 @@ impl ManagementCenter {
             .min_w_0()
             .gap_3()
             .p_3()
+            .child(gateway_section)
             .child(
-                h_flex()
+                div()
                     .w_full()
-                    .items_center()
-                    .justify_between()
+                    .flex_none()
+                    .h(px(1.0))
+                    .rounded_full()
+                    .bg(cx.theme().border),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .min_h_0()
+                    .flex_1()
                     .gap_2()
+                    .child(management_resource_sidebar_actions(
+                        management_locale_text("Providers", "供应商", "供應商"),
+                        vec![
+                            Button::new("management-provider-page-add")
+                                .xsmall()
+                                .outline()
+                                .icon(IconName::Plus)
+                                .tooltip(management_locale_text(
+                                    "Add a Provider",
+                                    "添加供应商",
+                                    "新增供應商",
+                                ))
+                                .accessibility_label(management_locale_text(
+                                    "Add a Provider",
+                                    "添加供应商",
+                                    "新增供應商",
+                                ))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_shared_provider_creator(window, cx)
+                                }))
+                                .into_any_element(),
+                        ],
+                        cx,
+                    ))
                     .child(
                         div()
-                            .text_sm()
-                            .font_semibold()
-                            .child(management_locale_text("Providers", "供应商", "供應商")),
-                    )
-                    .child(
-                        Button::new("management-provider-page-add")
-                            .xsmall()
-                            .outline()
-                            .icon(IconName::Plus)
-                            .tooltip(management_locale_text(
-                                "Add a Provider",
-                                "添加供应商",
-                                "新增供應商",
-                            ))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_shared_provider_creator(window, cx)
-                            })),
+                            .min_h_0()
+                            .flex_1()
+                            .overflow_y_scrollbar()
+                            .scroll_gutter()
+                            .child(list),
                     ),
             )
-            .child(list)
             .into_any_element()
     }
 
@@ -32623,6 +32663,29 @@ mod tests {
         assert!(
             sidebar.contains("this.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string())"),
             "the gateway is the page's default selection"
+        );
+        // Two groups, one sidebar: the gateway is its own captioned section and
+        // the Provider records are another, with a rule between them. Reading
+        // them as one list was the bug this guards.
+        let gateway_heading = sidebar
+            .find("management_locale_text(\"Gateway\", \"网关\", \"閘道\")")
+            .expect("the gateway section should carry a heading");
+        let gateway_row = sidebar
+            .find("management-global-provider-row-gateway")
+            .expect("the gateway row should be in the sidebar");
+        let rule = sidebar
+            .find(".h(px(1.0))")
+            .expect("the two sections should be separated by a rule");
+        let providers_heading = sidebar
+            .find("management_locale_text(\"Providers\", \"供应商\", \"供應商\")")
+            .expect("the Provider section should carry a heading");
+        assert!(
+            gateway_heading < gateway_row && gateway_row < rule && rule < providers_heading,
+            "the gateway heading and its row stay above the rule and the Provider list"
+        );
+        assert!(
+            providers_heading < sidebar.find("management-provider-page-add").unwrap(),
+            "the Add command belongs to the Provider section, not to the sidebar as a whole"
         );
 
         let page = source
