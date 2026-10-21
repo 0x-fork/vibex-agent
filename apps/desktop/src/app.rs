@@ -50931,7 +50931,27 @@ impl VibexWorkbench {
         let hairline = runtime_menu_hairline(cx);
         let mut visible_groups = Vec::new();
 
+        // A long list of route groups pushes the rest of the menu off screen, so
+        // only the first few are drawn. A search is never folded: the reader
+        // typed something specific, and hiding the match they wanted is the one
+        // failure a fold cannot justify.
+        let searching = !query.trim().is_empty();
+        let route_groups = groups
+            .iter()
+            .filter(|group| group.source.kind == RuntimeAuthSourceKind::ModelRoute)
+            .count();
+        let folded_routes = !searching && route_groups > RUNTIME_ROUTE_GROUP_FOLD;
+        let mut drawn_routes = 0usize;
+        let mut folded_away = 0usize;
+
         for group in &groups {
+            if group.source.kind == RuntimeAuthSourceKind::ModelRoute {
+                if folded_routes && drawn_routes >= RUNTIME_ROUTE_GROUP_FOLD {
+                    folded_away += 1;
+                    continue;
+                }
+                drawn_routes += 1;
+            }
             let heading_key = format!(
                 "{menu_prefix}-runtime-provider-heading:{}:{}",
                 group.agent_id.as_str(),
@@ -51143,6 +51163,34 @@ impl VibexWorkbench {
                     .w_full()
                     .child(heading)
                     .children(rows)
+                    .into_any_element(),
+            );
+        }
+
+        // A hidden group must not look like a route that does not exist: the
+        // count says how many were folded, and the hint says how to see them.
+        if folded_away > 0 {
+            visible_groups.push(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(theme::semantic_color(
+                        "muted-foreground",
+                        cx.theme().is_dark(),
+                    ))
+                    .child(match locale::current_locale() {
+                        locale::ResolvedLocale::En => {
+                            format!("{folded_away} more routes — type to search")
+                        }
+                        locale::ResolvedLocale::ZhCn => {
+                            format!("另有 {folded_away} 条路由 —— 输入以搜索")
+                        }
+                        locale::ResolvedLocale::ZhTw => {
+                            format!("另有 {folded_away} 條路由 —— 輸入以搜尋")
+                        }
+                    })
                     .into_any_element(),
             );
         }
@@ -73121,7 +73169,15 @@ fn runtime_provider_groups_for_query(
             if choices.is_empty() && (favorites_only || !source_matches) {
                 continue;
             }
-            let status = runtime_auth_source_status_label(&source, model_count);
+            // The route's own shape travels on its options; a Provider has one
+            // source and nothing to fail over to. The subtitle reads it, so it
+            // is computed first.
+            let member_count = choices
+                .iter()
+                .map(|choice| choice_option_member_count(catalog, &choice.selection))
+                .max()
+                .unwrap_or(1);
+            let status = runtime_auth_source_status_label(&source, model_count, member_count);
             let can_authenticate = source.kind == RuntimeAuthSourceKind::AgentAccount
                 && !matches!(
                     source.availability,
@@ -73326,11 +73382,70 @@ fn wrap_runtime_provider_model_selection(index: usize, delta: isize, count: usiz
     }
 }
 
+/// The option a selection names, when the catalogue still carries it.
+fn catalog_option_for<'a>(
+    catalog: &'a SessionRuntimeOptionCatalog,
+    selection: &SessionRuntimeSelection,
+) -> Option<&'a SessionRuntimeOption> {
+    catalog.options.iter().find(|option| {
+        option.selection.agent_id == selection.agent_id
+            && option.selection.auth_source == selection.auth_source
+            && option.selection.model == selection.model
+    })
+}
+
+fn choice_option_member_count(
+    catalog: &SessionRuntimeOptionCatalog,
+    selection: &SessionRuntimeSelection,
+) -> usize {
+    catalog_option_for(catalog, selection)
+        .map(|option| option.member_count.max(1))
+        .unwrap_or(1)
+}
+
+/// How many route groups the picker draws before folding the rest away.
+///
+/// Five keeps the menu's whole height in view alongside the Agents and the
+/// Providers above it. A search ignores the fold.
+const RUNTIME_ROUTE_GROUP_FOLD: usize = 5;
+
+/// The one line a route's group heading shows.
+///
+/// The design's rule is that this must never promise automatic recovery the
+/// route cannot deliver: a single-source route says nothing about failing over.
+fn runtime_route_subtitle(sources: usize, model_count: usize) -> String {
+    let models = runtime_model_count_label(model_count);
+    if sources > 1 {
+        match locale::current_locale() {
+            locale::ResolvedLocale::En => format!("{sources} sources · {models}"),
+            locale::ResolvedLocale::ZhCn => format!("{sources} 个来源 · {models}"),
+            locale::ResolvedLocale::ZhTw => format!("{sources} 個來源 · {models}"),
+        }
+    } else {
+        // One source is a direct route or a one-member composition; either way
+        // there is nothing to switch to, so the count would mislead.
+        match locale::current_locale() {
+            locale::ResolvedLocale::En => format!("Direct · {models}"),
+            locale::ResolvedLocale::ZhCn => format!("直连 · {models}"),
+            locale::ResolvedLocale::ZhTw => format!("直連 · {models}"),
+        }
+    }
+}
+
 fn runtime_auth_source_status_label(
     source: &RuntimeAuthSourceSummary,
     model_count: usize,
+    route_member_count: usize,
 ) -> String {
     match source.availability {
+        // A route's subtitle leads with how many sources back it, because that
+        // is what tells the reader whether a stale Key heals itself. A direct
+        // route says so instead of counting one source, which says nothing.
+        RuntimeAuthSourceAvailability::Available
+            if source.kind == RuntimeAuthSourceKind::ModelRoute =>
+        {
+            runtime_route_subtitle(route_member_count, model_count)
+        }
         RuntimeAuthSourceAvailability::Available => runtime_model_count_label(model_count),
         RuntimeAuthSourceAvailability::RequiresAuthentication => {
             locale::text("Sign in", "需要登录", "需要登入").to_string()
@@ -111521,5 +111636,66 @@ mod tests {
                 "fn sidebar_current_session_item(&self) -> Option<SidebarOrganizationItem>"
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod route_picker_tests {
+    use super::*;
+
+    fn route_source() -> RuntimeAuthSourceSummary {
+        RuntimeAuthSourceSummary {
+            source: RuntimeAuthSource::model_route(vibex_core::ModelRouteId::new()),
+            auth_source_revision: 0,
+            agent_id: AgentId::parse("codex").unwrap(),
+            label: "Standard".to_string(),
+            kind: RuntimeAuthSourceKind::ModelRoute,
+            availability: RuntimeAuthSourceAvailability::Available,
+            account_hint: None,
+            model_catalog_status: vibex_core::AgentAuthModelCatalogStatus::Unknown,
+            supported_actions: Vec::new(),
+        }
+    }
+
+    /// A route's subtitle says how many sources back it.
+    #[test]
+    fn a_route_subtitle_names_its_source_count() {
+        let label = runtime_auth_source_status_label(&route_source(), 2, 3);
+        assert!(label.contains('3'), "{label}");
+        assert!(label.contains("sources"), "{label}");
+    }
+
+    /// A single-source route says "Direct" instead of counting to one.
+    ///
+    /// "1 sources" is noise, and the reader needs to know there is nothing to
+    /// fail over to, which a count of one does not say.
+    #[test]
+    fn a_single_source_route_reads_as_direct() {
+        let label = runtime_auth_source_status_label(&route_source(), 1, 1);
+        assert!(label.contains("Direct"), "{label}");
+        assert!(!label.contains("sources"), "{label}");
+    }
+
+    /// A Provider keeps the plain model count.
+    #[test]
+    fn a_provider_subtitle_is_just_the_model_count() {
+        let source = RuntimeAuthSourceSummary {
+            source: RuntimeAuthSource::provider_profile(vibex_core::ProviderProfileId::new()),
+            auth_source_revision: 1,
+            agent_id: AgentId::parse("codex").unwrap(),
+            label: "DeepSeek".to_string(),
+            kind: RuntimeAuthSourceKind::ProviderProfile,
+            availability: RuntimeAuthSourceAvailability::Available,
+            account_hint: None,
+            model_catalog_status: vibex_core::AgentAuthModelCatalogStatus::Unknown,
+            supported_actions: Vec::new(),
+        };
+        assert_eq!(runtime_auth_source_status_label(&source, 4, 1), "4 models");
+    }
+
+    /// The fold keeps the picker's height bounded.
+    #[test]
+    fn the_route_fold_is_five_groups() {
+        assert_eq!(RUNTIME_ROUTE_GROUP_FOLD, 5);
     }
 }
