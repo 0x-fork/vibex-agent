@@ -186,6 +186,7 @@ impl ProviderConfigService {
     ) -> VibexResult<(ProviderProfileId, bool)> {
         let models = gateway_models(agent_id, model_catalog);
         let conn = self.open_connection()?;
+        let models = self.with_route_capabilities(&conn, models)?;
         let existing = gateway_profile_for(&conn, agent_id)?;
         match existing {
             Some(profile) => {
@@ -267,6 +268,36 @@ impl ProviderConfigService {
         }
     }
 
+    /// Fills each route-bearing model in with the capabilities its members
+    /// share.
+    ///
+    /// `gateway_models` builds entries from model ids alone, because the
+    /// catalog is a list of strings. A route's capabilities are a property of
+    /// its members, so they are merged here, where the Profiles are in hand.
+    fn with_route_capabilities(
+        &self,
+        conn: &vibex_db::DbConnection,
+        models: Vec<ProviderConfiguredModel>,
+    ) -> VibexResult<Vec<ProviderConfiguredModel>> {
+        let routes = vibex_db::ModelRouteRepository::list_enabled(conn)?;
+        if routes.is_empty() {
+            return Ok(models);
+        }
+        let profiles = vibex_db::ModelProviderProfileRepository::list(conn)?;
+        Ok(models
+            .into_iter()
+            .map(|model| {
+                let Some(route) = routes.iter().find(|route| route.model_id() == model.id) else {
+                    return model;
+                };
+                ProviderConfiguredModel {
+                    capabilities: route_capabilities(conn, &profiles, route),
+                    ..model
+                }
+            })
+            .collect())
+    }
+
     /// Rewrites every gateway Profile's address after the listener moved.
     ///
     /// Each write advances the Profile revision, so the existing projection
@@ -327,6 +358,12 @@ impl ProviderConfigService {
         let routes = vibex_db::ModelRouteRepository::list_enabled(&conn)?;
         let mut catalog = Vec::new();
         for route in routes {
+            // A direct route describes a connection that bypasses the gateway.
+            // Publishing it here would invite an Agent to call the gateway for
+            // something whose whole point is not to go through it.
+            if route.kind != vibex_core::RouteKind::Gateway {
+                continue;
+            }
             // A route whose members all point at Providers that no longer exist
             // has nothing to serve, so it is not offered.
             let served = route
@@ -415,6 +452,39 @@ fn gateway_models(agent_id: &AgentId, catalog: &[String]) -> Vec<ProviderConfigu
             capabilities: ProviderModelCapabilities::default(),
         })
         .collect()
+}
+
+/// Fills in a route entry's capabilities from its members.
+///
+/// A route claims only what every member can do: the smallest context window,
+/// and the intersection of the boolean features. Without this the Agent would
+/// be told a route supports images because one member does, and then have the
+/// request routed to a member that does not.
+pub(crate) fn route_capabilities(
+    conn: &vibex_db::DbConnection,
+    profiles: &[vibex_core::ModelProviderProfile],
+    route: &vibex_core::ModelRoute,
+) -> vibex_core::ProviderModelCapabilities {
+    let caps = route
+        .enabled_members()
+        .filter_map(|member| {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.id == member.model_provider_profile_id)?;
+            profile
+                .configured_models
+                .iter()
+                .find(|model| model.id == member.model_id)
+                .map(|model| model.capabilities.clone())
+        })
+        .collect::<Vec<_>>();
+    let _ = conn;
+    let merged = vibex_core::intersect_route_capabilities(caps);
+    // An explicit route window overrides the smallest-member rule.
+    vibex_core::ProviderModelCapabilities {
+        context_tokens: route.context_tokens.or(merged.context_tokens),
+        ..merged
+    }
 }
 
 /// The protocol an Agent should keep speaking after it is pointed at the

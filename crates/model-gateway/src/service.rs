@@ -260,6 +260,12 @@ pub struct ModelGatewayService {
     limits: GatewayLimits,
     runtime: GatewayRuntime,
     rotation: AtomicU64,
+    /// Rotation for the choice *between* route members.
+    ///
+    /// It is deliberately not the Key counter: one request picks a member and
+    /// then a Key, and sharing a counter would advance the Key rotation by two
+    /// every time a route had more than one member.
+    member_rotation: AtomicU64,
     /// Per-account concurrency and request-rate guards.
     limiter: std::sync::Arc<crate::limit::Limiter>,
     listener: Mutex<Option<ListenerHandle>>,
@@ -337,6 +343,7 @@ impl ModelGatewayService {
             limits,
             runtime: Arc::new(RwLock::new(ModelGatewayRuntimeState::default())),
             rotation: AtomicU64::new(0),
+            member_rotation: AtomicU64::new(0),
             limiter: crate::limit::Limiter::new(),
             listener: Mutex::new(None),
             snapshot: RwLock::new(None),
@@ -406,6 +413,11 @@ impl ModelGatewayService {
         // second one would be invisible in the gateway's own configuration.
         let mut referenced = settings.upstreams.clone();
         for route in vibex_db::ModelRouteRepository::list_enabled(&connection)? {
+            // A direct route is not served here, so its Providers are not
+            // upstreams of this listener.
+            if route.kind != vibex_core::RouteKind::Gateway {
+                continue;
+            }
             for member in route.enabled_members() {
                 if !referenced.contains(&member.model_provider_profile_id) {
                     referenced.push(member.model_provider_profile_id.clone());
@@ -469,6 +481,8 @@ impl ModelGatewayService {
         // would fail deep inside `prepare_member`.
         let routes = vibex_db::ModelRouteRepository::list_enabled(&connection)?
             .into_iter()
+            // Only a gateway route is resolved through this listener.
+            .filter(|route| route.kind == vibex_core::RouteKind::Gateway)
             .filter_map(|route| {
                 let members = route
                     .enabled_members()
@@ -931,10 +945,11 @@ impl ModelGatewayService {
                         .collect(),
                 });
             };
-            let strategy = crate::route::plan_members(
+            let strategy = crate::route::plan_members_with_usage(
                 &route.members,
                 route.strategy,
-                self.rotation.fetch_add(1, Ordering::Relaxed),
+                self.member_rotation.fetch_add(1, Ordering::Relaxed),
+                &self.member_usage(snapshot),
             );
             return Ok(strategy
                 .into_iter()
@@ -981,6 +996,26 @@ impl ModelGatewayService {
             // client timeout is the only bound.
             first_token_timeout_ms: None,
         }])
+    }
+
+    /// Tokens each upstream has spent in the current accounting window.
+    ///
+    /// This is the same figure the token ceiling uses, read once per request.
+    /// A Provider missing from the list has spent nothing, which is how a newly
+    /// added member gets tried.
+    fn member_usage(&self, snapshot: &GatewaySnapshot) -> Vec<(ModelProviderProfileId, u64)> {
+        snapshot
+            .upstreams
+            .iter()
+            .map(|upstream| {
+                let used = upstream
+                    .keys
+                    .first()
+                    .map(|key| key.used_tokens)
+                    .unwrap_or(0);
+                (upstream.profile_id.clone(), used)
+            })
+            .collect()
     }
 
     /// Resolves one member into everything needed to call it.

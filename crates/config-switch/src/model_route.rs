@@ -734,6 +734,34 @@ mod catalog_tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// A direct route is not served by the gateway.
+    ///
+    /// It exists to describe a connection that bypasses the gateway entirely.
+    /// Publishing it as a gateway model would invite an Agent to call a route
+    /// whose whole purpose is not to be called here.
+    #[test]
+    fn a_direct_route_is_not_published_by_the_gateway() {
+        let (path, service) = service();
+        let provider_id = provider(&service, "DeepSeek", &["flash"]);
+        service
+            .create_model_route(ModelRoute {
+                display_name: "Direct".to_string(),
+                kind: RouteKind::Direct,
+                strategy: RouteStrategy::Ordered,
+                status: RouteStatus::Enabled,
+                members: vec![ModelRouteMember::new(provider_id, "flash", 0)],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let catalog = service.gateway_model_catalog().unwrap();
+        assert!(
+            !catalog.iter().any(|entry| entry.display_name == "Direct"),
+            "a direct route must not be published as a gateway model"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     /// A disabled route is not offered, and a route whose Providers are gone is
     /// dropped rather than listed as a model nothing can serve.
     #[test]
@@ -756,6 +784,148 @@ mod catalog_tests {
             !catalog.iter().any(|entry| entry.display_name == "Off"),
             "a disabled route must not be offered"
         );
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::super::*;
+    use vibex_core::{
+        ModelProviderCatalogEntry, ModelProviderProfileStatus, ModelRoute, ModelRouteMember,
+        ProviderModelCapabilities, RouteKind, RouteStatus, RouteStrategy,
+    };
+
+    fn service() -> (std::path::PathBuf, ProviderConfigService) {
+        let path = std::env::temp_dir().join(format!(
+            "vibex-route-caps-{}.db",
+            vibex_core::RequestId::new().as_str()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let service = ProviderConfigService::new(&path);
+        (path, service)
+    }
+
+    fn provider_with(
+        service: &ProviderConfigService,
+        name: &str,
+        model: &str,
+        capabilities: ProviderModelCapabilities,
+    ) -> vibex_core::ModelProviderProfileId {
+        service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: name.to_string(),
+                vendor_hint: None,
+                endpoints: Vec::new(),
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![ModelProviderCatalogEntry {
+                    id: model.to_string(),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities,
+                }],
+                default_model_id: Some(model.to_string()),
+                headers: Vec::new(),
+                status: ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap()
+            .id
+    }
+
+    /// An Agent is told what the route can do, not what its best member can do.
+    ///
+    /// The window is the smallest member's; a boolean feature is claimed only
+    /// when every member has it. Otherwise the Agent would send an image to a
+    /// route that may route it to a member which cannot read one.
+    #[test]
+    fn a_route_claims_only_what_all_its_members_share() {
+        let (path, service) = service();
+        let wide = provider_with(
+            &service,
+            "Wide",
+            "m",
+            ProviderModelCapabilities {
+                context_tokens: Some(200_000),
+                image_input: Some(true),
+                reasoning: Some(true),
+                ..Default::default()
+            },
+        );
+        let narrow = provider_with(
+            &service,
+            "Narrow",
+            "m",
+            ProviderModelCapabilities {
+                context_tokens: Some(32_000),
+                image_input: Some(false),
+                reasoning: Some(true),
+                ..Default::default()
+            },
+        );
+        service
+            .create_model_route(ModelRoute {
+                display_name: "Mixed".to_string(),
+                kind: RouteKind::Gateway,
+                strategy: RouteStrategy::Ordered,
+                status: RouteStatus::Enabled,
+                members: vec![
+                    ModelRouteMember::new(wide, "m", 0),
+                    ModelRouteMember::new(narrow, "m", 1),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let conn = service.open_connection().unwrap();
+        let profiles = vibex_db::ModelProviderProfileRepository::list(&conn).unwrap();
+        let route = vibex_db::ModelRouteRepository::list(&conn)
+            .unwrap()
+            .remove(0);
+        let merged = crate::model_gateway::route_capabilities(&conn, &profiles, &route);
+        assert_eq!(
+            merged.context_tokens,
+            Some(32_000),
+            "the smallest window is the one the Agent must respect"
+        );
+        assert_eq!(merged.image_input, None, "one member cannot read an image");
+        assert_eq!(merged.reasoning, Some(true), "both can reason");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// An explicit route window wins over the smallest member.
+    #[test]
+    fn an_explicit_route_window_overrides_the_smallest_member() {
+        let (path, service) = service();
+        let small = provider_with(
+            &service,
+            "Small",
+            "m",
+            ProviderModelCapabilities {
+                context_tokens: Some(8_000),
+                ..Default::default()
+            },
+        );
+        service
+            .create_model_route(ModelRoute {
+                display_name: "Declared".to_string(),
+                kind: RouteKind::Gateway,
+                strategy: RouteStrategy::Ordered,
+                status: RouteStatus::Enabled,
+                context_tokens: Some(64_000),
+                members: vec![ModelRouteMember::new(small, "m", 0)],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let conn = service.open_connection().unwrap();
+        let profiles = vibex_db::ModelProviderProfileRepository::list(&conn).unwrap();
+        let route = vibex_db::ModelRouteRepository::list(&conn)
+            .unwrap()
+            .remove(0);
+        let merged = crate::model_gateway::route_capabilities(&conn, &profiles, &route);
+        assert_eq!(merged.context_tokens, Some(64_000));
         let _ = std::fs::remove_file(path);
     }
 }

@@ -450,16 +450,23 @@ pub fn route_id_from_model(requested: &str) -> Option<Option<&str>> {
     Some((!rest.trim().is_empty()).then_some(rest.trim()))
 }
 
-/// Chooses the member that should answer, and the order to try the rest.
+/// Chooses the member order, using observed usage for `LeastUsed`.
 ///
 /// The strategy applies across members; the Key strategy inside the chosen
 /// member is the existing `plan_route`, unchanged. A member with no usable Key
 /// is still tried — its failure is what tells the caller why nothing answered,
 /// and the caller may fail over to the next member.
-pub fn plan_members(
+///
+/// `usage` is per Provider, in tokens spent in the current window. A member
+/// with no recorded usage counts as zero, which is what makes a new Provider
+/// get tried instead of waiting behind one that has already spent its budget.
+/// Ties keep the configured order, so the strategy never shuffles a route that
+/// has nothing to distinguish.
+pub fn plan_members_with_usage(
     members: &[RouteMemberRef],
     strategy: vibex_core::RouteStrategy,
     rotation: u64,
+    usage: &[(ModelProviderProfileId, u64)],
 ) -> Vec<RouteMemberRef> {
     let mut ordered = members.to_vec();
     match strategy {
@@ -471,10 +478,13 @@ pub fn plan_members(
             }
         }
         vibex_core::RouteStrategy::LeastUsed => {
-            // Without per-member usage in hand, "least used" degrades to the
-            // configured order. The service re-sorts by observed usage before
-            // calling this; keeping a total function here means a snapshot
-            // without usage still routes.
+            ordered.sort_by_key(|member| {
+                usage
+                    .iter()
+                    .find(|(profile, _)| profile == &member.profile)
+                    .map(|(_, tokens)| *tokens)
+                    .unwrap_or(0)
+            });
         }
     }
     ordered
@@ -1057,7 +1067,7 @@ mod route_members {
             member("model_provider_a", "a"),
             member("model_provider_b", "b"),
         ];
-        let ordered = plan_members(&members, vibex_core::RouteStrategy::Ordered, 7);
+        let ordered = plan_members_with_usage(&members, vibex_core::RouteStrategy::Ordered, 7, &[]);
         assert_eq!(
             ordered
                 .iter()
@@ -1074,37 +1084,85 @@ mod route_members {
             member("model_provider_b", "b"),
             member("model_provider_c", "c"),
         ];
-        let first = plan_members(&members, vibex_core::RouteStrategy::RoundRobin, 0);
+        let first =
+            plan_members_with_usage(&members, vibex_core::RouteStrategy::RoundRobin, 0, &[]);
         assert_eq!(first[0].model, "a");
-        let second = plan_members(&members, vibex_core::RouteStrategy::RoundRobin, 1);
+        let second =
+            plan_members_with_usage(&members, vibex_core::RouteStrategy::RoundRobin, 1, &[]);
         assert_eq!(second[0].model, "b");
-        let wrapped = plan_members(&members, vibex_core::RouteStrategy::RoundRobin, 4);
+        let wrapped =
+            plan_members_with_usage(&members, vibex_core::RouteStrategy::RoundRobin, 4, &[]);
         assert_eq!(wrapped[0].model, "b", "four mod three is one");
         // Every request still offers the whole set.
         assert_eq!(wrapped.len(), 3);
     }
 
     #[test]
-    fn least_used_falls_back_to_the_configured_order() {
-        // Usage is applied by the service before this call; with none in hand
-        // the order must still be total rather than empty.
+    fn least_used_puts_the_least_spent_member_first() {
         let members = vec![
             member("model_provider_a", "a"),
             member("model_provider_b", "b"),
         ];
-        let planned = plan_members(&members, vibex_core::RouteStrategy::LeastUsed, 0);
+        // `b` has spent less, so it leads even though it is configured second.
+        let usage = vec![
+            (
+                ModelProviderProfileId::parse("model_provider_a").unwrap(),
+                9_000,
+            ),
+            (
+                ModelProviderProfileId::parse("model_provider_b").unwrap(),
+                12,
+            ),
+        ];
+        let planned =
+            plan_members_with_usage(&members, vibex_core::RouteStrategy::LeastUsed, 0, &usage);
         assert_eq!(
             planned
                 .iter()
                 .map(|member| member.model.as_str())
                 .collect::<Vec<_>>(),
-            vec!["a", "b"]
+            vec!["b", "a"]
+        );
+    }
+
+    #[test]
+    fn a_member_with_no_recorded_usage_counts_as_unspent() {
+        let members = vec![
+            member("model_provider_a", "a"),
+            member("model_provider_new", "b"),
+        ];
+        // The known Provider has spent tokens; the new one has no record at all.
+        // It must be tried first, not left behind a Provider already burning.
+        let usage = vec![(
+            ModelProviderProfileId::parse("model_provider_a").unwrap(),
+            500,
+        )];
+        let planned =
+            plan_members_with_usage(&members, vibex_core::RouteStrategy::LeastUsed, 0, &usage);
+        assert_eq!(planned[0].model, "b", "an unspent member goes first");
+    }
+
+    #[test]
+    fn least_used_without_usage_keeps_the_configured_order() {
+        let members = vec![
+            member("model_provider_a", "a"),
+            member("model_provider_b", "b"),
+        ];
+        let planned =
+            plan_members_with_usage(&members, vibex_core::RouteStrategy::LeastUsed, 0, &[]);
+        assert_eq!(
+            planned
+                .iter()
+                .map(|member| member.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "with nothing to distinguish them, order is stable"
         );
     }
 
     #[test]
     fn an_empty_route_plans_to_nothing() {
-        let planned = plan_members(&[], vibex_core::RouteStrategy::RoundRobin, 5);
+        let planned = plan_members_with_usage(&[], vibex_core::RouteStrategy::RoundRobin, 5, &[]);
         assert!(planned.is_empty());
     }
 }
