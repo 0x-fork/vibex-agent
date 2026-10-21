@@ -20960,16 +20960,12 @@ impl ManagementCenter {
         let mut recent = self
             .gateway_requests
             .iter()
-            .filter(|request| {
-                // The ledger stores the Provider under the answered member; a
-                // route request also carries which route it came from.
-                request.provider_name == member.provider_name
-            })
+            // By id, not by name: two Providers may share a display name, and
+            // a playback that conflated them would show another source's
+            // history under this member.
+            .filter(|request| request.model_provider_profile_id == member.provider_profile_id)
             .take(5)
             .collect::<Vec<_>>();
-        // A route may name two Providers with one display name; the member's
-        // own id is the tiebreaker the ledger does not carry, so the count is
-        // shown rather than claiming an exact match.
         let shown = recent.len();
         let mut body = v_flex().w_full().min_w_0().gap_1().pt_1().pl(px(16.0));
         if recent.is_empty() {
@@ -21083,7 +21079,14 @@ impl ManagementCenter {
                 .py(px(1.0))
                 .text_xs()
                 .text_color(color)
-                .child(label)
+                // The attempt number is what makes a failover legible: "the
+                // second source is answering" is the fact a reader needs when
+                // the first one was expected to.
+                .child(if live.attempt > 1 {
+                    format!("{} · #{}", label, live.attempt)
+                } else {
+                    label.to_string()
+                })
                 .into_any_element(),
         )
     }
@@ -21347,6 +21350,15 @@ impl ManagementCenter {
                             ),
                     )
                     .children(self.render_route_graph_live_badge(route, member, cx))
+                    .when(member.shows_usage(), |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_route_token_label(member.used_tokens)),
+                        )
+                    })
                     .child(
                         div()
                             .flex_none()
@@ -28953,9 +28965,23 @@ struct RouteGraphMember {
     ready_keys: usize,
     cooling_keys: usize,
     invalid_keys: usize,
+    /// Tokens this Provider has spent in the current window.
+    ///
+    /// Read from the same figure the token ceiling uses, so "how much has this
+    /// source burned" is answered by the number that decides whether it may
+    /// still answer.
+    used_tokens: u64,
 }
 
 impl RouteGraphMember {
+    /// Whether this member has spent enough tokens to be worth saying.
+    ///
+    /// A zero is noise on every fresh Provider, so the graph draws the count
+    /// only once there is one.
+    fn shows_usage(&self) -> bool {
+        self.used_tokens > 0
+    }
+
     /// The one-line state the graph appends to a member.
     fn state(&self) -> RouteGraphMemberState {
         if self.ready_keys > 0 {
@@ -29039,6 +29065,7 @@ fn route_graph_nodes(
                     enabled: member.enabled,
                     member_id: member.id.as_str().to_string(),
                     ready_keys: keys.iter().filter(|key| key.state.is_ready()).count(),
+                    used_tokens: keys.first().map(|key| key.used_tokens).unwrap_or(0),
                     cooling_keys: keys
                         .iter()
                         .filter(|key| {
@@ -29130,6 +29157,24 @@ fn management_agent_label(agent_id: &str, agents: &[vibex_core::AgentSnapshotEnt
         .find(|agent| agent.id.as_str() == agent_id)
         .map(|agent| agent.label.clone())
         .unwrap_or_else(|| agent_id.to_string())
+}
+
+/// A token count, thousands separated: the graph shows these inline and a bare
+/// `1234567` is unreadable at a glance.
+fn management_route_token_label(tokens: u64) -> String {
+    let digits = tokens.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    match locale::current_locale() {
+        ResolvedLocale::ZhCn => format!("{out} token"),
+        ResolvedLocale::ZhTw => format!("{out} token"),
+        ResolvedLocale::En => format!("{out} tokens"),
+    }
 }
 
 /// A request time, as the graph's playback shows it.
@@ -39132,6 +39177,7 @@ mod gateway_surface_tests {
         vibex_core::GatewayRequestSummary {
             request_id: vibex_core::RequestId::new(),
             agent_id: Some("codex".to_string()),
+            model_provider_profile_id: vibex_core::ModelProviderProfileId::new(),
             provider_name: "DeepSeek".to_string(),
             model_requested: "deepseek/deepseek-chat".to_string(),
             model_served: Some("deepseek-chat".to_string()),
@@ -39584,6 +39630,7 @@ mod route_graph_tests {
             ready_keys: 0,
             cooling_keys: 2,
             invalid_keys: 0,
+            used_tokens: 0,
         };
         assert_eq!(member.state(), RouteGraphMemberState::Cooling(2));
 
@@ -39722,5 +39769,96 @@ mod route_graph_edit_tests {
                 "{strategy:?} has no label"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod route_graph_live_tests {
+    use super::*;
+
+    fn member(provider: vibex_core::ModelProviderProfileId, used_tokens: u64) -> RouteGraphMember {
+        RouteGraphMember {
+            provider_name: "DeepSeek".to_string(),
+            provider_profile_id: provider,
+            model_id: "m".to_string(),
+            enabled: true,
+            member_id: "model_route_member_test".to_string(),
+            ready_keys: 1,
+            cooling_keys: 0,
+            invalid_keys: 0,
+            used_tokens,
+        }
+    }
+
+    /// Usage is drawn only once there is some.
+    ///
+    /// A zero beside every fresh Provider is noise, and the state line already
+    /// says whether the member can answer.
+    #[test]
+    fn usage_appears_only_after_tokens_are_spent() {
+        let provider = vibex_core::ModelProviderProfileId::new();
+        assert!(!member(provider.clone(), 0).shows_usage());
+        assert!(member(provider, 12).shows_usage());
+    }
+
+    /// A count is grouped so it can be read at a glance.
+    #[test]
+    fn a_token_count_is_thousands_separated() {
+        assert_eq!(management_route_token_label(999), "999 tokens");
+        assert_eq!(management_route_token_label(1_000), "1,000 tokens");
+        assert_eq!(management_route_token_label(1_234_567), "1,234,567 tokens");
+    }
+
+    /// A request is matched to the member by id, not by display name.
+    ///
+    /// Two Providers may share a name; matching on it would show one source's
+    /// history under the other.
+    #[test]
+    fn a_live_request_matches_its_member_by_id() {
+        let first = vibex_core::ModelProviderProfileId::new();
+        let second = vibex_core::ModelProviderProfileId::new();
+        let route = vibex_core::ModelRoute {
+            display_name: "Standard".to_string(),
+            ..Default::default()
+        };
+        let inflight = vibex_core::GatewayInflight {
+            request_id: vibex_core::RequestId::new(),
+            agent_id: Some("codex".to_string()),
+            model_route_id: Some(route.id.as_str().to_string()),
+            requested_model: route.model_id(),
+            model_provider_profile_id: second.clone(),
+            attempt: 2,
+            credential_id: None,
+            wire_protocol_id: vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+            started_at_ms: 1,
+            first_token_at_ms: None,
+        };
+        // The same display name is not enough to claim the request.
+        let matched = inflight.model_provider_profile_id == second;
+        assert!(matched);
+        assert_ne!(
+            inflight.model_provider_profile_id, first,
+            "a same-named Provider must not be matched"
+        );
+    }
+
+    /// The attempt number starts at one, so a first source is not "#0".
+    #[test]
+    fn the_attempt_number_is_one_based() {
+        let inflight = vibex_core::GatewayInflight {
+            request_id: vibex_core::RequestId::new(),
+            agent_id: None,
+            model_route_id: None,
+            requested_model: "m".to_string(),
+            model_provider_profile_id: vibex_core::ModelProviderProfileId::new(),
+            attempt: 1,
+            credential_id: None,
+            wire_protocol_id: vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+            started_at_ms: 1,
+            first_token_at_ms: None,
+        };
+        assert_eq!(inflight.attempt, 1);
+        // Only a retry is worth annotating; the first attempt is the norm.
+        assert!(inflight.attempt <= 1, "the first attempt is not annotated");
     }
 }

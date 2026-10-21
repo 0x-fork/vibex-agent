@@ -1045,6 +1045,13 @@ pub struct GatewayRequestSummary {
     pub request_id: RequestId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// The Provider that answered, by id.
+    ///
+    /// The display name beside it is for reading; two Providers may share one,
+    /// and a surface that filters the ledger by Provider must not conflate
+    /// them.
+    #[serde(default)]
+    pub model_provider_profile_id: ModelProviderProfileId,
     pub provider_name: String,
     pub model_requested: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1123,6 +1130,9 @@ impl GatewayRequestSummary {
                     .collect(),
             });
         Self {
+            model_provider_profile_id: profile
+                .map(|profile| profile.id.clone())
+                .unwrap_or_else(|| log.model_provider_profile_id.clone()),
             total_tokens: log.total_tokens(),
             input_tokens: log.input_tokens,
             output_tokens: log.output_tokens,
