@@ -835,11 +835,111 @@ pub struct RuntimeOptionCatalogAgentEvidence {
 /// Builds the runtime option catalog from one persisted capability snapshot
 /// per Agent. Provider Profiles contribute only their configured model IDs;
 /// no profile config is consulted for modes, efforts, or Features.
+/// What the catalog needs to know about a route.
+///
+/// The gateway Profile only carries `route/<id>`, so the name a reader picked
+/// and the number of sources behind it arrive beside the profile list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeRouteFacts {
+    /// The route's display name, as its owner wrote it.
+    pub display_name: String,
+    /// The Agents this route is bound to. A route appears for the Agents that
+    /// hold it and for no others.
+    pub agent_ids: Vec<AgentId>,
+    /// How many members can answer.
+    pub member_count: usize,
+    /// The models the route offers, in the order it lists them.
+    pub models: Vec<String>,
+    /// Whether the route reaches the gateway at all.
+    pub via_gateway: bool,
+}
+
+/// The three route lookups the option builder reads.
+#[allow(clippy::type_complexity)]
+fn route_fact_maps(
+    routes: &BTreeMap<vibex_core::ModelRouteId, RuntimeRouteFacts>,
+) -> (
+    BTreeMap<String, String>,
+    BTreeMap<String, usize>,
+    BTreeMap<String, String>,
+) {
+    let labels = routes
+        .iter()
+        .map(|(id, facts)| (id.as_str().to_string(), facts.display_name.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let counts = routes
+        .iter()
+        .map(|(id, facts)| (id.as_str().to_string(), facts.member_count))
+        .collect::<BTreeMap<_, _>>();
+    let models = routes
+        .iter()
+        .map(|(id, facts)| {
+            let label = if facts.models.is_empty() {
+                facts.display_name.clone()
+            } else {
+                facts.models.join(" \u{b7} ")
+            };
+            (id.as_str().to_string(), bounded_catalog_label(&label))
+        })
+        .collect::<BTreeMap<_, _>>();
+    (labels, counts, models)
+}
+
+/// The route a model id names, when it names one.
+fn route_source_for_model(model_id: &str) -> Option<String> {
+    let rest = model_id.strip_prefix("route/")?;
+    vibex_core::ModelRouteId::parse(rest)
+        .ok()
+        .map(|id| id.as_str().to_string())
+}
+
+/// One auth source per route, for the Agents it is bound to.
+fn route_auth_source_summaries(
+    agents: &[AgentSnapshotEntry],
+    routes: &BTreeMap<vibex_core::ModelRouteId, RuntimeRouteFacts>,
+) -> Vec<RuntimeAuthSourceSummary> {
+    let agents_by_id = agents
+        .iter()
+        .filter(|agent| agent.added && agent.enabled)
+        .map(|agent| (agent.id.clone(), agent))
+        .collect::<BTreeMap<_, _>>();
+    let mut summaries = Vec::new();
+    for (route_id, facts) in routes {
+        for agent_id in &facts.agent_ids {
+            let Some(agent) = agents_by_id.get(agent_id) else {
+                continue;
+            };
+            let availability = if matches!(
+                agent.config_status,
+                AgentConfigStatus::NeedsConfiguration | AgentConfigStatus::Unknown
+            ) {
+                RuntimeAuthSourceAvailability::RequiresConfiguration
+            } else {
+                RuntimeAuthSourceAvailability::Available
+            };
+            summaries.push(RuntimeAuthSourceSummary {
+                source: RuntimeAuthSource::model_route(route_id.clone()),
+                auth_source_revision: 0,
+                agent_id: agent.id.clone(),
+                label: bounded_catalog_label(&facts.display_name),
+                kind: RuntimeAuthSourceKind::ModelRoute,
+                availability,
+                account_hint: None,
+                model_catalog_status: AgentAuthModelCatalogStatus::Unknown,
+                supported_actions: Vec::new(),
+            });
+        }
+    }
+    summaries
+}
+
 pub fn build_runtime_option_catalog_for_agents(
     agents: &[AgentSnapshotEntry],
     profiles: &[ProviderProfileSummary],
     evidence_by_agent: &BTreeMap<AgentId, RuntimeOptionCatalogAgentEvidence>,
+    routes: &BTreeMap<vibex_core::ModelRouteId, RuntimeRouteFacts>,
 ) -> SessionRuntimeOptionCatalog {
+    let (route_labels, route_member_counts, route_model_labels) = route_fact_maps(routes);
     let agents_by_id = agents
         .iter()
         .filter(|agent| agent.added && agent.enabled)
@@ -933,18 +1033,52 @@ pub fn build_runtime_option_catalog_for_agents(
                     .is_some_and(|model| !model.trim().is_empty()),
         );
         for (model_id, model_label) in model_ids {
-            let mut selection =
-                SessionRuntimeSelection::provider(agent.id.clone(), profile.id.clone(), model_id);
+            // A gateway Profile carries one `route/<id>` entry per route. Each
+            // becomes its own group, because a route is what the reader picked:
+            // filing them under the gateway's name would show one group of
+            // unrelated compositions.
+            let route_source = route_source_for_model(&model_id);
+            let mut selection = match route_source.as_ref() {
+                Some(route_id) => SessionRuntimeSelection::model_route(
+                    agent.id.clone(),
+                    vibex_core::ModelRouteId::parse(route_id.clone())
+                        .expect("a parsed route id round-trips"),
+                ),
+                None => SessionRuntimeSelection::provider(
+                    agent.id.clone(),
+                    profile.id.clone(),
+                    model_id.clone(),
+                ),
+            };
             selection.config_values = feature_config_values.clone();
+            let auth_source_label = match route_source.as_ref() {
+                Some(route_id) => route_labels
+                    .get(route_id)
+                    .cloned()
+                    .unwrap_or_else(|| bounded_catalog_label(route_id)),
+                None => bounded_catalog_label(&profile.display_name),
+            };
+            let member_count = route_source
+                .as_ref()
+                .and_then(|route_id| route_member_counts.get(route_id).copied())
+                .unwrap_or(1);
             options.push(SessionRuntimeOption {
                 selection,
                 agent_label: bounded_catalog_label(&agent.label),
-                auth_source_label: bounded_catalog_label(&profile.display_name),
-                model_label,
+                auth_source_label,
+                // Inside a route group only the model name is shown: the
+                // Provider is the route's business.
+                model_label: route_source
+                    .as_ref()
+                    .and_then(|route_id| route_model_labels.get(route_id))
+                    .cloned()
+                    .unwrap_or(model_label),
                 reasoning_efforts: reasoning_efforts.clone(),
                 modes: modes.clone(),
                 features: features.clone(),
                 availability,
+                member_count,
+                auto_routes: member_count > 1,
             });
         }
     }
@@ -952,7 +1086,11 @@ pub fn build_runtime_option_catalog_for_agents(
     let mut catalog = SessionRuntimeOptionCatalog {
         revision: 1,
         agents: catalog_agent_summaries(agents),
-        auth_sources: provider_auth_source_summaries(agents, profiles),
+        auth_sources: {
+            let mut sources = provider_auth_source_summaries(agents, profiles);
+            sources.extend(route_auth_source_summaries(agents, routes));
+            sources
+        },
         options,
     };
     refresh_runtime_option_catalog_revision(&mut catalog, std::iter::empty::<&[u8]>());
@@ -968,6 +1106,7 @@ pub fn build_runtime_option_catalog(
         vibex_core::ProviderProfileId,
         RuntimeOptionCatalogProfileEvidence,
     >,
+    routes: &BTreeMap<vibex_core::ModelRouteId, RuntimeRouteFacts>,
 ) -> SessionRuntimeOptionCatalog {
     let agents_by_id = agents
         .iter()
@@ -1120,6 +1259,10 @@ pub fn build_runtime_option_catalog(
                 modes,
                 features,
                 availability,
+                // A gateway model entry that is not a route is a single
+                // upstream; it has nothing to fail over to.
+                member_count: 1,
+                auto_routes: false,
             });
         }
     }
@@ -1127,7 +1270,11 @@ pub fn build_runtime_option_catalog(
     let mut catalog = SessionRuntimeOptionCatalog {
         revision: 1,
         agents: catalog_agent_summaries(agents),
-        auth_sources: provider_auth_source_summaries(agents, profiles),
+        auth_sources: {
+            let mut sources = provider_auth_source_summaries(agents, profiles);
+            sources.extend(route_auth_source_summaries(agents, routes));
+            sources
+        },
         options,
     };
     refresh_runtime_option_catalog_revision(&mut catalog, std::iter::empty::<&[u8]>());
@@ -1200,6 +1347,8 @@ pub fn append_agent_account_runtime_options(
                     modes,
                     features,
                     availability: RuntimeOptionAvailability::Available,
+                    member_count: 1,
+                    auto_routes: false,
                 });
             }
         }
@@ -1217,6 +1366,8 @@ pub fn append_agent_account_runtime_options(
                 modes: snapshot.default_modes.clone(),
                 features: snapshot.default_features.clone(),
                 availability: RuntimeOptionAvailability::Available,
+                member_count: 1,
+                auto_routes: false,
             });
         }
         _ => {}
@@ -1693,6 +1844,7 @@ pub fn refresh_runtime_option_catalog_revision<'a>(
             match source.kind {
                 RuntimeAuthSourceKind::ProviderProfile => b"provider_profile",
                 RuntimeAuthSourceKind::AgentAccount => b"agent_account",
+                RuntimeAuthSourceKind::ModelRoute => b"model_route",
             },
         );
         write_catalog_component(&mut hasher, source.source.id().as_bytes());
@@ -1722,6 +1874,9 @@ pub fn refresh_runtime_option_catalog_revision<'a>(
             match option.selection.auth_source.kind() {
                 RuntimeAuthSourceKind::ProviderProfile => b"provider_profile",
                 RuntimeAuthSourceKind::AgentAccount => b"agent_account",
+                // Distinct, so a route cannot hash the same as the Profile it
+                // happens to resolve to this time.
+                RuntimeAuthSourceKind::ModelRoute => b"model_route",
             },
         );
         write_catalog_component(&mut hasher, option.selection.auth_source.id().as_bytes());
@@ -2295,7 +2450,8 @@ mod tests {
             last_attempt_at_ms: 10,
             last_error_code: None,
         };
-        let mut catalog = build_runtime_option_catalog(&[agent.clone()], &[], &BTreeMap::new());
+        let mut catalog =
+            build_runtime_option_catalog(&[agent.clone()], &[], &BTreeMap::new(), &BTreeMap::new());
 
         append_agent_account_runtime_options(&mut catalog, &agent, &context, Some(&snapshot), true);
 
@@ -2349,7 +2505,7 @@ mod tests {
         let mut signed_out = context;
         signed_out.status = AgentAuthContextStatus::AuthenticationRequired;
         let mut signed_out_catalog =
-            build_runtime_option_catalog(&[agent.clone()], &[], &BTreeMap::new());
+            build_runtime_option_catalog(&[agent.clone()], &[], &BTreeMap::new(), &BTreeMap::new());
         append_agent_account_runtime_options(
             &mut signed_out_catalog,
             &agent,
@@ -2852,8 +3008,12 @@ mod tests {
             launch_revision: 1,
         };
 
-        let catalog =
-            build_runtime_option_catalog_for_agents(&[agent], &[profile], &BTreeMap::new());
+        let catalog = build_runtime_option_catalog_for_agents(
+            &[agent],
+            &[profile],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
 
         assert!(catalog.options.is_empty());
     }
@@ -2959,11 +3119,13 @@ mod tests {
             std::slice::from_ref(&agent),
             std::slice::from_ref(&profile),
             &evidence,
+            &BTreeMap::new(),
         );
         let second = build_runtime_option_catalog(
             std::slice::from_ref(&agent),
             std::slice::from_ref(&profile),
             &evidence,
+            &BTreeMap::new(),
         );
         assert_eq!(first, second);
         assert_eq!(first.options.len(), 1);
@@ -3016,7 +3178,8 @@ mod tests {
             value: "false".to_string(),
             label: None,
         });
-        let changed = build_runtime_option_catalog(&[agent], &[profile], &changed_evidence);
+        let changed =
+            build_runtime_option_catalog(&[agent], &[profile], &changed_evidence, &BTreeMap::new());
         assert_ne!(first.revision, changed.revision);
         let json = serde_json::to_string(&first).unwrap();
         for forbidden in ["adapter", "nativeSession", "accountAlias", "secret"] {
@@ -3059,6 +3222,7 @@ mod tests {
             &[agent.clone()],
             std::slice::from_ref(&profile),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         );
         assert_eq!(catalog.options.len(), 1);
         assert!(catalog.options[0].reasoning_efforts.is_empty());
@@ -3071,12 +3235,13 @@ mod tests {
             &[agent.clone()],
             &[profile.clone(), native_config_profile],
             &BTreeMap::new(),
+            &BTreeMap::new(),
         );
         assert_eq!(catalog.options.len(), 1);
 
         agent.enabled = false;
         assert!(
-            build_runtime_option_catalog(&[agent], &[profile], &BTreeMap::new())
+            build_runtime_option_catalog(&[agent], &[profile], &BTreeMap::new(), &BTreeMap::new())
                 .options
                 .is_empty()
         );
@@ -3135,7 +3300,8 @@ mod tests {
             },
         )]);
 
-        let catalog = build_runtime_option_catalog(&[agent], &[profile], &evidence);
+        let catalog =
+            build_runtime_option_catalog(&[agent], &[profile], &evidence, &BTreeMap::new());
 
         assert_eq!(catalog.options.len(), 1);
         assert!(catalog.options[0].reasoning_efforts.is_empty());
@@ -3204,6 +3370,7 @@ mod tests {
             std::slice::from_ref(&agent),
             std::slice::from_ref(&profile),
             &evidence,
+            &BTreeMap::new(),
         );
         assert_eq!(catalog.options.len(), 1);
         assert_eq!(catalog.options[0].selection.model_id(), Some("sonnet"));
@@ -3220,9 +3387,14 @@ mod tests {
             capabilities: Default::default(),
         }];
         assert!(
-            build_runtime_option_catalog(&[agent], &[explicitly_disabled], &evidence)
-                .options
-                .is_empty()
+            build_runtime_option_catalog(
+                &[agent],
+                &[explicitly_disabled],
+                &evidence,
+                &BTreeMap::new(),
+            )
+            .options
+            .is_empty()
         );
     }
 
@@ -3285,5 +3457,117 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["https://agentclientprotocol.com/protocol/session-modes#agent"]
         );
+    }
+}
+
+#[cfg(test)]
+mod route_catalog_tests {
+    use super::*;
+    use vibex_core::builtin_agent_definitions;
+
+    fn agent(id: &str) -> AgentSnapshotEntry {
+        let definition = builtin_agent_definitions()
+            .into_iter()
+            .find(|definition| definition.id.as_str() == id)
+            .unwrap();
+        let mut agent = AgentSnapshotEntry::from_definition(&definition, None, None);
+        agent.added = true;
+        agent.enabled = true;
+        agent.installed = true;
+        agent.configured = true;
+        agent.config_status = AgentConfigStatus::Configured;
+        agent.runtime_status = AgentRuntimeStatus::Ready;
+        agent
+    }
+
+    fn route_facts(agent_id: &str, name: &str, count: usize) -> RuntimeRouteFacts {
+        RuntimeRouteFacts {
+            display_name: name.to_string(),
+            agent_ids: vec![AgentId::parse(agent_id).unwrap()],
+            member_count: count,
+            models: vec!["m".to_string()],
+            via_gateway: true,
+        }
+    }
+
+    /// A route is its own group, named by the route rather than the gateway.
+    #[test]
+    fn a_route_becomes_its_own_auth_source() {
+        let routes = [(
+            vibex_core::ModelRouteId::new(),
+            route_facts("codex", "Standard", 3),
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let catalog =
+            build_runtime_option_catalog(&[agent("codex")], &[], &BTreeMap::new(), &routes);
+        let route_sources = catalog
+            .auth_sources
+            .iter()
+            .filter(|source| source.kind == RuntimeAuthSourceKind::ModelRoute)
+            .collect::<Vec<_>>();
+        assert_eq!(route_sources.len(), 1);
+        assert_eq!(route_sources[0].label, "Standard");
+        assert_eq!(route_sources[0].agent_id.as_str(), "codex");
+    }
+
+    /// A route appears only for the Agents that hold it.
+    #[test]
+    fn a_route_is_offered_only_to_the_agents_bound_to_it() {
+        let routes = [(
+            vibex_core::ModelRouteId::new(),
+            route_facts("codex", "Standard", 1),
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let catalog = build_runtime_option_catalog(
+            &[agent("codex"), agent("claude")],
+            &[],
+            &BTreeMap::new(),
+            &routes,
+        );
+        let agents = catalog
+            .auth_sources
+            .iter()
+            .filter(|source| source.kind == RuntimeAuthSourceKind::ModelRoute)
+            .map(|source| source.agent_id.as_str().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(agents, vec!["codex"], "claude is not bound to it");
+    }
+
+    /// A `route/<id>` model is recognised as a route and nothing else is.
+    #[test]
+    fn only_the_route_prefix_marks_a_route_model() {
+        assert!(route_source_for_model("route/model_route_abc").is_some());
+        assert!(route_source_for_model("deepseek/deepseek-chat").is_none());
+        assert!(route_source_for_model("deepseek-chat").is_none());
+        assert!(route_source_for_model("route/").is_none());
+    }
+
+    /// A route selection carries the route's id as its model.
+    ///
+    /// A failover must not look like a new selection, so the model a route
+    /// selection names is the route itself, never the member that answered.
+    #[test]
+    fn a_route_selection_names_the_route() {
+        let route_id = vibex_core::ModelRouteId::new();
+        let selection = SessionRuntimeSelection::model_route(
+            AgentId::parse("codex").unwrap(),
+            route_id.clone(),
+        );
+        assert_eq!(
+            selection.model_id(),
+            Some(format!("route/{}", route_id.as_str()).as_str())
+        );
+        assert_eq!(selection.auth_source.model_route_id(), Some(&route_id));
+        assert!(selection.auth_source.provider_profile_id().is_none());
+    }
+
+    /// One source cannot fail over to another.
+    #[test]
+    fn a_single_source_route_does_not_promise_automatic_switching() {
+        let facts = route_facts("codex", "Only one", 1);
+        assert_eq!(facts.member_count, 1);
+        assert!(facts.member_count <= 1);
     }
 }

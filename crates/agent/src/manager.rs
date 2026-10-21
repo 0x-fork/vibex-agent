@@ -1389,6 +1389,31 @@ impl AgentManager {
                     ));
                 }
             }
+            vibex_core::RuntimeAuthSource::ModelRoute { model_route_id } => {
+                // A route must resolve to a launching Profile for *this* Agent,
+                // which also proves the route is bound to it: an unbound route,
+                // a direct route naming another Agent's row, and a gateway that
+                // does not serve the route all fail here rather than at spawn.
+                let profile =
+                    vibex_db::legacy_profile_for_route(&conn, &desired.agent_id, model_route_id)?
+                        .ok_or_else(|| {
+                        VibexError::validation(
+                            "model_route_not_launchable",
+                            "This route has no Profile this Agent can launch through",
+                        )
+                        .with_diagnostic("modelRouteId", model_route_id.as_str())
+                        .with_diagnostic("agentId", desired.agent_id.as_str())
+                    })?;
+                if profile.agent_id != desired.agent_id
+                    || profile.kind != ProviderKind::Acp
+                    || profile.status != ProviderProfileStatus::Enabled
+                {
+                    return Err(VibexError::validation(
+                        "model_route_route_mismatch",
+                        "The route's Profile is not enabled for the requested ACP Agent",
+                    ));
+                }
+            }
             vibex_core::RuntimeAuthSource::AgentAccount { auth_context_id } => {
                 let context = AgentAuthContextRepository::get_by_id(&conn, auth_context_id)?
                     .ok_or_else(|| {
@@ -5876,6 +5901,19 @@ impl AgentManager {
                     .unwrap_or_else(|| "Agent default".to_string());
                 (label, model_label)
             }
+            vibex_core::RuntimeAuthSource::ModelRoute { model_route_id } => {
+                // Attribution names the route, because the route is what the
+                // reader chose and what the ledger's own trace can be matched
+                // against. The member that answered is a property of the route,
+                // not of the selection.
+                let label = vibex_db::ModelRouteRepository::get(&conn, model_route_id)?
+                    .map(|route| route.display_name)
+                    .unwrap_or_else(|| model_route_id.as_str().to_string());
+                let model_label = effective_model_id
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "Agent default".to_string());
+                (label, model_label)
+            }
         };
 
         TurnExecutionAttribution::new(
@@ -6447,6 +6485,9 @@ fn delegation_runtime_summary(selection: &SessionRuntimeSelection) -> Delegation
             provider_profile_id,
         } => ("provider_profile", Some(provider_profile_id.clone())),
         vibex_core::RuntimeAuthSource::AgentAccount { .. } => ("agent_account", None),
+        // A route names its own kind: the summary says the session ran through
+        // a route, not which Provider a member happened to be.
+        vibex_core::RuntimeAuthSource::ModelRoute { .. } => ("model_route", None),
     };
     let configuration_label = selection
         .model_id()

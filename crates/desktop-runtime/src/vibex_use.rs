@@ -4675,6 +4675,9 @@ fn delegation_runtime_summary(selection: &SessionRuntimeSelection) -> Delegation
             provider_profile_id,
         } => ("provider_profile", Some(provider_profile_id.clone())),
         vibex_core::RuntimeAuthSource::AgentAccount { .. } => ("agent_account", None),
+        // A route is its own kind: the summary names what the reader chose, and
+        // the member a route happened to use is not that choice.
+        vibex_core::RuntimeAuthSource::ModelRoute { .. } => ("model_route", None),
     };
     DelegationRuntimeSummary {
         agent_id: selection.agent_id.clone(),
@@ -5286,6 +5289,8 @@ mod tests {
             modes: Vec::new(),
             features: Vec::new(),
             availability: vibex_core::RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
         };
         let first = runtime_option_ref(&option);
         // The reference is derived from the typed selection, not from a

@@ -742,6 +742,8 @@ fn the_prompt_names_the_runtime_the_session_is_on() {
         modes: Vec::new(),
         features: Vec::new(),
         availability: vibex_core::RuntimeOptionAvailability::Available,
+        member_count: 1,
+        auto_routes: false,
     };
     app.runtime_options = Some(vibex_core::SessionRuntimeOptionCatalog {
         revision: 1,
@@ -857,6 +859,8 @@ fn the_prompt_names_the_account_the_runtime_runs_on() {
         modes: Vec::new(),
         features: Vec::new(),
         availability: vibex_core::RuntimeOptionAvailability::Available,
+        member_count: 1,
+        auto_routes: false,
     };
     let catalog = vibex_core::SessionRuntimeOptionCatalog {
         revision: 1,
@@ -1007,6 +1011,8 @@ fn run_option_catalog() -> vibex_core::SessionRuntimeOptionCatalog {
         modes: Vec::new(),
         features: Vec::new(),
         availability: vibex_core::RuntimeOptionAvailability::Available,
+        member_count: 1,
+        auto_routes: false,
     };
     let mut codex = option("codex", "gpt-5");
     codex.reasoning_efforts = vec![value("low", "Low"), value("high", "High")];
@@ -1252,6 +1258,8 @@ fn the_models_under_an_agent_start_in_one_column() {
         modes: Vec::new(),
         features: Vec::new(),
         availability: vibex_core::RuntimeOptionAvailability::Available,
+        member_count: 1,
+        auto_routes: false,
     };
     let catalog = vibex_core::SessionRuntimeOptionCatalog {
         revision: 1,
@@ -1577,6 +1585,8 @@ fn a_catalogue_longer_than_the_window_keeps_the_cursor_on_screen() {
             modes: Vec::new(),
             features: Vec::new(),
             availability: vibex_core::RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
         })
         .collect::<Vec<_>>();
     let catalog = vibex_core::SessionRuntimeOptionCatalog {
@@ -7385,6 +7395,8 @@ fn the_agent_and_the_composer_line_carry_a_new_runtime_together() {
         modes: Vec::new(),
         features: Vec::new(),
         availability: vibex_core::RuntimeOptionAvailability::Available,
+        member_count: 1,
+        auto_routes: false,
     };
     let mut app = app(120, 40);
     app.live = vibex_tui::app::LiveState::Ready;
@@ -7585,6 +7597,8 @@ fn the_composing_page_chooses_the_runtime_the_session_is_born_with() {
         modes: Vec::new(),
         features: Vec::new(),
         availability: vibex_core::RuntimeOptionAvailability::Available,
+        member_count: 1,
+        auto_routes: false,
     };
     let mut app = app(100, 30);
     app.live = vibex_tui::app::LiveState::Ready;
@@ -7653,6 +7667,8 @@ fn the_new_session_page_names_the_agent_it_will_be_created_with() {
         modes: Vec::new(),
         features: Vec::new(),
         availability: vibex_core::RuntimeOptionAvailability::Available,
+        member_count: 1,
+        auto_routes: false,
     };
     let mut app = app(120, 40);
     app.live = vibex_tui::app::LiveState::Ready;
@@ -8713,6 +8729,8 @@ fn the_runtime_chosen_on_the_new_session_page_is_not_the_old_sessions() {
         modes: Vec::new(),
         features: Vec::new(),
         availability: vibex_core::RuntimeOptionAvailability::Available,
+        member_count: 1,
+        auto_routes: false,
     };
     let mut app = app(120, 40);
     app.live = vibex_tui::app::LiveState::Ready;
@@ -8908,6 +8926,8 @@ fn the_creating_session_view_waits_for_its_session() {
         modes: Vec::new(),
         features: Vec::new(),
         availability: vibex_core::RuntimeOptionAvailability::Available,
+        member_count: 1,
+        auto_routes: false,
     };
     let mut app = app(110, 30);
     app.live = vibex_tui::app::LiveState::Ready;
@@ -10920,6 +10940,8 @@ fn an_agent_account_is_named_in_the_readers_language_on_the_runtime_surfaces() {
             modes: Vec::new(),
             features: Vec::new(),
             availability: vibex_core::RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
         };
         let selection = option.selection.clone();
         app.runtime_options = Some(vibex_core::SessionRuntimeOptionCatalog {

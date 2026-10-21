@@ -321,6 +321,10 @@ fn auth_source_kind(source: &RuntimeAuthSource) -> &'static [u8] {
     match source {
         RuntimeAuthSource::ProviderProfile { .. } => b"provider_profile",
         RuntimeAuthSource::AgentAccount { .. } => b"agent_account",
+        // Distinct, so a route and the Profile it resolves to never share a
+        // fingerprint: switching between them is a new launch contract even
+        // when the process arguments look identical.
+        RuntimeAuthSource::ModelRoute { .. } => b"model_route",
     }
 }
 

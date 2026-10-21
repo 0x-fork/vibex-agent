@@ -13,14 +13,14 @@ use vibex_core::{
     AcpAdapterId, AgentAuthContextId, AgentId, AgentSessionRestoreCompatibilityKey,
     AgentSessionRestoreResult, AgentSessionState, BindingState, EventId,
     MAX_MESSAGE_IDEMPOTENCY_KEY_LEN, MAX_RUNTIME_SELECTION_ERROR_CODE_LEN, MessageSubmissionId,
-    MessageSubmissionState, MessageSubmissionStatus, NativeStateHomeId, ProviderProfileId,
-    RetrySemantics, RuntimeAuthSource, RuntimeAuthSourceKind, RuntimeBinding, RuntimeBindingId,
-    RuntimeSwitchActiveWorkPolicy, RuntimeSwitchEventKind, RuntimeSwitchEventProjection,
-    RuntimeSwitchId, RuntimeSwitchOperationId, RuntimeSwitchPolicy, RuntimeSwitchStatus,
-    SendAgentMessageRequest, SessionRuntimeConfigState, SessionRuntimeSelection,
-    SessionRuntimeSelectionStatus, SwitchOperationStatus, TimelineItem, TimelineItemId,
-    TimelineItemKind, TimelinePayload, TimelineRedactionState, TimelineSource, TransportKind,
-    UsageExecutionId, UserMessagePayload, VibexError, VibexResult, VibexSessionId,
+    MessageSubmissionState, MessageSubmissionStatus, ModelRouteId, NativeStateHomeId,
+    ProviderProfileId, RetrySemantics, RuntimeAuthSource, RuntimeAuthSourceKind, RuntimeBinding,
+    RuntimeBindingId, RuntimeSwitchActiveWorkPolicy, RuntimeSwitchEventKind,
+    RuntimeSwitchEventProjection, RuntimeSwitchId, RuntimeSwitchOperationId, RuntimeSwitchPolicy,
+    RuntimeSwitchStatus, SendAgentMessageRequest, SessionRuntimeConfigState,
+    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SwitchOperationStatus, TimelineItem,
+    TimelineItemId, TimelineItemKind, TimelinePayload, TimelineRedactionState, TimelineSource,
+    TransportKind, UsageExecutionId, UserMessagePayload, VibexError, VibexResult, VibexSessionId,
     unix_timestamp_ms,
 };
 
@@ -52,6 +52,19 @@ fn decode_runtime_auth_source(
             Ok(RuntimeAuthSource::provider_profile(parse_id(
                 source_id,
                 ProviderProfileId::parse,
+            )?))
+        }
+        RuntimeAuthSourceKind::ModelRoute => {
+            // A route has no legacy Profile, so the compatibility columns must
+            // be empty for it — exactly like an Agent account.
+            if legacy_provider_profile_id.is_some() {
+                return Err(VibexError::storage(
+                    "runtime_auth_source_legacy_mismatch",
+                    "route runtime auth source must not contain a Provider Profile",
+                ));
+            }
+            Ok(RuntimeAuthSource::model_route(ModelRouteId::parse(
+                source_id,
             )?))
         }
         RuntimeAuthSourceKind::AgentAccount => {

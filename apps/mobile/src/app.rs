@@ -19676,6 +19676,9 @@ impl MobileApp {
                     ("icons/database.svg", theme::accent_green())
                 }
                 RuntimeAuthSourceKind::AgentAccount => ("icons/user.svg", theme::accent_chart3()),
+                // A route is a saved composition, so it reads like a Provider
+                // group rather than an account.
+                RuntimeAuthSourceKind::ModelRoute => ("icons/database.svg", theme::accent_green()),
             };
             let group = div()
                 .child(
@@ -33280,7 +33283,9 @@ fn runtime_auth_source_display_label(source: &RuntimeAuthSourceSummary) -> Strin
         RuntimeAuthSourceKind::AgentAccount => {
             locale::text("Agent account", "Agent 账户", "Agent 帳戶").to_string()
         }
-        RuntimeAuthSourceKind::ProviderProfile => source.label.clone(),
+        RuntimeAuthSourceKind::ProviderProfile | RuntimeAuthSourceKind::ModelRoute => {
+            source.label.clone()
+        }
     }
 }
 
@@ -33298,7 +33303,8 @@ fn runtime_auth_source_selection_label(
         vibex_core::RuntimeAuthSource::AgentAccount { .. } => {
             locale::text("Agent account", "Agent 账户", "Agent 帳戶").to_string()
         }
-        vibex_core::RuntimeAuthSource::ProviderProfile { .. } => fallback.to_string(),
+        vibex_core::RuntimeAuthSource::ProviderProfile { .. }
+        | vibex_core::RuntimeAuthSource::ModelRoute { .. } => fallback.to_string(),
     }
 }
 
@@ -36466,6 +36472,8 @@ mod tests {
             modes: Vec::new(),
             features: Vec::new(),
             availability,
+            member_count: 1,
+            auto_routes: false,
         }
     }
 

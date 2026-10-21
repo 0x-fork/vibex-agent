@@ -76,6 +76,84 @@ impl ProviderConfigService {
         AgentModelRouteBindingRepository::list_for_agent(&conn, agent_id)
     }
 
+    /// The legacy Profile an Agent launches through for one route.
+    ///
+    /// A route is not a launch contract; it describes which sources to try. The
+    /// ACP projection still starts an Agent from a `ProviderProfile`, so a
+    /// session that selects a route resolves to the gateway Profile that serves
+    /// it: the route is written into that Profile's model list as `route/<id>`,
+    /// and the gateway picks the member.
+    ///
+    /// A direct route resolves to the Profile of the one Provider it names,
+    /// because it never reaches the gateway.
+    pub fn legacy_profile_for_route(
+        &self,
+        agent_id: &AgentId,
+        route_id: &ModelRouteId,
+    ) -> VibexResult<Option<vibex_core::ProviderProfile>> {
+        let conn = self.open_connection()?;
+        let Some(route) = ModelRouteRepository::get(&conn, route_id)? else {
+            return Ok(None);
+        };
+        // The route must be one this Agent may use; a route another Agent holds
+        // is not a launchable source for this one.
+        let bound = AgentModelRouteBindingRepository::list_for_agent(&conn, agent_id)?
+            .iter()
+            .any(|binding| &binding.model_route_id == route_id);
+        if !bound {
+            return Ok(None);
+        }
+        match route.kind {
+            vibex_core::RouteKind::Direct => {
+                // A direct route never enters the gateway: it launches through
+                // the row the Provider page materialised for this Agent. That
+                // row is found by the Provider's display name matching the
+                // route's single member, which is how the direct migration
+                // named it.
+                let Some(member) = route.enabled_members().next() else {
+                    return Ok(None);
+                };
+                let shared = vibex_db::ModelProviderProfileRepository::get(
+                    &conn,
+                    &member.model_provider_profile_id,
+                )?;
+                let Some(shared) = shared else {
+                    return Ok(None);
+                };
+                // The compatibility layer records which legacy row a shared
+                // Provider came from; matching on it is exact, where a display
+                // name would collide as soon as two Agents name theirs alike.
+                let Some(legacy_id) = shared.legacy_provider_profile_id else {
+                    return Ok(None);
+                };
+                let profile = vibex_db::ProviderProfileRepository::get(&conn, &legacy_id)?;
+                Ok(profile.filter(|profile| &profile.agent_id == agent_id))
+            }
+            vibex_core::RouteKind::Gateway => {
+                // The gateway Profile is per Agent and already carries every
+                // route id in its catalogue.
+                Ok(self.gateway_legacy_profile(agent_id)?.filter(|profile| {
+                    profile
+                        .configured_models
+                        .iter()
+                        .any(|model| model.id == route.model_id())
+                }))
+            }
+        }
+    }
+
+    /// The gateway's hidden Profile for one Agent, when it has one.
+    pub fn gateway_legacy_profile(
+        &self,
+        agent_id: &AgentId,
+    ) -> VibexResult<Option<vibex_core::ProviderProfile>> {
+        let conn = self.open_connection()?;
+        let profiles = vibex_db::ProviderProfileRepository::list_by_agent(&conn, agent_id, true)?;
+        Ok(profiles
+            .into_iter()
+            .find(crate::model_gateway::is_gateway_profile))
+    }
+
     /// Every live route binding, for a bundle that renders every Agent.
     pub fn list_all_agent_model_route_bindings(&self) -> VibexResult<Vec<AgentModelRouteBinding>> {
         let conn = self.open_connection()?;

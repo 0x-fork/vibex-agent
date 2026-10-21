@@ -38,6 +38,8 @@ fn app() -> App {
                 modes: vec![],
                 features: vec![],
                 availability: RuntimeOptionAvailability::Available,
+                member_count: 1,
+                auto_routes: false,
             })
             .collect(),
     });

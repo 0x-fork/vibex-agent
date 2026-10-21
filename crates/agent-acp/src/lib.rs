@@ -141,9 +141,9 @@ pub use session_attachment_registry::{
 };
 pub use session_config::{
     CanonicalKeyError, CanonicalSessionConfigKey, RuntimeOptionCatalogAgentEvidence,
-    RuntimeOptionCatalogProfileEvidence, SessionConfigExtension, SessionConfigFieldKind,
-    SessionConfigFieldRequest, SessionConfigOperationEvidence, SessionConfigPlan,
-    SessionConfigPlanner, SessionModelCatalogEntry, SessionModelCatalogSource,
+    RuntimeOptionCatalogProfileEvidence, RuntimeRouteFacts, SessionConfigExtension,
+    SessionConfigFieldKind, SessionConfigFieldRequest, SessionConfigOperationEvidence,
+    SessionConfigPlan, SessionConfigPlanner, SessionModelCatalogEntry, SessionModelCatalogSource,
     append_agent_account_runtime_options, build_runtime_option_catalog,
     build_runtime_option_catalog_for_agents, merge_model_catalog, normalize_identifier,
     refresh_runtime_option_catalog_revision, resolve_canonical_option_key, validate_effort_value,

@@ -9043,6 +9043,8 @@ mod tests {
             modes: Vec::new(),
             features: Vec::new(),
             availability,
+            member_count: 1,
+            auto_routes: false,
         };
         vibex_core::SessionRuntimeOptionCatalog {
             revision: 1,
@@ -9161,6 +9163,8 @@ mod tests {
             modes: Vec::new(),
             features: Vec::new(),
             availability: vibex_core::RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
         };
         let mut agent = option("codex", "gpt-5");
         agent.reasoning_efforts = vec![value("low", "Low"), value("high", "High")];

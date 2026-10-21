@@ -549,7 +549,7 @@ fn gateway_provider_kind(agent_id: &AgentId) -> ProviderKind {
     }
 }
 
-fn is_gateway_profile(profile: &ProviderProfile) -> bool {
+pub(crate) fn is_gateway_profile(profile: &ProviderProfile) -> bool {
     provider_option_value(&profile.provider_options, GATEWAY_PROFILE_ROLE_OPTION_KEY).as_deref()
         == Some(GATEWAY_PROFILE_ROLE)
 }

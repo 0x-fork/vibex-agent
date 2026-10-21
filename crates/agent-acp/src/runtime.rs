@@ -7731,91 +7731,99 @@ impl AcpRuntimeSwitchBridge {
                 "Agent session was not found",
             ));
         }
-        let (auth_source_revision, config, runtime_resources, env_unsets) =
-            match &selection.auth_source {
-                RuntimeAuthSource::ProviderProfile {
-                    provider_profile_id,
-                } => {
-                    let profile = self
-                        .client
-                        .config_service
-                        .get_profile(provider_profile_id)?
-                        .ok_or_else(|| {
-                            runtime_configuration_unavailable("provider_profile_not_found")
-                        })?;
-                    if profile.agent_id != selection.agent_id
-                        || profile.kind != ProviderKind::Acp
-                        || profile.status != ProviderProfileStatus::Enabled
-                    {
-                        return Err(runtime_configuration_unavailable(
-                            "provider_profile_route_unavailable",
-                        ));
-                    }
-                    let config = self
-                        .client
-                        .profile_config(provider_profile_id)
-                        .map_err(|error| runtime_configuration_unavailable(&error.code))?;
-                    // Profile config reads may perform a one-time native
-                    // import hydration. Capture the revision after that
-                    // migration so the launch snapshot is self-consistent.
-                    let profile = self
-                        .client
-                        .config_service
-                        .get_profile(provider_profile_id)?
-                        .ok_or_else(|| {
-                            runtime_configuration_unavailable("provider_profile_not_found")
-                        })?;
-                    let runtime_resources = self.manager.runtime_resources_for_session(
-                        session_id,
-                        &selection.agent_id,
-                        ProviderKind::Acp,
-                    )?;
-                    (
-                        profile.launch_revision(),
-                        config,
-                        runtime_resources,
-                        Vec::new(),
-                    )
+        let (auth_source_revision, config, runtime_resources, env_unsets) = match &selection
+            .auth_source
+        {
+            RuntimeAuthSource::ProviderProfile { .. } | RuntimeAuthSource::ModelRoute { .. } => {
+                // A route resolves to its Profile before anything is read,
+                // so the rest of this arm is the same launch contract a
+                // Provider selection uses.
+                let provider_profile_id = self
+                    .client
+                    .source_profile_id(&selection.agent_id, &selection.auth_source)?
+                    .ok_or_else(|| {
+                        runtime_configuration_unavailable("model_route_not_launchable")
+                    })?;
+                let profile = self
+                    .client
+                    .config_service
+                    .get_profile(&provider_profile_id)?
+                    .ok_or_else(|| {
+                        runtime_configuration_unavailable("provider_profile_not_found")
+                    })?;
+                if profile.agent_id != selection.agent_id
+                    || profile.kind != ProviderKind::Acp
+                    || profile.status != ProviderProfileStatus::Enabled
+                {
+                    return Err(runtime_configuration_unavailable(
+                        "provider_profile_route_unavailable",
+                    ));
                 }
-                RuntimeAuthSource::AgentAccount { auth_context_id } => {
-                    let context = AgentAuthContextRepository::get_by_id(&conn, auth_context_id)?
-                        .ok_or_else(|| {
-                            runtime_configuration_unavailable("agent_auth_context_not_found")
-                        })?;
-                    if context.agent_id != selection.agent_id {
-                        return Err(runtime_configuration_unavailable(
-                            "agent_auth_context_agent_mismatch",
-                        ));
-                    }
-                    if context.status != AgentAuthContextStatus::Authenticated {
-                        return Err(runtime_configuration_unavailable(
-                            "agent_authentication_required",
-                        ));
-                    }
-                    if AgentAuthenticationOperationRepository::get_active_for_context(
-                        &conn,
-                        auth_context_id,
-                    )?
-                    .is_some()
-                    {
-                        return Err(runtime_configuration_unavailable(
-                            "agent_authentication_operation_in_progress",
-                        ));
-                    }
-                    let config = self
-                        .client
-                        .config_service
-                        .get_agent_acp_runtime_config(&selection.agent_id)
-                        .map_err(|error| runtime_configuration_unavailable(&error.code))?;
-                    let runtime_resources = self.manager.runtime_resources_for_session(
-                        session_id,
-                        &selection.agent_id,
-                        ProviderKind::Acp,
-                    )?;
-                    let env_unsets = self.client.agent_account_env_unsets(&selection.agent_id);
-                    (context.revision, config, runtime_resources, env_unsets)
+                let config = self
+                    .client
+                    .profile_config(&provider_profile_id)
+                    .map_err(|error| runtime_configuration_unavailable(&error.code))?;
+                // Profile config reads may perform a one-time native
+                // import hydration. Capture the revision after that
+                // migration so the launch snapshot is self-consistent.
+                let profile = self
+                    .client
+                    .config_service
+                    .get_profile(&provider_profile_id)?
+                    .ok_or_else(|| {
+                        runtime_configuration_unavailable("provider_profile_not_found")
+                    })?;
+                let runtime_resources = self.manager.runtime_resources_for_session(
+                    session_id,
+                    &selection.agent_id,
+                    ProviderKind::Acp,
+                )?;
+                (
+                    profile.launch_revision(),
+                    config,
+                    runtime_resources,
+                    Vec::new(),
+                )
+            }
+            RuntimeAuthSource::AgentAccount { auth_context_id } => {
+                let context = AgentAuthContextRepository::get_by_id(&conn, auth_context_id)?
+                    .ok_or_else(|| {
+                        runtime_configuration_unavailable("agent_auth_context_not_found")
+                    })?;
+                if context.agent_id != selection.agent_id {
+                    return Err(runtime_configuration_unavailable(
+                        "agent_auth_context_agent_mismatch",
+                    ));
                 }
-            };
+                if context.status != AgentAuthContextStatus::Authenticated {
+                    return Err(runtime_configuration_unavailable(
+                        "agent_authentication_required",
+                    ));
+                }
+                if AgentAuthenticationOperationRepository::get_active_for_context(
+                    &conn,
+                    auth_context_id,
+                )?
+                .is_some()
+                {
+                    return Err(runtime_configuration_unavailable(
+                        "agent_authentication_operation_in_progress",
+                    ));
+                }
+                let config = self
+                    .client
+                    .config_service
+                    .get_agent_acp_runtime_config(&selection.agent_id)
+                    .map_err(|error| runtime_configuration_unavailable(&error.code))?;
+                let runtime_resources = self.manager.runtime_resources_for_session(
+                    session_id,
+                    &selection.agent_id,
+                    ProviderKind::Acp,
+                )?;
+                let env_unsets = self.client.agent_account_env_unsets(&selection.agent_id);
+                (context.revision, config, runtime_resources, env_unsets)
+            }
+        };
         // Compute the catalog identity before the selection's startup model is
         // folded into the config: the catalog is discovered without a selected
         // model, so keying it by a selection-dependent config would miss too.
@@ -7829,7 +7837,9 @@ impl AcpRuntimeSwitchBridge {
                     &env_unsets,
                 )?)
             }
-            RuntimeAuthSource::ProviderProfile { .. } => None,
+            RuntimeAuthSource::ProviderProfile { .. } | RuntimeAuthSource::ModelRoute { .. } => {
+                None
+            }
         };
         let mut config = config;
         apply_startup_model_to_config(
@@ -8447,6 +8457,36 @@ impl AcpRuntimeSwitchBridge {
                     .with_diagnostic("providerProfileId", provider_profile_id.as_str())
                 })?
                 .launch_revision()),
+            // A route's launch contract is the Profile it resolves to, so its
+            // revision is that Profile's launch revision. Using the route's own
+            // revision would restart every Agent on the route whenever a member
+            // order changed, which no launch contract depends on.
+            RuntimeAuthSource::ModelRoute { model_route_id } => {
+                let conn = open_database(&self.db_path)?;
+                let member = vibex_db::ModelRouteRepository::get(&conn, model_route_id)?
+                    .and_then(|route| route.enabled_members().next().cloned())
+                    .ok_or_else(|| {
+                        VibexError::validation(
+                            "model_route_not_launchable",
+                            "The route has no member to launch through",
+                        )
+                        .with_diagnostic("modelRouteId", model_route_id.as_str())
+                    })?;
+                let legacy_id = vibex_db::ModelProviderProfileRepository::get(
+                    &conn,
+                    &member.model_provider_profile_id,
+                )?
+                .and_then(|shared| shared.legacy_provider_profile_id)
+                .ok_or_else(|| {
+                    VibexError::validation(
+                        "model_route_not_launchable",
+                        "The route's Provider has no Profile this Agent can launch through",
+                    )
+                })?;
+                Ok(vibex_db::ProviderProfileRepository::get(&conn, &legacy_id)?
+                    .map(|profile| profile.launch_revision())
+                    .unwrap_or(0))
+            }
             RuntimeAuthSource::AgentAccount { auth_context_id } => {
                 let conn = open_database(&self.db_path)?;
                 Ok(AgentAuthContextRepository::get_by_id(&conn, auth_context_id)?
@@ -11067,13 +11107,21 @@ impl AcpRuntimeClient {
         let probe_resources = ProviderRuntimeResources::default();
         let mut process_args = config.args.clone();
         process_args.extend(["cli".to_string(), "app-server".to_string()]);
+        // A route resolves to its gateway Profile here, so the probing path
+        // needs no route-specific logic of its own.
         let materialized_env = match auth_source {
-            RuntimeAuthSource::ProviderProfile {
-                provider_profile_id,
-            } => {
+            RuntimeAuthSource::AgentAccount { .. } => None,
+            source => {
+                let profile_id = self.source_profile_id(agent_id, source)?.ok_or_else(|| {
+                    VibexError::validation(
+                        "provider_profile_not_found",
+                        "Provider Profile was not found for model capability probing",
+                    )
+                    .with_diagnostic("authSource", source.id())
+                })?;
                 let profile = self
                     .config_service
-                    .get_profile(provider_profile_id)?
+                    .get_profile(&profile_id)?
                     .ok_or_else(|| {
                         VibexError::validation(
                             "provider_profile_not_found",
@@ -11082,7 +11130,6 @@ impl AcpRuntimeClient {
                     })?;
                 Some(self.resolve_env_overlays_for_profile(&profile, config, &probe_cwd)?)
             }
-            RuntimeAuthSource::AgentAccount { .. } => None,
         };
         let process = self
             .spawn_process(
@@ -12123,14 +12170,61 @@ impl AcpRuntimeClient {
         Ok((key, snapshot))
     }
 
+    /// The Provider Profile id any auth source resolves to.
+    ///
+    /// A route names no Profile, but the launch path needs one; this is the one
+    /// place that translation happens, so every match below can keep handling a
+    /// single shape.
+    fn source_profile_id(
+        &self,
+        agent_id: &vibex_core::AgentId,
+        auth_source: &RuntimeAuthSource,
+    ) -> VibexResult<Option<vibex_core::ProviderProfileId>> {
+        self.source_profile_id_optional_agent(Some(agent_id), auth_source)
+    }
+
+    /// The same resolution when the caller holds a session but no Agent id.
+    ///
+    /// A route is bound per Agent, so a call site with only a session cannot
+    /// resolve one and reports `None` rather than guessing.
+    fn source_profile_id_optional_agent(
+        &self,
+        agent_id: Option<&vibex_core::AgentId>,
+        auth_source: &RuntimeAuthSource,
+    ) -> VibexResult<Option<vibex_core::ProviderProfileId>> {
+        match auth_source {
+            RuntimeAuthSource::ProviderProfile {
+                provider_profile_id,
+            } => Ok(Some(provider_profile_id.clone())),
+            RuntimeAuthSource::ModelRoute { model_route_id } => {
+                let Some(agent_id) = agent_id else {
+                    return Ok(None);
+                };
+                let conn = open_database(self.config_service.database_path())?;
+                Ok(
+                    vibex_db::legacy_profile_for_route(&conn, agent_id, model_route_id)?
+                        .map(|profile| profile.id),
+                )
+            }
+            RuntimeAuthSource::AgentAccount { .. } => Ok(None),
+        }
+    }
+
     fn process_launch_materialization(
         &self,
         launch: &AcpProcessLaunch<'_>,
     ) -> VibexResult<(ProcessAcquireKey, ProcessLaunchMaterialization)> {
+        // A route launches through the Profile that carries it, so it takes this
+        // same path; `resolved_profile_id` is the only place the two differ.
+        let resolved_profile_id = self.source_profile_id(launch.agent_id, launch.auth_source)?;
         let (snapshot, env_overlays) = match launch.auth_source {
-            RuntimeAuthSource::ProviderProfile {
-                provider_profile_id,
-            } => {
+            RuntimeAuthSource::ProviderProfile { .. } | RuntimeAuthSource::ModelRoute { .. } => {
+                let provider_profile_id = resolved_profile_id.as_ref().ok_or_else(|| {
+                    VibexError::validation(
+                        "provider_profile_not_found",
+                        "Provider Profile was not found for ACP process launch",
+                    )
+                })?;
                 let profile = self
                     .config_service
                     .get_profile(provider_profile_id)?
@@ -12264,11 +12358,17 @@ impl AcpRuntimeClient {
             env_unsets,
         } = source;
         match auth_source {
-            RuntimeAuthSource::ProviderProfile {
-                provider_profile_id,
-            } => {
+            RuntimeAuthSource::ProviderProfile { .. } | RuntimeAuthSource::ModelRoute { .. } => {
+                let provider_profile_id = self
+                    .source_profile_id(agent_id, auth_source)?
+                    .ok_or_else(|| {
+                        VibexError::validation(
+                            "provider_profile_not_found",
+                            "Provider Profile was not found for the launch snapshot",
+                        )
+                    })?;
                 let snapshot = self.process_spawn_config_snapshot(
-                    provider_profile_id,
+                    &provider_profile_id,
                     config,
                     cwd,
                     runtime_resources,
@@ -12986,14 +13086,19 @@ impl AcpRuntimeClient {
         let startup_model = startup_model_from_config(config, agent_id.as_str());
         let claude_session_settings = claude_session::session_settings_meta(&agent_id, config);
         let model_id_projection = match auth_source {
-            RuntimeAuthSource::ProviderProfile {
-                provider_profile_id,
-            } => AcpModelIdProjection::new(
-                self.config_service
-                    .legacy_agent_provider_model_id_projections(provider_profile_id)?
-                    .unwrap_or_default(),
-            )?,
             RuntimeAuthSource::AgentAccount { .. } => AcpModelIdProjection::default(),
+            source => {
+                // A route's Profile carries the model-alias projection, the
+                // same way a Provider selection's does.
+                let profile_id = self.source_profile_id(&agent_id, source)?.ok_or_else(|| {
+                    runtime_configuration_unavailable("model_route_not_launchable")
+                })?;
+                AcpModelIdProjection::new(
+                    self.config_service
+                        .legacy_agent_provider_model_id_projections(&profile_id)?
+                        .unwrap_or_default(),
+                )?
+            }
         };
         let command_path = Path::new(&config.command);
         if command_path.is_absolute() && !command_path.is_file() {
@@ -13031,15 +13136,19 @@ impl AcpRuntimeClient {
         let env_overlays = match materialized_env {
             Some(env) => env,
             None => match auth_source {
-                RuntimeAuthSource::ProviderProfile {
-                    provider_profile_id,
-                } => self.resolve_env_overlays(provider_profile_id, config, cwd)?,
                 RuntimeAuthSource::AgentAccount { .. } => {
                     let env_unsets = env_unsets.iter().collect::<BTreeSet<_>>();
                     agent_probe_env_overlays(config)
                         .into_iter()
                         .filter(|(key, _)| !env_unsets.contains(key))
                         .collect()
+                }
+                source => {
+                    let profile_id =
+                        self.source_profile_id(&agent_id, source)?.ok_or_else(|| {
+                            runtime_configuration_unavailable("model_route_not_launchable")
+                        })?;
+                    self.resolve_env_overlays(&profile_id, config, cwd)?
                 }
             },
         };
@@ -13989,9 +14098,21 @@ impl AcpRuntimeClient {
             ));
         }
         let state_home = match &binding.auth_source {
-            RuntimeAuthSource::ProviderProfile {
-                provider_profile_id,
-            } => stable_native_state_home_id(provider_profile_id, cwd)?,
+            RuntimeAuthSource::ProviderProfile { .. } | RuntimeAuthSource::ModelRoute { .. } => {
+                // A route launches through its Profile, so it shares that
+                // Profile's state home: a route and the Provider it resolves to
+                // are the same process contract, and two homes would split the
+                // Agent's state between them.
+                let profile_id = self
+                    .source_profile_id(&process.agent_id, &binding.auth_source)?
+                    .ok_or_else(|| {
+                        VibexError::validation(
+                            "model_route_not_launchable",
+                            "The route has no Profile to derive a state home from",
+                        )
+                    })?;
+                stable_native_state_home_id(&profile_id, cwd)?
+            }
             RuntimeAuthSource::AgentAccount { .. } => {
                 stable_agent_default_state_home_id(&binding.auth_source, &process.agent_id)?
             }
@@ -15053,12 +15174,21 @@ impl AcpRuntimeClient {
         workspace_root: &str,
     ) -> VibexResult<BindingLaunchContext> {
         let (agent_id, auth_source_revision, config, env_unsets) = match &binding.auth_source {
-            RuntimeAuthSource::ProviderProfile {
-                provider_profile_id,
-            } => {
+            RuntimeAuthSource::ProviderProfile { .. } | RuntimeAuthSource::ModelRoute { .. } => {
+                // A route resolves to its Profile before anything else here, so
+                // the rest of this arm is the same launch contract a Provider
+                // selection uses.
+                let provider_profile_id = self
+                    .source_profile_id_optional_agent(None, &binding.auth_source)?
+                    .ok_or_else(|| {
+                        VibexError::validation(
+                            "model_route_not_launchable",
+                            "The route has no Profile this Agent can launch through",
+                        )
+                    })?;
                 let profile = self
                     .config_service
-                    .get_profile(provider_profile_id)?
+                    .get_profile(&provider_profile_id)?
                     .ok_or_else(|| {
                         VibexError::validation(
                             "provider_profile_not_found",
@@ -15086,7 +15216,7 @@ impl AcpRuntimeClient {
                     .get_acp_profile_config(profile.id.clone())?;
                 let profile = self
                     .config_service
-                    .get_profile(provider_profile_id)?
+                    .get_profile(&provider_profile_id)?
                     .ok_or_else(|| {
                         VibexError::validation(
                             "provider_profile_not_found",
@@ -15312,16 +15442,26 @@ impl AcpRuntimeClient {
         let process = payload.process();
         let config = payload.runtime_config_state();
         let source_available = match &process.auth_source {
-            RuntimeAuthSource::ProviderProfile {
-                provider_profile_id,
-            } => self
-                .config_service
-                .get_profile(provider_profile_id)?
-                .is_some_and(|profile| {
-                    profile.kind == ProviderKind::Acp
-                        && profile.status == ProviderProfileStatus::Enabled
-                        && profile.agent_id == required_runtime.agent_id
-                }),
+            RuntimeAuthSource::ProviderProfile { .. } | RuntimeAuthSource::ModelRoute { .. } => {
+                // A route is available exactly when the Profile it resolves to
+                // is: availability is a property of the launch contract, not of
+                // how the session named it.
+                match self.source_profile_id_optional_agent(
+                    Some(&required_runtime.agent_id),
+                    &process.auth_source,
+                )? {
+                    Some(profile_id) => {
+                        self.config_service
+                            .get_profile(&profile_id)?
+                            .is_some_and(|profile| {
+                                profile.kind == ProviderKind::Acp
+                                    && profile.status == ProviderProfileStatus::Enabled
+                                    && profile.agent_id == required_runtime.agent_id
+                            })
+                    }
+                    None => false,
+                }
+            }
             RuntimeAuthSource::AgentAccount { auth_context_id } => {
                 let conn = open_database(self.config_service.database_path())?;
                 AgentAuthContextRepository::get_by_id(&conn, auth_context_id)?.is_some_and(

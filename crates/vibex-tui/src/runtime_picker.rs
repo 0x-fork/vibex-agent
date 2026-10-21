@@ -613,7 +613,11 @@ pub fn entry_matches(option: &SessionRuntimeOption, query: &str, strings: &Strin
 pub fn runtime_option_auth_label(strings: &Strings, option: &SessionRuntimeOption) -> String {
     match &option.selection.auth_source {
         RuntimeAuthSource::AgentAccount { .. } => strings.runtime_auth_agent_account().to_string(),
-        RuntimeAuthSource::ProviderProfile { .. } => option.auth_source_label.clone(),
+        // A route carries the name its reader gave it, which is a product
+        // concept rather than an Agent account: it reads like a Provider label.
+        RuntimeAuthSource::ProviderProfile { .. } | RuntimeAuthSource::ModelRoute { .. } => {
+            option.auth_source_label.clone()
+        }
     }
 }
 
@@ -677,6 +681,8 @@ mod tests {
             modes: Vec::new(),
             features: Vec::new(),
             availability: RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
         }
     }
 

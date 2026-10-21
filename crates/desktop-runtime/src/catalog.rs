@@ -5,9 +5,9 @@ use std::sync::{Arc, Weak};
 use async_trait::async_trait;
 use vibex_agent::AgentManager;
 use vibex_agent_acp::{
-    AcpRuntimeClient, RuntimeOptionCatalogProfileEvidence, SessionModelCatalogEntry,
-    SessionModelCatalogSource, append_agent_account_runtime_options, build_runtime_option_catalog,
-    refresh_runtime_option_catalog_revision,
+    AcpRuntimeClient, RuntimeOptionCatalogProfileEvidence, RuntimeRouteFacts,
+    SessionModelCatalogEntry, SessionModelCatalogSource, append_agent_account_runtime_options,
+    build_runtime_option_catalog, refresh_runtime_option_catalog_revision,
 };
 use vibex_config_switch::ProviderConfigService;
 use vibex_core::{
@@ -178,6 +178,10 @@ impl RuntimeOptionCatalogService {
             live_by_profile,
         );
 
+        // A route is one selectable model, so the catalogue needs its name and
+        // shape beside the Profile list: the gateway Profile only carries
+        // `route/<id>`, which is not a name a reader can choose from.
+        let route_facts = self.route_facts();
         let mut catalog = build_runtime_option_catalog(
             &agents.agents,
             &profiles
@@ -185,6 +189,7 @@ impl RuntimeOptionCatalogService {
                 .map(vibex_core::ProviderProfile::summary)
                 .collect::<Vec<_>>(),
             &evidence_by_profile,
+            &route_facts,
         );
         let account_fingerprints =
             self.merge_agent_account_sources(&mut catalog, &agents.agents)?;
@@ -281,6 +286,47 @@ impl RuntimeOptionCatalogService {
                 .or_insert(0) += 1;
         }
         counts
+    }
+
+    /// What the catalogue needs to know about each route.
+    ///
+    /// A route the catalogue cannot describe is left out rather than shown
+    /// namelessly: the gateway Profile still lists its `route/<id>`, and that
+    /// entry falls back to the raw id.
+    fn route_facts(&self) -> BTreeMap<vibex_core::ModelRouteId, RuntimeRouteFacts> {
+        let Ok(routes) = self.provider_config.list_enabled_model_routes() else {
+            return BTreeMap::new();
+        };
+        routes
+            .into_iter()
+            .map(|route| {
+                let facts = RuntimeRouteFacts {
+                    display_name: route.display_name.clone(),
+                    agent_ids: self.route_agents(&route.id).unwrap_or_default(),
+                    member_count: route.enabled_members().count(),
+                    models: route
+                        .distinct_models()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    via_gateway: route.kind == vibex_core::RouteKind::Gateway,
+                };
+                (route.id, facts)
+            })
+            .collect()
+    }
+
+    /// The Agents a route is bound to.
+    fn route_agents(
+        &self,
+        route_id: &vibex_core::ModelRouteId,
+    ) -> vibex_core::VibexResult<Vec<AgentId>> {
+        Ok(self
+            .provider_config
+            .list_agent_model_route_users(route_id)?
+            .into_iter()
+            .map(|binding| binding.agent_id)
+            .collect())
     }
 
     fn merge_agent_account_sources(
@@ -1924,6 +1970,7 @@ mod tests {
                 .map(ProviderProfile::summary)
                 .collect::<Vec<_>>(),
             &layered,
+            &BTreeMap::new(),
         );
         let first = catalog
             .options

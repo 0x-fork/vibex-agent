@@ -437,6 +437,8 @@ mod tests {
                 values: Vec::new(),
             }],
             availability: RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
         }
     }
 

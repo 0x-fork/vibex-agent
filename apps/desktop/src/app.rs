@@ -15447,6 +15447,7 @@ impl VibexWorkbench {
                                         &agents,
                                         &profiles,
                                         &BTreeMap::new(),
+                                        &BTreeMap::new(),
                                     )));
                             }
                             this.runtime_provider_profiles = profiles;
@@ -15612,6 +15613,7 @@ impl VibexWorkbench {
                                     Some(Rc::new(build_runtime_option_catalog_for_agents(
                                         &agents,
                                         &profiles,
+                                        &BTreeMap::new(),
                                         &BTreeMap::new(),
                                     )));
                             }
@@ -50957,9 +50959,15 @@ impl VibexWorkbench {
                         .on_hover(hover_listener(cx.entity_id(), heading_key.clone()))
                 })
                 .child(match group.source.kind {
+                    // A route is a saved composition rather than one upstream,
+                    // so it takes the branch icon instead of the database.
                     RuntimeAuthSourceKind::ProviderProfile => new_session_selector_icon(
                         "icons/vibex/database.svg",
                         theme::semantic_color("chart-2", cx.theme().is_dark()),
+                    ),
+                    RuntimeAuthSourceKind::ModelRoute => new_session_selector_icon(
+                        "icons/vibex/git-branch.svg",
+                        theme::semantic_color("chart-1", cx.theme().is_dark()),
                     ),
                     RuntimeAuthSourceKind::AgentAccount => Icon::new(IconName::User)
                         .size(px(16.0))
@@ -72880,7 +72888,10 @@ fn runtime_auth_source_display_label(source: &RuntimeAuthSourceSummary) -> Strin
         RuntimeAuthSourceKind::AgentAccount => {
             locale::text("Agent account", "Agent 账户", "Agent 帳戶").to_string()
         }
-        RuntimeAuthSourceKind::ProviderProfile => source.label.clone(),
+        // A route keeps the name its owner gave it, like a Provider.
+        RuntimeAuthSourceKind::ProviderProfile | RuntimeAuthSourceKind::ModelRoute => {
+            source.label.clone()
+        }
     }
 }
 
@@ -72889,7 +72900,9 @@ fn runtime_auth_source_selection_label(auth_source: &RuntimeAuthSource, fallback
         RuntimeAuthSource::AgentAccount { .. } => {
             locale::text("Agent account", "Agent 账户", "Agent 帳戶").to_string()
         }
-        RuntimeAuthSource::ProviderProfile { .. } => fallback.to_string(),
+        RuntimeAuthSource::ProviderProfile { .. } | RuntimeAuthSource::ModelRoute { .. } => {
+            fallback.to_string()
+        }
     }
 }
 
@@ -72909,7 +72922,8 @@ fn runtime_attribution_auth_label(
         Some(vibex_core::RuntimeAuthSource::AgentAccount { .. }) => {
             locale::agent_account_display_label(&attribution.auth_source_label)
         }
-        Some(vibex_core::RuntimeAuthSource::ProviderProfile { .. }) => {
+        Some(vibex_core::RuntimeAuthSource::ProviderProfile { .. })
+        | Some(vibex_core::RuntimeAuthSource::ModelRoute { .. }) => {
             attribution.auth_source_label.clone()
         }
         None => locale::agent_account_display_label(&attribution.auth_source_label),
@@ -90965,6 +90979,8 @@ mod tests {
             }],
             features: Vec::new(),
             availability: RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
         }
     }
 
@@ -101949,6 +101965,7 @@ mod tests {
         let catalog = build_runtime_option_catalog_for_agents(
             std::slice::from_ref(&agent),
             std::slice::from_ref(&profile),
+            &BTreeMap::new(),
             &BTreeMap::new(),
         );
         let auth_sources = runtime_auth_sources_for_agent(&catalog, &agent.id);

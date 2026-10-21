@@ -3,7 +3,7 @@ use vibex_core::{
     AgentAuthContextId, AgentId, AgentTurnUsageFact, AgentUsageCounterOrigin,
     AgentUsageCounterScope, AgentUsageCoverage, AgentUsageExecution, AgentUsageExecutionStatus,
     AgentUsageExecutionStatusUpdate, AgentUsageObservation, AgentUsageObservationSource,
-    AgentUsageReportedFields, AgentUsageTokenValues, MessageSubmissionId, ProjectId,
+    AgentUsageReportedFields, AgentUsageTokenValues, MessageSubmissionId, ModelRouteId, ProjectId,
     ProviderProfileId, RuntimeAuthSource, RuntimeAuthSourceKind, RuntimeBindingId,
     UsageExecutionId, VibexError, VibexResult, VibexSessionId, WorkspaceId,
     agent_usage_counter_scope,
@@ -544,6 +544,19 @@ fn decode_usage_auth_source(
             Ok(RuntimeAuthSource::provider_profile(
                 ProviderProfileId::parse(source_id)?,
             ))
+        }
+        RuntimeAuthSourceKind::ModelRoute => {
+            // A route has no legacy Profile, so the compatibility columns must
+            // be empty for it — exactly like an Agent account.
+            if legacy_provider_profile_id.is_some() {
+                return Err(VibexError::storage(
+                    "agent_usage_auth_source_legacy_mismatch",
+                    "route runtime auth source must not contain a Provider Profile",
+                ));
+            }
+            Ok(RuntimeAuthSource::model_route(ModelRouteId::parse(
+                source_id,
+            )?))
         }
         RuntimeAuthSourceKind::AgentAccount => {
             if legacy_provider_profile_id.is_some() {

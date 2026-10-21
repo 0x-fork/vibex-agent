@@ -3816,6 +3816,8 @@ mod tests {
                     modes: vec![],
                     features: vec![],
                     availability: vibex_core::RuntimeOptionAvailability::Available,
+                    member_count: 1,
+                    auto_routes: false,
                 })
                 .collect(),
         });

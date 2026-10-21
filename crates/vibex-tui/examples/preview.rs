@@ -563,6 +563,8 @@ fn showcase_catalog(
         ],
         features: Vec::new(),
         availability: vibex_core::RuntimeOptionAvailability::Available,
+        member_count: 1,
+        auto_routes: false,
     };
     vibex_core::SessionRuntimeOptionCatalog {
         revision: 1,

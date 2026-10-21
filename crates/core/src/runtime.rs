@@ -14,9 +14,9 @@ use crate::agent_auth::AgentAuthModelCatalogStatus;
 use crate::agent_config::AgentId;
 use crate::error::{VibexError, VibexResult};
 use crate::ids::{
-    AgentAuthContextId, EventId, NativeStateHomeId, ProviderProfileId, RuntimeBindingId,
-    RuntimeClientId, RuntimeLeaseId, RuntimeProcessId, RuntimeStreamId, RuntimeSwitchId,
-    VibexSessionId,
+    AgentAuthContextId, EventId, ModelRouteId, NativeStateHomeId, ProviderProfileId,
+    RuntimeBindingId, RuntimeClientId, RuntimeLeaseId, RuntimeProcessId, RuntimeStreamId,
+    RuntimeSwitchId, VibexSessionId,
 };
 use crate::permission::PermissionRequest;
 use crate::provider::ProviderSessionConfigValue;
@@ -522,6 +522,15 @@ pub enum RuntimeAuthSource {
     AgentAccount {
         auth_context_id: AgentAuthContextId,
     },
+    /// A reusable route the session runs through.
+    ///
+    /// A route is one selectable model, so a session that picks one names the
+    /// route rather than a Provider. The route decides which of its members
+    /// answers, and that choice must not move the session: a failover is not a
+    /// new selection.
+    ModelRoute {
+        model_route_id: ModelRouteId,
+    },
 }
 
 impl RuntimeAuthSource {
@@ -535,10 +544,15 @@ impl RuntimeAuthSource {
         Self::AgentAccount { auth_context_id }
     }
 
+    pub fn model_route(model_route_id: ModelRouteId) -> Self {
+        Self::ModelRoute { model_route_id }
+    }
+
     pub fn kind(&self) -> RuntimeAuthSourceKind {
         match self {
             Self::ProviderProfile { .. } => RuntimeAuthSourceKind::ProviderProfile,
             Self::AgentAccount { .. } => RuntimeAuthSourceKind::AgentAccount,
+            Self::ModelRoute { .. } => RuntimeAuthSourceKind::ModelRoute,
         }
     }
 
@@ -548,6 +562,14 @@ impl RuntimeAuthSource {
                 provider_profile_id,
             } => provider_profile_id.as_str(),
             Self::AgentAccount { auth_context_id } => auth_context_id.as_str(),
+            Self::ModelRoute { model_route_id } => model_route_id.as_str(),
+        }
+    }
+
+    pub fn model_route_id(&self) -> Option<&ModelRouteId> {
+        match self {
+            Self::ModelRoute { model_route_id } => Some(model_route_id),
+            _ => None,
         }
     }
 
@@ -556,13 +578,13 @@ impl RuntimeAuthSource {
             Self::ProviderProfile {
                 provider_profile_id,
             } => Some(provider_profile_id),
-            Self::AgentAccount { .. } => None,
+            Self::AgentAccount { .. } | Self::ModelRoute { .. } => None,
         }
     }
 
     pub fn auth_context_id(&self) -> Option<&AgentAuthContextId> {
         match self {
-            Self::ProviderProfile { .. } => None,
+            Self::ProviderProfile { .. } | Self::ModelRoute { .. } => None,
             Self::AgentAccount { auth_context_id } => Some(auth_context_id),
         }
     }
@@ -607,6 +629,7 @@ pub fn agent_account_label_hint(label: &str) -> Option<&str> {
 pub enum RuntimeAuthSourceKind {
     ProviderProfile,
     AgentAccount,
+    ModelRoute,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -733,6 +756,22 @@ impl SessionRuntimeSelection {
             agent_id,
             auth_source: RuntimeAuthSource::provider_profile(provider_profile_id),
             model: RuntimeModelSelection::explicit(model_id),
+            reasoning_effort: None,
+            mode_id: None,
+            config_values: BTreeMap::new(),
+        }
+    }
+
+    /// A selection that runs through a route.
+    ///
+    /// The model field carries the route's own id, because a route is one
+    /// selectable model: the members are what the gateway chooses between, and
+    /// that choice must not move the session.
+    pub fn model_route(agent_id: AgentId, model_route_id: ModelRouteId) -> Self {
+        Self {
+            agent_id,
+            auth_source: RuntimeAuthSource::model_route(model_route_id.clone()),
+            model: RuntimeModelSelection::explicit(format!("route/{}", model_route_id.as_str())),
             reasoning_effort: None,
             mode_id: None,
             config_values: BTreeMap::new(),
@@ -1037,6 +1076,42 @@ pub struct SessionRuntimeOption {
     #[serde(default)]
     pub features: Vec<SessionRuntimeFeature>,
     pub availability: RuntimeOptionAvailability,
+    /// How many sources back this option.
+    ///
+    /// A direct Provider is one; a route is its enabled member count. The
+    /// picker's subtitle reads this, and a client that does not know the field
+    /// takes one, which is the safe reading: it describes a single source.
+    #[serde(default)]
+    pub member_count: usize,
+    /// Whether failures move to another source on their own.
+    ///
+    /// False for a direct Provider, true for a route with more than one member.
+    /// This is the one thing the subtitle must not get wrong, because it is what
+    /// tells the reader whether a stale Key will heal itself.
+    #[serde(default)]
+    pub auto_routes: bool,
+}
+
+impl Default for SessionRuntimeOption {
+    fn default() -> Self {
+        Self {
+            selection: SessionRuntimeSelection::provider(
+                crate::AgentId::parse("unknown").expect("a literal Agent id is valid"),
+                ProviderProfileId::parse("provider_unknown")
+                    .expect("a literal Provider id is valid"),
+                String::new(),
+            ),
+            agent_label: String::new(),
+            auth_source_label: String::new(),
+            model_label: String::new(),
+            reasoning_efforts: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            availability: RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
+        }
+    }
 }
 
 /// Published snapshot consumed by ordinary session selectors. The revision is

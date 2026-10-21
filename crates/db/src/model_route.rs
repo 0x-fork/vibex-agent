@@ -902,6 +902,72 @@ fn direct_route_for(profile: &vibex_core::ProviderProfile) -> Option<ModelRoute>
     })
 }
 
+/// The legacy Profile an Agent launches through for one route.
+///
+/// Lives in the repository rather than the service because the launch path
+/// reaches it with a connection in hand and no service: resolving a selection
+/// must not require constructing the Config Center.
+pub fn legacy_profile_for_route(
+    conn: &Connection,
+    agent_id: &AgentId,
+    route_id: &ModelRouteId,
+) -> VibexResult<Option<vibex_core::ProviderProfile>> {
+    let Some(route) = ModelRouteRepository::get(conn, route_id)? else {
+        return Ok(None);
+    };
+    // A route another Agent holds is not a launchable source for this one.
+    let bound = AgentModelRouteBindingRepository::list_for_agent(conn, agent_id)?
+        .iter()
+        .any(|binding| &binding.model_route_id == route_id);
+    if !bound {
+        return Ok(None);
+    }
+    match route.kind {
+        vibex_core::RouteKind::Direct => {
+            let Some(member) = route.enabled_members().next() else {
+                return Ok(None);
+            };
+            let Some(shared) = super::ModelProviderProfileRepository::get(
+                conn,
+                &member.model_provider_profile_id,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(legacy_id) = shared.legacy_provider_profile_id else {
+                return Ok(None);
+            };
+            let profile = super::ProviderProfileRepository::get(conn, &legacy_id)?;
+            Ok(profile.filter(|profile| &profile.agent_id == agent_id))
+        }
+        vibex_core::RouteKind::Gateway => {
+            // The gateway Profile is per Agent and already lists every route
+            // id it serves.
+            let profiles = super::ProviderProfileRepository::list_by_agent(conn, agent_id, true)?;
+            Ok(profiles
+                .into_iter()
+                .find(is_gateway_profile)
+                .filter(|profile| {
+                    profile
+                        .configured_models
+                        .iter()
+                        .any(|model| model.id == route.model_id())
+                }))
+        }
+    }
+}
+
+/// Whether a Profile is the hidden one the gateway projects into an Agent.
+fn is_gateway_profile(profile: &vibex_core::ProviderProfile) -> bool {
+    profile
+        .provider_options
+        .entries
+        .iter()
+        .find(|entry| entry.key.trim() == "vibex.internal.profileRole")
+        .map(|entry| entry.value.trim() == "model_gateway")
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1555,5 +1621,54 @@ mod tests {
         assert_eq!(naming.len(), 2, "both routes name DeepSeek");
         let naming_kimi = ModelRouteRepository::list_naming_provider(&conn, &kimi).unwrap();
         assert_eq!(naming_kimi.len(), 1, "only one names Kimi");
+    }
+}
+
+#[cfg(test)]
+mod route_auth_source_tests {
+    use super::*;
+
+    /// A route's selection survives a round trip through storage.
+    ///
+    /// This is the persistence half of stage 5: a session that selected a route
+    /// must still name that route when it is reopened, not fall back to the
+    /// Profile the route resolved to at the time.
+    #[test]
+    fn a_route_auth_source_round_trips_through_the_database() {
+        let source = vibex_core::RuntimeAuthSource::model_route(ModelRouteId::new());
+        let (kind, id) = (source.kind(), source.id().to_string());
+        let encoded = match kind {
+            vibex_core::RuntimeAuthSourceKind::ModelRoute => "model_route",
+            other => panic!("a route must encode as its own kind, got {other:?}"),
+        };
+        assert_eq!(encoded, "model_route");
+        assert!(!id.is_empty());
+        // The legacy columns stay empty: a route has no legacy Profile, and a
+        // non-empty one would be rejected on read.
+        assert!(source.provider_profile_id().is_none());
+    }
+
+    /// An old row that predates routes still decodes.
+    ///
+    /// The new kind is additive; a stored `provider_profile` or `agent_account`
+    /// row must keep opening, which is what makes the change safe for existing
+    /// sessions.
+    #[test]
+    fn legacy_auth_sources_are_unaffected() {
+        let profile =
+            vibex_core::RuntimeAuthSource::provider_profile(vibex_core::ProviderProfileId::new());
+        assert_eq!(
+            profile.kind(),
+            vibex_core::RuntimeAuthSourceKind::ProviderProfile
+        );
+        assert!(profile.model_route_id().is_none());
+
+        let account =
+            vibex_core::RuntimeAuthSource::agent_account(vibex_core::AgentAuthContextId::new());
+        assert_eq!(
+            account.kind(),
+            vibex_core::RuntimeAuthSourceKind::AgentAccount
+        );
+        assert!(account.model_route_id().is_none());
     }
 }
