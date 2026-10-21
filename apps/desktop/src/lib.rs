@@ -31,6 +31,7 @@ pub mod remote_access_pairing;
 pub mod remote_client;
 pub mod resize_seam;
 pub mod responsive;
+pub mod selection_guard;
 pub mod skeleton;
 pub mod spinner;
 pub mod system_tray;

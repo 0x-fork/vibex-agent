@@ -556,18 +556,29 @@ renders. Menu flags stay on the workbench but are honoured only by the pane whos
 borrowed view is the selected session (`composer_menu_scope_focused`), and ids
 carry the pane's session (`composer_menu_scope`).
 
-A drag source must also suppress window-level text selection on its press. GPUI's
-selection layer anchors at any press that does not ask it not to, and while a
-drag is live it ignores the pointer, so the selection is extended by the moves
-that follow the release — a resize left a paragraph selected in the pane beside
-the seam. A control that owns a press or drag calls
-`gpui_base::GlobalState::suppress_text_selection` from a bubble-phase mouse-down
-handler. A resizable divider cannot: its grab band occludes, so no ancestor of it
-is in the press's bubble path. Group splits therefore paint a guard band
-(`session_group_split_guard`) in front of each divider — normal hit behavior, so
-the divider underneath still reads as hovered and still owns the drag — whose own
-press suppresses the selection; the band covers exactly the divider's grab area,
-placed from the shares the layout already stores.
+A drag must never leave window-level text selection armed. GPUI's selection layer
+anchors at any press that does not ask it not to, and while a drag is live it
+ignores the pointer, so a selection left over from the press is extended by the
+first moves after the release — a resize left a paragraph selected in the pane
+beside the seam, and a sidebar row or group tab selected the conversation it was
+dropped into.
+
+`apps/desktop/src/selection_guard.rs` handles this once for the whole product. It
+is a `RootPlugin` registered next to `hint_layer::init`, so every window root — the
+workbench, the detached preview, the computer-use panel — mounts it, and it is
+painted after application content so its listeners run ahead of drop targets in
+the bubble phase. It clears the window selection on the first move or release
+seen with `cx.has_active_drag()`, at most once per press. Text selection never sets
+an active drag, so dragging inside an input is unaffected.
+
+A control that owns a press but is *not* a drag still suppresses the selection
+itself, with `gpui_base::GlobalState::suppress_text_selection` from a bubble-phase
+mouse-down handler. A resizable divider cannot: its grab band occludes, so no
+ancestor of it is in the press's bubble path. Group splits therefore paint a guard
+band (`session_group_split_guard`) in front of each divider — normal hit behavior,
+so the divider underneath still reads as hovered and still owns the drag — whose
+own press suppresses the selection; the band covers exactly the divider's grab
+area, placed from the shares the layout already stores.
 
 Project headers in the session sidebar should display the project name only,
 not the workspace root path, to keep the rail scannable. Project-header clicks

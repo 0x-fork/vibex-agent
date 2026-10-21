@@ -13,7 +13,7 @@ use vibex_computer::cli::run as run_computer_cli;
 use vibex_desktop::{
     DEFAULT_HEIGHT, DEFAULT_WIDTH, MIN_HEIGHT, MIN_WIDTH, app, assets,
     code_workbench::{CodeWorkbenchFixture, CodeWorkbenchFixtureKind},
-    first_frame_probe, hint_layer, system_tray, terminal_surface, theme,
+    first_frame_probe, hint_layer, selection_guard, system_tray, terminal_surface, theme,
 };
 use vibex_desktop_model::{AppearanceUiState, ThemeMode};
 use vibex_terminal::run_terminal_feasibility;
@@ -448,6 +448,9 @@ fn main() {
             gpui_tokio::init(cx);
             gpui_component::init(cx);
             hint_layer::init(cx);
+            // Every window root, the workbench and its detached panels alike:
+            // a drag anywhere must not leave the selection layer armed.
+            selection_guard::init(cx);
             if !matches!(launch_mode, LaunchMode::Workbench) {
                 terminal_surface::bind_terminal_keys(cx);
             }
