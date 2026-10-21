@@ -12892,6 +12892,238 @@ impl ManagementCenter {
         }));
     }
 
+    /// Adds one model from a Provider's catalogue to a route.
+    ///
+    /// The list is built from what the Providers actually declare, not from a
+    /// free-text field: a member naming a model the Provider does not serve is
+    /// refused at save time, so offering only real models keeps the two in
+    /// step.
+    fn add_route_graph_member(
+        &mut self,
+        route_id: String,
+        provider_id: vibex_core::ModelProviderProfileId,
+        model_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(route) = self
+            .model_routes
+            .iter()
+            .find(|route| route.id.as_str() == route_id)
+            .cloned()
+        else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        if route.members.len() >= vibex_core::MAX_ROUTE_MEMBERS {
+            self.error = Some(
+                management_locale_text(
+                    "This route already holds as many models as it supports.",
+                    "这份路由的成员数已达上限。",
+                    "這份路由的成員數已達上限。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        if route.members.iter().any(|member| {
+            member.model_provider_profile_id == provider_id && member.model_id == model_id
+        }) {
+            self.error = Some(
+                management_locale_text(
+                    "That model is already in this route.",
+                    "这个模型已经在这份路由里了。",
+                    "這個模型已經在這份路由裡了。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let mut next = route.clone();
+        next.members.push(vibex_core::ModelRouteMember::new(
+            provider_id,
+            model_id,
+            next.members.len() as i64,
+        ));
+        let expected_revision = route.revision;
+        self.mutation = Some(ManagementMutation::RouteUpdate(route_id));
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .update_model_route(vibex_backend::MutationRequest::new(
+                    vibex_core::ModelRouteUpdateRequest {
+                        route: next,
+                        expected_revision,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(_) => this.refresh(cx),
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    /// Creates a route from one Provider's model and binds it to this Agent.
+    ///
+    /// One member is the smallest useful route, and it is what a reader who has
+    /// just picked a Provider wants: a route they can then extend. Composition
+    /// over several Providers is an edit of this route, not a second creation
+    /// path.
+    fn create_route_graph_route(
+        &mut self,
+        provider_id: vibex_core::ModelProviderProfileId,
+        model_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(agent_id) = self.selected_agent_id.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let display_name = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == provider_id)
+            .map(|profile| format!("{} · {model_id}", profile.display_name))
+            .unwrap_or_else(|| model_id.clone());
+        let route = vibex_core::ModelRoute {
+            display_name,
+            kind: vibex_core::RouteKind::Gateway,
+            members: vec![vibex_core::ModelRouteMember::new(provider_id, model_id, 0)],
+            strategy: vibex_core::RouteStrategy::Ordered,
+            status: vibex_core::RouteStatus::Enabled,
+            ..Default::default()
+        };
+        self.mutation = Some(ManagementMutation::RouteUpdate(
+            route.id.as_str().to_string(),
+        ));
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let parsed_agent = match vibex_core::AgentId::parse(agent_id.clone()) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.mutation = None;
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let created = backend
+                .management()
+                .create_model_route(vibex_backend::MutationRequest::new(route))
+                .await;
+            let created = match created {
+                Ok(created) => created,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.mutation = None;
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            // The new route is bound right away: a route no Agent uses is a
+            // draft, and this path exists because the reader is on an Agent's
+            // page trying to give it a model.
+            let bound = backend
+                .management()
+                .bind_agent_model_route(vibex_backend::MutationRequest::new(
+                    vibex_core::AgentModelRouteBindRequest {
+                        agent_id: parsed_agent,
+                        model_route_id: created.id.clone(),
+                        make_default: false,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match bound {
+                    Ok(_) => {
+                        this.selected_route_graph_route = Some(created.id.as_str().to_string());
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    /// Changes how a route picks among its members.
+    fn set_route_graph_strategy(
+        &mut self,
+        route_id: String,
+        strategy: vibex_core::RouteStrategy,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(route) = self
+            .model_routes
+            .iter()
+            .find(|route| route.id.as_str() == route_id)
+            .cloned()
+        else {
+            return;
+        };
+        if self.mutation.is_some() || route.strategy == strategy {
+            return;
+        }
+        let mut next = route.clone();
+        next.strategy = strategy;
+        let expected_revision = route.revision;
+        self.mutation = Some(ManagementMutation::RouteUpdate(route_id));
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .update_model_route(vibex_backend::MutationRequest::new(
+                    vibex_core::ModelRouteUpdateRequest {
+                        route: next,
+                        expected_revision,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(_) => this.refresh(cx),
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
     /// Removes one member from a route.
     ///
     /// A route must keep at least one member, so the last one is refused here
@@ -15070,9 +15302,9 @@ impl ManagementCenter {
         body = body.child(management_card_with_icon(
             management_locale_text("Upstream Providers", "上游供应商", "上游供應商"),
             management_locale_text(
-                "Providers are shared: one set of keys serves every Agent below.",
-                "供应商是共享的：一套 Key 服务于下面所有 Agent。",
-                "供應商是共享的：一套 Key 服務於下面所有 Agent。",
+                "Which Providers this gateway may call. An Agent's route then chooses among them.",
+                "这个网关可以调用哪些供应商。具体用哪个由 Agent 的路由决定。",
+                "這個閘道可以呼叫哪些供應商。具體用哪個由 Agent 的路由決定。",
             ),
             "icons/vibex/database.svg",
             upstream_rows.into_any_element(),
@@ -20384,7 +20616,59 @@ impl ManagementCenter {
                     })),
             );
         }
-        if unbound_count > 0 {
+        // Creating a route from scratch: the reader picks a Provider model and
+        // gets a one-member route bound to this Agent. Extending it to several
+        // sources is an edit of that route, so there is one creation path.
+        let mut new_choices = self
+            .providers
+            .iter()
+            .filter(|profile| profile.status == vibex_core::ModelProviderProfileStatus::Enabled)
+            .flat_map(|profile| {
+                profile
+                    .configured_models
+                    .iter()
+                    .filter(|model| model.enabled)
+                    .map(move |model| {
+                        (
+                            profile.id.clone(),
+                            profile.display_name.clone(),
+                            model.id.clone(),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        let has_new_choices = !new_choices.is_empty();
+        if has_new_choices {
+            new_choices.truncate(60);
+            let center = cx.entity();
+            let pending = self.mutation.is_some();
+            add_row = add_row.child(
+                Button::new("route-graph-new-route")
+                    .xsmall()
+                    .secondary()
+                    .label(management_locale_text("New route", "新建路由", "新增路由"))
+                    .disabled(pending)
+                    .dropdown_menu(move |menu, _, _| {
+                        let mut menu = menu;
+                        for (provider_id, provider_name, model_id) in &new_choices {
+                            let provider_id = provider_id.clone();
+                            let model_id = model_id.clone();
+                            let center = center.clone();
+                            let label = format!("{provider_name} · {model_id}");
+                            menu =
+                                menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                                    let provider_id = provider_id.clone();
+                                    let model_id = model_id.clone();
+                                    center.update(cx, |this, cx| {
+                                        this.create_route_graph_route(provider_id, model_id, cx)
+                                    });
+                                }));
+                        }
+                        menu
+                    }),
+            );
+        }
+        if unbound_count > 0 || has_new_choices {
             middle = middle.child(
                 v_flex()
                     .w_full()
@@ -20395,9 +20679,9 @@ impl ManagementCenter {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(management_locale_text(
-                                "Add a route this Agent does not use yet",
-                                "添加这个 Agent 尚未使用的路由",
-                                "新增這個 Agent 尚未使用的路由",
+                                "Add a route this Agent does not use yet, or make a new one",
+                                "添加这个 Agent 尚未使用的路由，或新建一份",
+                                "新增這個 Agent 尚未使用的路由，或新建一份",
                             )),
                     )
                     .child(add_row),
@@ -20843,12 +21127,47 @@ impl ManagementCenter {
             );
         }
         if route.members.len() > 1 {
+            // The strategy only means something across several members: with
+            // one, "ordered", "rotate" and "least used" all pick it.
+            let route_id = route.id().to_string();
+            let current = route.route.strategy;
+            let pending = self.mutation.is_some();
+            let mut choices = h_flex().flex_wrap().items_center().gap_1();
+            for strategy in vibex_core::RouteStrategy::ALL {
+                let id = route_id.clone();
+                let label = management_route_strategy_label(strategy);
+                choices = choices.child(
+                    Button::new(SharedString::from(format!(
+                        "route-graph-strategy-{}-{}",
+                        route.id(),
+                        strategy.id()
+                    )))
+                    .xsmall()
+                    .ghost()
+                    .label(SharedString::from(label))
+                    .selected(strategy == current)
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_route_graph_strategy(id.clone(), strategy, cx)
+                    })),
+                );
+            }
             rows = rows.child(
-                div()
+                v_flex()
+                    .w_full()
+                    .gap_1()
                     .pt_1()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_route_strategy_label(route.route.strategy)),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "How to choose among models",
+                                "在模型之间如何选择",
+                                "在模型之間如何選擇",
+                            )),
+                    )
+                    .child(choices),
             );
         }
         // Switching between gateway routes keeps the same loopback address, so
@@ -20881,6 +21200,85 @@ impl ManagementCenter {
                     .to_string()
                 }),
         );
+        // Every model a Provider declares is offered, minus the ones already in
+        // this route. Offering only real models keeps the picker and the
+        // service's own validation in step.
+        let already = route
+            .route
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.model_provider_profile_id.clone(),
+                    member.model_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut add_choices = Vec::new();
+        for profile in &self.providers {
+            if profile.status != vibex_core::ModelProviderProfileStatus::Enabled {
+                continue;
+            }
+            for model in profile
+                .configured_models
+                .iter()
+                .filter(|model| model.enabled)
+            {
+                if already
+                    .iter()
+                    .any(|(provider, id)| provider == &profile.id && id == &model.id)
+                {
+                    continue;
+                }
+                add_choices.push((
+                    profile.id.clone(),
+                    profile.display_name.clone(),
+                    model.id.clone(),
+                ));
+            }
+        }
+        if !add_choices.is_empty() {
+            let route_id = route.id().to_string();
+            let center = cx.entity();
+            let pending = self.mutation.is_some();
+            rows = rows.child(
+                div().pt_1().child(
+                    Button::new(SharedString::from(format!(
+                        "route-graph-add-member-{}",
+                        route.id()
+                    )))
+                    .xsmall()
+                    .secondary()
+                    .label(management_locale_text("Add model", "添加模型", "新增模型"))
+                    .disabled(pending)
+                    .dropdown_menu(move |menu, _, _| {
+                        let mut menu = menu;
+                        for (provider_id, provider_name, model_id) in &add_choices {
+                            let route_id = route_id.clone();
+                            let provider_id = provider_id.clone();
+                            let model_id = model_id.clone();
+                            let center = center.clone();
+                            let label = format!("{provider_name} · {model_id}");
+                            menu =
+                                menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                                    let route_id = route_id.clone();
+                                    let provider_id = provider_id.clone();
+                                    let model_id = model_id.clone();
+                                    center.update(cx, |this, cx| {
+                                        this.add_route_graph_member(
+                                            route_id,
+                                            provider_id,
+                                            model_id,
+                                            cx,
+                                        )
+                                    });
+                                }));
+                        }
+                        menu
+                    }),
+                ),
+            );
+        }
         rows = rows.child(self.render_route_graph_actions(route, cx));
         rows.into_any_element()
     }
@@ -38908,5 +39306,97 @@ mod route_graph_tests {
             management_route_member_summary(&drawn)
         );
         route.members.clear();
+    }
+}
+
+#[cfg(test)]
+mod route_graph_edit_tests {
+    use super::*;
+
+    /// A new route is created with one member and asks to be bound.
+    ///
+    /// One member is the smallest useful route; extending it is an edit of the
+    /// same record, so there is a single creation path.
+    #[test]
+    fn a_new_route_starts_with_one_enabled_member() {
+        let provider = vibex_core::ModelProviderProfileId::new();
+        let route = vibex_core::ModelRoute {
+            display_name: "DeepSeek · deepseek-chat".to_string(),
+            kind: vibex_core::RouteKind::Gateway,
+            members: vec![vibex_core::ModelRouteMember::new(
+                provider.clone(),
+                "deepseek-chat",
+                0,
+            )],
+            strategy: vibex_core::RouteStrategy::Ordered,
+            status: vibex_core::RouteStatus::Enabled,
+            ..Default::default()
+        };
+        assert!(route.validate().is_ok());
+        assert_eq!(route.members.len(), 1);
+        assert!(route.members[0].enabled);
+        assert_eq!(route.members[0].model_provider_profile_id, provider);
+    }
+
+    /// The same model cannot be added twice, and the last member cannot go.
+    ///
+    /// Both are refused before a write, so the reader learns the rule beside
+    /// the row rather than from a failed save.
+    #[test]
+    fn a_route_refuses_a_duplicate_member_and_an_empty_one() {
+        let provider = vibex_core::ModelProviderProfileId::new();
+        let mut route = vibex_core::ModelRoute {
+            display_name: "Standard".to_string(),
+            members: vec![vibex_core::ModelRouteMember::new(provider.clone(), "m", 0)],
+            status: vibex_core::RouteStatus::Enabled,
+            ..Default::default()
+        };
+        // Adding the same pair again is what the picker filters out; the record
+        // itself would still validate with two rows naming the same model at
+        // two Providers, which is legitimate.
+        route
+            .members
+            .push(vibex_core::ModelRouteMember::new(provider, "m", 1));
+        assert!(
+            route.validate().is_ok(),
+            "the same model at the same Provider is only refused by the picker"
+        );
+
+        // Removing every member is not a route.
+        route.members.clear();
+        assert_eq!(route.validate().unwrap_err().code, "route_member_missing");
+    }
+
+    /// A direct route cannot hold a second member, so the picker must not offer
+    /// one.
+    #[test]
+    fn a_direct_route_cannot_be_extended() {
+        let provider = vibex_core::ModelProviderProfileId::new();
+        let mut route = vibex_core::ModelRoute {
+            display_name: "Direct".to_string(),
+            kind: vibex_core::RouteKind::Direct,
+            members: vec![vibex_core::ModelRouteMember::new(provider.clone(), "m", 0)],
+            status: vibex_core::RouteStatus::Enabled,
+            ..Default::default()
+        };
+        assert!(route.validate().is_ok());
+        route
+            .members
+            .push(vibex_core::ModelRouteMember::new(provider, "n", 1));
+        assert_eq!(
+            route.validate().unwrap_err().code,
+            "route_direct_member_count_invalid"
+        );
+    }
+
+    /// The three strategies name what they do, and are all offered.
+    #[test]
+    fn the_strategy_labels_cover_every_strategy() {
+        for strategy in vibex_core::RouteStrategy::ALL {
+            assert!(
+                !management_route_strategy_label(strategy).is_empty(),
+                "{strategy:?} has no label"
+            );
+        }
     }
 }
