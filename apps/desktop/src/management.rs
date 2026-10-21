@@ -722,7 +722,6 @@ enum ManagementMutation {
         action: String,
     },
     ProviderPreview(String),
-    ProviderDisplayOrder(String),
     AgentToggle(String),
     AgentInstall(String),
     AgentRollback(String),
@@ -873,7 +872,6 @@ impl ManagementMutation {
             Self::ProviderProbe(id) => format!("provider:probe:{id}"),
             Self::AgentAuth { agent_id, action } => format!("agent:auth:{agent_id}:{action}"),
             Self::ProviderPreview(id) => format!("provider:preview:{id}"),
-            Self::ProviderDisplayOrder(id) => format!("provider:display-order:{id}"),
             Self::AgentToggle(id) => format!("agent:toggle:{id}"),
             Self::AgentInstall(id) => format!("agent:install:{id}"),
             Self::AgentRollback(id) => format!("agent:rollback:{id}"),
@@ -916,8 +914,7 @@ impl ManagementMutation {
             | Self::AgentInstall(agent_id)
             | Self::AgentRollback(agent_id)
             | Self::AgentUpdateCheck(agent_id)
-            | Self::AgentUninstall(agent_id)
-            | Self::ProviderDisplayOrder(agent_id) => Some(agent_id),
+            | Self::AgentUninstall(agent_id) => Some(agent_id),
             _ => None,
         }
     }
@@ -8310,63 +8307,6 @@ impl ManagementCenter {
         rows
     }
 
-    fn ordered_provider_profile_ids(&self, agent_id: &str) -> Vec<String> {
-        let mut ids = self
-            .snapshot
-            .profiles
-            .iter()
-            .filter(|profile| profile.agent_id == agent_id)
-            .map(|profile| profile.id.as_str().to_string())
-            .collect::<Vec<_>>();
-        ids.sort_by_key(|profile_id| {
-            (
-                !self
-                    .provider_display_order
-                    .contains_key(profile_id.as_str()),
-                self.provider_display_order
-                    .get(profile_id.as_str())
-                    .copied()
-                    .unwrap_or(i64::MAX),
-            )
-        });
-        ids
-    }
-
-    fn start_provider_profile_drag(
-        &mut self,
-        agent_id: &str,
-        profile_id: &str,
-        cursor_offset_y: f32,
-        cx: &mut Context<Self>,
-    ) {
-        let original_ids = self.ordered_provider_profile_ids(agent_id);
-        if !original_ids.iter().any(|id| id == profile_id) {
-            return;
-        }
-        let initial_target = reorder_target_from_cursor_offset(
-            &original_ids,
-            profile_id,
-            cursor_offset_y,
-            MANAGEMENT_PROVIDER_ROW_HEIGHT,
-            MANAGEMENT_PROVIDER_ROW_GAP,
-        );
-        let preview_ids = initial_target
-            .as_ref()
-            .map(|(target_id, after)| {
-                reordered_provider_profile_ids(&original_ids, profile_id, target_id, *after)
-            })
-            .unwrap_or_else(|| original_ids.clone());
-        self.provider_display_order_drag_state = Some(ProviderDisplayOrderDragState {
-            agent_id: agent_id.to_string(),
-            profile_id: profile_id.to_string(),
-            preview_ids,
-            original_ids,
-        });
-        self.provider_display_order_drop_target = initial_target
-            .map(|(profile_id, after)| ProviderDisplayOrderDropTarget { profile_id, after });
-        cx.notify();
-    }
-
     fn preview_provider_profile_reorder(
         &mut self,
         drag: &ProviderDisplayOrderDrag,
@@ -8395,92 +8335,6 @@ impl ManagementCenter {
         state.preview_ids = next_ids;
         self.provider_display_order_drop_target = Some(next_target);
         cx.notify();
-    }
-
-    fn finish_provider_profile_drag(
-        &mut self,
-        agent_id: &str,
-        profile_id: &str,
-        cx: &mut Context<Self>,
-    ) {
-        let valid_drag = self
-            .provider_display_order_drag_state
-            .as_ref()
-            .is_some_and(|state| state.agent_id == agent_id && state.profile_id == profile_id);
-        if !valid_drag {
-            return;
-        }
-        self.provider_display_order_drop_target = None;
-        let state = self
-            .provider_display_order_drag_state
-            .take()
-            .expect("validated provider drag state above");
-        if state.preview_ids == state.original_ids {
-            cx.notify();
-            return;
-        }
-        self.persist_provider_profile_order(&state.agent_id, state.preview_ids, cx);
-    }
-
-    fn persist_provider_profile_order(
-        &mut self,
-        agent_id: &str,
-        ordered_ids: Vec<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let current_ids = self.ordered_provider_profile_ids(agent_id);
-        if ordered_ids == current_ids {
-            return;
-        }
-        let Ok(parsed_agent_id) = AgentId::parse(agent_id.to_string()) else {
-            return;
-        };
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let active_locale = locale::current_locale();
-        let entries = ordered_ids
-            .iter()
-            .map(
-                |provider_profile_id| vibex_core::AgentModelProviderDisplayOrderSetEntry {
-                    provider_profile_id: vibex_core::ProviderProfileId::parse(
-                        provider_profile_id.clone(),
-                    )
-                    .expect("provider profile ids originate from the loaded snapshot"),
-                },
-            )
-            .collect::<Vec<_>>();
-        self.provider_display_order
-            .extend(ordered_ids.iter().enumerate().map(|(index, profile_id)| {
-                (
-                    profile_id.clone(),
-                    i64::try_from(index).expect("provider order index fits in i64"),
-                )
-            }));
-        cx.notify();
-        self.begin_simple_task(
-            ManagementMutation::ProviderDisplayOrder(agent_id.to_string()),
-            cx,
-            async move {
-                backend
-                    .management()
-                    .set_agent_model_provider_display_order(MutationRequest::new(
-                        vibex_core::AgentModelProviderDisplayOrderSetRequest {
-                            agent_id: parsed_agent_id,
-                            entries,
-                        },
-                    ))
-                    .await
-                    .map_err(crate::app::remote_error_into_vibex)?;
-                Ok(management_locale_text_for(
-                    active_locale,
-                    "Provider order updated",
-                    "模型供应商顺序已更新",
-                    "模型供應商順序已更新",
-                )
-                .to_string())
-            },
-        );
     }
 
     fn begin_simple_task<F>(
@@ -8555,11 +8409,7 @@ impl ManagementCenter {
                         | ManagementMutation::AgentUninstall(_)
                         | ManagementMutation::AgentDiscovery
                 );
-                let refresh_after_failure = agent_registry_changed
-                    || matches!(
-                        &completed_mutation,
-                        ManagementMutation::ProviderDisplayOrder(_)
-                    );
+                let refresh_after_failure = agent_registry_changed;
                 match outcome {
                     Ok(Ok(success)) => {
                         match &completed_mutation {
@@ -12821,6 +12671,102 @@ impl ManagementCenter {
         }));
     }
 
+    /// Switches the Agent's default route, confirming first when it restarts.
+    ///
+    /// The restart is the whole point of the check. Moving between gateway
+    /// routes keeps the same loopback address, so the Agent keeps running;
+    /// moving to or from a direct route changes the address it launches with,
+    /// which tears down whatever conversation is in flight. Confirming only the
+    /// second case is what makes the gateway's benefit visible instead of a
+    /// nuisance.
+    fn request_route_graph_default(
+        &mut self,
+        route_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let will_restart = self
+            .model_routes
+            .iter()
+            .find(|route| route.id.as_str() == route_id)
+            .is_some_and(|route| route.kind == vibex_core::RouteKind::Direct)
+            || self
+                .agent_model_route_bindings
+                .iter()
+                .find(|binding| {
+                    binding.is_default
+                        && self.selected_agent_id.as_deref() == Some(binding.agent_id.as_str())
+                })
+                .and_then(|binding| {
+                    self.model_routes
+                        .iter()
+                        .find(|route| route.id == binding.model_route_id)
+                })
+                .is_some_and(|route| route.kind == vibex_core::RouteKind::Direct);
+        if !will_restart {
+            self.set_route_graph_default(route_id, cx);
+            return;
+        }
+        let entity = cx.weak_entity();
+        let agent_label = self
+            .selected_agent_id
+            .clone()
+            .unwrap_or_else(|| "Agent".to_string());
+        let active_locale = locale::current_locale();
+        let body_en = format!(
+            "Switching {agent_label} to or from a direct route restarts it, and any conversation in progress will be interrupted. Routes that go through the gateway keep the same address and do not restart."
+        );
+        let body_zh_cn = format!(
+            "把 {agent_label} 切到直连路由（或切离）会重启它，正在进行的对话会中断。经过网关的路由地址不变，不会重启。"
+        );
+        let body_zh_tw = format!(
+            "把 {agent_label} 切到直連路由（或切離）會重新啟動它，正在進行的對話會中斷。經過閘道的路由位址不變，不會重新啟動。"
+        );
+        // Built per locale rather than through the shared helper: the helper
+        // borrows its arguments, and these are formatted, so the result has to
+        // own its text.
+        let body = match active_locale {
+            ResolvedLocale::En => body_en,
+            ResolvedLocale::ZhCn => body_zh_cn,
+            ResolvedLocale::ZhTw => body_zh_tw,
+        };
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let route_id = route_id.clone();
+            let body = body.clone();
+            dialog
+                .title(management_locale_text_for(
+                    active_locale,
+                    "Switching restarts this Agent",
+                    "切换会重启这个 Agent",
+                    "切換會重新啟動這個 Agent",
+                ))
+                .child(body.clone())
+                .footer(
+                    gpui_component::dialog::DialogFooter::new()
+                        .child(gpui_component::dialog::DialogClose::new().child(
+                            Button::new("cancel-route-switch").outline().label(
+                                management_locale_text_for(active_locale, "Cancel", "取消", "取消"),
+                            ),
+                        ))
+                        .child(gpui_component::dialog::DialogAction::new().child(
+                            Button::new("confirm-route-switch").label(management_locale_text_for(
+                                active_locale,
+                                "Switch",
+                                "切换",
+                                "切換",
+                            )),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.set_route_graph_default(route_id.clone(), cx)
+                    });
+                    true
+                })
+        });
+    }
+
     /// Binds a route to the Agent, so the graph lists it.
     fn bind_route_graph_route(&mut self, route_id: String, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
@@ -13249,6 +13195,63 @@ impl ManagementCenter {
             self.gateway_member_history = Some(key);
         }
         cx.notify();
+    }
+
+    /// Applies a change to a route's own launch policy.
+    ///
+    /// One method for pin, token ceiling and first-token timeout: they are the
+    /// same edit — a field on the route record — and giving each its own mutation
+    /// would be three copies of the same revision check.
+    fn update_route_graph_policy(
+        &mut self,
+        route_id: String,
+        edit: impl FnOnce(&mut vibex_core::ModelRoute),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(route) = self
+            .model_routes
+            .iter()
+            .find(|route| route.id.as_str() == route_id)
+            .cloned()
+        else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let mut next = route.clone();
+        edit(&mut next);
+        if next == route {
+            return;
+        }
+        let expected_revision = route.revision;
+        self.mutation = Some(ManagementMutation::RouteUpdate(route_id));
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .update_model_route(vibex_backend::MutationRequest::new(
+                    vibex_core::ModelRouteUpdateRequest {
+                        route: next,
+                        expected_revision,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(_) => this.refresh(cx),
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
     }
 
     /// Removes one member from a route.
@@ -20601,17 +20604,90 @@ impl ManagementCenter {
         let copy_target = management_locale_text("Models", "模型", "模型");
 
         let mut middle = v_flex().w_full().min_w_0().gap_2();
+        // The three empty cases are kept apart on purpose. Showing "no Providers
+        // yet" to someone whose Providers page has a dozen entries is the most
+        // confusing failure this panel can produce, and it comes from treating
+        // "nothing here" as one state when it is three.
+        let any_provider = !self.providers.is_empty();
+        // Every route this Agent holds whose members are all switched off or
+        // whose Providers are gone: a route that exists but cannot answer.
+        let broken_routes = self
+            .agent_model_route_bindings
+            .iter()
+            .filter(|binding| {
+                binding.agent_id.as_str() == agent_id && binding.deleted_at_ms.is_none()
+            })
+            .filter(|binding| {
+                self.model_routes
+                    .iter()
+                    .find(|route| route.id == binding.model_route_id)
+                    .is_some_and(|route| {
+                        route.enabled_members().count() == 0
+                            || route.enabled_members().all(|member| {
+                                !self.providers.iter().any(|provider| {
+                                    provider.id == member.model_provider_profile_id
+                                        && provider.status
+                                            == vibex_core::ModelProviderProfileStatus::Enabled
+                                })
+                            })
+                    })
+            })
+            .count();
         if nodes.is_empty() {
-            middle = middle.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "This Agent has no route yet. Add one to choose which models it may use.",
-                        "这个 Agent 还没有路由。添加一份，才能选择它可以用哪些模型。",
-                        "這個 Agent 還沒有路由。新增一份，才能選擇它可以用哪些模型。",
-                    )),
-            );
+            // Only the Agent's own account is drawn when it manages its own
+            // Providers: a gateway route cannot apply to it, and a direct one
+            // would be a Provider it never configured.
+            if !any_provider {
+                middle = middle.child(management_route_graph_empty_state(
+                    management_locale_text("No Providers yet", "还没有供应商", "還沒有供應商"),
+                    management_locale_text(
+                        "Add an API Key, or let Vibex import one from another tool.",
+                        "添加一个 API Key，或让 Vibex 从其他工具导入。",
+                        "新增一個 API Key，或讓 Vibex 從其他工具匯入。",
+                    ),
+                    management_locale_text("Add provider", "添加供应商", "新增供應商"),
+                    cx,
+                ));
+            } else if broken_routes > 0
+                && broken_routes
+                    == self
+                        .agent_model_route_bindings
+                        .iter()
+                        .filter(|binding| {
+                            binding.agent_id.as_str() == agent_id && binding.deleted_at_ms.is_none()
+                        })
+                        .count()
+            {
+                middle = middle.child(management_route_graph_empty_state(
+                    management_locale_text(
+                        "No usable model in this route",
+                        "路由里没有可用的模型",
+                        "路由裡沒有可用的模型",
+                    ),
+                    management_locale_text(
+                        "Every member is switched off, or its Provider was deleted.",
+                        "成员都停用了，或者供应商已被删除。",
+                        "成員都停用了，或者供應商已被刪除。",
+                    ),
+                    management_locale_text("Fix route", "修复路由", "修復路由"),
+                    cx,
+                ));
+            } else {
+                middle = middle.child(management_route_graph_empty_state(
+                    management_locale_text(
+                        "This Agent has no route yet",
+                        "这个 Agent 还没有路由",
+                        "這個 Agent 還沒有路由",
+                    ),
+                    management_locale_text(
+                        "Pick a few models from the Providers you already have, put them in order, and it works.",
+                        "从已有供应商里挑几个模型，排好顺序，就能用了。",
+                        "從已有供應商裡挑幾個模型，排好順序，就能用了。",
+                    ),
+                    management_locale_text("New route", "新建路由", "新增路由"),
+                    cx,
+                ));
+            }
         }
         for node in &nodes {
             match node {
@@ -20626,6 +20702,11 @@ impl ManagementCenter {
                                 management_locale_text("not running", "未运行", "未執行")
                                     .to_string()
                             });
+                    // A gateway that is not listening affects every route under
+                    // it, so the warning belongs on the node rather than on each
+                    // route: a per-route mark would read as "this one route is
+                    // degraded" while the others look fine.
+                    let listener_down = port.is_none();
                     middle = middle.child(
                         v_flex()
                             .id("route-graph-gateway")
@@ -20634,8 +20715,29 @@ impl ManagementCenter {
                             .gap_1()
                             .rounded(px(8.0))
                             .border_1()
-                            .border_color(cx.theme().border)
+                            .border_color(if listener_down {
+                                cx.theme().warning
+                            } else {
+                                cx.theme().border
+                            })
                             .p_2()
+                            .when(listener_down, |this| {
+                                this.child(
+                                    div()
+                                        .w_full()
+                                        .rounded(px(4.0))
+                                        .bg(cx.theme().warning.opacity(0.12))
+                                        .px_2()
+                                        .py_1()
+                                        .text_xs()
+                                        .text_color(cx.theme().warning)
+                                        .child(management_locale_text(
+                                            "The gateway is not listening, so every route under it is unavailable. Direct routes and the Agent account are not affected.",
+                                            "网关没有在监听，它下面的路由都不可用。直连路由和 Agent 账户不受影响。",
+                                            "閘道沒有在監聽，它下面的路由都不可用。直連路由和 Agent 賬戶不受影響。",
+                                        )),
+                                )
+                            })
                             .child(
                                 h_flex()
                                     .gap_2()
@@ -21302,8 +21404,8 @@ impl ManagementCenter {
                         "設為預設",
                     ))
                     .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_route_graph_default(id_for_default.clone(), cx)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.request_route_graph_default(id_for_default.clone(), window, cx)
                     })),
                 )
             })
@@ -21357,7 +21459,11 @@ impl ManagementCenter {
                 .into_any_element();
         };
         let mut rows = v_flex().w_full().min_w_0().gap_1();
-        let visible = route.members.len().min(ROUTE_GRAPH_VISIBLE_MEMBERS);
+        let visible = if route.members.len() > ROUTE_GRAPH_MEMBER_FOLD_THRESHOLD {
+            ROUTE_GRAPH_VISIBLE_MEMBERS
+        } else {
+            route.members.len()
+        };
         for member in &route.members[..visible] {
             let (state_text, state_color) = match member.state() {
                 RouteGraphMemberState::Ready => (
@@ -21485,6 +21591,140 @@ impl ManagementCenter {
                     .child(choices),
             );
         }
+        // The route's own launch policy. These are collapsed under "advanced"
+        // because they are tuned once and then left alone: pinning, a token
+        // ceiling and a first-token deadline are not what a reader opens this
+        // page to change, but leaving them uneditable is what made them fields
+        // with no surface.
+        // Every member without a usable Key: the route still exists and can be
+        // picked, but nothing can answer right now. Marked on the route rather
+        // than on any one member, because the reader's question is "will this
+        // work" and the answer is no for the whole composition.
+        let all_cooling = !route.members.is_empty()
+            && route
+                .members
+                .iter()
+                .all(|member| matches!(member.state(), RouteGraphMemberState::Cooling(_)));
+        if all_cooling {
+            rows = rows.child(div().pt_1().text_xs().text_color(cx.theme().warning).child(
+                management_locale_text(
+                    "Every member is cooling; this route will work again when one recovers.",
+                    "所有成员都在冷却；有成员恢复后这份路由就能用。",
+                    "所有成員都在冷卻；有成員恢復後這份路由就能用。",
+                ),
+            ));
+        }
+        let policy_route_id = route.id().to_string();
+        let pin_id = route.id().to_string();
+        let ceiling_id = route.id().to_string();
+        let timeout_id = route.id().to_string();
+        let pinned = route.route.pin == vibex_core::GatewayPinScope::Conversation;
+        let ceiling_text = route
+            .route
+            .token_limit
+            .as_ref()
+            .map(|limit| {
+                format!(
+                    "{} tokens · {}",
+                    limit.tokens,
+                    management_route_window_label(limit.window)
+                )
+            })
+            .unwrap_or_else(|| {
+                management_locale_text("no route ceiling", "无路由上限", "無路由上限").to_string()
+            });
+        let timeout_text = match route.route.first_token_timeout_ms {
+            Some(ms) => format!("{ms} ms"),
+            None => management_locale_text("no deadline", "无超时", "無逾時").to_string(),
+        };
+        let pending = self.mutation.is_some();
+        let mut advanced = v_flex().w_full().gap_1().pt_1();
+        advanced = advanced.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text("Advanced", "高级", "進階")),
+        );
+        advanced = advanced.child(
+            h_flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                // Conversation pinning: one Key until it is invalidated, or a new
+                // pick per request.
+                .child(
+                    Button::new(SharedString::from(format!("route-graph-pin-{pin_id}")))
+                        .xsmall()
+                        .ghost()
+                        .label(if pinned {
+                            management_locale_text("Pin conversation", "会话固定", "對話固定")
+                        } else {
+                            management_locale_text("Repick each request", "每次重选", "每次重選")
+                        })
+                        .selected(pinned)
+                        .disabled(pending)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let id = policy_route_id.clone();
+                            this.update_route_graph_policy(
+                                id,
+                                |route| {
+                                    route.pin =
+                                        if route.pin == vibex_core::GatewayPinScope::Conversation {
+                                            vibex_core::GatewayPinScope::Off
+                                        } else {
+                                            vibex_core::GatewayPinScope::Conversation
+                                        };
+                                },
+                                cx,
+                            )
+                        })),
+                )
+                // The token ceiling cycles through the offered windows, because
+                // a numeric input for a value that has a small fixed set would be
+                // more surface for the same answer.
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "route-graph-ceiling-{ceiling_id}"
+                    )))
+                    .xsmall()
+                    .ghost()
+                    .label(SharedString::from(ceiling_text))
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let id = ceiling_id.clone();
+                        this.update_route_graph_policy(
+                            id,
+                            |route| {
+                                route.token_limit =
+                                    management_next_route_ceiling(route.token_limit.take());
+                            },
+                            cx,
+                        )
+                    })),
+                )
+                // The first-token deadline, likewise cycling a small set.
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "route-graph-timeout-{timeout_id}"
+                    )))
+                    .xsmall()
+                    .ghost()
+                    .label(SharedString::from(timeout_text))
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let id = timeout_id.clone();
+                        this.update_route_graph_policy(
+                            id,
+                            |route| {
+                                route.first_token_timeout_ms =
+                                    management_next_route_timeout(route.first_token_timeout_ms);
+                            },
+                            cx,
+                        )
+                    })),
+                ),
+        );
+        rows = rows.child(advanced);
         // Switching between gateway routes keeps the same loopback address, so
         // the Agent keeps running. Switching to or from a direct route changes
         // the address it launches with, which restarts it — the reader needs to
@@ -23097,7 +23337,6 @@ impl ManagementCenter {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(management_unconfigured_label);
-            let model_count = management_model_count(profile.configured_model_count);
             let testing = matches!(
                 &self.mutation,
                 Some(ManagementMutation::ProviderProbe(active_id)) if active_id == &id
@@ -23272,22 +23511,6 @@ impl ManagementCenter {
                         })),
                     management_delete_profile_label(),
                 ));
-            let drag_payload = ProviderDisplayOrderDrag {
-                agent_id: selected_agent_id.clone(),
-                profile_id: id.clone(),
-                kind: profile.kind,
-                label: profile.display_name.clone(),
-                is_default,
-                address: address.clone(),
-                model_count: model_count.clone(),
-            };
-            let drag_entity = cx.weak_entity();
-            let drag_agent_id = selected_agent_id.clone();
-            let drag_profile_id = id.clone();
-            let release_agent_id = selected_agent_id.clone();
-            let release_profile_id = id.clone();
-            let release_out_agent_id = selected_agent_id.clone();
-            let release_out_profile_id = id.clone();
             let drag_handle = div()
                 .id(SharedString::from(format!("provider-drag-handle-{id}")))
                 .flex_none()
@@ -23296,12 +23519,15 @@ impl ManagementCenter {
                 .flex()
                 .items_center()
                 .justify_center()
-                .cursor_grab()
+                // Reordering moved to the routing section, where a member's
+                // position *is* its attempt order. Two surfaces that can both
+                // change the order would fight: the last write would win and the
+                // other would look broken.
                 .tooltip(move |window, cx| {
                     Tooltip::new(management_locale_text(
-                        "Drag to reorder providers",
-                        "拖动调整供应商顺序",
-                        "拖動調整供應商順序",
+                        "Order is set in the routing section above",
+                        "顺序已移到上方的路由分区",
+                        "順序已移到上方的路由分區",
                     ))
                     .build(window, cx)
                 })
@@ -23311,38 +23537,10 @@ impl ManagementCenter {
                         .size(px(18.0))
                         .text_color(cx.theme().muted_foreground.opacity(0.65)),
                 )
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.finish_provider_profile_drag(
-                            &release_agent_id,
-                            &release_profile_id,
-                            cx,
-                        );
-                    }),
-                )
-                .on_mouse_up_out(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.finish_provider_profile_drag(
-                            &release_out_agent_id,
-                            &release_out_profile_id,
-                            cx,
-                        );
-                    }),
-                )
-                .on_drag(drag_payload, move |drag, cursor_offset, _, cx| {
-                    cx.stop_propagation();
-                    let _ = drag_entity.update(cx, |this, cx| {
-                        this.start_provider_profile_drag(
-                            &drag_agent_id,
-                            &drag_profile_id,
-                            f32::from(cursor_offset.y),
-                            cx,
-                        );
-                    });
-                    cx.new(|_| drag.clone())
-                });
+                // No drag handlers: ordering moved to the routing section, where
+                // a member's position is its attempt order. Leaving the handlers
+                // in place would let two surfaces reorder the same list.
+                ;
             let active_drop_after = active_drop_target
                 .as_ref()
                 .and_then(|target| (target.profile_id == id).then_some(target.after));
@@ -23568,7 +23766,20 @@ impl ManagementCenter {
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(management_profile_count(profiles.len())),
+                                .child(management_route_count_for_agent(
+                                    self.selected_agent_id
+                                        .as_deref()
+                                        .map(|agent_id| {
+                                            self.agent_model_route_bindings
+                                                .iter()
+                                                .filter(|binding| {
+                                                    binding.agent_id.as_str() == agent_id
+                                                        && binding.deleted_at_ms.is_none()
+                                                })
+                                                .count()
+                                        })
+                                        .unwrap_or(0),
+                                )),
                         )
                         .child(
                             h_flex()
@@ -23607,16 +23818,14 @@ impl ManagementCenter {
                 .child(profile_rows)
                 .into_any_element()
         };
-        let provider_card = provider_configuration;
-        let provider_configuration = match agent_gateway_mode {
-            Some(mode) => v_flex()
-                .w_full()
-                .gap_3()
-                .child(render_agent_gateway_mode(&mode, cx))
-                .child(provider_card)
-                .into_any_element(),
-            None => provider_card,
-        };
+        // The mode line used to sit here. It said what the routing section now
+        // draws: which path this Agent takes. Keeping both would be the same fact
+        // stated twice, and they could disagree — so the section above owns it.
+        //
+        // `agent_gateway_mode` itself stays: §7.7 records that the routing
+        // section reuses its wording and its four states.
+        let _ = &agent_gateway_mode;
+        let provider_configuration = provider_configuration;
         let provider_configuration = management_card_with_icon(
             copy.provider_configuration,
             management_locale_text(
@@ -27576,33 +27785,6 @@ fn reordered_provider_profile_ids(
     ids
 }
 
-fn reorder_target_from_cursor_offset(
-    ordered_ids: &[String],
-    moving_id: &str,
-    cursor_offset_y: f32,
-    row_height: f32,
-    row_gap: f32,
-) -> Option<(String, bool)> {
-    let moving_index = ordered_ids.iter().position(|id| id == moving_id)?;
-    let stride = row_height + row_gap;
-    if stride <= 0.0 {
-        return None;
-    }
-    let row_delta = ((cursor_offset_y - row_height / 2.0) / stride).round() as isize;
-    if row_delta == 0 {
-        return None;
-    }
-    let target_index = moving_index
-        .saturating_add_signed(row_delta)
-        .min(ordered_ids.len().saturating_sub(1));
-    (target_index != moving_index).then(|| {
-        (
-            ordered_ids[target_index].clone(),
-            target_index > moving_index,
-        )
-    })
-}
-
 fn provider_reorder_row_offset(
     original_ids: &[String],
     preview_ids: &[String],
@@ -29072,7 +29254,16 @@ const DESKTOP_MAX_INFLIGHT: usize = 8;
 /// page is for.
 const ROUTE_GRAPH_VISIBLE_ROUTES: usize = 5;
 /// How many members a route draws before folding the rest away.
-const ROUTE_GRAPH_VISIBLE_MEMBERS: usize = 8;
+/// How many members the graph's right column draws before folding the rest.
+///
+/// The design's threshold is "more than eight", with the first seven staying —
+/// the eighth row is the overflow line. Members and routes use different
+/// thresholds on purpose: the middle column is "which one", where a long list
+/// crowds, and the right column is "how it composes", where the reader needs to
+/// see the shape.
+const ROUTE_GRAPH_VISIBLE_MEMBERS: usize = 7;
+/// The count above which the member fold engages.
+const ROUTE_GRAPH_MEMBER_FOLD_THRESHOLD: usize = 8;
 
 /// Builds the nodes an Agent's route graph draws, in reading order.
 ///
@@ -29339,6 +29530,98 @@ fn management_route_member_overflow_label(hidden: usize) -> String {
         ResolvedLocale::ZhCn => format!("还有 {hidden} 个成员"),
         ResolvedLocale::ZhTw => format!("還有 {hidden} 個成員"),
         ResolvedLocale::En => format!("{hidden} more member{}", management_route_plural(hidden)),
+    }
+}
+
+/// A titled empty state for the route graph.
+///
+/// Kept as one helper so the three cases read as the same kind of message: a
+/// title saying what is missing, a line saying why, and one action.
+fn management_route_graph_empty_state(
+    title: &'static str,
+    body: &'static str,
+    action: &'static str,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    v_flex()
+        .w_full()
+        .gap_1()
+        .rounded(px(6.0))
+        .bg(cx.theme().muted.opacity(0.25))
+        .p_3()
+        .child(div().text_sm().child(title))
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(body),
+        )
+        .child(
+            div()
+                .pt_1()
+                .text_xs()
+                .text_color(cx.theme().accent)
+                .child(action),
+        )
+        .into_any_element()
+}
+
+/// The token window a route ceiling applies over.
+fn management_route_window_label(window: vibex_core::GatewayTokenWindow) -> &'static str {
+    match (window, locale::current_locale()) {
+        (vibex_core::GatewayTokenWindow::Day, ResolvedLocale::En) => "day",
+        (vibex_core::GatewayTokenWindow::Day, ResolvedLocale::ZhCn) => "天",
+        (vibex_core::GatewayTokenWindow::Day, ResolvedLocale::ZhTw) => "天",
+        (vibex_core::GatewayTokenWindow::Week, ResolvedLocale::En) => "week",
+        (vibex_core::GatewayTokenWindow::Week, ResolvedLocale::ZhCn) => "周",
+        (vibex_core::GatewayTokenWindow::Week, ResolvedLocale::ZhTw) => "週",
+        (vibex_core::GatewayTokenWindow::Month, ResolvedLocale::En) => "month",
+        (vibex_core::GatewayTokenWindow::Month, ResolvedLocale::ZhCn) => "月",
+        (vibex_core::GatewayTokenWindow::Month, ResolvedLocale::ZhTw) => "月",
+    }
+}
+
+/// The next ceiling in the cycle: none, then a day, week and month at a fixed
+/// size.
+///
+/// A cycle rather than a numeric field because the useful answers are few and a
+/// text box would need parsing, validation and an error state for each of them.
+fn management_next_route_ceiling(
+    current: Option<vibex_core::GatewayTokenLimit>,
+) -> Option<vibex_core::GatewayTokenLimit> {
+    const STEPS: [(vibex_core::GatewayTokenWindow, u64); 3] = [
+        (vibex_core::GatewayTokenWindow::Day, 1_000_000),
+        (vibex_core::GatewayTokenWindow::Week, 5_000_000),
+        (vibex_core::GatewayTokenWindow::Month, 20_000_000),
+    ];
+    let next = match current {
+        None => 0,
+        Some(limit) => STEPS
+            .iter()
+            .position(|(window, tokens)| *window == limit.window && *tokens == limit.tokens)
+            .map(|index| index + 1)
+            .unwrap_or(0),
+    };
+    if next >= STEPS.len() {
+        return None;
+    }
+    let (window, tokens) = STEPS[next];
+    Some(vibex_core::GatewayTokenLimit { window, tokens })
+}
+
+/// The next first-token deadline in the cycle.
+///
+/// A deadline guards a vendor that accepts a connection and then stalls; the
+/// useful values are few, and going past the last one turns the guard off.
+fn management_next_route_timeout(current: Option<u64>) -> Option<u64> {
+    const STEPS: [u64; 3] = [8_000, 20_000, 60_000];
+    match current {
+        None => Some(STEPS[0]),
+        Some(value) => STEPS
+            .iter()
+            .position(|step| *step == value)
+            .map(|index| STEPS.get(index + 1).copied())
+            .unwrap_or(None),
     }
 }
 
@@ -29749,6 +30032,13 @@ fn agent_gateway_mode(
 }
 
 /// The mode line, in the colour its answer deserves.
+/// Renders the old mode line.
+///
+/// No longer called: the routing section above draws the current path, and this
+/// line was the same fact stated twice. Kept because its wording is the reference
+/// the routing section's copy follows — §7.7 says not to delete it for that
+/// reason, and `allow` records that the absence of a caller is deliberate.
+#[allow(dead_code)]
 fn render_agent_gateway_mode(mode: &AgentGatewayMode, cx: &App) -> AnyElement {
     let color = match mode.tone {
         AgentGatewayModeTone::Normal => cx.theme().foreground,
@@ -32696,6 +32986,20 @@ fn detail_empty_state(
     )
     .header(detail_empty_state_header(title, description, cx))
     .into_any_element()
+}
+
+/// How many compositions one Agent holds.
+///
+/// The Provider card used to count configurations, which answered "how many
+/// Providers does this Agent have". After routing, the question a reader has is
+/// "how many compositions", so the count moved with the meaning rather than
+/// showing the same number under a new label.
+fn management_route_count_for_agent(count: usize) -> String {
+    match locale::current_locale() {
+        ResolvedLocale::En => format!("{count} route(s)"),
+        ResolvedLocale::ZhCn => format!("{count} 份路由"),
+        ResolvedLocale::ZhTw => format!("{count} 份路由"),
+    }
 }
 
 fn management_profile_count(count: usize) -> String {
@@ -37049,24 +37353,34 @@ mod tests {
         assert!(!version_row.contains("content = content.child(\n                div()"));
     }
 
+    /// Provider rows no longer reorder by dragging.
+    ///
+    /// §7.6 of the routing design moved ordering to the routing section, where a
+    /// member's position is its attempt order. Two surfaces that can both change
+    /// the order fight: the last write wins and the other looks broken. The
+    /// mechanism is still in the source — it is the routing section that needs
+    /// it — so this asserts the Provider card stops offering it.
     #[test]
-    fn provider_rows_expose_a_drag_handle_and_persist_reordered_ids() {
+    fn provider_rows_no_longer_reorder_by_dragging() {
         let source = include_str!("management.rs");
         let render = source
             .split_once("    fn render_providers(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp("))
             .map(|(body, _)| body)
             .expect("Provider renderer should remain inspectable");
-        assert!(render.contains("ProviderDisplayOrderDrag"));
         assert!(render.contains("provider-drag-handle-"));
-        assert!(render.contains(".cursor_grab()"));
-        assert!(render.contains(".on_drag_move(cx.listener("));
-        assert!(render.contains(".on_mouse_up_out("));
-        assert!(render.contains("finish_provider_profile_drag("));
-        assert!(source.contains("state.preview_ids"));
-        assert!(source.contains("persist_provider_profile_order("));
-        assert!(render.contains("provider_display_order_drop_target"));
-        assert!(source.contains("ProviderDisplayOrderDragState"));
+        assert!(
+            !render.contains(".cursor_grab()"),
+            "the Provider card must not offer a drag handle any more: ordering lives in the routing section"
+        );
+        assert!(
+            !render.contains("finish_provider_profile_drag("),
+            "and must not persist an order of its own"
+        );
+        assert!(
+            render.contains("Order is set in the routing section above"),
+            "it should say where the order moved to, not simply stop working"
+        );
         assert!(render.contains("MANAGEMENT_PROVIDER_ROW_HEIGHT"));
         assert!(render.contains("Transition::new(Duration::from_millis("));
         assert!(source.contains(".shadow_lg()"));
@@ -37099,36 +37413,6 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(reordered_provider_profile_ids(&ids, "b", "b", false), ids);
-    }
-
-    #[test]
-    fn provider_reorder_fast_initial_motion_selects_a_target() {
-        let ids = ["a", "b", "c", "d"]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            reorder_target_from_cursor_offset(
-                &ids,
-                "b",
-                MANAGEMENT_PROVIDER_ROW_HEIGHT / 2.0
-                    + 2.0 * (MANAGEMENT_PROVIDER_ROW_HEIGHT + MANAGEMENT_PROVIDER_ROW_GAP),
-                MANAGEMENT_PROVIDER_ROW_HEIGHT,
-                MANAGEMENT_PROVIDER_ROW_GAP,
-            ),
-            Some(("d".to_string(), true))
-        );
-        assert_eq!(
-            reorder_target_from_cursor_offset(
-                &ids,
-                "c",
-                MANAGEMENT_PROVIDER_ROW_HEIGHT / 2.0
-                    - 2.0 * (MANAGEMENT_PROVIDER_ROW_HEIGHT + MANAGEMENT_PROVIDER_ROW_GAP),
-                MANAGEMENT_PROVIDER_ROW_HEIGHT,
-                MANAGEMENT_PROVIDER_ROW_GAP,
-            ),
-            Some(("a".to_string(), false))
-        );
     }
 
     #[test]
@@ -39917,5 +40201,65 @@ mod route_graph_live_tests {
         assert_eq!(inflight.attempt, 1);
         // Only a retry is worth annotating; the first attempt is the norm.
         assert!(inflight.attempt <= 1, "the first attempt is not annotated");
+    }
+}
+
+#[cfg(test)]
+mod route_policy_control_tests {
+    use super::*;
+
+    /// The token ceiling cycles through its offered values and back to none.
+    ///
+    /// A cycle rather than a text field because the useful answers are few; a
+    /// box would need parsing, validation and an error state for each of them.
+    #[test]
+    fn the_ceiling_cycles_and_ends_at_none() {
+        let first = management_next_route_ceiling(None).expect("the first step exists");
+        assert_eq!(first.window, vibex_core::GatewayTokenWindow::Day);
+
+        let second = management_next_route_ceiling(Some(first.clone())).expect("a second step");
+        assert_ne!(second, first);
+        let third = management_next_route_ceiling(Some(second.clone())).expect("a third step");
+        assert_ne!(third, second);
+
+        // Past the last step the ceiling turns off, so the cycle has an end
+        // rather than growing without bound.
+        assert!(
+            management_next_route_ceiling(Some(third)).is_none(),
+            "the cycle must return to no ceiling"
+        );
+        // And an unrecognised value restarts it rather than getting stuck.
+        assert!(
+            management_next_route_ceiling(Some(vibex_core::GatewayTokenLimit {
+                window: vibex_core::GatewayTokenWindow::Month,
+                tokens: 1,
+            }))
+            .is_some()
+        );
+    }
+
+    /// The first-token deadline cycles and then turns off.
+    #[test]
+    fn the_first_token_deadline_cycles_and_ends_at_none() {
+        let first = management_next_route_timeout(None).expect("the first step exists");
+        let second = management_next_route_timeout(Some(first)).expect("a second step");
+        let third = management_next_route_timeout(Some(second)).expect("a third step");
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        assert!(
+            management_next_route_timeout(Some(third)).is_none(),
+            "the cycle must return to no deadline"
+        );
+    }
+
+    /// A route ceiling names its window, so "5,000,000" alone is never shown.
+    #[test]
+    fn the_ceiling_label_names_its_window() {
+        for window in vibex_core::GatewayTokenWindow::ALL {
+            assert!(
+                !management_route_window_label(window).is_empty(),
+                "{window:?} has no label"
+            );
+        }
     }
 }

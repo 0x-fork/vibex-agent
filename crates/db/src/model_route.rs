@@ -42,7 +42,8 @@ impl ModelRouteRepository {
             .query_row(
                 "
                 SELECT model_route_id, display_name, description, kind, strategy,
-                    first_token_timeout_ms, context_tokens, status, revision,
+                    first_token_timeout_ms, context_tokens, pin, token_limit_json,
+                    status, revision,
                     created_at_ms, updated_at_ms, deleted_at_ms
                 FROM model_routes
                 WHERE model_route_id = ?1 AND deleted_at_ms IS NULL
@@ -104,11 +105,13 @@ impl ModelRouteRepository {
                     strategy = ?5,
                     first_token_timeout_ms = ?6,
                     context_tokens = ?7,
-                    status = ?8,
+                    pin = ?8,
+                    token_limit_json = ?9,
+                    status = ?10,
                     revision = revision + 1,
-                    updated_at_ms = ?9
+                    updated_at_ms = ?11
                 WHERE model_route_id = ?1
-                    AND revision = ?10
+                    AND revision = ?12
                     AND deleted_at_ms IS NULL
                 ",
                 params![
@@ -119,6 +122,8 @@ impl ModelRouteRepository {
                     enum_to_db(&route.strategy)?,
                     route.first_token_timeout_ms,
                     route.context_tokens,
+                    enum_to_db(&route.pin)?,
+                    encode_token_limit(&route.token_limit)?,
                     enum_to_db(&route.status)?,
                     next_stamp(conn, route)?,
                     expected_revision,
@@ -512,10 +517,11 @@ fn insert_route(conn: &Connection, route: &ModelRoute) -> VibexResult<()> {
         "
         INSERT INTO model_routes (
             model_route_id, display_name, description, kind, strategy,
-            first_token_timeout_ms, context_tokens, status, revision,
+            first_token_timeout_ms, context_tokens, pin, token_limit_json,
+            status, revision,
             created_at_ms, updated_at_ms, deleted_at_ms
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         ",
         params![
             route.id.as_str(),
@@ -525,6 +531,8 @@ fn insert_route(conn: &Connection, route: &ModelRoute) -> VibexResult<()> {
             enum_to_db(&route.strategy)?,
             route.first_token_timeout_ms,
             route.context_tokens,
+            enum_to_db(&route.pin)?,
+            encode_token_limit(&route.token_limit)?,
             enum_to_db(&route.status)?,
             route.revision.max(1),
             route.created_at_ms.max(1),
@@ -607,7 +615,8 @@ fn list_where(conn: &Connection, predicate: &str, order: &str) -> VibexResult<Ve
     let sql = format!(
         "
         SELECT model_route_id, display_name, description, kind, strategy,
-            first_token_timeout_ms, context_tokens, status, revision,
+            first_token_timeout_ms, context_tokens, pin, token_limit_json,
+                    status, revision,
             created_at_ms, updated_at_ms, deleted_at_ms
         FROM model_routes
         WHERE {predicate}
@@ -632,7 +641,7 @@ fn list_where(conn: &Connection, predicate: &str, order: &str) -> VibexResult<Ve
 fn map_route(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRoute> {
     let kind: RouteKind = enum_from_db_sql(row.get(3)?)?;
     let strategy: RouteStrategy = enum_from_db_sql(row.get(4)?)?;
-    let status: RouteStatus = enum_from_db_sql(row.get(7)?)?;
+    let status: RouteStatus = enum_from_db_sql(row.get(9)?)?;
     Ok(ModelRoute {
         id: parse_id_sql(row.get(0)?, ModelRouteId::parse)?,
         display_name: row.get(1)?,
@@ -646,11 +655,24 @@ fn map_route(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRoute> {
         context_tokens: row
             .get::<_, Option<i64>>(6)?
             .and_then(|value| u32::try_from(value).ok().filter(|value| *value > 0)),
+        pin: enum_from_db_sql(row.get(7)?)?,
+        token_limit: row
+            .get::<_, Option<String>>(8)?
+            .map(|raw| {
+                serde_json::from_str::<vibex_core::GatewayTokenLimit>(&raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .transpose()?,
         status,
-        revision: row.get(8)?,
-        created_at_ms: row.get(9)?,
-        updated_at_ms: row.get(10)?,
-        deleted_at_ms: row.get(11)?,
+        revision: row.get(10)?,
+        created_at_ms: row.get(11)?,
+        updated_at_ms: row.get(12)?,
+        deleted_at_ms: row.get(13)?,
     })
 }
 
@@ -966,6 +988,24 @@ fn is_gateway_profile(profile: &vibex_core::ProviderProfile) -> bool {
         .find(|entry| entry.key.trim() == "vibex.internal.profileRole")
         .map(|entry| entry.value.trim() == "model_gateway")
         .unwrap_or(false)
+}
+
+/// Encodes a route's token ceiling for storage.
+///
+/// `None` is stored as NULL rather than `"null"`, so "no ceiling" and "a ceiling
+/// of zero tokens" cannot be confused by a reader that only looks at presence.
+fn encode_token_limit(
+    limit: &Option<vibex_core::GatewayTokenLimit>,
+) -> VibexResult<Option<String>> {
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    serde_json::to_string(limit).map(Some).map_err(|error| {
+        VibexError::storage(
+            "model_route_token_limit_encode_failed",
+            format!("failed to encode the route token limit: {error}"),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1673,5 +1713,95 @@ mod route_auth_source_tests {
             vibex_core::RuntimeAuthSourceKind::AgentAccount
         );
         assert!(account.model_route_id().is_none());
+    }
+}
+
+#[cfg(test)]
+mod route_policy_tests {
+    use super::*;
+
+    /// A route's pin and token ceiling survive storage.
+    ///
+    /// These are the fields the route graph edits. Without them stored, the UI
+    /// would offer controls whose answers vanish on the next read — a field with
+    /// a surface but no memory.
+    #[test]
+    fn route_policy_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-route-policy-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut conn = rusqlite::Connection::open(dir.join("state.db")).unwrap();
+        crate::apply_migrations(&mut conn).unwrap();
+
+        let provider = {
+            let profile = vibex_core::ModelProviderProfile {
+                id: vibex_core::ModelProviderProfileId::new(),
+                legacy_provider_profile_id: None,
+                display_name: "DeepSeek".to_string(),
+                vendor_hint: None,
+                endpoints: Vec::new(),
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: Vec::new(),
+                default_model_id: None,
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+                revision: 1,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                deleted_at_ms: None,
+            };
+            crate::ModelProviderProfileRepository::insert(&conn, &profile).unwrap();
+            profile.id
+        };
+
+        let route = ModelRoute {
+            display_name: "Standard".to_string(),
+            members: vec![vibex_core::ModelRouteMember::new(
+                provider,
+                "deepseek-chat",
+                0,
+            )],
+            status: vibex_core::RouteStatus::Enabled,
+            pin: vibex_core::GatewayPinScope::Conversation,
+            token_limit: Some(vibex_core::GatewayTokenLimit {
+                window: vibex_core::GatewayTokenWindow::Week,
+                tokens: 5_000_000,
+            }),
+            first_token_timeout_ms: Some(20_000),
+            ..Default::default()
+        };
+        ModelRouteRepository::insert(&conn, &route).unwrap();
+
+        let read = ModelRouteRepository::get(&conn, &route.id)
+            .unwrap()
+            .expect("the route must exist");
+        assert_eq!(
+            read.pin,
+            vibex_core::GatewayPinScope::Conversation,
+            "a route's pinning choice must survive storage"
+        );
+        let limit = read.token_limit.expect("the ceiling must survive");
+        assert_eq!(limit.window, vibex_core::GatewayTokenWindow::Week);
+        assert_eq!(limit.tokens, 5_000_000);
+        assert_eq!(read.first_token_timeout_ms, Some(20_000));
+
+        // Turning the ceiling off must clear it, not store a zero: a zero-token
+        // ceiling would forbid every request.
+        let mut cleared = read.clone();
+        cleared.token_limit = None;
+        cleared.revision = read.revision.saturating_add(1);
+        ModelRouteRepository::update(&conn, &cleared, read.revision).unwrap();
+        let reread = ModelRouteRepository::get(&conn, &route.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            reread.token_limit.is_none(),
+            "clearing a ceiling must store NULL, not a zero ceiling"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

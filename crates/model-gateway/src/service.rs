@@ -103,6 +103,10 @@ pub struct GatewayRoute {
     pub display_name: String,
     pub strategy: vibex_core::RouteStrategy,
     pub first_token_timeout_ms: Option<u64>,
+    /// Whether this route holds a conversation on one Key.
+    pub pin: vibex_core::GatewayPinScope,
+    /// A ceiling on the tokens this route may spend in its window.
+    pub token_limit: Option<vibex_core::GatewayTokenLimit>,
     /// Members in attempt order, already filtered to enabled ones.
     pub members: Vec<crate::route::RouteMemberRef>,
 }
@@ -530,6 +534,8 @@ impl ModelGatewayService {
                         display_name: route.display_name.clone(),
                         strategy: route.strategy,
                         first_token_timeout_ms: route.first_token_timeout_ms,
+                        pin: route.pin,
+                        token_limit: route.token_limit.clone(),
                         members,
                     },
                 ))
@@ -941,8 +947,21 @@ impl ModelGatewayService {
             service: self,
             armed: self.begin_attempt()?,
         };
-        if let Some(limit) = snapshot.settings.policy.token_limit
-            && snapshot.gateway_used_tokens >= limit.tokens
+        // A route may set its own ceiling. It is checked instead of the gateway's
+        // rather than in addition: a route that names three members needs one
+        // ceiling over the composition, and the per-Key limits do not compose —
+        // three Keys with a limit each still allow three times the spend.
+        let route_token_limit = resolved_model_route_id(&request.model).and_then(|route_id| {
+            snapshot
+                .route(&route_id)
+                .and_then(|route| route.token_limit.clone())
+        });
+        let ceiling = route_token_limit
+            .as_ref()
+            .or(snapshot.settings.policy.token_limit.as_ref())
+            .map(|limit| limit.tokens);
+        if let Some(tokens) = ceiling
+            && snapshot.gateway_used_tokens >= tokens
         {
             return Err(GatewayError::TokenCeilingReached {
                 provider: snapshot.settings.display_name.clone(),
@@ -978,7 +997,14 @@ impl ModelGatewayService {
                     .map(|value| (name.as_str().to_string(), value.to_string()))
             })
             .collect::<Vec<_>>();
-        let conversation = (policy.pin == GatewayPinScope::Conversation)
+        // A route may override the gateway's pinning. The route's own choice wins
+        // because pinning is a property of the composition: one route over
+        // several Keys may want a conversation held on one of them while another
+        // over the same Providers prefers to re-pick each request.
+        let pin = resolved_model_route_id(&request.model)
+            .and_then(|route_id| snapshot.route(&route_id).map(|route| route.pin))
+            .unwrap_or(policy.pin);
+        let conversation = (pin == GatewayPinScope::Conversation)
             .then(|| conversation_key(agent_id.as_deref(), &header_pairs, &body_value))
             .flatten();
         let pinned = conversation

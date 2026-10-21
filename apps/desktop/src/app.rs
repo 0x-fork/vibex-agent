@@ -50940,7 +50940,7 @@ impl VibexWorkbench {
             .iter()
             .filter(|group| group.source.kind == RuntimeAuthSourceKind::ModelRoute)
             .count();
-        let folded_routes = !searching && route_groups > RUNTIME_ROUTE_GROUP_FOLD;
+        let folded_routes = !searching && route_groups > RUNTIME_ROUTE_GROUP_FOLD_THRESHOLD;
         let mut drawn_routes = 0usize;
         let mut folded_away = 0usize;
 
@@ -73405,9 +73405,12 @@ fn choice_option_member_count(
 
 /// How many route groups the picker draws before folding the rest away.
 ///
-/// Five keeps the menu's whole height in view alongside the Agents and the
-/// Providers above it. A search ignores the fold.
-const RUNTIME_ROUTE_GROUP_FOLD: usize = 5;
+/// The design's threshold is "more than five", with the first four staying — the
+/// fifth row is the one that says how many were folded, so it is not a route.
+/// A search ignores the fold.
+const RUNTIME_ROUTE_GROUP_FOLD: usize = 4;
+/// The count above which the fold engages.
+const RUNTIME_ROUTE_GROUP_FOLD_THRESHOLD: usize = 5;
 
 /// The one line a route's group heading shows.
 ///
@@ -111696,6 +111699,7 @@ mod route_picker_tests {
     /// The fold keeps the picker's height bounded.
     #[test]
     fn the_route_fold_is_five_groups() {
-        assert_eq!(RUNTIME_ROUTE_GROUP_FOLD, 5);
+        assert_eq!(RUNTIME_ROUTE_GROUP_FOLD_THRESHOLD, 5);
+        assert_eq!(RUNTIME_ROUTE_GROUP_FOLD, 4);
     }
 }

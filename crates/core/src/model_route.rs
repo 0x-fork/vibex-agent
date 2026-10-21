@@ -199,6 +199,22 @@ pub struct ModelRoute {
     /// rule. Only meaningful for a gateway route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
+    /// Whether one conversation stays on one Key.
+    ///
+    /// Route-scoped rather than gateway-scoped: a route with several Keys per
+    /// member may want to hold a conversation on one of them, while another
+    /// route over the same Providers prefers to re-pick each request. Off is the
+    /// default so a route behaves the way it did before this field existed.
+    #[serde(default)]
+    pub pin: crate::GatewayPinScope,
+    /// A ceiling on the tokens this route may spend in its window.
+    ///
+    /// `None` means no route-level ceiling; per-Key limits still apply. A route
+    /// that names several members needs its own ceiling because the per-Key ones
+    /// do not compose: three Keys with a limit each still allow three times the
+    /// spend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<crate::GatewayTokenLimit>,
     pub status: RouteStatus,
     pub revision: i64,
     pub created_at_ms: i64,
@@ -247,6 +263,8 @@ impl Default for ModelRoute {
             strategy: RouteStrategy::Ordered,
             first_token_timeout_ms: None,
             context_tokens: None,
+            pin: crate::GatewayPinScope::Off,
+            token_limit: None,
             status: RouteStatus::Disabled,
             revision: 1,
             created_at_ms: 0,

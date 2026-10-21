@@ -95,7 +95,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 68;
+pub const CURRENT_SCHEMA_VERSION: i64 = 69;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12453,6 +12453,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     model_gateway::migrate_gateway_agents(conn, &mut applied)?;
     apply_model_routes(conn, &mut applied)?;
     apply_binding_launch_fields(conn, &mut applied)?;
+    apply_route_launch_policy(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -12465,6 +12466,53 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // route graph can show direct connections beside gateway ones.
     model_route::backfill_direct_routes(conn)?;
     Ok(applied)
+}
+
+/// Adds the route-scoped launch policy to `model_routes`.
+///
+/// `pin` and `token_limit` belong to the route rather than to the gateway: two
+/// routes over the same Providers may want different conversation pinning, and a
+/// route naming several members needs its own ceiling because per-Key limits do
+/// not compose — three Keys with a limit each still allow three times the spend.
+fn apply_route_launch_policy(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 69;
+    const NAME: &str = "route_launch_policy";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    for (column, definition) in [
+        ("pin", "TEXT NOT NULL DEFAULT 'off'"),
+        ("token_limit_json", "TEXT NULL"),
+    ] {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('model_routes') WHERE name = ?1",
+                rusqlite::params![column],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if exists == 0 {
+            conn.execute_batch(&format!(
+                "ALTER TABLE model_routes ADD COLUMN {column} {definition};"
+            ))
+            .map_err(|error| {
+                VibexError::storage(
+                    "route_launch_policy_alter_failed",
+                    format!("failed to add {column} to model_routes: {error}"),
+                )
+            })?;
+        }
+    }
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the route launch policy migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }
 
 /// Adds the Agent-scoped launch fields to the v2 binding.
@@ -17823,6 +17871,7 @@ mod tests {
                 "66:model_gateway_agents",
                 "67:model_routes",
                 "68:binding_launch_fields",
+                "69:route_launch_policy",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -17975,6 +18024,7 @@ mod tests {
                 "66:model_gateway_agents",
                 "67:model_routes",
                 "68:binding_launch_fields",
+                "69:route_launch_policy",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -18108,6 +18158,7 @@ mod tests {
                 "66:model_gateway_agents",
                 "67:model_routes",
                 "68:binding_launch_fields",
+                "69:route_launch_policy",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -18279,6 +18330,7 @@ mod tests {
                 "66:model_gateway_agents",
                 "67:model_routes",
                 "68:binding_launch_fields",
+                "69:route_launch_policy",
             ]
         );
         assert_eq!(
@@ -19710,6 +19762,7 @@ mod tests {
                 "66:model_gateway_agents",
                 "67:model_routes",
                 "68:binding_launch_fields",
+                "69:route_launch_policy",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
