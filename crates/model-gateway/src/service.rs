@@ -249,6 +249,13 @@ impl Default for GatewayLimits {
     }
 }
 
+/// Where the gateway sends request events.
+///
+/// A boxed callback rather than a channel, so the gateway crate needs no
+/// knowledge of the runtime's event bus: the runtime decides what a subscriber
+/// is, and the gateway only says what happened.
+pub type GatewayEventSink = Arc<dyn Fn(vibex_core::GatewayEvent) + Send + Sync>;
+
 /// The listener's own state, readable by the Config Center.
 pub type GatewayRuntime = Arc<RwLock<ModelGatewayRuntimeState>>;
 
@@ -283,6 +290,16 @@ pub struct ModelGatewayService {
     /// When the last failure happened, so a stale count does not degrade a
     /// gateway that has simply been idle.
     last_failure_at_ms: AtomicU64,
+    /// Requests currently being served, newest last.
+    ///
+    /// Bounded, because the graph draws a handful: a long-running gateway under
+    /// load would otherwise grow this without limit. The oldest entry is
+    /// dropped when the bound is reached, which is also what stops one stuck
+    /// request from pinning memory forever.
+    inflight: RwLock<Vec<vibex_core::GatewayInflight>>,
+    /// Where request events go. A sink rather than a direct broadcast so the
+    /// gateway crate stays unaware of the runtime's event bus.
+    events: RwLock<Option<GatewayEventSink>>,
     /// Set while one request is being let through a degraded gateway.
     ///
     /// A degraded gateway is not closed: it still forwards one request at a
@@ -316,6 +333,11 @@ impl ModelGatewayService {
     pub const DEGRADE_AFTER_FAILURES: u64 = 3;
     /// A failure this old no longer contributes to the count.
     pub const FAILURE_MEMORY_MS: i64 = 2 * 60 * 1000;
+    /// The most in-flight requests retained for a client to draw.
+    ///
+    /// A graph that drew more would be unreadable, and a request that never
+    /// finished must not pin memory indefinitely.
+    pub const MAX_INFLIGHT: usize = 8;
 
     pub fn new(
         db_path: impl Into<std::path::PathBuf>,
@@ -351,6 +373,8 @@ impl ModelGatewayService {
             consecutive_failures: AtomicU64::new(0),
             last_failure_at_ms: AtomicU64::new(0),
             probe_in_flight: std::sync::atomic::AtomicBool::new(false),
+            inflight: RwLock::new(Vec::new()),
+            events: RwLock::new(None),
         })
     }
 
@@ -741,6 +765,90 @@ impl ModelGatewayService {
         self.publish(state);
     }
 
+    /// Installs the sink request events are delivered to.
+    ///
+    /// The runtime owns the event bus, so the gateway is handed a way to send
+    /// rather than a bus of its own: one listener, one place events originate.
+    pub fn set_event_sink(&self, sink: GatewayEventSink) {
+        if let Ok(mut guard) = self.events.write() {
+            *guard = Some(sink);
+        }
+    }
+
+    /// The requests being served right now.
+    ///
+    /// This is what a graph reads on first paint, before any event arrives; the
+    /// event stream then keeps it current.
+    pub fn inflight_requests(&self) -> Vec<vibex_core::GatewayInflight> {
+        self.inflight
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    /// Records that a request started, or moved to another member.
+    pub(crate) fn note_inflight(&self, inflight: vibex_core::GatewayInflight) {
+        let request_id = inflight.request_id.clone();
+        if let Ok(mut guard) = self.inflight.write() {
+            guard.retain(|existing| existing.request_id != request_id);
+            guard.push(inflight.clone());
+            // Keep the newest `MAX_INFLIGHT`; a graph that cannot draw them all
+            // does not need them all retained.
+            while guard.len() > Self::MAX_INFLIGHT {
+                guard.remove(0);
+            }
+        }
+        self.publish_event(vibex_core::GatewayEvent::Began(inflight));
+    }
+
+    /// Records the first token of a request, which ends its deadline.
+    pub(crate) fn note_first_token(&self, request_id: &RequestId, at_ms: i64) {
+        let updated = {
+            let Ok(mut guard) = self.inflight.write() else {
+                return;
+            };
+            let Some(entry) = guard
+                .iter_mut()
+                .find(|entry| &entry.request_id == request_id)
+            else {
+                return;
+            };
+            if entry.first_token_at_ms.is_some() {
+                return;
+            }
+            entry.first_token_at_ms = Some(at_ms);
+            true
+        };
+        if updated {
+            self.publish_event(vibex_core::GatewayEvent::FirstToken {
+                request_id: request_id.clone(),
+                at_ms,
+            });
+        }
+    }
+
+    /// Drops a finished request from the in-flight table.
+    pub(crate) fn note_finished(
+        &self,
+        request_id: &RequestId,
+        outcome: vibex_core::GatewayRequestOutcome,
+    ) {
+        if let Ok(mut guard) = self.inflight.write() {
+            guard.retain(|entry| &entry.request_id != request_id);
+        }
+        self.publish_event(vibex_core::GatewayEvent::Ended {
+            request_id: request_id.clone(),
+            outcome,
+        });
+    }
+
+    fn publish_event(&self, event: vibex_core::GatewayEvent) {
+        let sink = self.events.read().ok().and_then(|guard| guard.clone());
+        if let Some(sink) = sink {
+            sink(event);
+        }
+    }
+
     /// Whether the gateway is currently stepping aside.
     pub fn is_degraded(&self) -> bool {
         self.runtime_state().status == ModelGatewayStatus::Degraded
@@ -918,6 +1026,7 @@ impl ModelGatewayService {
             stream: request.stream,
             route_id: resolved_model_route_id(&request.model),
             probe: probe.armed,
+            request_id: RequestId::new(),
         };
         // The slot now belongs to the caller of `open_attempt`.
         probe.armed = false;
@@ -1185,6 +1294,25 @@ impl ModelGatewayService {
         // hands over to the next one; once a stream has started, the caller
         // decides and this loop never retries.
         for (index, member) in prepared.members.iter().enumerate() {
+            // Announce the attempt before it is sent: a client draws the dot
+            // moving to this member while the call is in flight, which is the
+            // only moment the information is useful.
+            self.note_inflight(vibex_core::GatewayInflight {
+                request_id: prepared.request_id.clone(),
+                agent_id: prepared.agent_id.clone(),
+                model_route_id: prepared.route_id.clone(),
+                requested_model: prepared.requested_model.clone(),
+                model_provider_profile_id: member.profile_id.clone(),
+                // One-based: the graph numbers sources as "1st, 2nd".
+                attempt: (index as u32).saturating_add(1),
+                credential_id: member
+                    .keys
+                    .first()
+                    .map(|(_, credential)| credential.id.clone()),
+                wire_protocol_id: member.target.wire_protocol_id().to_string(),
+                started_at_ms: vibex_core::unix_timestamp_ms(),
+                first_token_at_ms: None,
+            });
             match self
                 .open_member_attempt(prepared, member, &mut failed_attempts, &mut skipped_members)
                 .await
@@ -1224,6 +1352,10 @@ impl ModelGatewayService {
             }
         }
         self.finish_attempt(prepared.probe);
+        self.note_finished(
+            &prepared.request_id,
+            vibex_core::GatewayRequestOutcome::Failed,
+        );
         Err(last_error.unwrap_or_else(|| GatewayError::AllKeysCooling {
             model: prepared.requested_model.clone(),
             retry_after_ms: None,
@@ -1458,6 +1590,10 @@ impl ModelGatewayService {
         // cut. Releasing the probe first keeps a ledger write failure from
         // wedging the one slot a degraded gateway has.
         self.finish_attempt(prepared.probe);
+        // The in-flight table and the event stream are cleared here rather than
+        // at each return site: this is the single funnel every finished request
+        // passes through, so nothing can be left drawn as still running.
+        self.note_finished(&prepared.request_id, outcome.kind);
         let Ok(connection) = self.connection() else {
             return;
         };
@@ -1474,7 +1610,7 @@ impl ModelGatewayService {
             .target
             .or_else(|| prepared.first_member().map(|member| member.target));
         let log = ModelGatewayRequestLog {
-            request_id: RequestId::new(),
+            request_id: prepared.request_id.clone(),
             agent_id: prepared.agent_id.clone(),
             model_provider_profile_id: answered.clone().unwrap_or_else(|| {
                 // A request that matched no member at all has no Provider to
@@ -1656,6 +1792,12 @@ pub struct PreparedCall {
     /// This request holds a degraded gateway's single probe slot and must
     /// release it once an upstream has answered or refused.
     pub probe: bool,
+    /// The id this request is traced and recorded under.
+    ///
+    /// One id for the whole request, not one per attempt: the inflight entry,
+    /// the ledger row, and the events a client draws all have to name the same
+    /// thing.
+    pub request_id: RequestId,
 }
 
 /// One upstream this request may call, with everything needed to call it.
@@ -2005,7 +2147,12 @@ pub(crate) async fn forward(
             failed = true;
             break;
         };
-        first_token_seen = true;
+        if !first_token_seen {
+            first_token_seen = true;
+            // The deadline only guards the wait for the first token; the event
+            // is what lets a client stop drawing the member as "starting".
+            service.note_first_token(&prepared.request_id, vibex_core::unix_timestamp_ms());
+        }
         if passthrough {
             sniffer.observe(&buffer.push(&chunk));
             if sender.send(Ok(chunk)).await.is_err() {
@@ -2176,6 +2323,11 @@ pub(crate) async fn gather(
         skipped_members,
     } = attempt;
     let started = std::time::Instant::now();
+    // A non-streaming client gets one body, so the whole reply is its "first
+    // token": the deadline has already done its job by the time the body
+    // arrives, and the graph still needs to stop drawing this request as
+    // starting.
+    service.note_first_token(&prepared.request_id, vibex_core::unix_timestamp_ms());
     let bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -2532,5 +2684,144 @@ mod tests {
                 entry.id
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod inflight_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    fn service() -> Arc<ModelGatewayService> {
+        let service = ModelGatewayService::new(
+            std::env::temp_dir().join(format!("vibex-inflight-{}.db", RequestId::new().as_str())),
+            ProviderConfigService::new(std::env::temp_dir().join(format!(
+                "vibex-inflight-cfg-{}.db",
+                RequestId::new().as_str()
+            ))),
+            GatewayLimits::default(),
+        );
+        service.publish(ModelGatewayRuntimeState::running(3425, 1));
+        service
+    }
+
+    fn inflight(request_id: &RequestId, attempt: u32) -> vibex_core::GatewayInflight {
+        vibex_core::GatewayInflight {
+            request_id: request_id.clone(),
+            agent_id: Some("codex".to_string()),
+            model_route_id: Some("model_route_test".to_string()),
+            requested_model: "route/model_route_test".to_string(),
+            model_provider_profile_id: ModelProviderProfileId::new(),
+            attempt,
+            credential_id: Some(RequestId::new()),
+            wire_protocol_id: WireProtocol::ChatCompletions.wire_protocol_id().to_string(),
+            started_at_ms: vibex_core::unix_timestamp_ms(),
+            first_token_at_ms: None,
+        }
+    }
+
+    /// A request is visible while it runs, not only once it has finished.
+    #[test]
+    fn an_inflight_request_is_listed_until_it_ends() {
+        let service = service();
+        let request_id = RequestId::new();
+        assert!(service.inflight_requests().is_empty());
+
+        service.note_inflight(inflight(&request_id, 1));
+        let listed = service.inflight_requests();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].request_id, request_id);
+        assert!(!listed[0].has_first_token());
+
+        service.note_first_token(&request_id, vibex_core::unix_timestamp_ms());
+        assert!(
+            service.inflight_requests()[0].has_first_token(),
+            "the first token ends the deadline and the starting state"
+        );
+
+        service.note_finished(&request_id, vibex_core::GatewayRequestOutcome::Ok);
+        assert!(
+            service.inflight_requests().is_empty(),
+            "a finished request must not stay drawn"
+        );
+    }
+
+    /// Moving to another member replaces the entry rather than adding one.
+    #[test]
+    fn a_member_retry_updates_the_same_request() {
+        let service = service();
+        let request_id = RequestId::new();
+        service.note_inflight(inflight(&request_id, 1));
+        service.note_inflight(inflight(&request_id, 2));
+
+        let listed = service.inflight_requests();
+        assert_eq!(listed.len(), 1, "one request, not one per attempt");
+        assert_eq!(listed[0].attempt, 2, "the attempt number advances");
+    }
+
+    /// The table is bounded, so a long-running gateway cannot grow it forever.
+    #[test]
+    fn the_inflight_table_keeps_only_the_newest_requests() {
+        let service = service();
+        for _ in 0..ModelGatewayService::MAX_INFLIGHT + 3 {
+            service.note_inflight(inflight(&RequestId::new(), 1));
+        }
+        assert_eq!(
+            service.inflight_requests().len(),
+            ModelGatewayService::MAX_INFLIGHT
+        );
+    }
+
+    /// Every transition reaches the sink, in order.
+    #[test]
+    fn each_transition_is_published_to_the_sink() {
+        let service = service();
+        let seen: Arc<StdMutex<Vec<vibex_core::GatewayEvent>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        service.set_event_sink(Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        }));
+
+        let request_id = RequestId::new();
+        service.note_inflight(inflight(&request_id, 1));
+        service.note_first_token(&request_id, 42);
+        service.note_finished(&request_id, vibex_core::GatewayRequestOutcome::Failover);
+
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], vibex_core::GatewayEvent::Began(_)));
+        assert!(matches!(
+            events[1],
+            vibex_core::GatewayEvent::FirstToken { at_ms: 42, .. }
+        ));
+        assert!(matches!(
+            events[2],
+            vibex_core::GatewayEvent::Ended {
+                outcome: vibex_core::GatewayRequestOutcome::Failover,
+                ..
+            }
+        ));
+        // Every event names the same request, which is what lets a client
+        // follow one request rather than guess.
+        assert!(events.iter().all(|event| event.request_id() == &request_id));
+    }
+
+    /// A first token is only announced once.
+    #[test]
+    fn the_first_token_is_announced_once() {
+        let service = service();
+        let seen: Arc<StdMutex<usize>> = Arc::new(StdMutex::new(0));
+        let sink = Arc::clone(&seen);
+        service.set_event_sink(Arc::new(move |event| {
+            if matches!(event, vibex_core::GatewayEvent::FirstToken { .. }) {
+                *sink.lock().unwrap() += 1;
+            }
+        }));
+        let request_id = RequestId::new();
+        service.note_inflight(inflight(&request_id, 1));
+        service.note_first_token(&request_id, 1);
+        service.note_first_token(&request_id, 2);
+        assert_eq!(*seen.lock().unwrap(), 1);
     }
 }

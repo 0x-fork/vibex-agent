@@ -4107,6 +4107,16 @@ impl ManagementBackend for WebRemoteBackend {
         )
     }
 
+    fn model_gateway_inflight(&self) -> BackendFuture<'_, Vec<vibex_core::GatewayInflight>> {
+        // In-flight state is the authority's live memory; the remote protocol
+        // does not stream it yet. An empty list would read as "nothing is
+        // running", so this says what it is.
+        self.unsupported(
+            "model_gateway_inflight_remote_unsupported",
+            "this runtime does not serve live gateway state over the remote protocol yet",
+        )
+    }
+
     fn clear_model_gateway_requests(&self) -> BackendFuture<'_, usize> {
         self.gateway_rpc(
             vibex_core::RemoteProviderRequest::ClearModelGatewayRequests(

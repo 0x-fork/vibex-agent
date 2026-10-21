@@ -1340,6 +1340,62 @@ mod tests {
             error_future()
         }
 
+        fn list_model_routes(&self) -> BackendFuture<'_, Vec<vibex_core::ModelRoute>> {
+            error_future()
+        }
+
+        fn list_all_agent_model_route_bindings(
+            &self,
+        ) -> BackendFuture<'_, Vec<vibex_core::AgentModelRouteBinding>> {
+            error_future()
+        }
+
+        fn create_model_route(
+            &self,
+            _request: MutationRequest<vibex_core::ModelRoute>,
+        ) -> BackendFuture<'_, vibex_core::ModelRoute> {
+            error_future()
+        }
+
+        fn update_model_route(
+            &self,
+            _request: MutationRequest<vibex_core::ModelRouteUpdateRequest>,
+        ) -> BackendFuture<'_, vibex_core::ModelRoute> {
+            error_future()
+        }
+
+        fn delete_model_route(
+            &self,
+            _request: MutationRequest<vibex_core::ModelRouteDeleteRequest>,
+        ) -> BackendFuture<'_, bool> {
+            error_future()
+        }
+
+        fn bind_agent_model_route(
+            &self,
+            _request: MutationRequest<vibex_core::AgentModelRouteBindRequest>,
+        ) -> BackendFuture<'_, vibex_core::AgentModelRouteBinding> {
+            error_future()
+        }
+
+        fn unbind_agent_model_route(
+            &self,
+            _request: MutationRequest<vibex_core::AgentModelRouteUnbindRequest>,
+        ) -> BackendFuture<'_, bool> {
+            error_future()
+        }
+
+        fn set_agent_default_model_route(
+            &self,
+            _request: MutationRequest<vibex_core::AgentModelRouteDefaultRequest>,
+        ) -> BackendFuture<'_, ()> {
+            error_future()
+        }
+
+        fn model_gateway_inflight(&self) -> BackendFuture<'_, Vec<vibex_core::GatewayInflight>> {
+            error_future()
+        }
+
         fn create_model_provider_profile(
             &self,
             _request: MutationRequest<vibex_core::ModelProviderProfileCreateRequest>,

@@ -180,6 +180,7 @@ fn map_desktop_event(event: DesktopEvent) -> BackendEvent {
         DesktopEvent::ProviderConfigChanged(_) => {
             BackendEvent::ProjectionInvalidated(BackendProjection::Management)
         }
+        DesktopEvent::ModelGateway(event) => BackendEvent::ModelGateway(event),
         DesktopEvent::UsageInvalidated => {
             BackendEvent::ProjectionInvalidated(BackendProjection::Usage)
         }
@@ -3227,6 +3228,16 @@ impl ManagementBackend for NativeBackend {
                 .into_iter()
                 .map(|log| GatewayRequestSummary::from_log(log, &profiles))
                 .collect())
+        })
+    }
+
+    fn model_gateway_inflight(&self) -> BackendFuture<'_, Vec<vibex_core::GatewayInflight>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            // A live read, not a database query: in-flight state exists only
+            // while the request does.
+            Ok(runtime.model_gateway().inflight_requests())
         })
     }
 

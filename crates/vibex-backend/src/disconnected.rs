@@ -915,6 +915,10 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn model_gateway_inflight(&self) -> BackendFuture<'_, Vec<vibex_core::GatewayInflight>> {
+        disconnected_future!()
+    }
+
     fn clear_model_gateway_requests(&self) -> BackendFuture<'_, usize> {
         disconnected_future!()
     }

@@ -979,6 +979,16 @@ pub struct ManagementCenter {
     model_routes: Vec<vibex_core::ModelRoute>,
     /// Which routes each Agent may use.
     agent_model_route_bindings: Vec<vibex_core::AgentModelRouteBinding>,
+    /// The member whose recent requests the graph is listing, if any.
+    ///
+    /// Playback belongs beside the member rather than on the gateway page: the
+    /// question "why did this one not answer" is asked while looking at it.
+    gateway_member_history: Option<(String, vibex_core::ModelProviderProfileId)>,
+    /// Requests the gateway is serving right now, newest last.
+    ///
+    /// Kept here rather than re-read on every event: a request emits several
+    /// events a second, and the graph is the only surface that draws them.
+    gateway_inflight: Vec<vibex_core::GatewayInflight>,
     /// The route whose members the graph's right column shows.
     ///
     /// Selection is by route, not by node: clicking the gateway says nothing
@@ -2070,6 +2080,8 @@ impl ManagementCenter {
             model_routes: Vec::new(),
             agent_model_route_bindings: Vec::new(),
             selected_route_graph_route: None,
+            gateway_inflight: Vec::new(),
+            gateway_member_history: None,
             gateway_requests: Vec::new(),
             gateway_request_detail: None,
             gateway_limit_inputs: BTreeMap::new(),
@@ -4383,7 +4395,11 @@ impl ManagementCenter {
             // The ledger is a separate, small read: it changes per request and
             // must not hold up the Config Center's own snapshot.
             let requests = backend.management().model_gateway_requests().await;
-            (snapshot, requests)
+            // The live table is read on first paint as well as subscribed to:
+            // a request that started before this page opened is still running,
+            // and its events have already gone by.
+            let inflight = backend.management().model_gateway_inflight().await;
+            (snapshot, requests, inflight)
         });
         self.refresh_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -4392,15 +4408,16 @@ impl ManagementCenter {
                     return;
                 }
                 this.loading = false;
-                let success = matches!(&outcome, Ok((Ok(_), _)));
+                let success = matches!(&outcome, Ok((Ok(_), _, _)));
                 match outcome {
-                    Ok((Ok(snapshot), requests)) => {
+                    Ok((Ok(snapshot), requests, inflight)) => {
                         this.gateway_requests = requests.unwrap_or_default();
+                        this.gateway_inflight = inflight.unwrap_or_default();
                         this.apply_snapshot(snapshot, cx);
                         cx.notify();
                         this.start_full_refresh(cx);
                     }
-                    Ok((Err(error), _)) => {
+                    Ok((Err(error), _, _)) => {
                         this.error = Some(format!("{}: {}", error.code, error.message))
                     }
                     Err(error) => {
@@ -12650,6 +12667,43 @@ impl ManagementCenter {
         }));
     }
 
+    /// Applies one gateway request event to the graph's live state.
+    ///
+    /// The graph is the only surface that draws a request while it runs, so
+    /// this keeps a small table rather than re-reading the gateway on every
+    /// event: a request can emit three events in a second, and a round trip for
+    /// each would be slower than the thing it describes.
+    pub(crate) fn apply_gateway_event(
+        &mut self,
+        event: vibex_core::GatewayEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            vibex_core::GatewayEvent::Began(inflight) => {
+                self.gateway_inflight
+                    .retain(|existing| existing.request_id != inflight.request_id);
+                self.gateway_inflight.push(inflight);
+                while self.gateway_inflight.len() > DESKTOP_MAX_INFLIGHT {
+                    self.gateway_inflight.remove(0);
+                }
+            }
+            vibex_core::GatewayEvent::FirstToken { request_id, at_ms } => {
+                if let Some(entry) = self
+                    .gateway_inflight
+                    .iter_mut()
+                    .find(|entry| entry.request_id == request_id)
+                {
+                    entry.first_token_at_ms = Some(at_ms);
+                }
+            }
+            vibex_core::GatewayEvent::Ended { request_id, .. } => {
+                self.gateway_inflight
+                    .retain(|entry| entry.request_id != request_id);
+            }
+        }
+        cx.notify();
+    }
+
     /// Makes a route the Agent's default.
     ///
     /// This is the one route edit that changes what the next session uses, so
@@ -13122,6 +13176,22 @@ impl ManagementCenter {
                 }
             });
         }));
+    }
+
+    /// Opens or closes the recent requests served by one member.
+    fn toggle_route_graph_member_history(
+        &mut self,
+        route_id: String,
+        provider_id: vibex_core::ModelProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (route_id, provider_id);
+        if self.gateway_member_history.as_ref() == Some(&key) {
+            self.gateway_member_history = None;
+        } else {
+            self.gateway_member_history = Some(key);
+        }
+        cx.notify();
     }
 
     /// Removes one member from a route.
@@ -20876,6 +20946,148 @@ impl ManagementCenter {
             .into_any_element()
     }
 
+    /// The recent requests one member served, newest first.
+    ///
+    /// Read from the ledger the Config Center already holds rather than from a
+    /// new query: the same rows the gateway page lists, filtered to this
+    /// Provider, so the two surfaces cannot disagree about what happened.
+    fn render_route_graph_member_history(
+        &mut self,
+        route: &RouteGraphRoute,
+        member: &RouteGraphMember,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut recent = self
+            .gateway_requests
+            .iter()
+            .filter(|request| {
+                // The ledger stores the Provider under the answered member; a
+                // route request also carries which route it came from.
+                request.provider_name == member.provider_name
+            })
+            .take(5)
+            .collect::<Vec<_>>();
+        // A route may name two Providers with one display name; the member's
+        // own id is the tiebreaker the ledger does not carry, so the count is
+        // shown rather than claiming an exact match.
+        let shown = recent.len();
+        let mut body = v_flex().w_full().min_w_0().gap_1().pt_1().pl(px(16.0));
+        if recent.is_empty() {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "No recent requests from this model.",
+                        "这个模型最近没有请求。",
+                        "這個模型最近沒有請求。",
+                    )),
+            );
+        }
+        for request in recent.drain(..) {
+            let route_lines = gateway_route_lines(request, locale::current_locale());
+            let mut lines = v_flex().w_full().min_w_0().gap_0p5();
+            for line in route_lines {
+                lines = lines.child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(line),
+                );
+            }
+            body =
+                body.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_0p5()
+                        .rounded(px(4.0))
+                        .bg(cx.theme().background.opacity(0.6))
+                        .px_2()
+                        .py_1()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(div().min_w_0().flex_1().truncate().text_xs().child(
+                                    management_route_history_time_label(request.created_at_ms),
+                                ))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!(
+                                            "{} · {} ms",
+                                            management_route_outcome_label(request.outcome),
+                                            request.latency_ms.unwrap_or(0)
+                                        )),
+                                ),
+                        )
+                        .child(lines),
+                );
+        }
+        if shown > 0 {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Recent requests from this model",
+                        "这个模型最近的请求",
+                        "這個模型最近的請求",
+                    )),
+            );
+        }
+        let _ = route;
+        body.into_any_element()
+    }
+
+    /// Marks the member a request is currently answering from.
+    ///
+    /// This is the whole point of the live channel: a route's members look
+    /// identical on disk, and only the running request says which one is doing
+    /// the work. The first-token event turns "starting" into "answering", so a
+    /// stalled member is visibly stalled rather than quietly busy.
+    fn render_route_graph_live_badge(
+        &mut self,
+        route: &RouteGraphRoute,
+        member: &RouteGraphMember,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let live = self.gateway_inflight.iter().rev().find(|inflight| {
+            // The route is known when the request named one; a direct Provider
+            // request has no route, so a member of a route cannot be its match.
+            inflight.model_route_id.as_deref() == Some(route.id())
+                && inflight.model_provider_profile_id == member.provider_profile_id
+        })?;
+        let (label, color) = if live.has_first_token() {
+            (
+                management_locale_text("answering…", "回答中…", "回答中…"),
+                cx.theme().success,
+            )
+        } else {
+            (
+                management_locale_text("waiting…", "等待首个 token", "等待首個 token"),
+                cx.theme().info,
+            )
+        };
+        Some(
+            div()
+                .flex_none()
+                .rounded(px(4.0))
+                .bg(color.opacity(0.14))
+                .px_1()
+                .py(px(1.0))
+                .text_xs()
+                .text_color(color)
+                .child(label)
+                .into_any_element(),
+        )
+    }
+
     /// A member's own controls: enable, and move within the order.
     ///
     /// Moving is two buttons rather than a drag: the member list is short, the
@@ -20931,6 +21143,34 @@ impl ManagementCenter {
             .disabled(pending || route.source_count() <= 1)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.remove_route_graph_member(route_remove.clone(), id_remove.clone(), cx)
+            }))
+            .into_any_element(),
+        );
+        let route_history = route.id().to_string();
+        let id_history = member.provider_profile_id.clone();
+        let history_open = self.gateway_member_history.as_ref()
+            == Some(&(route.id().to_string(), member.provider_profile_id.clone()));
+        actions.push(
+            Button::new(SharedString::from(format!(
+                "route-graph-history-{member_id}"
+            )))
+            .xsmall()
+            .ghost()
+            .compact()
+            .icon(Icon::default().path("icons/vibex/clock.svg"))
+            .selected(history_open)
+            .tooltip(management_locale_text(
+                "Recent requests",
+                "最近的请求",
+                "最近的請求",
+            ))
+            .disabled(pending)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_route_graph_member_history(
+                    route_history.clone(),
+                    id_history.clone(),
+                    cx,
+                )
             }))
             .into_any_element(),
         );
@@ -21106,6 +21346,7 @@ impl ManagementCenter {
                                     .child(member.provider_name.clone()),
                             ),
                     )
+                    .children(self.render_route_graph_live_badge(route, member, cx))
                     .child(
                         div()
                             .flex_none()
@@ -21115,6 +21356,11 @@ impl ManagementCenter {
                     )
                     .children(self.render_route_graph_member_actions(route, member, cx)),
             );
+            if self.gateway_member_history.as_ref()
+                == Some(&(route.id().to_string(), member.provider_profile_id.clone()))
+            {
+                rows = rows.child(self.render_route_graph_member_history(route, member, cx));
+            }
         }
         if route.members.len() > visible {
             rows = rows.child(
@@ -28582,6 +28828,36 @@ fn gateway_route_lines(
                 }
             });
         }
+        // A cross-member failover is the one thing a Key-level trace cannot
+        // express: it says a whole source was unavailable, not that a Key
+        // cooled. Naming the Provider is what makes "why did this go to the
+        // second one" answerable from the ledger.
+        for member in &route.skipped_members {
+            let provider = member
+                .provider_name
+                .clone()
+                .unwrap_or_else(|| member.model_provider_profile_id.as_str().to_string());
+            lines.push(match locale {
+                ResolvedLocale::En => {
+                    format!(
+                        "skipped {provider} · {}",
+                        gateway_failure_text(member.failure, locale)
+                    )
+                }
+                ResolvedLocale::ZhCn => {
+                    format!(
+                        "已跳过 {provider} · {}",
+                        gateway_failure_text(member.failure, locale)
+                    )
+                }
+                ResolvedLocale::ZhTw => {
+                    format!(
+                        "已跳過 {provider} · {}",
+                        gateway_failure_text(member.failure, locale)
+                    )
+                }
+            });
+        }
     }
     lines
 }
@@ -28666,6 +28942,8 @@ impl RouteGraphRoute {
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct RouteGraphMember {
     provider_name: String,
+    /// The Provider this member calls, so a live request can be matched to it.
+    provider_profile_id: vibex_core::ModelProviderProfileId,
     model_id: String,
     /// Whether the route still routes to this member.
     enabled: bool,
@@ -28699,6 +28977,10 @@ enum RouteGraphMemberState {
     Invalid(usize),
     NoKeys,
 }
+
+/// The most in-flight requests the graph keeps, matching the gateway's own
+/// bound so a client never holds a request the gateway has already dropped.
+const DESKTOP_MAX_INFLIGHT: usize = 8;
 
 /// How many routes the graph lists before folding the rest away.
 ///
@@ -28752,6 +29034,7 @@ fn route_graph_nodes(
                     .unwrap_or(&[]);
                 Some(RouteGraphMember {
                     provider_name: profile.display_name.clone(),
+                    provider_profile_id: profile.id.clone(),
                     model_id: member.model_id.clone(),
                     enabled: member.enabled,
                     member_id: member.id.as_str().to_string(),
@@ -28847,6 +29130,43 @@ fn management_agent_label(agent_id: &str, agents: &[vibex_core::AgentSnapshotEnt
         .find(|agent| agent.id.as_str() == agent_id)
         .map(|agent| agent.label.clone())
         .unwrap_or_else(|| agent_id.to_string())
+}
+
+/// A request time, as the graph's playback shows it.
+///
+/// Only the clock time is shown: playback lists the last few requests, so the
+/// date is the same for all of them and would be noise.
+fn management_route_history_time_label(at_ms: i64) -> String {
+    let seconds = at_ms.div_euclid(1000);
+    let day = seconds.div_euclid(86_400);
+    let in_day = seconds.rem_euclid(86_400);
+    let hours = in_day / 3_600;
+    let minutes = (in_day % 3_600) / 60;
+    let secs = in_day % 60;
+    let _ = day;
+    format!("{hours:02}:{minutes:02}:{secs:02}")
+}
+
+/// How a finished request ended, in the reader's terms.
+fn management_route_outcome_label(outcome: vibex_core::GatewayRequestOutcome) -> String {
+    let label = match (outcome, locale::current_locale()) {
+        (vibex_core::GatewayRequestOutcome::Ok, ResolvedLocale::En) => "ok",
+        (vibex_core::GatewayRequestOutcome::Ok, ResolvedLocale::ZhCn) => "成功",
+        (vibex_core::GatewayRequestOutcome::Ok, ResolvedLocale::ZhTw) => "成功",
+        (vibex_core::GatewayRequestOutcome::Failover, ResolvedLocale::En) => "switched",
+        (vibex_core::GatewayRequestOutcome::Failover, ResolvedLocale::ZhCn) => "已切换",
+        (vibex_core::GatewayRequestOutcome::Failover, ResolvedLocale::ZhTw) => "已切換",
+        (vibex_core::GatewayRequestOutcome::Cooldown, ResolvedLocale::En) => "cooling",
+        (vibex_core::GatewayRequestOutcome::Cooldown, ResolvedLocale::ZhCn) => "冷却中",
+        (vibex_core::GatewayRequestOutcome::Cooldown, ResolvedLocale::ZhTw) => "冷卻中",
+        (vibex_core::GatewayRequestOutcome::Rejected, ResolvedLocale::En) => "refused",
+        (vibex_core::GatewayRequestOutcome::Rejected, ResolvedLocale::ZhCn) => "已拒绝",
+        (vibex_core::GatewayRequestOutcome::Rejected, ResolvedLocale::ZhTw) => "已拒絕",
+        (vibex_core::GatewayRequestOutcome::Failed, ResolvedLocale::En) => "failed",
+        (vibex_core::GatewayRequestOutcome::Failed, ResolvedLocale::ZhCn) => "失败",
+        (vibex_core::GatewayRequestOutcome::Failed, ResolvedLocale::ZhTw) => "失敗",
+    };
+    label.to_string()
 }
 
 /// How many routes the gateway node serves.
@@ -38858,6 +39178,7 @@ mod gateway_surface_tests {
                     "Primary",
                     vibex_core::GatewayFailureKind::Quota,
                 )],
+                skipped_members: Vec::new(),
             }),
         );
 
@@ -38887,6 +39208,7 @@ mod gateway_surface_tests {
                 skipped_cooling: 0,
                 skipped_over_limit: 2,
                 failed_attempts: Vec::new(),
+                skipped_members: Vec::new(),
             }),
         );
         let lines = gateway_route_lines(&over_limit, ResolvedLocale::ZhCn);
@@ -38915,6 +39237,7 @@ mod gateway_surface_tests {
                     failed_attempt("Primary", vibex_core::GatewayFailureKind::Credit),
                     failed_attempt("Backup", vibex_core::GatewayFailureKind::Rate),
                 ],
+                skipped_members: Vec::new(),
             }),
         );
         let lines = gateway_route_lines(&two_dead, ResolvedLocale::En);
@@ -39254,6 +39577,7 @@ mod route_graph_tests {
     fn a_member_reports_why_it_cannot_answer() {
         let member = RouteGraphMember {
             provider_name: "DeepSeek".to_string(),
+            provider_profile_id: vibex_core::ModelProviderProfileId::new(),
             model_id: "m".to_string(),
             enabled: true,
             member_id: "model_route_member_test".to_string(),

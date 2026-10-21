@@ -1911,6 +1911,10 @@ impl AgentWorkflowController {
                 AgentEventDecision::IgnoredStale
             }
             BackendEvent::ProjectionInvalidated(_) => AgentEventDecision::IgnoredStale,
+            // A gateway request belongs to the Config Center's route graph. The
+            // Agent projection draws a timeline, not routing, so it has nothing
+            // to apply and must not repaint for each of a request's events.
+            BackendEvent::ModelGateway(_) => AgentEventDecision::IgnoredStale,
             BackendEvent::Lagged { refetch, .. } => {
                 if refetch.session_id.is_some()
                     && refetch.session_id.as_ref() != self.state.selected_session_id.as_ref()

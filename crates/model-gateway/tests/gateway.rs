@@ -2157,3 +2157,74 @@ async fn a_stalled_member_is_abandoned_for_the_next() {
     service.shutdown().await;
     cleanup(path);
 }
+
+/// A real request announces itself while it runs, not only when it finishes.
+///
+/// This is the channel the route graph draws from, so it has to exist for a
+/// request the gateway actually served — the unit tests cover the table, this
+/// covers the wiring from `prepare` to the ledger.
+#[tokio::test]
+async fn a_live_request_publishes_begin_and_end() {
+    use std::sync::Mutex as StdMutex;
+
+    let path = database_path();
+    let (upstream_url, _recorder, upstream_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-test",
+    );
+    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let seen: Arc<StdMutex<Vec<vibex_core::GatewayEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    service.set_event_sink(Arc::new(move |event| {
+        sink.lock().unwrap().push(event);
+    }));
+
+    let status = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": "deepseek/deepseek-chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 200);
+
+    let events = seen.lock().unwrap().clone();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, vibex_core::GatewayEvent::Began(_))),
+        "a request that ran must have announced itself: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, vibex_core::GatewayEvent::Ended { .. })),
+        "and must announce that it finished: {events:?}"
+    );
+    // One request, one id: the events describe the same thing the ledger row
+    // does, so a client can follow it rather than guess.
+    let first = events[0].request_id().clone();
+    assert!(events.iter().all(|event| event.request_id() == &first));
+    assert!(
+        service.inflight_requests().is_empty(),
+        "nothing may stay drawn once the reply is done"
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}

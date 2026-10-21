@@ -77,6 +77,11 @@ pub enum BackendEvent {
     /// matches acts on it.
     DeviceRenamed(vibex_core::RemoteDeviceRenamed),
     ProjectionInvalidated(BackendProjection),
+    /// One gateway request began, produced its first token, or ended.
+    ///
+    /// This carries in-progress state, unlike every other event here: the
+    /// route graph draws a request while it runs.
+    ModelGateway(vibex_core::GatewayEvent),
     Lagged {
         stream: BackendEventStream,
         skipped: u64,

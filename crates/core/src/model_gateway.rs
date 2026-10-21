@@ -1108,6 +1108,19 @@ impl GatewayRequestSummary {
                         failure: attempt.failure,
                     })
                     .collect(),
+                skipped_members: trace
+                    .skipped_members
+                    .into_iter()
+                    .map(|member| GatewaySkippedMemberSummary {
+                        provider_name: profiles
+                            .iter()
+                            .find(|candidate| candidate.id == member.model_provider_profile_id)
+                            .map(|candidate| candidate.display_name.clone()),
+                        model_provider_profile_id: member.model_provider_profile_id,
+                        wire_protocol_id: member.wire_protocol_id,
+                        failure: member.failure,
+                    })
+                    .collect(),
             });
         Self {
             total_tokens: log.total_tokens(),
@@ -1133,6 +1146,79 @@ impl GatewayRequestSummary {
     }
 }
 
+/// One request the gateway is serving right now.
+///
+/// This is memory state, never a ledger row: a request that is still running
+/// has no outcome to record, and the graph needs to draw it *while* it runs.
+/// The identifiers are the ones a client already sees; no prompt, reply, or Key
+/// material appears here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayInflight {
+    pub request_id: RequestId,
+    /// The Agent that sent it, when the request carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// The route, when the request named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_route_id: Option<String>,
+    /// The model id the Agent asked for.
+    pub requested_model: String,
+    /// The member currently answering, and its place in the attempt order.
+    pub model_provider_profile_id: ModelProviderProfileId,
+    /// Which member of the route this is, counting from one: the graph numbers
+    /// attempts so a failover reads as "the second source".
+    pub attempt: u32,
+    /// The Key serving this attempt, when one has been chosen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<RequestId>,
+    /// The protocol the member is called with.
+    pub wire_protocol_id: String,
+    pub started_at_ms: i64,
+    /// Set once the first token has arrived. A request with a deadline and no
+    /// first token yet is the one that may be abandoned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_at_ms: Option<i64>,
+}
+
+impl GatewayInflight {
+    /// Whether this request has produced any of its reply yet.
+    pub fn has_first_token(&self) -> bool {
+        self.first_token_at_ms.is_some()
+    }
+}
+
+/// What the gateway tells a client about a request it is serving.
+///
+/// These are the transitions a graph needs, not every internal step: a request
+/// begins, it starts answering, or it ends. Member-level retries are folded
+/// into a new `Began` with a higher attempt number, because that is what the
+/// graph draws.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum GatewayEvent {
+    /// A request started, or moved to another member.
+    Began(GatewayInflight),
+    /// The member produced its first token.
+    FirstToken { request_id: RequestId, at_ms: i64 },
+    /// The request finished, however it ended.
+    Ended {
+        request_id: RequestId,
+        outcome: GatewayRequestOutcome,
+    },
+}
+
+impl GatewayEvent {
+    /// The request this event is about.
+    pub fn request_id(&self) -> &RequestId {
+        match self {
+            Self::Began(inflight) => &inflight.request_id,
+            Self::FirstToken { request_id, .. } => request_id,
+            Self::Ended { request_id, .. } => request_id,
+        }
+    }
+}
+
 /// The route, with each Key named the way its Provider labels it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1140,6 +1226,21 @@ pub struct GatewayRouteSummary {
     pub skipped_cooling: u32,
     pub skipped_over_limit: u32,
     pub failed_attempts: Vec<GatewayRouteAttemptSummary>,
+    /// Members the request walked past, with their Providers named.
+    #[serde(default)]
+    pub skipped_members: Vec<GatewaySkippedMemberSummary>,
+}
+
+/// One skipped route member, named for display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewaySkippedMemberSummary {
+    /// Absent once the Provider has been removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+    pub model_provider_profile_id: ModelProviderProfileId,
+    pub wire_protocol_id: String,
+    pub failure: GatewayFailureKind,
 }
 
 /// One failed attempt, named for display.

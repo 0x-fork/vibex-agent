@@ -4135,6 +4135,7 @@ fn map_backend_event(event: BackendEvent) -> Option<DesktopEvent> {
         }
         BackendEvent::Runtime(event) => Some(DesktopEvent::Runtime(event)),
         BackendEvent::RuntimeSelection(event) => Some(DesktopEvent::RuntimeSelection(event)),
+        BackendEvent::ModelGateway(event) => Some(DesktopEvent::ModelGateway(event)),
         BackendEvent::ProjectionInvalidated(BackendProjection::Management) => {
             Some(DesktopEvent::ProviderConfigChanged(
                 vibex_desktop_runtime::ProviderConfigChangedEvent {
@@ -25204,6 +25205,15 @@ impl VibexWorkbench {
                         self.load_agent_runtime_catalog(cx)
                     }
                 }
+                false
+            }
+            DesktopEvent::ModelGateway(event) => {
+                // Only the Config Center draws a running request, so the work
+                // is forwarded there and the workbench itself does not repaint:
+                // a request starting is not a reason to redraw the timeline.
+                self.management_view.update(cx, |management, cx| {
+                    management.apply_gateway_event(event, cx)
+                });
                 false
             }
             DesktopEvent::UsageInvalidated => {

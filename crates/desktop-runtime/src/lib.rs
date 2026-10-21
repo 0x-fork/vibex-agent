@@ -3253,6 +3253,9 @@ impl DesktopRuntime {
             AppUpdateService::unavailable(app_update_config, error)
         });
         let (events, _) = broadcast::channel(config.event_capacity);
+        // The gateway's event sink outlives this scope, so it gets its own
+        // handle rather than borrowing the one moved into the runtime.
+        let gateway_events = events.clone();
         let agent = AgentHandle {
             manager: manager.clone(),
             runtime_selection,
@@ -3377,6 +3380,17 @@ impl DesktopRuntime {
         // be reported through the same handle the Config Center reads. Agents
         // keep their direct Provider configuration when it fails, and the UI
         // says so rather than pretending automatic routing is active.
+        // The gateway announces each request as it begins, answers, and ends;
+        // this is what lets a client draw a request while it is still running.
+        // The sink forwards onto the runtime's own bus so there is one event
+        // stream, not two.
+        {
+            runtime.model_gateway.set_event_sink(Arc::new(
+                move |event: vibex_core::GatewayEvent| {
+                    let _ = gateway_events.send(DesktopEvent::ModelGateway(event));
+                },
+            ));
+        }
         startup_stage_async("model_gateway_start", async {
             let service = Arc::clone(&runtime.model_gateway);
             match service.start().await {

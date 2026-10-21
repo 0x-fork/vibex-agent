@@ -78,6 +78,11 @@ pub enum DesktopEvent {
     Runtime(RuntimeSessionEvent),
     RuntimeSelection(AgentSessionRuntimeSelectionEvent),
     ProviderConfigChanged(ProviderConfigChangedEvent),
+    /// One gateway request began, produced its first token, or ended.
+    ///
+    /// The graph draws a request while it runs, so this is the only event that
+    /// carries in-progress state rather than a completed fact.
+    ModelGateway(vibex_core::GatewayEvent),
     UsageInvalidated,
     Lagged {
         stream: DesktopEventStream,
