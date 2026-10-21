@@ -1238,6 +1238,13 @@ impl ProviderConfigService {
                 "failed to read provider profile after create",
             )
         })?;
+        // The shared record is written first, so it is what owns the Provider:
+        // the Providers page edits it, the catalogue reads it, and the legacy row
+        // is its launch projection. Doing this in one place — here — is what lets
+        // every later read prefer v2 without a migration day.
+        vibex_db::ProviderProjectionCompatibilityRepository::create_model_provider_from_legacy(
+            &conn, &created,
+        )?;
         self.sync_legacy_projection(&conn, &created)?;
         self.notify_profile_saved(&created);
         Ok(created)

@@ -12494,10 +12494,8 @@ fn apply_binding_launch_fields(
     ] {
         let exists: i64 = conn
             .query_row(
-                &format!(
-                    "SELECT COUNT(*) FROM pragma_table_info('agent_model_provider_bindings_v2') \
-                     WHERE name = ?1"
-                ),
+                "SELECT COUNT(*) FROM pragma_table_info('agent_model_provider_bindings_v2') \
+                 WHERE name = ?1",
                 rusqlite::params![column],
                 |row| row.get(0),
             )

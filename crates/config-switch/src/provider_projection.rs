@@ -8315,3 +8315,131 @@ mod shared_provider_launch_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod v2_authority_tests {
+    use super::*;
+
+    /// Creating a Profile on the legacy path writes the shared record first.
+    ///
+    /// This is the reversal's evidence: the v2 row is no longer a side effect of
+    /// a compatibility sync, it is the record the Provider *is*. The legacy row
+    /// is derived from it, so a Provider created here is editable on the
+    /// Providers page without a migration day.
+    #[test]
+    fn a_created_profile_has_a_shared_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-v2-authority-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        let service = ProviderConfigService::new(&path);
+        service.open_connection().unwrap();
+
+        let created = service
+            .create_profile(vibex_core::ProviderProfileCreateRequest {
+                agent_id: Some(vibex_core::AgentId::parse("codex").unwrap()),
+                kind: vibex_core::ProviderKind::Codex,
+                display_name: "DeepSeek".to_string(),
+                account_alias: Some("Work".to_string()),
+                base_url: Some("https://api.example.com/v1".to_string()),
+                default_model: Some("deepseek-chat".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: vec![vibex_core::ProviderConfiguredModel {
+                    id: "deepseek-chat".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiResponses),
+                    capabilities: Default::default(),
+                }],
+                reasoning_effort: Some("high".to_string()),
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+                secret_references: Vec::new(),
+            })
+            .unwrap();
+
+        let conn = service.open_connection().unwrap();
+        let shared =
+            vibex_db::ModelProviderProfileRepository::get_by_legacy_profile(&conn, &created.id)
+                .unwrap()
+                .expect("a created Profile must have a shared record");
+
+        assert_eq!(shared.display_name, "DeepSeek");
+        assert_eq!(
+            shared.legacy_provider_profile_id.as_ref(),
+            Some(&created.id),
+            "the two must point at each other, or the reverse projection cannot find the row"
+        );
+        assert_eq!(
+            shared.default_model_id.as_deref(),
+            Some("deepseek-chat"),
+            "the model the reader chose must be on the shared record"
+        );
+        assert!(
+            shared
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.url == "https://api.example.com/v1"),
+            "the address must reach the shared record: {:?}",
+            shared.endpoints
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The shared record keeps the answers a legacy Profile can express but the
+    /// shared shape cannot.
+    ///
+    /// A Profile may name a default model before its catalogue arrives. The v2
+    /// model refuses that on a v2 edit, but the projection must carry it anyway:
+    /// dropping it would silently change what the Agent launches with.
+    #[test]
+    fn a_default_model_survives_even_before_its_catalogue_arrives() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-v2-default-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        let service = ProviderConfigService::new(&path);
+        service.open_connection().unwrap();
+
+        let created = service
+            .create_profile(vibex_core::ProviderProfileCreateRequest {
+                agent_id: Some(vibex_core::AgentId::parse("codex").unwrap()),
+                kind: vibex_core::ProviderKind::Codex,
+                display_name: "Early".to_string(),
+                account_alias: None,
+                base_url: Some("https://api.example.com/v1".to_string()),
+                default_model: Some("gpt-5-codex".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: Vec::new(),
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+                secret_references: Vec::new(),
+            })
+            .unwrap();
+
+        let conn = service.open_connection().unwrap();
+        let shared =
+            vibex_db::ModelProviderProfileRepository::get_by_legacy_profile(&conn, &created.id)
+                .unwrap()
+                .expect("the shared record must exist even with no models yet");
+        assert_eq!(
+            shared.default_model_id.as_deref(),
+            Some("gpt-5-codex"),
+            "the projection must not drop a default whose catalogue has not arrived"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

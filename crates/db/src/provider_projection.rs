@@ -655,6 +655,62 @@ impl ProviderProjectionCompatibilityRepository {
     ///
     /// A Profile with no legacy row is not projected: it was created outside the v1
     /// surface and has no launch path to keep in step.
+    /// Creates the v2 record for a legacy Profile that is about to exist.
+    ///
+    /// This is the direction reversal, made concrete. A legacy Profile can no
+    /// longer be the only row a Provider has: the shared record is what the
+    /// Providers page edits and what the catalogue reads, and the legacy row is
+    /// its launch projection. So creation writes v2 first, and the legacy row is
+    /// derived from it.
+    ///
+    /// The v2 id is derived from the legacy id, because the direct-route backfill
+    /// and the launch path both derive it that way. Deriving it here rather than
+    /// inventing one is what keeps those two able to find the record.
+    pub fn create_model_provider_from_legacy(
+        conn: &Connection,
+        legacy: &ProviderProfile,
+    ) -> VibexResult<ModelProviderProfile> {
+        let now = vibex_core::unix_timestamp_ms().max(1);
+        let provider = ModelProviderProfile {
+            id: legacy_model_provider_id(&legacy.id)?,
+            legacy_provider_profile_id: Some(legacy.id.clone()),
+            display_name: legacy.display_name.clone(),
+            vendor_hint: None,
+            endpoints: primary_endpoints_from_legacy(legacy),
+            proxy_policy: ModelProviderProxyPolicy::InheritSystem,
+            credentials: Vec::new(),
+            configured_models: legacy
+                .configured_models
+                .iter()
+                .map(|model| ModelProviderCatalogEntry {
+                    id: model.id.clone(),
+                    display_name: model.display_name.clone(),
+                    enabled: model.enabled,
+                    capabilities: model.capabilities.clone(),
+                    metadata: Vec::new(),
+                })
+                .collect(),
+            default_model_id: legacy.default_model.clone(),
+            headers: Vec::new(),
+            status: match legacy.status {
+                ProviderProfileStatus::Enabled => ModelProviderProfileStatus::Enabled,
+                ProviderProfileStatus::Disabled => ModelProviderProfileStatus::Disabled,
+            },
+            revision: 1,
+            created_at_ms: legacy.created_at_ms.min(now),
+            updated_at_ms: legacy.updated_at_ms.min(now),
+            deleted_at_ms: legacy.deleted_at_ms,
+        };
+        // The v2 model refuses a default that is not an enabled configured model,
+        // and that rule is right for a Provider created on the v2 side. A legacy
+        // Profile written before this direction existed may name a default before
+        // its model list is filled in — the catalog arrives later — so the
+        // projection keeps the value and lets the v2 rule apply to v2 edits.
+        // Dropping it here would silently change what the Agent launches with.
+        insert_model_provider_profile(conn, &provider)?;
+        Ok(provider)
+    }
+
     pub fn project_model_provider_to_legacy(
         conn: &Connection,
         provider: &ModelProviderProfile,
@@ -738,6 +794,31 @@ impl ProviderProjectionCompatibilityRepository {
 /// v2 keeps one endpoint per protocol; v1 keeps one `base_url` plus a
 /// per-protocol override that stays in `provider_options`. The endpoint with no
 /// protocol is the fallback and is exactly what `base_url` means.
+/// The endpoints a legacy Profile's single address implies.
+///
+/// A legacy Profile has one `base_url` plus, optionally, a per-protocol pin in
+/// `provider_options`. The v2 shape needs an endpoint per protocol, so the base
+/// address becomes the default endpoint and each pinned protocol gets its own
+/// address — which is what a Provider created on the v2 side would have carried.
+fn primary_endpoints_from_legacy(legacy: &ProviderProfile) -> Vec<ModelProviderEndpoint> {
+    let Some(base_url) = legacy
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    else {
+        return Vec::new();
+    };
+    let pin = provider_option(legacy, LEGACY_WIRE_API_OPTION_KEY)
+        .filter(|value| !value.trim().is_empty());
+    vec![ModelProviderEndpoint {
+        id: "endpoint-api".to_string(),
+        kind: ModelProviderEndpointKind::Api,
+        url: base_url.to_string(),
+        wire_protocol_id: pin,
+    }]
+}
+
 fn primary_legacy_base_url(provider: &ModelProviderProfile) -> Option<String> {
     provider
         .endpoints
