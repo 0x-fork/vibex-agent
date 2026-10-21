@@ -803,6 +803,11 @@ impl ProviderConfigService {
             projection_descriptor_id: request.projection_descriptor_id,
             projection_overrides: request.projection_overrides,
             configured_models: request.configured_models,
+            // Carried from the request: these describe how this Agent calls the
+            // Provider, so they cannot be derived from the shared record.
+            account_alias: request.account_alias,
+            reasoning_effort: request.reasoning_effort,
+            provider_options: request.provider_options,
             projection_fingerprint: None,
             status: status_for_resolution(resolution.match_kind, &resolution.descriptor),
             verification: verification_from_descriptor(&resolution.descriptor),
@@ -5938,6 +5943,9 @@ mod tests {
             created_at_ms: now,
             updated_at_ms: now,
             deleted_at_ms: None,
+            account_alias: None,
+            reasoning_effort: None,
+            provider_options: vibex_core::ProviderOptions::empty(),
         };
         (provider, runtime, binding, descriptor)
     }
@@ -6339,6 +6347,9 @@ mod tests {
             created_at_ms: now,
             updated_at_ms: now,
             deleted_at_ms: None,
+            account_alias: None,
+            reasoning_effort: None,
+            provider_options: vibex_core::ProviderOptions::empty(),
         };
         (provider, runtime, binding)
     }
@@ -7843,6 +7854,9 @@ mod tests {
                         ..AgentProviderProjectionOverrides::default()
                     },
                     configured_models: Vec::new(),
+                    account_alias: None,
+                    reasoning_effort: None,
+                    provider_options: vibex_core::ProviderOptions::empty(),
                 })
                 .unwrap();
         }
@@ -8219,8 +8233,6 @@ mod tests {
             .unwrap()
     }
 }
-
-
 
 #[cfg(test)]
 mod shared_provider_launch_tests {

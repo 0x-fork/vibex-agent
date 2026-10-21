@@ -1053,7 +1053,10 @@ mod tests {
     #[test]
     fn migration_64_creates_gateway_tables_and_is_idempotent() {
         let (path, mut conn) = database();
-        assert_eq!(crate::current_schema_version(&conn).unwrap(), 67);
+        assert_eq!(
+            crate::current_schema_version(&conn).unwrap(),
+            crate::CURRENT_SCHEMA_VERSION
+        );
         assert!(crate::migration_applied(&conn, 64).unwrap());
         assert!(crate::migration_applied(&conn, 65).unwrap());
         assert!(crate::migration_applied(&conn, 66).unwrap());

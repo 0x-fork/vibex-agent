@@ -95,7 +95,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 67;
+pub const CURRENT_SCHEMA_VERSION: i64 = 68;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12452,6 +12452,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     model_gateway::migrate_route_trace(conn, &mut applied)?;
     model_gateway::migrate_gateway_agents(conn, &mut applied)?;
     apply_model_routes(conn, &mut applied)?;
+    apply_binding_launch_fields(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -12464,6 +12465,65 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // route graph can show direct connections beside gateway ones.
     model_route::backfill_direct_routes(conn)?;
     Ok(applied)
+}
+
+/// Adds the Agent-scoped launch fields to the v2 binding.
+///
+/// These three had no home on the v2 side at all: they lived only on the legacy
+/// `ProviderProfile`, which is why that row could not yet retire to a projection.
+/// They belong to the binding rather than to the shared Provider, because they
+/// describe how *one* Agent calls the Provider — its account alias, the reasoning
+/// effort it asks for, and the protocol pin that is not the shared record's to
+/// own.
+fn apply_binding_launch_fields(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 68;
+    const NAME: &str = "binding_launch_fields";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    // Added one at a time: `ALTER TABLE ... ADD COLUMN` has no `IF NOT EXISTS`
+    // in the SQLite this ships against, so a partially applied migration has to
+    // be tolerated rather than retried from the top.
+    for (column, definition) in [
+        ("account_alias", "TEXT NULL"),
+        ("reasoning_effort", "TEXT NULL"),
+        ("provider_options_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ] {
+        let exists: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('agent_model_provider_bindings_v2') \
+                     WHERE name = ?1"
+                ),
+                rusqlite::params![column],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if exists == 0 {
+            conn.execute_batch(&format!(
+                "ALTER TABLE agent_model_provider_bindings_v2 ADD COLUMN {column} {definition};"
+            ))
+            .map_err(|error| {
+                VibexError::storage(
+                    "binding_launch_fields_alter_failed",
+                    format!("failed to add {column} to the v2 binding: {error}"),
+                )
+            })?;
+        }
+    }
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the binding launch fields migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }
 
 /// Creates the reusable model route tables.
@@ -17764,6 +17824,7 @@ mod tests {
                 "65:model_gateway_route_trace",
                 "66:model_gateway_agents",
                 "67:model_routes",
+                "68:binding_launch_fields",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -17915,6 +17976,7 @@ mod tests {
                 "65:model_gateway_route_trace",
                 "66:model_gateway_agents",
                 "67:model_routes",
+                "68:binding_launch_fields",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -18047,6 +18109,7 @@ mod tests {
                 "65:model_gateway_route_trace",
                 "66:model_gateway_agents",
                 "67:model_routes",
+                "68:binding_launch_fields",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -18217,6 +18280,7 @@ mod tests {
                 "65:model_gateway_route_trace",
                 "66:model_gateway_agents",
                 "67:model_routes",
+                "68:binding_launch_fields",
             ]
         );
         assert_eq!(
@@ -19647,6 +19711,7 @@ mod tests {
                 "65:model_gateway_route_trace",
                 "66:model_gateway_agents",
                 "67:model_routes",
+                "68:binding_launch_fields",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

@@ -1007,7 +1007,10 @@ mod tests {
     #[test]
     fn the_route_tables_exist_and_re_applying_migrations_changes_nothing() {
         let mut conn = migrated_connection();
-        assert_eq!(crate::current_schema_version(&conn).unwrap(), 67);
+        assert_eq!(
+            crate::current_schema_version(&conn).unwrap(),
+            crate::CURRENT_SCHEMA_VERSION
+        );
         assert!(crate::migration_applied(&conn, 67).unwrap());
 
         let applied = crate::apply_migrations(&mut conn).unwrap();

@@ -710,6 +710,27 @@ pub struct AgentModelProviderBinding {
     pub projection_descriptor_id: AgentProviderProjectionDescriptorId,
     pub projection_overrides: AgentProviderProjectionOverrides,
     pub configured_models: Vec<AgentConfiguredModelBinding>,
+    /// How this Agent names the account behind this Provider.
+    ///
+    /// Agent-scoped, not Provider-scoped: two Agents may share one Provider and
+    /// call it different things, because the alias is what the reader sees in
+    /// one Agent's picker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_alias: Option<String>,
+    /// The reasoning effort this Agent asks this Provider for.
+    ///
+    /// Agent-scoped for the same reason: one Provider may serve an Agent that
+    /// wants high effort and another that wants none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Launch options that have no structured home yet.
+    ///
+    /// These carry the protocol pin, the ACP configuration and the native-import
+    /// markers. They are Agent-scoped because they describe how *this* Agent
+    /// calls the Provider, which is exactly why the reverse projection has
+    /// always refused to overwrite them from the shared record.
+    #[serde(default = "default_provider_options")]
+    pub provider_options: crate::ProviderOptions,
     pub projection_fingerprint: Option<String>,
     pub status: AgentModelProviderBindingStatus,
     pub verification: ProjectionVerificationState,
@@ -717,6 +738,11 @@ pub struct AgentModelProviderBinding {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub deleted_at_ms: Option<i64>,
+}
+
+/// An empty option set, for records written before the field existed.
+fn default_provider_options() -> crate::ProviderOptions {
+    crate::ProviderOptions::empty()
 }
 
 impl Default for AgentModelProviderBinding {
@@ -734,6 +760,9 @@ impl Default for AgentModelProviderBinding {
             .expect("a literal descriptor id is valid"),
             projection_overrides: AgentProviderProjectionOverrides::default(),
             configured_models: Vec::new(),
+            account_alias: None,
+            reasoning_effort: None,
+            provider_options: crate::ProviderOptions::empty(),
             projection_fingerprint: None,
             status: AgentModelProviderBindingStatus::Draft,
             verification: ProjectionVerificationState {
@@ -1712,6 +1741,13 @@ pub struct AgentModelProviderBindingCreateRequest {
     pub projection_descriptor_id: AgentProviderProjectionDescriptorId,
     pub projection_overrides: AgentProviderProjectionOverrides,
     pub configured_models: Vec<AgentConfiguredModelBinding>,
+    /// Agent-scoped launch fields, omitted by callers that have none to set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default = "default_provider_options")]
+    pub provider_options: crate::ProviderOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2606,6 +2642,9 @@ mod tests {
                 enabled: true,
                 process_scoped: false,
             }],
+            account_alias: None,
+            reasoning_effort: None,
+            provider_options: crate::ProviderOptions::empty(),
             projection_fingerprint: None,
             status: AgentModelProviderBindingStatus::Draft,
             verification: ProjectionVerificationState {
@@ -2668,6 +2707,9 @@ mod tests {
                 enabled: true,
                 process_scoped: false,
             }],
+            account_alias: None,
+            reasoning_effort: None,
+            provider_options: crate::ProviderOptions::empty(),
             projection_fingerprint: None,
             status: AgentModelProviderBindingStatus::Draft,
             verification: ProjectionVerificationState {

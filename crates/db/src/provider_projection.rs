@@ -370,7 +370,8 @@ impl AgentModelProviderBindingRepository {
                     agent_id, agent_runtime_profile_id, model_provider_profile_id,
                     projection_descriptor_id, projection_overrides_json,
                     projection_fingerprint, status, verification_json, revision,
-                    created_at_ms, updated_at_ms, deleted_at_ms
+                    created_at_ms, updated_at_ms, deleted_at_ms,
+                    account_alias, reasoning_effort, provider_options_json
                 FROM agent_model_provider_bindings_v2
                 WHERE agent_model_provider_binding_id = ?1 AND deleted_at_ms IS NULL
                 ",
@@ -496,7 +497,10 @@ impl AgentModelProviderBindingRepository {
                     verification_json = ?10,
                     revision = ?11,
                     updated_at_ms = ?12,
-                    deleted_at_ms = ?13
+                    deleted_at_ms = ?13,
+                    account_alias = ?14,
+                    reasoning_effort = ?15,
+                    provider_options_json = ?16
                 WHERE agent_model_provider_binding_id = ?1
                     AND revision = ?2
                     AND deleted_at_ms IS NULL
@@ -515,6 +519,9 @@ impl AgentModelProviderBindingRepository {
                     binding.revision,
                     binding.updated_at_ms,
                     binding.deleted_at_ms,
+                    binding.account_alias,
+                    binding.reasoning_effort,
+                    json_to_db(&binding.provider_options)?,
                 ],
             )
             .map_err(storage_err(
@@ -911,8 +918,10 @@ fn insert_agent_model_provider_binding(
                 agent_id, agent_runtime_profile_id, model_provider_profile_id,
                 projection_descriptor_id, projection_overrides_json,
                 projection_fingerprint, status, verification_json, revision,
-                created_at_ms, updated_at_ms, deleted_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                created_at_ms, updated_at_ms, deleted_at_ms,
+                account_alias, reasoning_effort, provider_options_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                      ?15, ?16, ?17)
             ",
             params![
                 binding.id.as_str(),
@@ -932,6 +941,9 @@ fn insert_agent_model_provider_binding(
                 binding.created_at_ms,
                 binding.updated_at_ms,
                 binding.deleted_at_ms,
+                binding.account_alias,
+                binding.reasoning_effort,
+                json_to_db(&binding.provider_options)?,
             ],
         )
         .map_err(storage_err(
@@ -1061,6 +1073,9 @@ fn map_agent_model_provider_binding_without_models(
         created_at_ms: row.get(11)?,
         updated_at_ms: row.get(12)?,
         deleted_at_ms: row.get(13)?,
+        account_alias: row.get(14)?,
+        reasoning_effort: row.get(15)?,
+        provider_options: json_from_db_sql(row.get(16)?)?,
     })
 }
 
@@ -1127,7 +1142,8 @@ fn list_bindings<P: rusqlite::Params>(
             agent_id, agent_runtime_profile_id, model_provider_profile_id,
             projection_descriptor_id, projection_overrides_json,
             projection_fingerprint, status, verification_json, revision,
-            created_at_ms, updated_at_ms, deleted_at_ms
+            created_at_ms, updated_at_ms, deleted_at_ms,
+            account_alias, reasoning_effort, provider_options_json
         FROM agent_model_provider_bindings_v2
         WHERE {predicate} AND deleted_at_ms IS NULL
         ORDER BY updated_at_ms DESC, agent_model_provider_binding_id ASC
@@ -1302,6 +1318,12 @@ fn map_legacy_projection_records(
         projection_descriptor_id: resolution.descriptor.id.clone(),
         projection_overrides: AgentProviderProjectionOverrides::default(),
         configured_models,
+        // Carried across unchanged: these describe how this Agent calls the
+        // Provider, so the compatibility layer's job is to preserve them, not to
+        // interpret them.
+        account_alias: legacy.account_alias.clone(),
+        reasoning_effort: legacy.reasoning_effort.clone(),
+        provider_options: legacy.provider_options.clone(),
         projection_fingerprint: None,
         status: match (resolution.match_kind, resolution.descriptor.evidence.state) {
             (ProjectionDescriptorMatch::Conservative, _) => {
@@ -3020,5 +3042,138 @@ mod tests {
             records.binding.configured_models[0].wire_protocol_id,
             WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS
         );
+    }
+}
+
+#[cfg(test)]
+mod binding_launch_field_tests {
+    use super::*;
+    use crate::apply_migrations;
+    use vibex_core::{
+        ProviderConfiguredModel, ProviderOptions, WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+    };
+
+    /// The migration adds the three columns, and adding them twice changes
+    /// nothing.
+    ///
+    /// Round-tripping the values needs a runtime row and a Provider row, which
+    /// the projection tests already build; what is not covered anywhere else is
+    /// whether the columns exist at all on an existing database — the case that
+    /// matters, because every user has one.
+    #[test]
+    fn the_launch_columns_are_added_idempotently() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-binding-columns-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let columns = |conn: &Connection| {
+            let mut stmt = conn
+                .prepare("SELECT name FROM pragma_table_info('agent_model_provider_bindings_v2')")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+        };
+        let first = columns(&conn);
+        for expected in ["account_alias", "reasoning_effort", "provider_options_json"] {
+            assert!(
+                first.iter().any(|name| name == expected),
+                "{expected} is missing from the v2 binding: {first:?}"
+            );
+        }
+
+        // Re-running migrations must not fail on the columns already being
+        // there, which is what a user upgrading twice would exercise.
+        apply_migrations(&mut conn).unwrap();
+        assert_eq!(columns(&conn), first);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A legacy Profile's launch fields reach the v2 binding, and survive a
+    /// second sync unchanged.
+    ///
+    /// This is the case the round trip has to prove: the launch path reads the
+    /// legacy row, so if the projection drops these three the v2 side cannot be
+    /// the authority for them — which is the whole reason they were added.
+    #[test]
+    fn launch_fields_survive_the_projection() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-binding-projection-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let mut options = ProviderOptions::empty();
+        options.entries.push(vibex_core::ProviderBindingMetadata {
+            key: "wireApi".to_string(),
+            value: WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+        });
+        let legacy = ProviderProfile {
+            id: ProviderProfileId::new(),
+            agent_id: AgentId::parse("codex").unwrap(),
+            kind: vibex_core::ProviderKind::Codex,
+            display_name: "DeepSeek".to_string(),
+            status: ProviderProfileStatus::Enabled,
+            account_alias: Some("Work account".to_string()),
+            base_url: Some("https://api.example.com/v1".to_string()),
+            default_model: Some("deepseek-chat".to_string()),
+            small_model: None,
+            large_model: None,
+            configured_models: vec![ProviderConfiguredModel {
+                id: "deepseek-chat".to_string(),
+                display_name: None,
+                enabled: true,
+                wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions),
+                capabilities: Default::default(),
+            }],
+            reasoning_effort: Some("high".to_string()),
+            sandbox_defaults: vibex_core::ProviderSandboxDefaults::workspace_write_ask_on_risk(),
+            network_defaults: vibex_core::ProviderNetworkDefaults::local_default(),
+            permission_defaults: vibex_core::ProviderPermissionDefaults::ask_on_risk(),
+            provider_options: options,
+            secrets: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            deleted_at_ms: None,
+        };
+        crate::ProviderProfileRepository::insert(&conn, &legacy).unwrap();
+        let records =
+            ProviderProjectionCompatibilityRepository::sync_legacy_profile(&conn, &legacy).unwrap();
+
+        assert_eq!(
+            records.binding.account_alias.as_deref(),
+            Some("Work account"),
+            "the alias must reach the binding"
+        );
+        assert_eq!(
+            records.binding.reasoning_effort.as_deref(),
+            Some("high"),
+            "the effort must reach the binding"
+        );
+        assert_eq!(
+            records.binding.provider_options.entries.len(),
+            1,
+            "the protocol pin must reach the binding, because the launch path reads it from here"
+        );
+
+        // A second sync is a no-op for these fields, so a repeated write cannot
+        // quietly clear them.
+        let again =
+            ProviderProjectionCompatibilityRepository::sync_legacy_profile(&conn, &legacy).unwrap();
+        assert_eq!(again.binding.account_alias.as_deref(), Some("Work account"));
+        assert_eq!(again.binding.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(again.binding.provider_options.entries.len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
