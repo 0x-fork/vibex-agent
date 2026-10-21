@@ -24,6 +24,7 @@ pub mod ids;
 pub mod local_history;
 pub mod market;
 pub mod model_gateway;
+pub mod model_route;
 pub mod pairing_code_link;
 pub mod permission;
 pub mod provider;
@@ -220,16 +221,17 @@ pub use goal::{
 };
 pub use ids::{
     AgentAuthContextId, AgentAuthenticationOperationId, AgentConfiguredModelBindingId,
-    AgentDelegationId, AgentModelProviderBindingId, AgentProviderProjectionDescriptorId,
-    AgentRuntimeProbeId, AgentRuntimeProfileId, AutomationEdgeId, AutomationGraphId,
-    AutomationNodeId, AutomationRunId, AutomationRunStepId, BrowserSessionId, BrowserTabId,
-    ChannelId, ComputerSessionId, CorrelationId, DeviceId, EventId, HookId, McpServerId,
-    MessageSubmissionId, ModelProviderProfileId, NativeStateHomeId, ProjectId, PromptId,
-    ProviderProfileId, RelayConnectionId, RelayFrameId, RelayPeerId, RelayRoomId, RelaySessionId,
-    RequestId, RuntimeBindingId, RuntimeClientId, RuntimeLeaseId, RuntimeProcessId,
-    RuntimeStreamId, RuntimeSwitchId, RuntimeSwitchOperationId, ScheduledTaskId,
-    ScheduledTaskRunId, SessionGroupId, SkillId, TerminalId, TimelineItemId, UsageExecutionId,
-    VibexExecutionId, VibexOperationId, VibexSessionId, WorkspaceId,
+    AgentDelegationId, AgentModelProviderBindingId, AgentModelRouteBindingId,
+    AgentProviderProjectionDescriptorId, AgentRuntimeProbeId, AgentRuntimeProfileId,
+    AutomationEdgeId, AutomationGraphId, AutomationNodeId, AutomationRunId, AutomationRunStepId,
+    BrowserSessionId, BrowserTabId, ChannelId, ComputerSessionId, CorrelationId, DeviceId, EventId,
+    HookId, McpServerId, MessageSubmissionId, ModelProviderProfileId, ModelRouteId,
+    ModelRouteMemberId, NativeStateHomeId, ProjectId, PromptId, ProviderProfileId,
+    RelayConnectionId, RelayFrameId, RelayPeerId, RelayRoomId, RelaySessionId, RequestId,
+    RuntimeBindingId, RuntimeClientId, RuntimeLeaseId, RuntimeProcessId, RuntimeStreamId,
+    RuntimeSwitchId, RuntimeSwitchOperationId, ScheduledTaskId, ScheduledTaskRunId, SessionGroupId,
+    SkillId, TerminalId, TimelineItemId, UsageExecutionId, VibexExecutionId, VibexOperationId,
+    VibexSessionId, WorkspaceId,
 };
 pub use local_history::{
     LocalHistoryImportRecord, LocalHistoryImportResult, LocalHistoryImportStatus, LocalHistoryKey,
@@ -239,6 +241,7 @@ pub use local_history::{
 };
 pub use market::*;
 pub use model_gateway::*;
+pub use model_route::*;
 pub use pairing_code_link::{
     MAX_PAIRING_CODE_CERTIFICATE_BYTES, MAX_PAIRING_CODE_CHARS, MAX_PAIRING_CODE_LINK_BYTES,
     PAIRING_CODE_FRAGMENT_PREFIX, PAIRING_CODE_LINK_HOST, PAIRING_CODE_LINK_PREFIX,

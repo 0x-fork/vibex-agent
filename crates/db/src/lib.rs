@@ -79,6 +79,8 @@ mod agent_auth_context;
 pub use agent_auth_context::*;
 mod model_gateway;
 pub use model_gateway::*;
+mod model_route;
+pub use model_route::*;
 
 pub type DbConnection = Connection;
 
@@ -93,7 +95,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 66;
+pub const CURRENT_SCHEMA_VERSION: i64 = 67;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12449,13 +12451,98 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     model_gateway::migrate(conn, &mut applied)?;
     model_gateway::migrate_route_trace(conn, &mut applied)?;
     model_gateway::migrate_gateway_agents(conn, &mut applied)?;
+    apply_model_routes(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
     // must not start the backfill's own transaction.
     ProviderProfileRepository::ensure_local_defaults(conn)?;
     ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(conn)?;
+    // Turns the gateway's pre-route upstream list into one reusable route, once.
+    model_route::backfill_first_route(conn)?;
     Ok(applied)
+}
+
+/// Creates the reusable model route tables.
+///
+/// A route is one row plus its members, and its bindings are a separate table so
+/// one route can serve several Agents. The partial unique index is the last
+/// fence against an Agent holding two defaults: the write path demotes the old
+/// one, but a direct write that skips it would otherwise leave two.
+fn apply_model_routes(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 67;
+    const NAME: &str = "model_routes";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS model_routes (
+            model_route_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            description TEXT NULL,
+            kind TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            context_tokens INTEGER NULL CHECK(context_tokens IS NULL OR context_tokens > 0),
+            status TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            deleted_at_ms INTEGER NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_model_routes_active
+            ON model_routes(deleted_at_ms, updated_at_ms);
+
+        CREATE TABLE IF NOT EXISTS model_route_members (
+            model_route_member_id TEXT PRIMARY KEY,
+            model_route_id TEXT NOT NULL
+                REFERENCES model_routes(model_route_id) ON DELETE CASCADE,
+            model_provider_profile_id TEXT NOT NULL
+                REFERENCES model_provider_profiles(model_provider_profile_id),
+            model_id TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            order_index INTEGER NOT NULL CHECK(order_index >= 0),
+            reasoning_effort TEXT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_model_route_members_route
+            ON model_route_members(model_route_id, order_index);
+        CREATE INDEX IF NOT EXISTS idx_model_route_members_provider
+            ON model_route_members(model_provider_profile_id, model_id);
+
+        CREATE TABLE IF NOT EXISTS agent_model_route_bindings (
+            agent_model_route_binding_id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            model_route_id TEXT NOT NULL
+                REFERENCES model_routes(model_route_id) ON DELETE CASCADE,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            deleted_at_ms INTEGER NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_model_route_bindings_agent
+            ON agent_model_route_bindings(agent_id, deleted_at_ms, updated_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_agent_model_route_bindings_route
+            ON agent_model_route_bindings(model_route_id, deleted_at_ms);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_model_route_bindings_default
+            ON agent_model_route_bindings(agent_id)
+            WHERE is_default = 1 AND deleted_at_ms IS NULL;
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to create the model route tables",
+    ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the model route migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }
 
 fn apply_local_history_import_index(
@@ -17671,6 +17758,7 @@ mod tests {
                 "64:model_gateway",
                 "65:model_gateway_route_trace",
                 "66:model_gateway_agents",
+                "67:model_routes",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -17821,6 +17909,7 @@ mod tests {
                 "64:model_gateway",
                 "65:model_gateway_route_trace",
                 "66:model_gateway_agents",
+                "67:model_routes",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -17952,6 +18041,7 @@ mod tests {
                 "64:model_gateway",
                 "65:model_gateway_route_trace",
                 "66:model_gateway_agents",
+                "67:model_routes",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -18121,6 +18211,7 @@ mod tests {
                 "64:model_gateway",
                 "65:model_gateway_route_trace",
                 "66:model_gateway_agents",
+                "67:model_routes",
             ]
         );
         assert_eq!(
@@ -19550,6 +19641,7 @@ mod tests {
                 "64:model_gateway",
                 "65:model_gateway_route_trace",
                 "66:model_gateway_agents",
+                "67:model_routes",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
