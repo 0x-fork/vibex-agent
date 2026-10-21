@@ -10561,7 +10561,7 @@ impl VibexWorkbench {
                                 .update(cx, |input, cx| input.replace("\n", window, cx));
                             this.sync_inline_composer_attachments(true, cx);
                         } else if !command_enter || *secondary {
-                            this.submit_new_session(window, cx)
+                            this.handle_new_session_enter(window, cx)
                         }
                     }
                     InputEvent::Change => {
@@ -34779,6 +34779,26 @@ impl VibexWorkbench {
             .iter()
             .find(|agent| agent.id == *agent_id)
             .cloned()
+    }
+
+    /// Enter on the home Composer.
+    ///
+    /// The compact prompt sends on Enter, exactly like the create button. The
+    /// expanded prompt is an editor — the fullscreen input the session
+    /// Composer offers — so Enter belongs to the draft and sending stays with
+    /// the button.
+    fn handle_new_session_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.new_session_expanded {
+            self.submit_new_session(window, cx);
+            return;
+        }
+
+        self.new_session_input
+            .update(cx, |input, cx| input.replace("\n", window, cx));
+        self.sync_inline_composer_attachments(true, cx);
+        self.sync_composer_command_entry(ComposerTarget::NewSession, cx);
+        self.refresh_new_session_worktree_suggestions(window, cx);
+        self.refresh_suggestions(ComposerTarget::NewSession, window, cx);
     }
 
     fn submit_new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -100342,6 +100362,46 @@ mod tests {
         assert!(
             open.contains("self.new_session_expanded = false;"),
             "a page opened again starts from the compact shape"
+        );
+    }
+
+    /// The expanded home prompt is an editor, exactly like the expanded session
+    /// Composer: Enter belongs to the draft and the create button sends.
+    #[test]
+    fn expanded_new_session_enter_inserts_a_newline() {
+        let source = include_str!("app.rs");
+        let enter = source
+            .split_once("    fn handle_new_session_enter(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn submit_new_session("))
+            .map(|(body, _)| body)
+            .expect("the home enter handler should remain inspectable");
+        assert!(enter.contains("if !self.new_session_expanded {"));
+        assert!(enter.contains("self.submit_new_session(window, cx);"));
+        assert!(enter.contains("input.replace(\"\\n\", window, cx)"));
+        assert!(enter.contains("ComposerTarget::NewSession"));
+
+        let subscription = source
+            .split_once("                &new_session_input,")
+            .and_then(|(_, tail)| tail.split_once("InputEvent::Change =>"))
+            .map(|(body, _)| body)
+            .expect("the home input subscription should remain inspectable");
+        assert!(
+            subscription.contains("this.handle_new_session_enter(window, cx)"),
+            "the Enter path must ask whether the prompt is expanded"
+        );
+        assert!(
+            !subscription.contains("this.submit_new_session(window, cx)"),
+            "sending straight from Enter would skip the expanded check"
+        );
+
+        let panel = source
+            .split_once("    fn render_new_session_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_turn_preview_rail("))
+            .map(|(body, _)| body)
+            .expect("new-session panel should remain inspectable");
+        assert!(
+            panel.contains("this.submit_new_session("),
+            "the create button stays the way to send an expanded draft"
         );
     }
 
