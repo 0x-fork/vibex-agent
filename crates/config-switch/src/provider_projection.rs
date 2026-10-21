@@ -653,6 +653,15 @@ impl ProviderConfigService {
         };
         let conn = self.open_connection()?;
         ModelProviderProfileRepository::insert(&conn, &profile)?;
+        // A Provider created here has no legacy row on purpose. A shared Provider
+        // is not owned by an Agent, and it may carry several protocols at once —
+        // so which Agent's launch contract it corresponds to is undecidable at
+        // creation time. Borrowing an Agent here was the bug the global
+        // Providers page hit: a Provider whose protocol that Agent cannot speak
+        // was refused even though nothing about the Provider was wrong.
+        //
+        // The legacy row is created when an Agent binds the Provider, because
+        // only then is there an Agent to project onto.
         Ok(profile)
     }
 
@@ -8208,5 +8217,89 @@ mod tests {
             .find(|descriptor| descriptor.route.agent_id.as_str() == agent_id)
             .cloned()
             .unwrap()
+    }
+}
+
+
+
+#[cfg(test)]
+mod shared_provider_launch_tests {
+    use super::*;
+
+    /// Binding a shared Provider gives the Agent a launchable row of its own.
+    ///
+    /// This is the reversal's real boundary today. A shared Provider is created
+    /// without a legacy row on purpose — it belongs to no Agent and may carry
+    /// several protocols, so which launch contract it corresponds to is
+    /// undecidable then. Binding is the moment an Agent claims it, and
+    /// `materialize_legacy_profile_for_agent` is what produces the row that
+    /// Agent launches through.
+    ///
+    /// What the bind does *not* do is link the shared record back to that row:
+    /// `legacy_provider_profile_id` is `UNIQUE`, and the compatibility sync
+    /// already owns it with the row derived from the legacy id. Recording the
+    /// gap here keeps the next reader from assuming the reverse projection can
+    /// find a bound Agent's row.
+    #[test]
+    fn binding_a_shared_provider_gives_the_agent_a_launchable_row() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-shared-launch-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        let service = ProviderConfigService::new(&path);
+        service.open_connection().unwrap();
+
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Shared".to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://api.example.com/v1".to_string(),
+                    wire_protocol_id: Some(
+                        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
+                    ),
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "claude-sonnet".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    capabilities: Default::default(),
+                    metadata: Default::default(),
+                }],
+                default_model_id: Some("claude-sonnet".to_string()),
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        // Nothing has claimed it, so there is no launch contract yet.
+        assert!(
+            shared.legacy_provider_profile_id.is_none(),
+            "a shared Provider must not reserve an Agent's launch row at creation"
+        );
+
+        let bound = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_provider_profile_id: Some(shared.id.clone()),
+                agent_id: vibex_core::AgentId::parse("claude").unwrap(),
+                make_default: true,
+            })
+            .unwrap();
+
+        // Binding produces the Agent's own row, with the protocol it can speak
+        // and the address the shared record published.
+        assert_eq!(bound.agent_id.as_str(), "claude");
+        assert_eq!(bound.display_name, "Shared");
+        assert!(bound.base_url.is_some());
+        assert!(!bound.configured_models.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
