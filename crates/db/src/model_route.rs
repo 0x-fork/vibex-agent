@@ -738,6 +738,138 @@ pub fn backfill_first_route(conn: &Connection) -> VibexResult<Option<ModelRouteI
     Ok(Some(route.id))
 }
 
+/// Seeds one `Direct` route per legacy direct Provider Profile.
+///
+/// A direct Profile carries its own `base_url`, its own Key and its own model
+/// catalogue, and is projected into exactly one Agent. That is the same shape as
+/// a single-member direct route, so it can be expressed as one — which is what
+/// lets the route graph show the direct connections beside the gateway ones
+/// instead of drawing a second kind of thing.
+///
+/// The legacy row is *not* removed. The launch path still resolves a Key and a
+/// protocol through it, so the route is a description of it, not a replacement
+/// for it until the projection moves over.
+///
+/// Skipped Profiles:
+/// - the hidden gateway Profile, which is machinery rather than a user choice;
+/// - internal runtime Profiles, which are launch scaffolding with no catalogue;
+/// - the per-kind local default, which exists only to give an Agent a fallback.
+///
+/// Idempotent: a Profile that already has a route is left alone, so this can run
+/// on every launch.
+pub fn backfill_direct_routes(conn: &Connection) -> VibexResult<usize> {
+    let profiles = super::ProviderProfileRepository::list_all(conn)?;
+    let mut created = 0usize;
+    for profile in profiles {
+        if !is_direct_route_candidate(&profile) {
+            continue;
+        }
+        // One route per Profile. The marker lives in the description because it
+        // has to survive a rename: the route's own name is the user's to change.
+        let marker = direct_route_marker(&profile);
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM model_routes WHERE description = ?1",
+                params![marker],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if exists > 0 {
+            continue;
+        }
+        let Some(route) = direct_route_for(&profile) else {
+            continue;
+        };
+        // The member names the shared Provider the compatibility layer derives
+        // from this Profile. A Profile written after the last backfill has no
+        // such row yet, so materialise it before the member's foreign key looks
+        // for it. This is the same mapping the launch path uses.
+        super::ProviderProjectionCompatibilityRepository::sync_legacy_profile(conn, &profile)?;
+        super::ModelRouteRepository::insert(conn, &route)?;
+        created += 1;
+    }
+    Ok(created)
+}
+
+/// The shared Provider a legacy Profile projects onto.
+///
+/// The compatibility layer derives the v2 id deterministically, so the same
+/// Profile always names the same Provider.
+fn legacy_provider_key(profile: &vibex_core::ProviderProfile) -> String {
+    format!("model_provider_legacy_{}", profile.id.as_str())
+}
+
+/// A Profile that is a real, single-Agent, user-visible direct connection.
+///
+/// The exclusions mirror the Config Center's own list filter: anything that is
+/// machinery must not turn into a user-facing route.
+fn is_direct_route_candidate(profile: &vibex_core::ProviderProfile) -> bool {
+    if profile.deleted_at_ms.is_some() {
+        return false;
+    }
+    if profile
+        .base_url
+        .as_deref()
+        .is_none_or(|url| url.trim().is_empty())
+    {
+        // No address means nothing to connect to: an ACP runtime Profile has a
+        // command, not an endpoint.
+        return false;
+    }
+    // The hidden gateway Profile, and the internal runtime Profiles, carry a
+    // role marker. Either one would be a route the user never made.
+    let internal_role = profile
+        .provider_options
+        .entries
+        .iter()
+        .find(|entry| entry.key.trim() == "vibex.internal.profileRole")
+        .map(|entry| entry.value.trim().to_string());
+    if internal_role.is_some() {
+        return false;
+    }
+    // The per-kind local default exists so an Agent always has a fallback; it
+    // is disabled scaffolding, not a connection the user configured.
+    !profile.id.as_str().starts_with("provider_local_")
+}
+
+/// The provenance marker a seeded direct route carries.
+///
+/// It names the legacy Profile and is what makes the backfill idempotent. A
+/// display name cannot serve that purpose: renaming a route is a normal edit.
+fn direct_route_marker(profile: &vibex_core::ProviderProfile) -> String {
+    format!("vibex.direct_provider:{}", profile.id.as_str())
+}
+
+fn direct_route_for(profile: &vibex_core::ProviderProfile) -> Option<ModelRoute> {
+    let model = profile
+        .default_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            profile
+                .configured_models
+                .iter()
+                .find(|model| model.enabled)
+                .map(|model| model.id.clone())
+        })?;
+    let provider = ModelProviderProfileId::parse(legacy_provider_key(profile)).ok()?;
+    let now = unix_timestamp_ms().max(1);
+    Some(ModelRoute {
+        display_name: profile.display_name.clone(),
+        description: Some(direct_route_marker(profile)),
+        kind: RouteKind::Direct,
+        members: vec![ModelRouteMember::new(provider, model, 0)],
+        strategy: RouteStrategy::Ordered,
+        status: RouteStatus::Enabled,
+        revision: 1,
+        created_at_ms: now,
+        updated_at_ms: now,
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,6 +947,169 @@ mod tests {
             crate::ModelGatewayAgentRepository::set(conn, &AgentId::parse(*agent).unwrap(), true)
                 .unwrap();
         }
+    }
+
+    /// A legacy direct Profile in the shape the Config Center writes: an
+    /// address, a model, and one Agent.
+    fn seed_direct_profile(
+        conn: &Connection,
+        agent: &str,
+        name: &str,
+        base_url: &str,
+        model: &str,
+        role: Option<&str>,
+    ) -> vibex_core::ProviderProfile {
+        let options = role.map(|role| vibex_core::ProviderOptions {
+            schema_version: 1,
+            entries: vec![vibex_core::ProviderBindingMetadata {
+                key: "vibex.internal.profileRole".to_string(),
+                value: role.to_string(),
+            }],
+        });
+        let profile = crate::ProviderProfileRepository::from_create_request(
+            vibex_core::ProviderProfileCreateRequest {
+                agent_id: Some(AgentId::parse(agent).unwrap()),
+                kind: vibex_core::ProviderKind::Acp,
+                display_name: name.to_string(),
+                account_alias: None,
+                base_url: Some(base_url.to_string()),
+                default_model: Some(model.to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: Vec::new(),
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: options,
+                secret_references: Vec::new(),
+            },
+        );
+        crate::ProviderProfileRepository::insert(conn, &profile).unwrap();
+        profile
+    }
+
+    #[test]
+    fn a_direct_profile_becomes_a_single_member_direct_route() {
+        let conn = migrated_connection();
+        seed_direct_profile(
+            &conn,
+            "codex",
+            "DeepSeek 直连",
+            "https://api.deepseek.com/v1",
+            "deepseek-chat",
+            None,
+        );
+
+        let created = backfill_direct_routes(&conn).unwrap();
+        assert_eq!(created, 1);
+
+        let routes = ModelRouteRepository::list(&conn).unwrap();
+        assert_eq!(routes.len(), 1);
+        let route = &routes[0];
+        assert_eq!(route.kind, RouteKind::Direct);
+        assert_eq!(route.display_name, "DeepSeek 直连");
+        assert_eq!(
+            route.members.len(),
+            1,
+            "a direct route has exactly one member"
+        );
+        assert_eq!(route.members[0].model_id, "deepseek-chat");
+    }
+
+    #[test]
+    fn a_gateway_profile_is_not_turned_into_a_direct_route() {
+        let conn = migrated_connection();
+        // The hidden Profile the gateway projects into an Agent carries the
+        // gateway role. It is machinery, so it must not become a route the user
+        // never made.
+        seed_direct_profile(
+            &conn,
+            "codex",
+            "Vibex Gateway",
+            "http://127.0.0.1:3425",
+            "deepseek/deepseek-chat",
+            Some("model_gateway"),
+        );
+        // An internal runtime Profile has a role too, and no catalogue at all.
+        seed_direct_profile(
+            &conn,
+            "claude",
+            "Claude ACP",
+            "https://api.anthropic.com",
+            "claude-sonnet-5",
+            Some("agent_runtime"),
+        );
+
+        assert_eq!(backfill_direct_routes(&conn).unwrap(), 0);
+        assert!(ModelRouteRepository::list(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_profile_without_an_address_or_a_model_is_skipped() {
+        let conn = migrated_connection();
+        // No base_url: an ACP runtime Profile has a command, not an endpoint.
+        seed_direct_profile(&conn, "codex", "No address", "", "m", None);
+        assert_eq!(backfill_direct_routes(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_direct_backfill_is_idempotent_across_launches() {
+        let conn = migrated_connection();
+        seed_direct_profile(
+            &conn,
+            "codex",
+            "DeepSeek 直连",
+            "https://api.deepseek.com/v1",
+            "deepseek-chat",
+            None,
+        );
+
+        assert_eq!(backfill_direct_routes(&conn).unwrap(), 1);
+        assert_eq!(
+            backfill_direct_routes(&conn).unwrap(),
+            0,
+            "a re-run seeds nothing"
+        );
+        assert_eq!(ModelRouteRepository::list(&conn).unwrap().len(), 1);
+
+        // Renaming the route must not make the backfill create it again: the
+        // marker is provenance, not the display name.
+        let mut route = ModelRouteRepository::list(&conn).unwrap().remove(0);
+        route.display_name = "Renamed".to_string();
+        route.revision += 1;
+        ModelRouteRepository::update(&conn, &route, route.revision - 1).unwrap();
+        assert_eq!(backfill_direct_routes(&conn).unwrap(), 0);
+        assert_eq!(ModelRouteRepository::list(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn two_agents_keep_two_independent_direct_routes() {
+        let conn = migrated_connection();
+        seed_direct_profile(
+            &conn,
+            "codex",
+            "DeepSeek",
+            "https://api.deepseek.com/v1",
+            "deepseek-chat",
+            None,
+        );
+        seed_direct_profile(
+            &conn,
+            "claude",
+            "DeepSeek",
+            "https://api.deepseek.com/v1",
+            "deepseek-chat",
+            None,
+        );
+
+        // The same Provider for two Agents is two Profiles, so two routes. They
+        // must stay separate: an edit to one Agent's protocol is not an edit to
+        // the other's.
+        assert_eq!(backfill_direct_routes(&conn).unwrap(), 2);
+        let routes = ModelRouteRepository::list(&conn).unwrap();
+        assert_eq!(routes.len(), 2);
+        assert!(routes.iter().all(|route| route.kind == RouteKind::Direct));
     }
 
     #[test]

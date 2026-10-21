@@ -7,6 +7,25 @@
 //!
 //! Keeping these here rather than in the UI means the same checks apply to the
 //! Config Center, the remote client, and anything added later.
+//!
+//! # Which layer to call
+//!
+//! The read methods mirror the repository on purpose, because every other
+//! Provider surface does the same: a client never opens a database connection
+//! for a Config Center page. The distinction that matters is *writes*.
+//!
+//! - **Reads** may go through either layer; this one is the one clients use,
+//!   because it does not hand them a `Connection`.
+//! - **Writes must go through this layer.** `create_model_route` stamps the
+//!   revision and checks the member models exist; `update_model_route` sorts and
+//!   validates; `bind_model_route` refuses a disabled route and keeps exactly
+//!   one default. Calling `ModelRouteRepository` directly skips all of it — the
+//!   only reason that repository is public is so migrations can seed rows
+//!   without going through a service that is still being constructed.
+//!
+//! A read that is genuinely a repository query with no rule attached (say,
+//! listing routes for a migration) may call the repository; a read under a rule
+//! belongs here next to the rule.
 
 use vibex_core::{
     AgentId, AgentModelRouteBinding, MAX_ROUTES, ModelProviderProfile, ModelRoute, ModelRouteId,
@@ -371,6 +390,211 @@ mod tests {
         let bindings = service.list_agent_model_routes(&agent).unwrap();
         assert_eq!(bindings[0].model_route_id, second.id);
         assert!(bindings[0].is_default);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn updating_a_route_keeps_the_order_it_was_given() {
+        let (path, service) = service();
+        let deepseek = provider(&service, "DeepSeek", &["a", "b"]);
+        let route = service
+            .create_model_route(gateway_route(deepseek, &["a", "b"]))
+            .unwrap();
+
+        let mut next = route.clone();
+        next.members.reverse();
+        for (index, member) in next.members.iter_mut().enumerate() {
+            member.order_index = index as i64;
+        }
+        let updated = service.update_model_route(next, route.revision).unwrap();
+        assert_eq!(updated.revision, route.revision + 1);
+        assert_eq!(
+            updated
+                .members
+                .iter()
+                .map(|member| member.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn updating_to_an_unserved_model_is_refused_and_the_route_is_untouched() {
+        let (path, service) = service();
+        let deepseek = provider(&service, "DeepSeek", &["a"]);
+        let route = service
+            .create_model_route(gateway_route(deepseek.clone(), &["a"]))
+            .unwrap();
+
+        let mut next = route.clone();
+        next.members[0].model_id = "not-a-model".to_string();
+        let error = service
+            .update_model_route(next, route.revision)
+            .unwrap_err();
+        assert_eq!(error.code, "model_route_member_model_unknown");
+
+        // The rejected write must not have landed.
+        let stored = service.get_model_route(&route.id).unwrap().unwrap();
+        assert_eq!(stored.members[0].model_id, "a");
+        assert_eq!(stored.revision, route.revision);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn deleting_a_route_unbinds_it_and_removes_it_from_the_list() {
+        let (path, service) = service();
+        let deepseek = provider(&service, "DeepSeek", &["a"]);
+        let route = service
+            .create_model_route(gateway_route(deepseek, &["a"]))
+            .unwrap();
+        let agent = AgentId::parse("codex").unwrap();
+        service.bind_model_route(&agent, &route.id, true).unwrap();
+
+        assert!(service.delete_model_route(&route.id).unwrap());
+        assert!(service.get_model_route(&route.id).unwrap().is_none());
+        assert!(service.list_model_routes().unwrap().is_empty());
+        assert!(
+            service.list_agent_model_routes(&agent).unwrap().is_empty(),
+            "a deleted route must not stay bound"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unbinding_removes_only_that_agents_binding() {
+        let (path, service) = service();
+        let deepseek = provider(&service, "DeepSeek", &["a"]);
+        let route = service
+            .create_model_route(gateway_route(deepseek, &["a"]))
+            .unwrap();
+        let codex = AgentId::parse("codex").unwrap();
+        let claude = AgentId::parse("claude").unwrap();
+        service.bind_model_route(&codex, &route.id, true).unwrap();
+        service.bind_model_route(&claude, &route.id, true).unwrap();
+
+        assert!(service.unbind_model_route(&codex, &route.id).unwrap());
+        assert!(service.list_agent_model_routes(&codex).unwrap().is_empty());
+        assert_eq!(
+            service.list_agent_model_routes(&claude).unwrap().len(),
+            1,
+            "the other Agent keeps its binding"
+        );
+        assert!(
+            !service.unbind_model_route(&codex, &route.id).unwrap(),
+            "unbinding twice reports that there was nothing left to remove"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn one_route_can_serve_two_agents_and_reports_both() {
+        let (path, service) = service();
+        let deepseek = provider(&service, "DeepSeek", &["a"]);
+        let route = service
+            .create_model_route(gateway_route(deepseek, &["a"]))
+            .unwrap();
+        for agent_id in ["codex", "claude"] {
+            let agent = AgentId::parse(agent_id).unwrap();
+            service.bind_model_route(&agent, &route.id, false).unwrap();
+        }
+
+        let users = service.list_agent_model_route_users(&route.id).unwrap();
+        assert_eq!(
+            users
+                .iter()
+                .map(|binding| binding.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude", "codex"]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The stage-1 acceptance criterion, end to end.
+    ///
+    /// Two routes with different member orders, two Agents bound to different
+    /// ones, and both read back exactly as written. Nothing here goes through
+    /// the repository, so this is also the test that would catch the service
+    /// and the repository drifting apart.
+    #[test]
+    fn two_routes_bound_to_two_agents_read_back_in_their_own_order() {
+        let (path, service) = service();
+        let deepseek = provider(&service, "DeepSeek", &["ds-chat", "ds-reasoner"]);
+        let kimi = provider(&service, "Kimi", &["kimi-k3"]);
+
+        // Route A: DeepSeek first, Kimi second.
+        let mut route_a = gateway_route(deepseek.clone(), &["ds-chat", "ds-reasoner"]);
+        route_a.display_name = "Standard".to_string();
+        route_a
+            .members
+            .push(ModelRouteMember::new(kimi.clone(), "kimi-k3", 2));
+        let route_a = service.create_model_route(route_a).unwrap();
+
+        // Route B: Kimi first, DeepSeek second.
+        let mut route_b = gateway_route(kimi.clone(), &["kimi-k3"]);
+        route_b.display_name = "Kimi first".to_string();
+        route_b
+            .members
+            .push(ModelRouteMember::new(deepseek.clone(), "ds-reasoner", 1));
+        let route_b = service.create_model_route(route_b).unwrap();
+
+        let codex = AgentId::parse("codex").unwrap();
+        let claude = AgentId::parse("claude").unwrap();
+        service.bind_model_route(&codex, &route_a.id, true).unwrap();
+        service
+            .bind_model_route(&claude, &route_b.id, true)
+            .unwrap();
+
+        let codex_bindings = service.list_agent_model_routes(&codex).unwrap();
+        assert_eq!(codex_bindings.len(), 1);
+        assert_eq!(codex_bindings[0].model_route_id, route_a.id);
+        assert!(codex_bindings[0].is_default);
+
+        let claude_bindings = service.list_agent_model_routes(&claude).unwrap();
+        assert_eq!(claude_bindings[0].model_route_id, route_b.id);
+
+        let read_a = service.get_model_route(&route_a.id).unwrap().unwrap();
+        assert_eq!(
+            read_a
+                .members
+                .iter()
+                .map(|member| member.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ds-chat", "ds-reasoner", "kimi-k3"]
+        );
+        let read_b = service.get_model_route(&route_b.id).unwrap().unwrap();
+        assert_eq!(
+            read_b
+                .members
+                .iter()
+                .map(|member| member.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kimi-k3", "ds-reasoner"],
+            "the two routes keep independent orders over the same Providers"
+        );
+
+        // One route is one model id, whatever its members are.
+        assert_ne!(read_a.model_id(), read_b.model_id());
+        assert!(read_a.model_id().starts_with("route/"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_route_may_hold_at_most_sixteen_members() {
+        let (path, service) = service();
+        let models = (0..17)
+            .map(|index| format!("model-{index}"))
+            .collect::<Vec<_>>();
+        let refs = models.iter().map(String::as_str).collect::<Vec<_>>();
+        let deepseek = provider(&service, "DeepSeek", &refs);
+
+        let at_limit = gateway_route(deepseek.clone(), &refs[..16]);
+        assert!(service.create_model_route(at_limit).is_ok());
+
+        let mut over = gateway_route(deepseek, &refs[..17]);
+        over.display_name = "Too many".to_string();
+        let error = service.create_model_route(over).unwrap_err();
+        assert_eq!(error.code, "route_member_limit_exceeded");
         let _ = std::fs::remove_file(path);
     }
 

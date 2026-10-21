@@ -12460,6 +12460,9 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(conn)?;
     // Turns the gateway's pre-route upstream list into one reusable route, once.
     model_route::backfill_first_route(conn)?;
+    // Describes each Agent's direct Provider as a single-member route, so the
+    // route graph can show direct connections beside gateway ones.
+    model_route::backfill_direct_routes(conn)?;
     Ok(applied)
 }
 
