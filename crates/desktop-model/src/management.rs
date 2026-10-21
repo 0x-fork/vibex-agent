@@ -330,7 +330,69 @@ pub struct ProviderProfileProjection {
     pub updated_at_ms: i64,
 }
 
+/// How an Agent launches a Provider, from the Agent alone.
+///
+/// Three Agents have their own launch contract; everything else speaks ACP. This
+/// mirrors the mapping the Config Center uses, kept here so the shared record —
+/// which does not store a kind — can still produce a drawable row.
+fn provider_kind_for_agent(agent_id: &vibex_core::AgentId) -> ProviderKind {
+    match agent_id.as_str() {
+        "claude" => ProviderKind::Claude,
+        "codex" => ProviderKind::Codex,
+        _ => ProviderKind::Acp,
+    }
+}
+
 impl ProviderProfileProjection {
+    /// Builds the row a Config Center list draws from the shared record.
+    ///
+    /// The shared record is shared, so it cannot say which Agent a row belongs
+    /// to; the binding can. This is the pair the UI needs, and taking it from
+    /// the shared side is what lets the list stop reading the legacy row — which
+    /// is the last thing keeping that row from being a pure projection.
+    ///
+    /// `kind` is derived from the Agent, not stored: a Provider's launch kind is
+    /// a property of how that Agent runs, and two Agents may reach the same
+    /// Provider through different kinds.
+    pub fn from_shared(
+        provider: &vibex_core::ModelProviderProfile,
+        binding: &vibex_core::AgentModelProviderBinding,
+    ) -> Self {
+        let kind = provider_kind_for_agent(&binding.agent_id);
+        // The shared record's own legacy id, not the binding's: the binding's
+        // points at the launch row of *that* Agent, and a Provider bound to two
+        // Agents has two of those. The row the list draws is one Provider, so it
+        // is keyed by the Provider's id.
+        let id = provider
+            .legacy_provider_profile_id
+            .as_ref()
+            .map(|id| id.as_str().to_string())
+            .unwrap_or_else(|| provider.id.as_str().to_string());
+        Self {
+            id,
+            agent_id: binding.agent_id.as_str().to_string(),
+            kind,
+            display_name: provider.display_name.clone(),
+            base_url: provider
+                .endpoints
+                .first()
+                .map(|endpoint| endpoint.url.clone()),
+            status: match provider.status {
+                vibex_core::ModelProviderProfileStatus::Enabled => ProviderProfileStatus::Enabled,
+                vibex_core::ModelProviderProfileStatus::Disabled => ProviderProfileStatus::Disabled,
+            },
+            account_alias: binding.account_alias.clone(),
+            default_model: provider.default_model_id.clone(),
+            configured_model_count: provider
+                .configured_models
+                .iter()
+                .filter(|m| m.enabled)
+                .count(),
+            secret_configured: !provider.credentials.is_empty(),
+            updated_at_ms: provider.updated_at_ms,
+        }
+    }
+
     pub fn from_profile(profile: &ProviderProfile) -> Self {
         Self {
             id: profile.id.as_str().to_string(),
@@ -979,5 +1041,151 @@ mod tests {
         let summary = serde_json::to_string(&draft.redacted_summary()).unwrap();
         assert!(!summary.contains("sentinel-secret-value"));
         assert!(summary.contains("secretConfigured"));
+    }
+}
+
+#[cfg(test)]
+mod shared_projection_tests {
+    use super::*;
+
+    fn provider(
+        status: vibex_core::ModelProviderProfileStatus,
+        models: usize,
+        credentials: usize,
+    ) -> vibex_core::ModelProviderProfile {
+        vibex_core::ModelProviderProfile {
+            id: vibex_core::ModelProviderProfileId::new(),
+            legacy_provider_profile_id: None,
+            display_name: "DeepSeek".to_string(),
+            vendor_hint: None,
+            endpoints: vec![vibex_core::ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: vibex_core::ModelProviderEndpointKind::Api,
+                url: "https://api.example.com/v1".to_string(),
+                wire_protocol_id: None,
+            }],
+            proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+            credentials: (0..credentials)
+                .map(|_| vibex_core::ModelProviderCredentialReference {
+                    id: vibex_core::RequestId::new(),
+                    display_name: "Key".to_string(),
+                    status: vibex_core::AgentCredentialStatus::Ready,
+                    credential: vibex_core::AgentCredential::ApiKey {
+                        secret: vibex_core::ProjectionSecretReference {
+                            id: vibex_core::RequestId::new(),
+                            backend: vibex_core::ProviderSecretBackend::OsKeychain,
+                            setup_state: vibex_core::ProviderSecretSetupState::Available,
+                            lookup_key: "k".to_string(),
+                            redacted_hint: "sk-…".to_string(),
+                            revision: 1,
+                            legacy_secret_reference_id: None,
+                        },
+                        target_hint: None,
+                    },
+                    revision: 1,
+                })
+                .collect(),
+            configured_models: (0..models)
+                .map(|index| vibex_core::ModelProviderCatalogEntry {
+                    id: format!("model-{index}"),
+                    display_name: None,
+                    enabled: true,
+                    capabilities: Default::default(),
+                    metadata: Vec::new(),
+                })
+                .collect(),
+            default_model_id: Some("model-0".to_string()),
+            headers: Vec::new(),
+            status,
+            revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 42,
+            deleted_at_ms: None,
+        }
+    }
+
+    fn binding(
+        agent: &str,
+        provider: &vibex_core::ModelProviderProfile,
+    ) -> vibex_core::AgentModelProviderBinding {
+        vibex_core::AgentModelProviderBinding {
+            agent_id: vibex_core::AgentId::parse(agent).unwrap(),
+            model_provider_profile_id: provider.id.clone(),
+            account_alias: Some("Work".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The row a list draws comes from the shared record plus its binding.
+    #[test]
+    fn a_row_is_built_from_the_shared_record() {
+        let shared = provider(vibex_core::ModelProviderProfileStatus::Enabled, 2, 1);
+        let bound = binding("codex", &shared);
+        let row = ProviderProfileProjection::from_shared(&shared, &bound);
+
+        assert_eq!(row.agent_id, "codex");
+        assert_eq!(row.display_name, "DeepSeek");
+        assert_eq!(
+            row.base_url.as_deref(),
+            Some("https://api.example.com/v1"),
+            "the address the reader configured must reach the row"
+        );
+        assert_eq!(row.default_model.as_deref(), Some("model-0"));
+        assert_eq!(row.configured_model_count, 2);
+        assert!(
+            row.secret_configured,
+            "a stored Key must show as configured"
+        );
+        assert_eq!(row.account_alias.as_deref(), Some("Work"));
+        assert_eq!(row.updated_at_ms, 42);
+    }
+
+    /// The kind follows the Agent, not the shared record.
+    ///
+    /// Two Agents may reach one Provider through different launch contracts, so
+    /// a kind stored on the shared record would be wrong for one of them.
+    #[test]
+    fn the_kind_follows_the_agent() {
+        let shared = provider(vibex_core::ModelProviderProfileStatus::Enabled, 1, 0);
+        let for_claude = binding("claude", &shared);
+        let for_codex = binding("codex", &shared);
+        let other = binding("gemini", &shared);
+
+        assert_eq!(
+            ProviderProfileProjection::from_shared(&shared, &for_claude).kind,
+            ProviderKind::Claude
+        );
+        assert_eq!(
+            ProviderProfileProjection::from_shared(&shared, &for_codex).kind,
+            ProviderKind::Codex
+        );
+        assert_eq!(
+            ProviderProfileProjection::from_shared(&shared, &other).kind,
+            ProviderKind::Acp,
+            "an Agent without its own launch contract speaks ACP"
+        );
+    }
+
+    /// A disabled shared Provider reads as disabled, and a Keyless one as such.
+    #[test]
+    fn status_and_key_presence_follow_the_shared_record() {
+        let shared = provider(vibex_core::ModelProviderProfileStatus::Disabled, 1, 0);
+        let row = ProviderProfileProjection::from_shared(&shared, &binding("codex", &shared));
+        assert_eq!(row.status, ProviderProfileStatus::Disabled);
+        assert!(
+            !row.secret_configured,
+            "no credential must not read as configured"
+        );
+    }
+
+    /// The row is keyed by the legacy id, so the selection the UI already holds
+    /// keeps pointing at the same Provider.
+    #[test]
+    fn a_row_prefers_the_legacy_id() {
+        let mut shared = provider(vibex_core::ModelProviderProfileStatus::Enabled, 1, 0);
+        let legacy = vibex_core::ProviderProfileId::new();
+        shared.legacy_provider_profile_id = Some(legacy.clone());
+        let row = ProviderProfileProjection::from_shared(&shared, &binding("codex", &shared));
+        assert_eq!(row.id, legacy.as_str());
     }
 }

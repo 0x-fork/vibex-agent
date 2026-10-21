@@ -4539,11 +4539,14 @@ impl ManagementCenter {
         self.projection_states = snapshot.projection_states;
         self.reconcile_selected_agent();
         let selected_agent_id = self.selected_agent_id.as_deref();
+        // Read from the shared record, not the legacy row: the legacy row is the
+        // launch projection, and a list that read it would be drawing a copy.
+        let provider_rows = self.provider_rows();
         let selected_profile_is_valid =
             self.selected_provider_profile_id
                 .as_deref()
                 .is_some_and(|selected_profile_id| {
-                    self.snapshot.profiles.iter().any(|profile| {
+                    provider_rows.iter().any(|profile| {
                         Some(profile.agent_id.as_str()) == selected_agent_id
                             && profile.id == selected_profile_id
                     })
@@ -4556,8 +4559,7 @@ impl ManagementCenter {
                     .find(|state| state.agent_id == agent_id && state.is_default)
                     .map(|state| state.profile_id.clone())
                     .or_else(|| {
-                        self.snapshot
-                            .profiles
+                        provider_rows
                             .iter()
                             .find(|profile| profile.agent_id == agent_id)
                             .map(|profile| profile.id.clone())
@@ -4646,17 +4648,48 @@ impl ManagementCenter {
                 self.provider_profiles.push(profile.clone());
             }
 
-            let projection = vibex_desktop_model::ProviderProfileProjection::from_profile(profile);
-            if let Some(existing) = self
-                .snapshot
-                .profiles
-                .iter_mut()
-                .find(|existing| existing.id == projection.id)
-            {
-                *existing = projection;
-            } else {
-                self.snapshot.profiles.push(projection);
+            // Refresh from the shared record rather than projecting the legacy
+            // row the mutation returned. The legacy row is the launch
+            // projection; drawing the list from it would mean the list shows a
+            // copy of what the shared record already holds, and the two could
+            // disagree after a v2-side edit.
+            self.sync_provider_rows_from_shared(profile);
+        }
+    }
+
+    /// Replaces one Agent's Provider row with what the shared record says.
+    ///
+    /// The mutation hands back the legacy Profile because that is still the
+    /// launch contract's shape, but a list drawn from it would be showing the
+    /// projection. This looks the shared record and its binding up instead, and
+    /// falls back to the legacy row only when no shared record exists yet — a
+    /// Profile written before this direction existed.
+    fn sync_provider_rows_from_shared(&mut self, profile: &vibex_core::ProviderProfile) {
+        let shared = self
+            .providers
+            .iter()
+            .find(|provider| provider.legacy_provider_profile_id.as_ref() == Some(&profile.id))
+            .and_then(|provider| {
+                self.provider_bindings
+                    .iter()
+                    .find(|binding| binding.model_provider_profile_id == provider.id)
+                    .map(|binding| (provider, binding))
+            });
+        let projection = match shared {
+            Some((provider, binding)) => {
+                vibex_desktop_model::ProviderProfileProjection::from_shared(provider, binding)
             }
+            None => vibex_desktop_model::ProviderProfileProjection::from_profile(profile),
+        };
+        if let Some(existing) = self
+            .snapshot
+            .profiles
+            .iter_mut()
+            .find(|existing| existing.id == projection.id)
+        {
+            *existing = projection;
+        } else {
+            self.snapshot.profiles.push(projection);
         }
     }
 
@@ -8251,6 +8284,30 @@ impl ManagementCenter {
                 Ok(management_default_updated_message(active_locale, scope_kind).into())
             },
         );
+    }
+
+    /// The Provider rows the Config Center draws, built from the shared record.
+    ///
+    /// One row per (shared Provider, Agent) pair, because the shared record is
+    /// shared and the binding is what says which Agent reaches it. This replaces
+    /// reading the legacy Profile: the legacy row is the launch projection now,
+    /// so a list that reads it would be showing a copy of what the shared record
+    /// already holds.
+    fn provider_rows(&self) -> Vec<vibex_desktop_model::ProviderProfileProjection> {
+        let mut rows = Vec::new();
+        for binding in &self.provider_bindings {
+            let Some(provider) = self
+                .providers
+                .iter()
+                .find(|provider| provider.id == binding.model_provider_profile_id)
+            else {
+                continue;
+            };
+            rows.push(vibex_desktop_model::ProviderProfileProjection::from_shared(
+                provider, binding,
+            ));
+        }
+        rows
     }
 
     fn ordered_provider_profile_ids(&self, agent_id: &str) -> Vec<String> {

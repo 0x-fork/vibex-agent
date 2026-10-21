@@ -316,6 +316,8 @@ mod tests {
                 .collect(),
             features: Vec::new(),
             availability: RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
         }
     }
 
