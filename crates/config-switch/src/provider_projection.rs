@@ -8970,3 +8970,138 @@ mod shared_provider_reuse_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod shared_bind_route_tests {
+    use super::*;
+
+    /// Binding a shared Provider creates no route — it is a direct connection.
+    ///
+    /// The question this answers is the one a reader asks after enabling a
+    /// Provider for an Agent: does traffic go through the gateway now? It does
+    /// not. Binding produces a launch row whose `base_url` is the Provider's own
+    /// address, and no `ModelRoute` at all, so the Agent calls the Provider
+    /// directly. Making it go through the gateway is a separate act — creating a
+    /// gateway route and selecting it.
+    #[test]
+    fn binding_a_provider_creates_a_direct_connection_not_a_route() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-bind-route-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Direct".to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://api.example.com/v1".to_string(),
+                    wire_protocol_id: Some(
+                        vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    ),
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "shared-model".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    capabilities: Default::default(),
+                    metadata: Default::default(),
+                }],
+                default_model_id: Some("shared-model".to_string()),
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        let bound = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_provider_profile_id: Some(shared.id.clone()),
+                agent_id: vibex_core::AgentId::parse("goose").unwrap(),
+                make_default: false,
+            })
+            .unwrap();
+
+        assert_eq!(
+            bound.base_url.as_deref(),
+            Some("https://api.example.com/v1"),
+            "the launch row must point at the Provider itself, not at the gateway"
+        );
+        assert!(
+            service.list_enabled_model_routes().unwrap().is_empty(),
+            "binding must not invent a route: routing is a separate choice"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The launch row a bind creates is never an `Acp` Profile.
+    ///
+    /// This is why an Agent's own list can show the Provider while the composer's
+    /// selector does not: the selector lists `Acp` Profiles only, and a bind for
+    /// claude or codex produces a `Claude` or `Codex` row.
+    #[test]
+    fn a_bound_row_takes_the_agents_own_kind() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-bind-kind-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        for (agent, expected) in [
+            ("claude", vibex_core::ProviderKind::Claude),
+            ("codex", vibex_core::ProviderKind::Codex),
+            ("goose", vibex_core::ProviderKind::Acp),
+        ] {
+            let shared = service
+                .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                    display_name: format!("For {agent}"),
+                    vendor_hint: None,
+                    endpoints: vec![vibex_core::ModelProviderEndpoint {
+                        id: "api".to_string(),
+                        kind: vibex_core::ModelProviderEndpointKind::Api,
+                        url: "https://api.example.com/v1".to_string(),
+                        wire_protocol_id: Some(
+                            match expected {
+                                vibex_core::ProviderKind::Codex => {
+                                    vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES
+                                }
+                                vibex_core::ProviderKind::Claude => {
+                                    vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES
+                                }
+                                _ => vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                            }
+                            .to_string(),
+                        ),
+                    }],
+                    proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                    credentials: Vec::new(),
+                    configured_models: Vec::new(),
+                    default_model_id: None,
+                    headers: Vec::new(),
+                    status: vibex_core::ModelProviderProfileStatus::Enabled,
+                })
+                .unwrap();
+            let bound = service
+                .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                    provider_profile_id: vibex_core::ProviderProfileId::new(),
+                    model_provider_profile_id: Some(shared.id.clone()),
+                    agent_id: vibex_core::AgentId::parse(agent).unwrap(),
+                    make_default: false,
+                })
+                .unwrap();
+            assert_eq!(bound.kind, expected, "{agent} must get its own kind");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

@@ -2000,11 +2000,8 @@ impl ProviderConfigService {
                 // there is nothing left to copy: it is the answer itself.
                 let before = vibex_db::ModelProviderProfileRepository::list(&conn)?.len();
                 eprintln!("PROBE before materialize: {before}");
-                let created = self.materialize_legacy_profile_for_agent(
-                    &conn,
-                    &shared,
-                    &request.agent_id,
-                )?;
+                let created =
+                    self.materialize_legacy_profile_for_agent(&conn, &shared, &request.agent_id)?;
 
                 // Bind before anything can re-open the database: a connection
                 // runs the migrations, and their backfill projects every *unbound*
