@@ -9067,6 +9067,208 @@ mod shared_provider_reuse_tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// A refresh after the bind must not turn the second Agent's row into a Provider.
+    ///
+    /// This is the report: enabling a shared Provider for a second Agent added a
+    /// second Provider to the sidebar. The bind itself links the new launch row to
+    /// the shared record, but a refresh re-projects that row — and the projection
+    /// derived a record from the row's own id, because only the first Agent's row
+    /// carries the id the shared record was derived from. The visible symptom is one
+    /// extra row, so the assertion is on the list the sidebar draws.
+    #[test]
+    fn a_refresh_after_binding_keeps_one_shared_row() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-shared-refresh-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "design".to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://api.example.com/v1".to_string(),
+                    wire_protocol_id: None,
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "design-model".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    capabilities: Default::default(),
+                    metadata: Default::default(),
+                }],
+                default_model_id: Some("design-model".to_string()),
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        for agent in ["deepseek-harness", "pi"] {
+            service
+                .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                    provider_profile_id: vibex_core::ProviderProfileId::new(),
+                    model_provider_profile_id: Some(shared.id.clone()),
+                    agent_id: vibex_core::AgentId::parse(agent).unwrap(),
+                    make_default: false,
+                })
+                .unwrap();
+            // What the Config Center does on the next refresh: re-project every ACP
+            // launch row this Agent has, which is where the duplicate appeared.
+            service
+                .refresh_agent_snapshot(vibex_core::AgentRefreshSnapshotRequest {
+                    agent_id: vibex_core::AgentId::parse(agent).unwrap(),
+                    cwd_scope: None,
+                })
+                .unwrap();
+
+            let listed = service
+                .list_visible_model_provider_profiles()
+                .unwrap()
+                .into_iter()
+                .filter(|profile| profile.display_name == "design")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                listed.len(),
+                1,
+                "after binding {agent} and refreshing, one Provider must stay one row, found: {:?}",
+                listed
+                    .iter()
+                    .map(|profile| profile.id.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                listed[0].id, shared.id,
+                "the surviving record must be the one the user added"
+            );
+        }
+
+        // The binding each Agent holds has to name that same record, or the sidebar
+        // attributes the Agents to a Provider that is no longer theirs.
+        let conn = service.open_connection().unwrap();
+        for agent in ["deepseek-harness", "pi"] {
+            let bindings = vibex_db::AgentModelProviderBindingRepository::list_for_agent(
+                &conn,
+                &vibex_core::AgentId::parse(agent).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(bindings.len(), 1, "{agent} should hold exactly one binding");
+            assert_eq!(
+                bindings[0].model_provider_profile_id.as_ref(),
+                Some(&shared.id),
+                "{agent}'s binding must reach the Provider it was given"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An edit made for one Agent reaches the shared record without taking its Keys.
+    ///
+    /// The launch row is a copy, so its own secret ids are not the Provider's. Writing
+    /// them onto the shared record would rewrite the Key list the other Agents are
+    /// bound through — the names would survive, the identities would not — while the
+    /// ACP options the copy carries describe one Agent's launch, not the record.
+    #[test]
+    fn an_agent_edit_reaches_the_record_but_not_its_identity() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-shared-merge-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "design".to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://api.example.com/v1".to_string(),
+                    wire_protocol_id: None,
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "design-model".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    capabilities: Default::default(),
+                    metadata: Default::default(),
+                }],
+                default_model_id: Some("design-model".to_string()),
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        let bound = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_provider_profile_id: Some(shared.id.clone()),
+                agent_id: vibex_core::AgentId::parse("pi").unwrap(),
+                make_default: false,
+            })
+            .unwrap();
+
+        // A rename on the Agent page: the same gesture the page's own editor makes.
+        service
+            .update_agent_model_provider_profile(
+                vibex_core::AgentModelProviderProfileUpdateRequest {
+                    agent_id: vibex_core::AgentId::parse("pi").unwrap(),
+                    provider_profile_id: bound.id.clone(),
+                    display_name: Some("design renamed".to_string()),
+                    status: None,
+                    account_alias: None,
+                    base_url: None,
+                    default_model: None,
+                    small_model: None,
+                    large_model: None,
+                    configured_models: None,
+                    reasoning_effort: None,
+                    sandbox_defaults: None,
+                    network_defaults: None,
+                    permission_defaults: None,
+                    provider_options: None,
+                },
+            )
+            .unwrap();
+
+        // Exactly one Provider, and it is the one the user added.
+        let listed = service
+            .list_visible_model_provider_profiles()
+            .unwrap()
+            .into_iter()
+            .filter(|profile| profile.id == shared.id)
+            .collect::<Vec<_>>();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].display_name, "design renamed",
+            "an edit for one Agent must reach the Provider it is bound to"
+        );
+        assert_eq!(
+            listed[0].legacy_provider_profile_id, shared.legacy_provider_profile_id,
+            "and must not move the record's identity onto the Agent's row"
+        );
+
+        // The Agent's own row keeps the name too, so both sides agree.
+        let conn = service.open_connection().unwrap();
+        let legacy = vibex_db::ProviderProfileRepository::get(&conn, &bound.id)
+            .unwrap()
+            .expect("the Agent's launch row must still exist");
+        assert_eq!(legacy.display_name, "design renamed");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(test)]

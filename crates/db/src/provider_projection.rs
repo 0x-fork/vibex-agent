@@ -690,8 +690,7 @@ impl ProviderProjectionCompatibilityRepository {
             // Providers page. Repair still happens for the ordinary case: a row
             // whose binding points at its own derived record.
             if let Some(existing) = before.as_ref()
-                && existing.model_provider_profile_id.as_ref()
-                    != Some(&legacy_model_provider_id(&profile.id)?)
+                && Self::shared_record_reached_by_binding(conn, existing)?.is_some()
             {
                 continue;
             }
@@ -701,6 +700,87 @@ impl ProviderProjectionCompatibilityRepository {
             }
         }
         Ok(changed)
+    }
+
+    /// The Provider a launch row already reaches, when it is not the record derived
+    /// from that row.
+    ///
+    /// A launch row is one Agent's copy of a shared Provider, and the binding is the
+    /// only record that says which Provider the copy reaches: the shared record is
+    /// keyed by the legacy id of the row it was first derived from, and every later
+    /// Agent's row has a different id. So the answer cannot be derived from the row
+    /// — it has to be read from the binding.
+    ///
+    /// `None` is the ordinary case: the row's binding names the record derived from
+    /// it, and projecting it again is what keeps that record and its protocol
+    /// repaired.
+    fn shared_record_reached_by_binding(
+        conn: &Connection,
+        binding: &AgentModelProviderBinding,
+    ) -> VibexResult<Option<ModelProviderProfileId>> {
+        let Some(provider_id) = binding.model_provider_profile_id.as_ref() else {
+            return Ok(None);
+        };
+        let Some(provider) = ModelProviderProfileRepository::get(conn, provider_id)? else {
+            // The Provider is gone; re-deriving is the only way to leave this launch
+            // row something to reach.
+            return Ok(None);
+        };
+        if provider
+            .legacy_provider_profile_id
+            .as_ref()
+            .is_some_and(|id| Some(id) == binding.legacy_provider_profile_id.as_ref())
+        {
+            return Ok(None);
+        }
+        Ok(Some(provider_id.clone()))
+    }
+
+    /// Folds a launch row's copy of a Provider into the record it already reaches.
+    ///
+    /// A second Agent's launch row contributes a runtime and a binding, not a second
+    /// Provider. Its row is a copy made when the Agent bound the Provider, and some of
+    /// what it carries is not the Provider's to begin with: `provider_options` holds
+    /// the ACP config, the protocol pin and the import markers — properties of how
+    /// that Agent launches, not of the shared record. Writing the copy back wholesale
+    /// would move those onto the record *and* overwrite the Keys with the copy's own
+    /// secret ids, which every other Agent's binding still names.
+    ///
+    /// So only what the record actually owns flows — the name, the status, the
+    /// addresses and the model list — while the identity, the Key list and those
+    /// Agent-only options stay with the record. `explicit` separates an edit from a
+    /// refresh: a refresh must not push a copy's possibly stale content over the
+    /// record the Providers page owns.
+    fn merge_into_shared(
+        conn: &Connection,
+        shared_id: &ModelProviderProfileId,
+        candidate: ModelProviderProfile,
+        explicit: bool,
+    ) -> VibexResult<ModelProviderProfile> {
+        let Some(existing) = ModelProviderProfileRepository::get(conn, shared_id)? else {
+            return upsert_legacy_model_provider(conn, candidate, explicit);
+        };
+        if !explicit {
+            return Ok(existing);
+        }
+        let mut merged = ModelProviderProfile {
+            display_name: candidate.display_name,
+            vendor_hint: candidate.vendor_hint,
+            endpoints: candidate.endpoints,
+            configured_models: candidate.configured_models,
+            default_model_id: candidate.default_model_id,
+            headers: candidate.headers,
+            status: candidate.status,
+            ..existing.clone()
+        };
+        if same_model_provider_content(&existing, &merged) {
+            return Ok(existing);
+        }
+        merged.revision = existing.revision.saturating_add(1);
+        merged.updated_at_ms = merged
+            .updated_at_ms
+            .max(existing.updated_at_ms.saturating_add(1));
+        ModelProviderProfileRepository::update(conn, &merged, existing.revision)
     }
 
     /// Projects a legacy Profile onto an *existing* shared record.
@@ -776,8 +856,27 @@ impl ProviderProjectionCompatibilityRepository {
                 "failed to start provider projection compatibility transaction",
             ))?;
         let records = map_legacy_projection_records(&transaction, legacy)?;
-        let model_provider =
-            upsert_legacy_model_provider(&transaction, records.model_provider, explicit)?;
+        // A launch row that already reaches a shared Provider keeps reaching it.
+        // Deriving a record from its own id is what turned one Provider into one
+        // record per Agent: the derivation cannot know that this row is a copy.
+        let existing =
+            AgentModelProviderBindingRepository::get_by_legacy_profile(&transaction, &legacy.id)?;
+        let reached = match existing.as_ref() {
+            Some(binding) => Self::shared_record_reached_by_binding(&transaction, binding)?,
+            None => None,
+        };
+        let model_provider = match reached {
+            Some(shared_id) => Self::merge_into_shared(
+                &transaction,
+                &shared_id,
+                ModelProviderProfile {
+                    id: shared_id.clone(),
+                    ..records.model_provider
+                },
+                explicit,
+            )?,
+            None => upsert_legacy_model_provider(&transaction, records.model_provider, explicit)?,
+        };
         let agent_runtime = upsert_legacy_agent_runtime(&transaction, records.agent_runtime)?;
         let mut binding = records.binding;
         binding.model_provider_profile_id = Some(model_provider.id.clone());
