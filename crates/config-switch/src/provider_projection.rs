@@ -9042,15 +9042,15 @@ mod shared_bind_route_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A row materialised from a shared Provider takes the Agent's own kind.
+    /// A row materialised from a shared Provider is always `Acp`.
     ///
-    /// This is the *bind* path. It differs from the Agent page's own create path
-    /// on purpose: binding a shared Provider has to write into the config file the
-    /// Agent actually owns, so `claude` and `codex` get their own kinds here. That
-    /// is why such a Provider appears in the Agent's list but not in the
-    /// composer's selector, which lists `Acp` Profiles only.
+    /// The `Claude` and `Codex` kinds name the config file an Agent owns, which is
+    /// the native importer's business. They are not launchable: the ACP runtime
+    /// refuses a Profile whose kind is not `Acp`, so a bound Provider materialised
+    /// with one could not start a session and would not appear in the composer's
+    /// selector. Binding therefore agrees with adding a Provider on the Agent page.
     #[test]
-    fn a_bound_row_takes_the_agents_own_kind() {
+    fn a_bound_row_is_always_acp_whatever_the_agent() {
         let dir = std::env::temp_dir().join(format!(
             "vibex-bind-kind-{}",
             vibex_core::RequestId::new().as_str()
@@ -9059,10 +9059,10 @@ mod shared_bind_route_tests {
         let service = ProviderConfigService::new(dir.join("state.db"));
         service.open_connection().unwrap();
 
-        for (agent, expected) in [
-            ("claude", vibex_core::ProviderKind::Claude),
-            ("codex", vibex_core::ProviderKind::Codex),
-            ("goose", vibex_core::ProviderKind::Acp),
+        for (agent, protocol) in [
+            ("claude", vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES),
+            ("codex", vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES),
+            ("goose", vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS),
         ] {
             let shared = service
                 .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
@@ -9072,18 +9072,7 @@ mod shared_bind_route_tests {
                         id: "api".to_string(),
                         kind: vibex_core::ModelProviderEndpointKind::Api,
                         url: "https://api.example.com/v1".to_string(),
-                        wire_protocol_id: Some(
-                            match expected {
-                                vibex_core::ProviderKind::Codex => {
-                                    vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES
-                                }
-                                vibex_core::ProviderKind::Claude => {
-                                    vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES
-                                }
-                                _ => vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
-                            }
-                            .to_string(),
-                        ),
+                        wire_protocol_id: Some(protocol.to_string()),
                     }],
                     proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
                     credentials: Vec::new(),
@@ -9101,7 +9090,11 @@ mod shared_bind_route_tests {
                     make_default: false,
                 })
                 .unwrap();
-            assert_eq!(bound.kind, expected, "{agent} must get its own kind");
+            assert_eq!(
+                bound.kind,
+                vibex_core::ProviderKind::Acp,
+                "{agent} must get an Acp Profile, or the ACP runtime would refuse to start it"
+            );
         }
 
         std::fs::remove_dir_all(&dir).ok();

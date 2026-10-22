@@ -1859,11 +1859,21 @@ impl ProviderConfigService {
         shared: &vibex_core::ModelProviderProfile,
         agent_id: &AgentId,
     ) -> VibexResult<ProviderProfile> {
-        let kind = match agent_id.as_str() {
-            "claude" => ProviderKind::Claude,
-            "codex" => ProviderKind::Codex,
-            _ => ProviderKind::Acp,
-        };
+        // Always `Acp`, never the Agent's own kind.
+        //
+        // `ProviderKind::Claude` and `Codex` name the config file an Agent owns —
+        // `~/.claude/settings.json`, `~/.codex/config.toml` — which is what the
+        // native importer needs. They are not a launch contract: the ACP runtime
+        // refuses any Profile whose kind is not `Acp`
+        // (`provider_profile_route_unavailable`), so a bound Provider materialised
+        // with one of those kinds could not be started at all, and would not appear
+        // in the composer's selector either.
+        //
+        // This also makes binding agree with adding a Provider on the Agent page,
+        // which has always produced `Acp`. Two entry points writing the same
+        // Provider with different kinds is what made the same Provider selectable
+        // from one and invisible from the other.
+        let kind = ProviderKind::Acp;
         let protocol_endpoint = shared
             .endpoints
             .iter()

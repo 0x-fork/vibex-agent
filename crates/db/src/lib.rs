@@ -95,7 +95,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 70;
+pub const CURRENT_SCHEMA_VERSION: i64 = 71;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12455,6 +12455,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_binding_launch_fields(conn, &mut applied)?;
     apply_route_launch_policy(conn, &mut applied)?;
     apply_binding_provider_options_repair(conn, &mut applied)?;
+    apply_bound_provider_kind_repair(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -12467,6 +12468,54 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // route graph can show direct connections beside gateway ones.
     model_route::backfill_direct_routes(conn)?;
     Ok(applied)
+}
+
+/// Makes a bound Provider's launch row `Acp`, which is the only kind that starts.
+///
+/// Binding a shared Provider to claude or codex used to write that Agent's config
+/// kind — `claude`, `codex` — into the launch row. Those kinds name a config file,
+/// not a launch contract, and the ACP runtime refuses any Profile whose kind is not
+/// `Acp`: the Provider appeared in the Agent's list, could not start a session, and
+/// never appeared in the composer's selector.
+///
+/// Only rows a bind created are touched. The per-kind local defaults carry the same
+/// kinds by design and are scaffolding, not Providers the user bound, so they are
+/// left alone.
+fn apply_bound_provider_kind_repair(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 71;
+    const NAME: &str = "bound_provider_kind_repair";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE provider_profiles
+         SET provider_kind = 'acp'
+         WHERE provider_kind IN ('claude', 'codex')
+           AND deleted_at_ms IS NULL
+           AND provider_profile_id NOT LIKE 'provider_local_default_%'
+           AND provider_profile_id IN (
+               SELECT legacy_provider_profile_id FROM agent_model_provider_bindings_v2
+               WHERE legacy_provider_profile_id IS NOT NULL
+           )",
+        [],
+    )
+    .map_err(storage_err(
+        "bound_provider_kind_repair_failed",
+        "failed to repair the kind of a bound Provider",
+    ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the bound Provider kind repair",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }
 
 /// Repairs binding rows written with an undecodable `provider_options_json`.
@@ -17933,6 +17982,7 @@ mod tests {
                 "68:binding_launch_fields",
                 "69:route_launch_policy",
                 "70:binding_provider_options_repair",
+                "71:bound_provider_kind_repair",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -18087,6 +18137,7 @@ mod tests {
                 "68:binding_launch_fields",
                 "69:route_launch_policy",
                 "70:binding_provider_options_repair",
+                "71:bound_provider_kind_repair",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -18222,6 +18273,7 @@ mod tests {
                 "68:binding_launch_fields",
                 "69:route_launch_policy",
                 "70:binding_provider_options_repair",
+                "71:bound_provider_kind_repair",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -18395,6 +18447,7 @@ mod tests {
                 "68:binding_launch_fields",
                 "69:route_launch_policy",
                 "70:binding_provider_options_repair",
+                "71:bound_provider_kind_repair",
             ]
         );
         assert_eq!(
@@ -19828,6 +19881,7 @@ mod tests {
                 "68:binding_launch_fields",
                 "69:route_launch_policy",
                 "70:binding_provider_options_repair",
+                "71:bound_provider_kind_repair",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
