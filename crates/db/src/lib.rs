@@ -95,7 +95,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 71;
+pub const CURRENT_SCHEMA_VERSION: i64 = 72;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12456,6 +12456,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_route_launch_policy(conn, &mut applied)?;
     apply_binding_provider_options_repair(conn, &mut applied)?;
     apply_bound_provider_kind_repair(conn, &mut applied)?;
+    apply_runtime_profile_acp_catalog(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -12468,6 +12469,59 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // route graph can show direct connections beside gateway ones.
     model_route::backfill_direct_routes(conn)?;
     Ok(applied)
+}
+
+/// Adds the ACP catalogue fields `AcpProviderConfig` carries to the runtime Profile.
+///
+/// `command` and `args` were enough for the probe, but not for a launch: the ACP
+/// session needs the model list, the modes, the features and the disabled tools
+/// that the legacy row keeps inside its serialised config. Without them the v2
+/// runtime Profile cannot describe a launch, which is what has kept the launch path
+/// reading the legacy row.
+fn apply_runtime_profile_acp_catalog(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 72;
+    const NAME: &str = "runtime_profile_acp_catalog";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    for column in [
+        "models_json",
+        "modes_json",
+        "features_json",
+        "disabled_tools_json",
+    ] {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('agent_runtime_profiles') WHERE name = ?1",
+                rusqlite::params![column],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if exists == 0 {
+            conn.execute_batch(&format!(
+                "ALTER TABLE agent_runtime_profiles ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]';"
+            ))
+            .map_err(|error| {
+                VibexError::storage(
+                    "runtime_profile_acp_catalog_alter_failed",
+                    format!("failed to add {column} to agent_runtime_profiles: {error}"),
+                )
+            })?;
+        }
+    }
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the runtime Profile ACP catalogue migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }
 
 /// Makes a bound Provider's launch row `Acp`, which is the only kind that starts.
@@ -17983,6 +18037,7 @@ mod tests {
                 "69:route_launch_policy",
                 "70:binding_provider_options_repair",
                 "71:bound_provider_kind_repair",
+                "72:runtime_profile_acp_catalog",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -18138,6 +18193,7 @@ mod tests {
                 "69:route_launch_policy",
                 "70:binding_provider_options_repair",
                 "71:bound_provider_kind_repair",
+                "72:runtime_profile_acp_catalog",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -18274,6 +18330,7 @@ mod tests {
                 "69:route_launch_policy",
                 "70:binding_provider_options_repair",
                 "71:bound_provider_kind_repair",
+                "72:runtime_profile_acp_catalog",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -18448,6 +18505,7 @@ mod tests {
                 "69:route_launch_policy",
                 "70:binding_provider_options_repair",
                 "71:bound_provider_kind_repair",
+                "72:runtime_profile_acp_catalog",
             ]
         );
         assert_eq!(
@@ -19882,6 +19940,7 @@ mod tests {
                 "69:route_launch_policy",
                 "70:binding_provider_options_repair",
                 "71:bound_provider_kind_repair",
+                "72:runtime_profile_acp_catalog",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

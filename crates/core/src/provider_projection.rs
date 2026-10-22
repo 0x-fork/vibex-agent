@@ -608,6 +608,20 @@ pub struct AgentRuntimeProfile {
     pub runtime_home_strategy: AgentRuntimeHomeStrategy,
     pub host_capabilities: AgentHostCapabilities,
     pub resource_policy: AgentRuntimeResourcePolicy,
+    /// The ACP catalogue this launch offers.
+    ///
+    /// These four are what `AcpProviderConfig` needs beyond the command line. They
+    /// used to live only inside the legacy row's serialised config, which is why the
+    /// launch path could not be moved off that row: a runtime Profile without them
+    /// cannot describe a session.
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub modes: Vec<String>,
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
     pub revision: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -1723,6 +1737,15 @@ pub struct AgentRuntimeProfileCreateRequest {
     pub runtime_home_strategy: AgentRuntimeHomeStrategy,
     pub host_capabilities: AgentHostCapabilities,
     pub resource_policy: AgentRuntimeResourcePolicy,
+    /// The ACP catalogue this launch offers, omitted by callers that offer none.
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub modes: Vec<String>,
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

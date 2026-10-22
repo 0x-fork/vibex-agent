@@ -2173,7 +2173,7 @@ impl AgentProvider for AcpAgentProvider {
     ) -> ProviderCapabilities {
         match (provider_profile_id, self.config_service.as_ref()) {
             (Some(profile_id), Some(service)) => service
-                .get_acp_profile_config(profile_id.clone())
+                .get_acp_profile_config_for_launch(profile_id.clone())
                 .map(|config| acp_capabilities_from_config(&config))
                 .unwrap_or_else(|_| {
                     ProviderCapabilities::conservative(
@@ -2254,7 +2254,7 @@ impl AgentProvider for AcpAgentProvider {
                 }],
             });
         };
-        let config = service.get_acp_profile_config(profile_id.clone())?;
+        let config = service.get_acp_profile_config_for_launch(profile_id.clone())?;
         let models = normalize_model_list(config.models);
         if !models.is_empty() {
             let is_codex = service
@@ -2749,7 +2749,7 @@ impl AcpAgentProvider {
     ) -> Option<AcpProviderConfig> {
         self.config_service
             .as_ref()?
-            .get_acp_profile_config(provider_profile_id.clone())
+            .get_acp_profile_config_for_launch(provider_profile_id.clone())
             .ok()
     }
 
@@ -3109,7 +3109,7 @@ pub async fn run_opencode_acp_smoke(
         })
         .map_err(|err| OpenCodeAcpSmokeError::Config(err.to_string()))?;
     let config = service
-        .get_acp_profile_config(profile.id.clone())
+        .get_acp_profile_config_for_launch(profile.id.clone())
         .map_err(|err| OpenCodeAcpSmokeError::Config(err.to_string()))?;
     let capability_result = service
         .run_capability_probes(ProviderRunCapabilityProbesRequest {

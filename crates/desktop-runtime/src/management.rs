@@ -144,6 +144,15 @@ impl ProviderManagementFacade {
         self.service.list_visible_model_provider_profiles()
     }
 
+    /// The ACP config a launch should use, v2 runtime Profile first.
+    pub fn get_acp_profile_config_for_launch(
+        &self,
+        provider_profile_id: vibex_core::ProviderProfileId,
+    ) -> VibexResult<vibex_core::AcpProviderConfig> {
+        self.service
+            .get_acp_profile_config_for_launch(provider_profile_id)
+    }
+
     /// Deletes a shared Provider and the bindings that point at it.
     pub fn delete_model_provider_profile(
         &self,

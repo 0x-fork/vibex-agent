@@ -1398,6 +1398,41 @@ impl ProviderConfigService {
         })
     }
 
+    /// The ACP config a launch should use, read from the v2 runtime Profile when
+    /// there is one.
+    ///
+    /// This is the step that lets the launch path stop depending on the legacy row.
+    /// The v2 runtime Profile now carries the whole `AcpProviderConfig`, including
+    /// the catalogue, so a session can be described from it alone. The legacy row
+    /// stays as the fallback for a Profile written before this existed, and for the
+    /// per-kind local defaults, which never had a runtime Profile of their own.
+    pub fn get_acp_profile_config_for_launch(
+        &self,
+        provider_profile_id: ProviderProfileId,
+    ) -> VibexResult<AcpProviderConfig> {
+        let conn = self.open_connection()?;
+        if let Some(runtime) = vibex_db::AgentRuntimeProfileRepository::get_by_legacy_profile(
+            &conn,
+            &provider_profile_id,
+        )? {
+            return Ok(AcpProviderConfig {
+                command: runtime.command,
+                args: runtime.args,
+                env: runtime.safe_env_references,
+                cwd_template: runtime.cwd_template,
+                process_strategy: runtime.process_strategy,
+                terminal_tools: runtime.host_capabilities.terminal,
+                terminal_auth: runtime.host_capabilities.terminal_auth,
+                models: runtime.models,
+                modes: runtime.modes,
+                features: runtime.features,
+                disabled_tools: runtime.disabled_tools,
+            });
+        }
+        drop(conn);
+        self.get_acp_profile_config(provider_profile_id)
+    }
+
     pub fn get_acp_profile_config(
         &self,
         provider_profile_id: ProviderProfileId,

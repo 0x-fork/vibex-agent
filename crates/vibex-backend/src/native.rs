@@ -4688,7 +4688,7 @@ impl ManagementBackend for NativeBackend {
                 .management()
                 .providers()
                 .management()
-                .get_acp_profile_config(provider_profile_id)
+                .get_acp_profile_config_for_launch(provider_profile_id)
                 .map_err(Into::into)
         })
     }

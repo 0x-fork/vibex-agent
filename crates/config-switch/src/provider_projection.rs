@@ -759,6 +759,10 @@ impl ProviderConfigService {
             runtime_home_strategy: request.runtime_home_strategy,
             host_capabilities: request.host_capabilities,
             resource_policy: request.resource_policy,
+            models: request.models,
+            modes: request.modes,
+            features: request.features,
+            disabled_tools: request.disabled_tools,
             revision: 1,
             created_at_ms: now,
             updated_at_ms: now,
@@ -5931,6 +5935,10 @@ mod tests {
                 network: ProviderNetworkDefaults::local_default(),
                 permissions: ProviderPermissionDefaults::ask_on_risk(),
             },
+            models: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            disabled_tools: Vec::new(),
             revision: 1,
             created_at_ms: now,
             updated_at_ms: now,
@@ -6361,6 +6369,10 @@ mod tests {
                 network: ProviderNetworkDefaults::local_default(),
                 permissions: ProviderPermissionDefaults::ask_on_risk(),
             },
+            models: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            disabled_tools: Vec::new(),
             revision: 1,
             created_at_ms: now,
             updated_at_ms: now,
@@ -7868,6 +7880,10 @@ mod tests {
                     network: ProviderNetworkDefaults::local_default(),
                     permissions: ProviderPermissionDefaults::ask_on_risk(),
                 },
+                models: Vec::new(),
+                modes: Vec::new(),
+                features: Vec::new(),
+                disabled_tools: Vec::new(),
             }
         };
         let claude_runtime = service
@@ -9452,6 +9468,79 @@ mod visible_shared_provider_tests {
                     .collect::<Vec<_>>()
             );
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod launch_reads_v2_tests {
+    use super::*;
+
+    /// A launch reads the ACP config from the v2 runtime Profile.
+    ///
+    /// The step this establishes is narrow and worth stating precisely: the launch
+    /// path no longer needs the legacy row's serialised config, because the v2
+    /// runtime Profile carries the whole `AcpProviderConfig`.
+    ///
+    /// It is not yet the case that v2 is authoritative. The compatibility backfill
+    /// re-projects every legacy row on each migration run, so a change made directly
+    /// on the v2 side is overwritten the next time a connection opens. Reversing that
+    /// means writing v2 first and projecting to v1 — a separate step, and the one
+    /// that actually retires the legacy row.
+    #[test]
+    fn a_launch_can_be_described_by_the_v2_runtime_profile_alone() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-launch-v2-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+        let agent_id = vibex_core::AgentId::parse("opencode").unwrap();
+
+        let created = service
+            .create_agent_model_provider_profile(
+                vibex_core::AgentModelProviderProfileCreateRequest {
+                    agent_id: agent_id.clone(),
+                    display_name: "design".to_string(),
+                    account_alias: None,
+                    base_url: Some("https://api.example.com/v1".to_string()),
+                    default_model: Some("model-a".to_string()),
+                    small_model: None,
+                    large_model: None,
+                    configured_models: vec![vibex_core::ProviderConfiguredModel {
+                        id: "model-a".to_string(),
+                        display_name: None,
+                        enabled: true,
+                        wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions),
+                        capabilities: Default::default(),
+                    }],
+                    reasoning_effort: None,
+                    sandbox_defaults: None,
+                    network_defaults: None,
+                    permission_defaults: None,
+                    provider_options: None,
+                    secret_references: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let legacy = service.get_acp_profile_config(created.id.clone()).unwrap();
+        let launch = service
+            .get_acp_profile_config_for_launch(created.id.clone())
+            .unwrap();
+
+        // Everything a session needs must survive the v2 round trip: a launch that
+        // lost the catalogue would come back with no models to offer.
+        assert_eq!(launch.command, legacy.command);
+        assert_eq!(launch.args, legacy.args);
+        assert_eq!(launch.models, legacy.models);
+        assert_eq!(launch.modes, legacy.modes);
+        assert_eq!(launch.features, legacy.features);
+        assert_eq!(launch.disabled_tools, legacy.disabled_tools);
+        assert_eq!(launch.process_strategy, legacy.process_strategy);
+        assert_eq!(launch.terminal_tools, legacy.terminal_tools);
 
         std::fs::remove_dir_all(&dir).ok();
     }

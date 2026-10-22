@@ -269,7 +269,8 @@ impl AgentRuntimeProfileRepository {
                 version_identity_json, command, args_json,
                 safe_env_references_json, cwd_template, process_strategy,
                 runtime_home_strategy, host_capabilities_json,
-                resource_policy_json, revision, created_at_ms, updated_at_ms,
+                resource_policy_json, models_json, modes_json, features_json,
+                disabled_tools_json, revision, created_at_ms, updated_at_ms,
                 deleted_at_ms
             FROM agent_runtime_profiles
             WHERE agent_runtime_profile_id = ?1 AND deleted_at_ms IS NULL
@@ -294,7 +295,8 @@ impl AgentRuntimeProfileRepository {
                 version_identity_json, command, args_json,
                 safe_env_references_json, cwd_template, process_strategy,
                 runtime_home_strategy, host_capabilities_json,
-                resource_policy_json, revision, created_at_ms, updated_at_ms,
+                resource_policy_json, models_json, modes_json, features_json,
+                disabled_tools_json, revision, created_at_ms, updated_at_ms,
                 deleted_at_ms
             FROM agent_runtime_profiles
             WHERE legacy_provider_profile_id = ?1
@@ -320,7 +322,8 @@ impl AgentRuntimeProfileRepository {
                     version_identity_json, command, args_json,
                     safe_env_references_json, cwd_template, process_strategy,
                     runtime_home_strategy, host_capabilities_json,
-                    resource_policy_json, revision, created_at_ms, updated_at_ms,
+                    resource_policy_json, models_json, modes_json, features_json,
+                    disabled_tools_json, revision, created_at_ms, updated_at_ms,
                     deleted_at_ms
                 FROM agent_runtime_profiles
                 WHERE agent_id = ?1 AND deleted_at_ms IS NULL
@@ -365,9 +368,13 @@ impl AgentRuntimeProfileRepository {
                     runtime_home_strategy = ?11,
                     host_capabilities_json = ?12,
                     resource_policy_json = ?13,
-                    revision = ?14,
-                    updated_at_ms = ?15,
-                    deleted_at_ms = ?16
+                    models_json = ?14,
+                    modes_json = ?15,
+                    features_json = ?16,
+                    disabled_tools_json = ?17,
+                    revision = ?18,
+                    updated_at_ms = ?19,
+                    deleted_at_ms = ?20
                 WHERE agent_runtime_profile_id = ?1
                     AND revision = ?2
                     AND deleted_at_ms IS NULL
@@ -386,6 +393,10 @@ impl AgentRuntimeProfileRepository {
                     enum_to_db(&profile.runtime_home_strategy)?,
                     json_to_db(&profile.host_capabilities)?,
                     json_to_db(&profile.resource_policy)?,
+                    json_to_db(&profile.models)?,
+                    json_to_db(&profile.modes)?,
+                    json_to_db(&profile.features)?,
+                    json_to_db(&profile.disabled_tools)?,
                     profile.revision,
                     profile.updated_at_ms,
                     profile.deleted_at_ms,
@@ -1072,8 +1083,10 @@ fn insert_agent_runtime_profile(
             adapter_id, version_identity_json, command, args_json,
             safe_env_references_json, cwd_template, process_strategy,
             runtime_home_strategy, host_capabilities_json, resource_policy_json,
+            models_json, modes_json, features_json, disabled_tools_json,
             revision, created_at_ms, updated_at_ms, deleted_at_ms
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                  ?16, ?17, ?18, ?19, ?20, ?21)
         ",
         params![
             profile.id.as_str(),
@@ -1092,6 +1105,10 @@ fn insert_agent_runtime_profile(
             enum_to_db(&profile.runtime_home_strategy)?,
             json_to_db(&profile.host_capabilities)?,
             json_to_db(&profile.resource_policy)?,
+            json_to_db(&profile.models)?,
+            json_to_db(&profile.modes)?,
+            json_to_db(&profile.features)?,
+            json_to_db(&profile.disabled_tools)?,
             profile.revision,
             profile.created_at_ms,
             profile.updated_at_ms,
@@ -1239,10 +1256,14 @@ fn map_agent_runtime_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentR
         runtime_home_strategy: enum_from_db_sql(row.get(8)?)?,
         host_capabilities: json_from_db_sql(row.get(9)?)?,
         resource_policy: json_from_db_sql(row.get(10)?)?,
-        revision: row.get(11)?,
-        created_at_ms: row.get(12)?,
-        updated_at_ms: row.get(13)?,
-        deleted_at_ms: row.get(14)?,
+        models: json_from_db_sql(row.get(11)?)?,
+        modes: json_from_db_sql(row.get(12)?)?,
+        features: json_from_db_sql(row.get(13)?)?,
+        disabled_tools: json_from_db_sql(row.get(14)?)?,
+        revision: row.get(15)?,
+        created_at_ms: row.get(16)?,
+        updated_at_ms: row.get(17)?,
+        deleted_at_ms: row.get(18)?,
     })
 }
 
@@ -1443,6 +1464,10 @@ fn map_legacy_projection_records(
         process_strategy,
         terminal,
         terminal_auth,
+        acp_models,
+        acp_modes,
+        acp_features,
+        acp_disabled_tools,
     ) = acp_config.map_or_else(
         || {
             (
@@ -1453,6 +1478,10 @@ fn map_legacy_projection_records(
                 AcpProcessStrategy::PerSession,
                 false,
                 false,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
             )
         },
         |config| {
@@ -1464,6 +1493,10 @@ fn map_legacy_projection_records(
                 config.process_strategy,
                 config.terminal_tools,
                 config.terminal_auth,
+                config.models,
+                config.modes,
+                config.features,
+                config.disabled_tools,
             )
         },
     );
@@ -1491,6 +1524,13 @@ fn map_legacy_projection_records(
             network: legacy.network_defaults.clone(),
             permissions: legacy.permission_defaults.clone(),
         },
+        // The ACP catalogue the legacy row keeps inside its serialised config.
+        // Carrying it across is what lets a launch read this row instead of the
+        // legacy one.
+        models: acp_models,
+        modes: acp_modes,
+        features: acp_features,
+        disabled_tools: acp_disabled_tools,
         revision: 1,
         created_at_ms: legacy.created_at_ms.max(1),
         updated_at_ms: now,
@@ -1858,6 +1898,13 @@ fn same_agent_runtime_content(left: &AgentRuntimeProfile, right: &AgentRuntimePr
         && left.runtime_home_strategy == right.runtime_home_strategy
         && left.host_capabilities == right.host_capabilities
         && left.resource_policy == right.resource_policy
+        // The ACP catalogue is part of the launch contract: a Profile that gains or
+        // loses a model must be written, or the runtime keeps launching with the
+        // catalogue it saw first — which is exactly what a stale `models` list did.
+        && left.models == right.models
+        && left.modes == right.modes
+        && left.features == right.features
+        && left.disabled_tools == right.disabled_tools
         && left.deleted_at_ms == right.deleted_at_ms
 }
 

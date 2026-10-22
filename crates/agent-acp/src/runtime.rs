@@ -11337,7 +11337,7 @@ impl AcpRuntimeClient {
             .provider_profile_id()
             .and_then(|profile_id| {
                 self.config_service
-                    .get_acp_profile_config(profile_id.clone())
+                    .get_acp_profile_config_for_launch(profile_id.clone())
                     .ok()
             })
             .map(|config| config.models)
@@ -11938,7 +11938,7 @@ impl AcpRuntimeClient {
         profile_id: &ProviderProfileId,
     ) -> VibexResult<AcpProviderConfig> {
         self.config_service
-            .get_acp_profile_config(profile_id.clone())
+            .get_acp_profile_config_for_launch(profile_id.clone())
             .map_err(|err| {
                 err.with_recovery_hint(
                     "Create or select an ACP provider profile with a typed command in the config center before starting ACP sessions.",
@@ -15213,7 +15213,7 @@ impl AcpRuntimeClient {
                 }
                 let config = self
                     .config_service
-                    .get_acp_profile_config(profile.id.clone())?;
+                    .get_acp_profile_config_for_launch(profile.id.clone())?;
                 let profile = self
                     .config_service
                     .get_profile(&provider_profile_id)?
@@ -27096,7 +27096,7 @@ for line in sys.stdin:
         ) -> ProviderProfileId {
             let service = self.service();
             let config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             service
                 .create_acp_profile(vibex_core::AcpProviderProfileCreateRequest {
@@ -27127,7 +27127,7 @@ for line in sys.stdin:
                 .store(safe, std::sync::atomic::Ordering::SeqCst);
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             config.process_strategy = AcpProcessStrategy::PerProfilePool;
             if !config
@@ -27148,7 +27148,7 @@ for line in sys.stdin:
         fn push_profile_env(&self, key: &str, value: &str) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             config.env.push(vibex_core::AcpProviderEnvReference {
                 key: key.to_string(),
@@ -27168,7 +27168,7 @@ for line in sys.stdin:
         fn force_model_config_option_fallback(&self) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             config.env.push(vibex_core::AcpProviderEnvReference {
                 key: "VIBEX_MOCK_ACP_SET_MODEL_MODE".to_string(),
@@ -27188,7 +27188,7 @@ for line in sys.stdin:
         fn set_model_failure_mode(&self, mode: &str) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             config.env.push(vibex_core::AcpProviderEnvReference {
                 key: "VIBEX_MOCK_ACP_SET_MODEL_MODE".to_string(),
@@ -27211,7 +27211,7 @@ for line in sys.stdin:
         fn enable_post_session_config_update(&self) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             config.env.push(vibex_core::AcpProviderEnvReference {
                 key: "VIBEX_MOCK_ACP_POST_SESSION_CONFIG_UPDATE".to_string(),
@@ -27231,7 +27231,7 @@ for line in sys.stdin:
         fn enable_model_config_updates(&self) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             config.env.push(vibex_core::AcpProviderEnvReference {
                 key: "VIBEX_MOCK_ACP_MODEL_CONFIG_UPDATES".to_string(),
@@ -27254,7 +27254,7 @@ for line in sys.stdin:
         fn enable_effort_on_model_switch(&self) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             config.env.push(vibex_core::AcpProviderEnvReference {
                 key: "VIBEX_MOCK_ACP_EFFORT_ON_MODEL_SWITCH".to_string(),
@@ -27274,7 +27274,7 @@ for line in sys.stdin:
         fn enable_mode_config_update(&self) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             config.env.push(vibex_core::AcpProviderEnvReference {
                 key: "VIBEX_MOCK_ACP_MODE_CONFIG_UPDATE".to_string(),
@@ -27294,7 +27294,7 @@ for line in sys.stdin:
         fn set_model_prefix(&self, prefix: &str) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             config.env.push(vibex_core::AcpProviderEnvReference {
                 key: "VIBEX_MOCK_ACP_MODEL_PREFIX".to_string(),
@@ -27314,7 +27314,7 @@ for line in sys.stdin:
         fn use_verified_opencode_projection(&self) {
             let service = self.service();
             let config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             let conn = open_database(&self.db_path).unwrap();
             persist_managed_runtime(
@@ -27342,7 +27342,7 @@ for line in sys.stdin:
         fn set_advertise_inclusive_fork(&self) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             if config
                 .env
@@ -27371,7 +27371,7 @@ for line in sys.stdin:
         fn set_advertise_fork(&self) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             if config
                 .env
@@ -27400,7 +27400,7 @@ for line in sys.stdin:
         fn set_advertise_steering(&self) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             if config
                 .env
@@ -27429,7 +27429,7 @@ for line in sys.stdin:
         fn set_advertise_goal(&self) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             if config
                 .env
@@ -27460,7 +27460,7 @@ for line in sys.stdin:
             }
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             if !config
                 .env
@@ -27498,7 +27498,7 @@ for line in sys.stdin:
         fn enable_auth_methods(&self) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             config.env.push(vibex_core::AcpProviderEnvReference {
                 key: "VIBEX_MOCK_ACP_ADVERTISE_LOGIN".to_string(),
@@ -27521,7 +27521,7 @@ for line in sys.stdin:
         fn enable_terminal_auth_gated_login(&self) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             config.env.push(vibex_core::AcpProviderEnvReference {
                 key: "VIBEX_MOCK_TERMINAL_LOGIN_GATED".to_string(),
@@ -27541,7 +27541,7 @@ for line in sys.stdin:
         fn set_authentication_hang(&self, hang: bool) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             config
                 .env
@@ -27564,7 +27564,7 @@ for line in sys.stdin:
         fn configure_known_auth_fallback(&self, acp_mode: &str, initialize_mode: &str) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             config.args.push(acp_mode.to_string());
             config.env.push(vibex_core::AcpProviderEnvReference {
@@ -27585,7 +27585,7 @@ for line in sys.stdin:
         fn set_session_new_delay(&self, delay_seconds: &str) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             config.env.push(vibex_core::AcpProviderEnvReference {
                 key: "VIBEX_MOCK_ACP_SESSION_NEW_DELAY".to_string(),
@@ -27605,7 +27605,7 @@ for line in sys.stdin:
         fn fail_first_session_new(&self) {
             let service = self.service();
             let mut config = service
-                .get_acp_profile_config(self.profile_id.clone())
+                .get_acp_profile_config_for_launch(self.profile_id.clone())
                 .unwrap();
             config.env.push(vibex_core::AcpProviderEnvReference {
                 key: "VIBEX_MOCK_ACP_FAIL_FIRST_SESSION_NEW".to_string(),
@@ -28361,7 +28361,7 @@ for line in sys.stdin:
     fn configure_mock_default_agent_runtime(fixture: &MockAcpFixture, agent_id: &AgentId) {
         let service = fixture.service();
         let profile_config = service
-            .get_acp_profile_config(fixture.profile_id.clone())
+            .get_acp_profile_config_for_launch(fixture.profile_id.clone())
             .unwrap();
         let env = profile_config
             .env
@@ -28481,7 +28481,7 @@ for line in sys.stdin:
             })
             .unwrap();
         let mut config = service
-            .get_acp_profile_config(fixture.profile_id.clone())
+            .get_acp_profile_config_for_launch(fixture.profile_id.clone())
             .unwrap();
         config.models = vec!["mock/model-1".to_string(), "mock/model-2".to_string()];
         config.modes = vec!["build".to_string(), "review".to_string()];
@@ -31935,7 +31935,7 @@ for line in sys.stdin:
                 preset_id: None,
                 config: Some(
                     service
-                        .get_acp_profile_config(fixture.fixture.profile_id.clone())
+                        .get_acp_profile_config_for_launch(fixture.fixture.profile_id.clone())
                         .unwrap(),
                 ),
             })
@@ -32751,7 +32751,7 @@ for line in sys.stdin:
         };
         let service = fixture.service();
         let mut config = service
-            .get_acp_profile_config(fixture.profile_id.clone())
+            .get_acp_profile_config_for_launch(fixture.profile_id.clone())
             .unwrap();
         config.env.push(vibex_core::AcpProviderEnvReference {
             key: "ANTHROPIC_MODEL".to_string(),
@@ -33438,7 +33438,7 @@ for line in sys.stdin:
         };
         let service = fixture.service();
         let mut config = service
-            .get_acp_profile_config(fixture.profile_id.clone())
+            .get_acp_profile_config_for_launch(fixture.profile_id.clone())
             .unwrap();
         config.models = vec!["mock/model-1".to_string(), "mock/model-2".to_string()];
         let conn = open_database(&fixture.db_path).unwrap();
@@ -37455,7 +37455,7 @@ for line in sys.stdin:
         };
         let service = fixture.service();
         let mut config = service
-            .get_acp_profile_config(fixture.profile_id.clone())
+            .get_acp_profile_config_for_launch(fixture.profile_id.clone())
             .unwrap();
         config.terminal_tools = true;
         service
@@ -37555,7 +37555,7 @@ for line in sys.stdin:
         };
         let service = fixture.service();
         let mut config = service
-            .get_acp_profile_config(fixture.profile_id.clone())
+            .get_acp_profile_config_for_launch(fixture.profile_id.clone())
             .unwrap();
         config.terminal_tools = true;
         service
@@ -37896,7 +37896,7 @@ for line in sys.stdin:
         };
         let service = fixture.service();
         let mut config = service
-            .get_acp_profile_config(fixture.profile_id.clone())
+            .get_acp_profile_config_for_launch(fixture.profile_id.clone())
             .unwrap();
         config.models = vec!["claude-opus-5[1m]".to_string()];
         service
@@ -37933,7 +37933,7 @@ for line in sys.stdin:
         };
         let service = fixture.service();
         let mut config = service
-            .get_acp_profile_config(fixture.profile_id.clone())
+            .get_acp_profile_config_for_launch(fixture.profile_id.clone())
             .unwrap();
         config.models = vec!["mock/model-1".to_string(), "mock/model-2".to_string()];
         let conn = open_database(&fixture.db_path).unwrap();
@@ -38038,7 +38038,7 @@ for line in sys.stdin:
         };
         let service = ProviderConfigService::new(fixture.db_path.clone());
         let mut config = service
-            .get_acp_profile_config(fixture.profile_id.clone())
+            .get_acp_profile_config_for_launch(fixture.profile_id.clone())
             .unwrap();
         config.models = vec!["mock/model-1".to_string(), "configured-only".to_string()];
         service
@@ -38228,7 +38228,7 @@ for line in sys.stdin:
 
         let service = ProviderConfigService::new(fixture.db_path.clone());
         let mut config = service
-            .get_acp_profile_config(fixture.profile_id.clone())
+            .get_acp_profile_config_for_launch(fixture.profile_id.clone())
             .unwrap();
         config.models = vec!["mock/model-1".to_string()];
         config.modes = vec!["build".to_string()];
