@@ -1911,6 +1911,27 @@ impl ProviderConfigService {
                     value: endpoint.url.clone(),
                 });
         }
+        // The ACP runtime config this Agent launches with, exactly as the Agent
+        // page's own create path inherits it. Without it the row has no ACP
+        // configuration at all, and launching fails at `acp_config_missing` — the
+        // Provider shows up, is selectable, and cannot start a session.
+        let configured_acp_models = configured_acp_model_ids(
+            &shared
+                .configured_models
+                .iter()
+                .map(|model| ProviderConfiguredModel {
+                    id: model.id.clone(),
+                    display_name: model.display_name.clone(),
+                    enabled: model.enabled,
+                    wire_api,
+                    capabilities: model.capabilities.clone(),
+                })
+                .collect::<Vec<_>>(),
+            shared.default_model_id.as_deref(),
+        );
+        let provider_options =
+            inherit_agent_acp_runtime_options(conn, agent_id, Some(provider_options))?;
+        let provider_options = with_acp_configured_models(provider_options, configured_acp_models)?;
         let now = unix_timestamp_ms().max(1);
         let id = ProviderProfileId::new();
         let models = shared

@@ -9172,3 +9172,169 @@ mod agent_page_provider_kind_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod bound_provider_usability_tests {
+    use super::*;
+
+    /// A bound Provider is launchable, like one added on the Agent page.
+    ///
+    /// The report: the same address, key and models work when added on the Agent
+    /// page and fail when enabled from the Providers page. The difference is the
+    /// ACP runtime config — the Agent page inherits it, and binding did not, so the
+    /// row had no ACP configuration and launching stopped at
+    /// `acp_config_missing`.
+    #[test]
+    fn a_bound_provider_can_be_launched() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-bound-launch-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+        let agent_id = vibex_core::AgentId::parse("opencode").unwrap();
+
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Design".to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://api.example.com/v1".to_string(),
+                    wire_protocol_id: Some(
+                        vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    ),
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "design-model".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    capabilities: Default::default(),
+                    metadata: Default::default(),
+                }],
+                default_model_id: Some("design-model".to_string()),
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        let bound = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_provider_profile_id: Some(shared.id.clone()),
+                agent_id: agent_id.clone(),
+                make_default: false,
+            })
+            .unwrap();
+
+        // The call the runtime makes when starting a session. It fails with
+        // `acp_config_missing` when the row has no ACP configuration.
+        let config = service
+            .get_acp_profile_config(bound.id.clone())
+            .expect("a bound Provider must carry the ACP config a session launches with");
+        assert!(
+            !config.command.trim().is_empty(),
+            "the ACP config must name a command, or the runtime has nothing to spawn"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Binding leaves the row as usable as creating it by hand does.
+    #[test]
+    fn a_bound_provider_matches_a_hand_added_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-bound-parity-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+        let agent_id = vibex_core::AgentId::parse("opencode").unwrap();
+
+        // The hand-added one, which works.
+        let manual = service
+            .create_agent_model_provider_profile(
+                vibex_core::AgentModelProviderProfileCreateRequest {
+                    agent_id: agent_id.clone(),
+                    display_name: "Design-2".to_string(),
+                    account_alias: None,
+                    base_url: Some("https://api.example.com/v1".to_string()),
+                    default_model: Some("design-model".to_string()),
+                    small_model: None,
+                    large_model: None,
+                    configured_models: vec![vibex_core::ProviderConfiguredModel {
+                        id: "design-model".to_string(),
+                        display_name: None,
+                        enabled: true,
+                        wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions),
+                        capabilities: Default::default(),
+                    }],
+                    reasoning_effort: None,
+                    sandbox_defaults: None,
+                    network_defaults: None,
+                    permission_defaults: None,
+                    provider_options: None,
+                    secret_references: Vec::new(),
+                },
+            )
+            .unwrap();
+        let manual_config = service
+            .get_acp_profile_config(manual.id.clone())
+            .expect("the hand-added Provider is the working reference");
+
+        // The bound one, which failed.
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Design".to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://api.example.com/v1".to_string(),
+                    wire_protocol_id: Some(
+                        vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    ),
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "design-model".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    capabilities: Default::default(),
+                    metadata: Default::default(),
+                }],
+                default_model_id: Some("design-model".to_string()),
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+        let bound = service
+            .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+                model_provider_profile_id: Some(shared.id.clone()),
+                agent_id,
+                make_default: false,
+            })
+            .unwrap();
+        let bound_config = service
+            .get_acp_profile_config(bound.id.clone())
+            .expect("the bound Provider must carry ACP config too");
+
+        assert_eq!(
+            bound_config.command, manual_config.command,
+            "both entry points must launch the same ACP command"
+        );
+        assert_eq!(
+            bound_config.args, manual_config.args,
+            "and the same arguments"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
