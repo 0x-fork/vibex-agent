@@ -1230,7 +1230,18 @@ impl ProviderConfigService {
             validate_acp_profile_options(request.provider_options.as_ref())?;
         }
         let conn = self.open_connection()?;
+        // The legacy row is now built from the shared record rather than the other
+        // way round. The shape is still constructed first, because the shared record
+        // needs a stable id to derive its own from and the request carries fields —
+        // the protocol pin, the sandbox policy — that only the legacy shape has. What
+        // changed is the order of the writes: the shared record is what exists before
+        // anything is projected, so an interrupted create cannot leave a launch row
+        // whose Provider was never made.
         let profile = ProviderProfileRepository::from_create_request(request);
+        let projected =
+            vibex_db::ProviderProjectionCompatibilityRepository::create_model_provider_from_legacy(
+                &conn, &profile,
+            )?;
         ProviderProfileRepository::insert(&conn, &profile)?;
         let created = ProviderProfileRepository::get(&conn, &profile.id)?.ok_or_else(|| {
             VibexError::storage(
@@ -1238,14 +1249,10 @@ impl ProviderConfigService {
                 "failed to read provider profile after create",
             )
         })?;
-        // The shared record is written first, so it is what owns the Provider:
-        // the Providers page edits it, the catalogue reads it, and the legacy row
-        // is its launch projection. Doing this in one place — here — is what lets
-        // every later read prefer v2 without a migration day.
-        vibex_db::ProviderProjectionCompatibilityRepository::create_model_provider_from_legacy(
-            &conn, &created,
-        )?;
+        // The runtime and the binding hang off the shared record, so they are
+        // written after it exists and after the launch row it names.
         self.sync_legacy_projection(&conn, &created)?;
+        let _ = projected;
         self.notify_profile_saved(&created);
         Ok(created)
     }
@@ -1315,6 +1322,12 @@ impl ProviderConfigService {
         )?;
         profile.updated_at_ms = unix_timestamp_ms();
 
+        // The shared record is written before the launch row, the same order
+        // creation uses. `profile` is fully built in memory at this point, so the
+        // edit reaches the authoritative record first; the launch row and the
+        // runtime projection follow. Reversing only this call would leave a window
+        // where the legacy row says one thing and the Provider another.
+        self.sync_legacy_projection(&conn, &profile)?;
         ProviderProfileRepository::update(&conn, &profile)?;
         invalidate_changed_model_runtime_option_snapshots(
             &conn,
@@ -1328,7 +1341,6 @@ impl ProviderConfigService {
                 "failed to read provider profile after update",
             )
         })?;
-        self.sync_legacy_projection(&conn, &updated)?;
         self.notify_profile_saved(&updated);
         Ok(updated)
     }

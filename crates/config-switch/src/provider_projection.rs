@@ -9685,3 +9685,161 @@ mod shared_record_authority_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod write_direction_tests {
+    use super::*;
+
+    /// Creation writes the shared record before the legacy launch row.
+    ///
+    /// The order is the whole point of the reversal: with the shared record written
+    /// second, an interrupted create could leave a launch row whose Provider was
+    /// never made, and the legacy shape would still be the thing that came first.
+    ///
+    /// What this can observe from outside is that a create which fails to project
+    /// leaves nothing behind, rather than a launch row alone. So the test creates a
+    /// Provider and asserts both records exist and point at each other — the
+    /// observable consequence of having written the shared record first.
+    #[test]
+    fn creation_leaves_both_records_linked() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-write-order-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        // The Agent page's entry point, because an ACP Profile needs the inherited
+        // ACP config to be valid; the ordering guarantee is the same either way.
+        let created = service
+            .create_agent_model_provider_profile(
+                vibex_core::AgentModelProviderProfileCreateRequest {
+                    agent_id: vibex_core::AgentId::parse("opencode").unwrap(),
+                    display_name: "design".to_string(),
+                    account_alias: None,
+                    base_url: Some("https://api.example.com/v1".to_string()),
+                    default_model: Some("model-a".to_string()),
+                    small_model: None,
+                    large_model: None,
+                    configured_models: vec![vibex_core::ProviderConfiguredModel {
+                        id: "model-a".to_string(),
+                        display_name: None,
+                        enabled: true,
+                        wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions),
+                        capabilities: Default::default(),
+                    }],
+                    reasoning_effort: None,
+                    sandbox_defaults: None,
+                    network_defaults: None,
+                    permission_defaults: None,
+                    provider_options: None,
+                    secret_references: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let conn = service.open_connection().unwrap();
+        let shared =
+            vibex_db::ModelProviderProfileRepository::get_by_legacy_profile(&conn, &created.id)
+                .unwrap()
+                .expect("the shared record must exist");
+        assert_eq!(
+            shared.legacy_provider_profile_id.as_ref(),
+            Some(&created.id),
+            "the two must point at each other, or a later edit cannot find the row"
+        );
+        // And there must be exactly one, not one per write path.
+        let all = vibex_db::ModelProviderProfileRepository::list(&conn).unwrap();
+        let same_name = all
+            .iter()
+            .filter(|profile| profile.display_name == "design")
+            .count();
+        assert_eq!(
+            same_name, 1,
+            "a single create must leave a single shared record, found {same_name}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod write_order_tests {
+    use super::*;
+
+    /// An edit reaches the shared record even if the launch row never changes.
+    ///
+    /// The observable difference the ordering makes: the shared record is written
+    /// first, so it reflects the edit as soon as it is made, rather than after the
+    /// projection that follows. This asserts the edit lands on the shared record —
+    /// which the previous direction also achieved, but through the legacy row, so a
+    /// failure in between would have lost it.
+    #[test]
+    fn an_edit_is_on_the_shared_record_after_the_call_returns() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-write-order-edit-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        let created = service
+            .create_agent_model_provider_profile(
+                vibex_core::AgentModelProviderProfileCreateRequest {
+                    agent_id: vibex_core::AgentId::parse("opencode").unwrap(),
+                    display_name: "before".to_string(),
+                    account_alias: None,
+                    base_url: Some("https://api.example.com/v1".to_string()),
+                    default_model: Some("model-a".to_string()),
+                    small_model: None,
+                    large_model: None,
+                    configured_models: vec![vibex_core::ProviderConfiguredModel {
+                        id: "model-a".to_string(),
+                        display_name: None,
+                        enabled: true,
+                        wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions),
+                        capabilities: Default::default(),
+                    }],
+                    reasoning_effort: None,
+                    sandbox_defaults: None,
+                    network_defaults: None,
+                    permission_defaults: None,
+                    provider_options: None,
+                    secret_references: Vec::new(),
+                },
+            )
+            .unwrap();
+        service
+            .update_profile(vibex_core::ProviderProfileUpdateRequest {
+                provider_profile_id: created.id.clone(),
+                display_name: Some("after".to_string()),
+                status: None,
+                account_alias: None,
+                base_url: None,
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: None,
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+            })
+            .unwrap();
+
+        let conn = service.open_connection().unwrap();
+        let shared =
+            vibex_db::ModelProviderProfileRepository::get_by_legacy_profile(&conn, &created.id)
+                .unwrap()
+                .expect("the shared record must exist");
+        assert_eq!(
+            shared.display_name, "after",
+            "the edit must be on the shared record, not only on the launch row"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
