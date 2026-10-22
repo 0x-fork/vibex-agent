@@ -620,6 +620,41 @@ fn replace_yaml_scalar(value: &mut serde_yaml::Value, marker: &str, replacement:
 }
 
 impl ProviderConfigService {
+    /// The shared Providers a reader created, without the machinery.
+    ///
+    /// The store holds three kinds of row that are not Providers anyone added:
+    /// a per-kind `local default`占位, an `XXX ACP` launch config per Agent, and
+    /// the gateway's own hidden Profile. They have to exist — the ACP runtime
+    /// launches through the second, and the third is the gateway itself — but they
+    /// are not what the Providers page is listing, and showing them made the page
+    /// look like it contained Suppliers the reader never created.
+    ///
+    /// The legacy list has filtered these since it was written
+    /// (`visible_model_provider_profiles`). This is the same filter for the shared
+    /// side, which the v2 migration left out.
+    pub fn list_visible_model_provider_profiles(&self) -> VibexResult<Vec<ModelProviderProfile>> {
+        let conn = self.open_connection()?;
+        let profiles = ModelProviderProfileRepository::list(&conn)?;
+        let legacy_ids = vibex_db::ProviderProfileRepository::list_all(&conn)?
+            .into_iter()
+            .map(|profile| (profile.id.clone(), profile))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        Ok(profiles
+            .into_iter()
+            .filter(|profile| {
+                // The rules live on the legacy row: the shared shape has no place
+                // for the role marker, and the local-default and ACP-scaffold
+                // identifiers are legacy ids. A shared record that projects from
+                // one of those is machinery too.
+                profile
+                    .legacy_provider_profile_id
+                    .as_ref()
+                    .and_then(|id| legacy_ids.get(id))
+                    .is_none_or(|legacy| !crate::is_internal_profile_for_listing(legacy))
+            })
+            .collect())
+    }
+
     pub fn list_model_provider_profiles(&self) -> VibexResult<Vec<ModelProviderProfile>> {
         let conn = self.open_connection()?;
         ModelProviderProfileRepository::list(&conn)
@@ -9334,6 +9369,89 @@ mod bound_provider_usability_tests {
             bound_config.args, manual_config.args,
             "and the same arguments"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod visible_shared_provider_tests {
+    use super::*;
+
+    /// The page's list omits the machinery the store has to hold.
+    ///
+    /// Three kinds of row are not Suppliers anyone added: the per-kind local
+    /// defaults, the per-Agent `XXX ACP` launch configs, and the gateway's own
+    /// hidden Profile. They have to exist — the ACP runtime launches through the
+    /// second — but drawing them made the Providers page look like it contained
+    /// entries nobody created.
+    #[test]
+    fn the_page_list_hides_scaffolding_and_keeps_real_providers() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-visible-list-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+        let agent_id = vibex_core::AgentId::parse("opencode").unwrap();
+
+        // A real Provider, added the way a reader adds one.
+        service
+            .create_agent_model_provider_profile(
+                vibex_core::AgentModelProviderProfileCreateRequest {
+                    agent_id: agent_id.clone(),
+                    display_name: "design".to_string(),
+                    account_alias: None,
+                    base_url: Some("https://api.example.com/v1".to_string()),
+                    default_model: Some("design-model".to_string()),
+                    small_model: None,
+                    large_model: None,
+                    configured_models: vec![vibex_core::ProviderConfiguredModel {
+                        id: "design-model".to_string(),
+                        display_name: None,
+                        enabled: true,
+                        wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions),
+                        capabilities: Default::default(),
+                    }],
+                    reasoning_effort: None,
+                    sandbox_defaults: None,
+                    network_defaults: None,
+                    permission_defaults: None,
+                    provider_options: None,
+                    secret_references: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        // The scaffolding the agent bootstrap created alongside it.
+        let every = service.list_model_provider_profiles().unwrap();
+        let visible = service.list_visible_model_provider_profiles().unwrap();
+
+        assert!(
+            every.len() > visible.len(),
+            "the store must hold more rows than the page shows: every {}, visible {}",
+            every.len(),
+            visible.len()
+        );
+        assert!(
+            visible
+                .iter()
+                .any(|profile| profile.display_name == "design"),
+            "the Provider the reader added must survive the filter"
+        );
+        for hidden in ["local default", "ACP"] {
+            assert!(
+                visible
+                    .iter()
+                    .all(|profile| !profile.display_name.contains(hidden)),
+                "{hidden} entries must not reach the page: {:?}",
+                visible
+                    .iter()
+                    .map(|profile| profile.display_name.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -2806,7 +2806,12 @@ impl ManagementBackend for NativeBackend {
                 .management()
                 .providers()
                 .management()
-                .list_model_provider_profiles()
+                // The page lists Providers a reader created. The store also holds
+                // the per-kind local defaults, the per-Agent ACP launch configs and
+                // the gateway's own Profile; they must exist but are not Suppliers,
+                // and drawing them made the page look like it contained entries
+                // nobody added.
+                .list_visible_model_provider_profiles()
                 .map_err(Into::into)
         })
     }

@@ -137,6 +137,13 @@ impl ProviderManagementFacade {
         self.service.list_all_agent_model_route_bindings()
     }
 
+    /// The shared Providers a reader created, without the machinery.
+    pub fn list_visible_model_provider_profiles(
+        &self,
+    ) -> VibexResult<Vec<vibex_core::ModelProviderProfile>> {
+        self.service.list_visible_model_provider_profiles()
+    }
+
     /// Deletes a shared Provider and the bindings that point at it.
     pub fn delete_model_provider_profile(
         &self,

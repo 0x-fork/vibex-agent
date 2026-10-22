@@ -8545,6 +8545,19 @@ fn visible_model_provider_profiles(
         .collect())
 }
 
+/// Whether a Profile is machinery rather than something a reader added.
+///
+/// Used by the list filters on both shapes: the legacy list drops these, and the
+/// shared list asks the same question of the row each shared record projects from.
+pub(crate) fn is_internal_profile_for_listing(profile: &ProviderProfile) -> bool {
+    is_local_default_profile(&profile.id)
+        || matches!(
+            provider_option_value(&profile.provider_options, INTERNAL_PROFILE_ROLE_OPTION_KEY)
+                .as_deref(),
+            Some(INTERNAL_AGENT_RUNTIME_PROFILE_ROLE) | Some(GATEWAY_PROFILE_ROLE)
+        )
+}
+
 fn is_internal_provider_profile(conn: &vibex_db::DbConnection, profile: &ProviderProfile) -> bool {
     is_local_default_profile(&profile.id)
         || matches!(
