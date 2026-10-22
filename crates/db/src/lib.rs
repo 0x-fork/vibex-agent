@@ -95,7 +95,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 74;
+pub const CURRENT_SCHEMA_VERSION: i64 = 75;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1595,7 +1595,7 @@ const MIGRATIONS: &[Migration] = &[
                 agent_id TEXT NOT NULL,
                 agent_runtime_profile_id TEXT NOT NULL
                     REFERENCES agent_runtime_profiles(agent_runtime_profile_id),
-                model_provider_profile_id TEXT NOT NULL
+                model_provider_profile_id TEXT NULL
                     REFERENCES model_provider_profiles(model_provider_profile_id),
                 projection_descriptor_id TEXT NOT NULL,
                 projection_overrides_json TEXT NOT NULL,
@@ -12449,6 +12449,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_runtime_profile_acp_catalog(conn, &mut applied)?;
     apply_v2_authority_cutover(conn, &mut applied)?;
     apply_drop_local_default_placeholders(conn, &mut applied)?;
+    apply_binding_provider_optional(conn, &mut applied)?;
 
     // Seeding the per-kind placeholders used to happen here, before the backfill,
     // so a caller always had a Provider id to fall back on. They are gone: a missing
@@ -12461,6 +12462,132 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // route graph can show direct connections beside gateway ones.
     model_route::backfill_direct_routes(conn)?;
     Ok(applied)
+}
+
+/// Lets a binding name no Provider, and clears the ones that named a placeholder.
+///
+/// An Agent that authenticates as itself — `claude login`, a Codex subscription —
+/// has a launch command and no Provider endpoint. The column required one, so such
+/// an Agent got a placeholder Provider row with no address and no Key purely to
+/// satisfy it, and the Providers page drew those rows as Suppliers nobody added.
+///
+/// The launch path never read this column: it resolves the runtime Profile and the
+/// projection descriptor, which is what a session needs. Only the Provider views and
+/// the projection refresh looked at it, and both already handle a missing Provider
+/// after this change.
+///
+/// SQLite cannot drop a NOT NULL in place, so the table is rebuilt the way earlier
+/// migrations rebuilt it: foreign keys off outside the transaction, copy, drop,
+/// rename, restore the indexes.
+fn apply_binding_provider_optional(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 75;
+    const NAME: &str = "binding_provider_optional";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    conn.pragma_update(None, "foreign_keys", false)
+        .map_err(storage_err(
+            "migration_foreign_keys_disable_failed",
+            "failed to disable foreign keys for the binding provider rebuild",
+        ))?;
+    let migration_result = (|| -> VibexResult<()> {
+        let tx = conn.transaction().map_err(storage_err(
+            "migration_transaction_failed",
+            "failed to start the binding provider rebuild transaction",
+        ))?;
+        tx.execute_batch(
+            "
+            CREATE TABLE agent_model_provider_bindings_v75 (
+                agent_model_provider_binding_id TEXT PRIMARY KEY,
+                legacy_provider_profile_id TEXT NULL UNIQUE,
+                agent_id TEXT NOT NULL,
+                agent_runtime_profile_id TEXT NOT NULL
+                    REFERENCES agent_runtime_profiles(agent_runtime_profile_id),
+                model_provider_profile_id TEXT NULL
+                    REFERENCES model_provider_profiles(model_provider_profile_id),
+                projection_descriptor_id TEXT NOT NULL,
+                projection_overrides_json TEXT NOT NULL,
+                projection_fingerprint TEXT NULL,
+                status TEXT NOT NULL,
+                verification_json TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK(revision > 0),
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                deleted_at_ms INTEGER NULL,
+                account_alias TEXT NULL,
+                reasoning_effort TEXT NULL,
+                provider_options_json TEXT NOT NULL DEFAULT '{\"schemaVersion\":1,\"entries\":[]}'
+            );
+            INSERT INTO agent_model_provider_bindings_v75
+            SELECT * FROM agent_model_provider_bindings_v2;
+            DROP TABLE agent_model_provider_bindings_v2;
+            ALTER TABLE agent_model_provider_bindings_v75
+                RENAME TO agent_model_provider_bindings_v2;
+            ",
+        )
+        .map_err(storage_err(
+            "migration_binding_provider_rebuild_failed",
+            "failed to rebuild the binding table",
+        ))?;
+        // Only now can the value be cleared: the old table still required one. The
+        // placeholder Providers are the rows with neither an endpoint nor a
+        // credential — a real Provider has at least one, and nothing else does.
+        tx.execute(
+            "UPDATE agent_model_provider_bindings_v2
+             SET model_provider_profile_id = NULL
+             WHERE model_provider_profile_id IN (
+                 SELECT model_provider_profile_id FROM model_provider_profiles
+                 WHERE json_array_length(endpoints_json) = 0
+                   AND json_array_length(credentials_json) = 0)",
+            [],
+        )
+        .map_err(storage_err(
+            "binding_provider_clear_failed",
+            "failed to clear placeholder Providers from bindings",
+        ))?;
+        // With the bindings no longer naming them, the placeholder Providers are
+        // unreferenced. They were only ever there to satisfy the column, so they go
+        // — otherwise the Providers page would keep listing rows with no address and
+        // no Key that nothing can reach.
+        tx.execute(
+            "DELETE FROM model_provider_profiles
+             WHERE json_array_length(endpoints_json) = 0
+               AND json_array_length(credentials_json) = 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM agent_model_provider_bindings_v2 b
+                   WHERE b.model_provider_profile_id =
+                         model_provider_profiles.model_provider_profile_id)",
+            [],
+        )
+        .map_err(storage_err(
+            "provider_placeholder_delete_failed",
+            "failed to delete the unreferenced placeholder Providers",
+        ))?;
+        tx.commit().map_err(storage_err(
+            "migration_commit_failed",
+            "failed to commit the binding provider rebuild",
+        ))?;
+        Ok(())
+    })();
+    conn.pragma_update(None, "foreign_keys", true)
+        .map_err(storage_err(
+            "migration_foreign_keys_enable_failed",
+            "failed to re-enable foreign keys after the binding provider rebuild",
+        ))?;
+    migration_result?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the binding provider rebuild",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }
 
 /// Removes the per-kind `local default` placeholders.
@@ -18136,6 +18263,7 @@ mod tests {
                 "72:runtime_profile_acp_catalog",
                 "73:v2_authority_cutover",
                 "74:drop_local_default_placeholders",
+                "75:binding_provider_optional",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -18294,6 +18422,7 @@ mod tests {
                 "72:runtime_profile_acp_catalog",
                 "73:v2_authority_cutover",
                 "74:drop_local_default_placeholders",
+                "75:binding_provider_optional",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -18433,6 +18562,7 @@ mod tests {
                 "72:runtime_profile_acp_catalog",
                 "73:v2_authority_cutover",
                 "74:drop_local_default_placeholders",
+                "75:binding_provider_optional",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -18610,6 +18740,7 @@ mod tests {
                 "72:runtime_profile_acp_catalog",
                 "73:v2_authority_cutover",
                 "74:drop_local_default_placeholders",
+                "75:binding_provider_optional",
             ]
         );
         assert_eq!(
@@ -20047,6 +20178,7 @@ mod tests {
                 "72:runtime_profile_acp_catalog",
                 "73:v2_authority_cutover",
                 "74:drop_local_default_placeholders",
+                "75:binding_provider_optional",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

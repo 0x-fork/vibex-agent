@@ -848,8 +848,8 @@ pub fn backfill_direct_routes(conn: &Connection) -> VibexResult<usize> {
         if let Some(existing) =
             super::AgentModelProviderBindingRepository::get_by_legacy_profile(conn, &profile.id)?
             && (crate::migration_applied(conn, 73)?
-                || existing.model_provider_profile_id
-                    != super::legacy_model_provider_id(&profile.id)?)
+                || existing.model_provider_profile_id.as_ref()
+                    != Some(&super::legacy_model_provider_id(&profile.id)?))
         {
             continue;
         }

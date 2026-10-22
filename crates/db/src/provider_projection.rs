@@ -586,7 +586,10 @@ impl AgentModelProviderBindingRepository {
                     expected_revision,
                     binding.agent_id.as_str(),
                     binding.runtime_profile_id.as_str(),
-                    binding.model_provider_profile_id.as_str(),
+                    binding
+                        .model_provider_profile_id
+                        .as_ref()
+                        .map(ModelProviderProfileId::as_str),
                     binding.projection_descriptor_id.as_str(),
                     json_to_db(&binding.projection_overrides)?,
                     binding.projection_fingerprint,
@@ -687,7 +690,8 @@ impl ProviderProjectionCompatibilityRepository {
             // Providers page. Repair still happens for the ordinary case: a row
             // whose binding points at its own derived record.
             if let Some(existing) = before.as_ref()
-                && existing.model_provider_profile_id != legacy_model_provider_id(&profile.id)?
+                && existing.model_provider_profile_id.as_ref()
+                    != Some(&legacy_model_provider_id(&profile.id)?)
             {
                 continue;
             }
@@ -726,7 +730,7 @@ impl ProviderProjectionCompatibilityRepository {
         records.model_provider.id = shared_id.clone();
         let agent_runtime = upsert_legacy_agent_runtime(&transaction, records.agent_runtime)?;
         let mut binding = records.binding;
-        binding.model_provider_profile_id = shared_id.clone();
+        binding.model_provider_profile_id = Some(shared_id.clone());
         binding.runtime_profile_id = agent_runtime.id.clone();
         let binding = upsert_legacy_binding(&transaction, binding)?;
         transaction.commit().map_err(storage_err(
@@ -776,7 +780,7 @@ impl ProviderProjectionCompatibilityRepository {
             upsert_legacy_model_provider(&transaction, records.model_provider, explicit)?;
         let agent_runtime = upsert_legacy_agent_runtime(&transaction, records.agent_runtime)?;
         let mut binding = records.binding;
-        binding.model_provider_profile_id = model_provider.id.clone();
+        binding.model_provider_profile_id = Some(model_provider.id.clone());
         binding.runtime_profile_id = agent_runtime.id.clone();
         let binding = upsert_legacy_binding(&transaction, binding)?;
         transaction.commit().map_err(storage_err(
@@ -1169,7 +1173,10 @@ fn insert_agent_model_provider_binding(
                     .map(ProviderProfileId::as_str),
                 binding.agent_id.as_str(),
                 binding.runtime_profile_id.as_str(),
-                binding.model_provider_profile_id.as_str(),
+                binding
+                    .model_provider_profile_id
+                    .as_ref()
+                    .map(ModelProviderProfileId::as_str),
                 binding.projection_descriptor_id.as_str(),
                 json_to_db(&binding.projection_overrides)?,
                 binding.projection_fingerprint,
@@ -1301,7 +1308,11 @@ fn map_agent_model_provider_binding_without_models(
             .map_err(to_sql_decode_error)?,
         agent_id: AgentId::parse(row.get::<_, String>(2)?).map_err(to_sql_decode_error)?,
         runtime_profile_id: parse_id_sql(row.get(3)?, AgentRuntimeProfileId::parse)?,
-        model_provider_profile_id: parse_id_sql(row.get(4)?, ModelProviderProfileId::parse)?,
+        model_provider_profile_id: row
+            .get::<_, Option<String>>(4)?
+            .map(ModelProviderProfileId::parse)
+            .transpose()
+            .map_err(to_sql_decode_error)?,
         projection_descriptor_id: parse_id_sql(
             row.get(5)?,
             AgentProviderProjectionDescriptorId::parse,
@@ -1575,7 +1586,7 @@ fn map_legacy_projection_records(
         legacy_provider_profile_id: Some(legacy.id.clone()),
         agent_id: legacy.agent_id.clone(),
         runtime_profile_id,
-        model_provider_profile_id: model_provider_id,
+        model_provider_profile_id: Some(model_provider_id),
         projection_descriptor_id: resolution.descriptor.id.clone(),
         projection_overrides: AgentProviderProjectionOverrides::default(),
         configured_models,
@@ -1875,7 +1886,10 @@ fn update_binding_in_transaction(
                 expected_revision,
                 binding.agent_id.as_str(),
                 binding.runtime_profile_id.as_str(),
-                binding.model_provider_profile_id.as_str(),
+                binding
+                    .model_provider_profile_id
+                    .as_ref()
+                    .map(ModelProviderProfileId::as_str),
                 binding.projection_descriptor_id.as_str(),
                 json_to_db(&binding.projection_overrides)?,
                 binding.projection_fingerprint,
@@ -3202,7 +3216,7 @@ mod tests {
             legacy.id = ProviderProfileId::new();
             let mut records = map_legacy_projection_records(&conn, &legacy).unwrap();
             AgentRuntimeProfileRepository::insert(&conn, &records.agent_runtime).unwrap();
-            records.binding.model_provider_profile_id = shared.id.clone();
+            records.binding.model_provider_profile_id = Some(shared.id.clone());
             AgentModelProviderBindingRepository::insert(&conn, &records.binding).unwrap();
         }
 
@@ -3271,7 +3285,7 @@ mod tests {
             legacy.id = ProviderProfileId::new();
             let mut records = map_legacy_projection_records(&conn, &legacy).unwrap();
             AgentRuntimeProfileRepository::insert(&conn, &records.agent_runtime).unwrap();
-            records.binding.model_provider_profile_id = shared.id.clone();
+            records.binding.model_provider_profile_id = Some(shared.id.clone());
             AgentModelProviderBindingRepository::insert(&conn, &records.binding).unwrap();
             inserted.push(records.binding.agent_id.as_str().to_string());
         }

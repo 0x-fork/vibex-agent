@@ -720,7 +720,14 @@ pub struct AgentModelProviderBinding {
     pub legacy_provider_profile_id: Option<ProviderProfileId>,
     pub agent_id: AgentId,
     pub runtime_profile_id: AgentRuntimeProfileId,
-    pub model_provider_profile_id: ModelProviderProfileId,
+    /// The Provider this Agent sends to, when it has one.
+    ///
+    /// `None` is a real case, not a gap: an Agent that authenticates as itself —
+    /// `claude login`, a Codex subscription — has a launch command and no Provider
+    /// endpoint. The binding used to require a Provider, so such an Agent got a
+    /// placeholder row with no address and no Key purely to satisfy the column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider_profile_id: Option<ModelProviderProfileId>,
     pub projection_descriptor_id: AgentProviderProjectionDescriptorId,
     pub projection_overrides: AgentProviderProjectionOverrides,
     pub configured_models: Vec<AgentConfiguredModelBinding>,
@@ -767,7 +774,7 @@ impl Default for AgentModelProviderBinding {
             legacy_provider_profile_id: None,
             agent_id: AgentId::parse("unknown").expect("a literal Agent id is valid"),
             runtime_profile_id: AgentRuntimeProfileId::new(),
-            model_provider_profile_id: ModelProviderProfileId::new(),
+            model_provider_profile_id: None,
             projection_descriptor_id: AgentProviderProjectionDescriptorId::parse(
                 "projection_unknown_runtime_v1",
             )

@@ -4672,7 +4672,9 @@ impl ManagementCenter {
             .and_then(|provider| {
                 self.provider_bindings
                     .iter()
-                    .find(|binding| binding.model_provider_profile_id == provider.id)
+                    .find(|binding| {
+                        binding.model_provider_profile_id.as_ref() == Some(&provider.id)
+                    })
                     .map(|binding| (provider, binding))
             });
         let projection = match shared {
@@ -8299,7 +8301,7 @@ impl ManagementCenter {
             let Some(provider) = self
                 .providers
                 .iter()
-                .find(|provider| provider.id == binding.model_provider_profile_id)
+                .find(|provider| Some(&provider.id) == binding.model_provider_profile_id.as_ref())
             else {
                 continue;
             };
@@ -29085,7 +29087,7 @@ fn shared_provider_rows(
             let agents = bindings
                 .iter()
                 .filter(|binding| {
-                    binding.model_provider_profile_id == profile.id
+                    binding.model_provider_profile_id.as_ref() == Some(&profile.id)
                         && binding.deleted_at_ms.is_none()
                 })
                 .map(|binding| binding.agent_id.as_str().to_string())
@@ -38925,7 +38927,7 @@ mod gateway_surface_tests {
         let bindings = ["claude", "codex", "gemini"]
             .into_iter()
             .map(|agent_id| vibex_core::AgentModelProviderBinding {
-                model_provider_profile_id: profile_id.clone(),
+                model_provider_profile_id: Some(profile_id.clone()),
                 agent_id: vibex_core::AgentId::parse(agent_id).unwrap(),
                 deleted_at_ms: None,
                 ..Default::default()
@@ -38954,12 +38956,12 @@ mod gateway_surface_tests {
         let profile_id = profile.id.clone();
         let bindings = vec![
             vibex_core::AgentModelProviderBinding {
-                model_provider_profile_id: profile_id.clone(),
+                model_provider_profile_id: Some(profile_id.clone()),
                 agent_id: vibex_core::AgentId::parse("codex").unwrap(),
                 ..Default::default()
             },
             vibex_core::AgentModelProviderBinding {
-                model_provider_profile_id: profile_id,
+                model_provider_profile_id: Some(profile_id),
                 agent_id: vibex_core::AgentId::parse("claude").unwrap(),
                 deleted_at_ms: Some(1),
                 ..Default::default()
@@ -39137,7 +39139,7 @@ mod gateway_surface_tests {
             legacy_provider_profile_id: Some(bound.clone()),
             agent_id: agent.clone(),
             runtime_profile_id: AgentRuntimeProfileId::new(),
-            model_provider_profile_id: ModelProviderProfileId::new(),
+            model_provider_profile_id: Some(ModelProviderProfileId::new()),
             deleted_at_ms: None,
             ..AgentModelProviderBinding::default()
         };

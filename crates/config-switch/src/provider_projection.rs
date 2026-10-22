@@ -228,7 +228,7 @@ impl AgentProviderProjectionEngine {
         descriptor.validate()?;
         if binding.agent_id != runtime.version_identity.route.agent_id
             || binding.runtime_profile_id != runtime.id
-            || binding.model_provider_profile_id != model_provider.id
+            || binding.model_provider_profile_id.as_ref() != Some(&model_provider.id)
             || binding.projection_descriptor_id != descriptor.id
             || binding.agent_id != descriptor.route.agent_id
             || runtime.version_identity.route != descriptor.route
@@ -795,7 +795,9 @@ impl ProviderConfigService {
             (Some(agent_id), Some(provider_id)) => Ok(
                 AgentModelProviderBindingRepository::list_for_agent(&conn, &agent_id)?
                     .into_iter()
-                    .filter(|binding| binding.model_provider_profile_id == provider_id)
+                    .filter(|binding| {
+                        binding.model_provider_profile_id.as_ref() == Some(&provider_id)
+                    })
                     .collect(),
             ),
             (Some(agent_id), None) => {
@@ -853,7 +855,7 @@ impl ProviderConfigService {
             legacy_provider_profile_id: None,
             agent_id: request.agent_id,
             runtime_profile_id: request.runtime_profile_id,
-            model_provider_profile_id: request.model_provider_profile_id,
+            model_provider_profile_id: Some(request.model_provider_profile_id),
             projection_descriptor_id: request.projection_descriptor_id,
             projection_overrides: request.projection_overrides,
             configured_models: request.configured_models,
@@ -897,7 +899,16 @@ impl ProviderConfigService {
                 )
             })?;
         let runtime = require_runtime(&conn, &request.binding.runtime_profile_id)?;
-        let provider = require_model_provider(&conn, &request.binding.model_provider_profile_id)?;
+        // A projection only exists when both halves do: there is no endpoint to
+        // describe for an Agent that authenticates as itself.
+        let provider =
+            optional_model_provider(&conn, request.binding.model_provider_profile_id.as_ref())?
+                .ok_or_else(|| {
+                    VibexError::validation(
+                        "agent_projection_requires_provider",
+                        "a projection cannot be written for a binding with no Provider",
+                    )
+                })?;
         let resolution =
             AgentProviderProjectionRegistry::builtin()?.resolve(&runtime.version_identity)?;
         if request.binding.projection_descriptor_id != resolution.descriptor.id {
@@ -935,8 +946,11 @@ impl ProviderConfigService {
             .as_ref()
             .map(|binding_id| require_binding(&conn, binding_id))
             .transpose()?
-            .map(|binding| require_model_provider(&conn, &binding.model_provider_profile_id))
+            .map(|binding| {
+                optional_model_provider(&conn, binding.model_provider_profile_id.as_ref())
+            })
             .transpose()?
+            .flatten()
             .as_ref()
             .map_or(ProjectionAuthState::Unknown, projection_auth_state);
         Ok(AgentProviderProjectionCapability::from_resolution(
@@ -1350,7 +1364,14 @@ impl ProviderConfigService {
         conn: &vibex_db::DbConnection,
         mut binding: AgentModelProviderBinding,
     ) -> VibexResult<bool> {
-        let provider = require_model_provider(conn, &binding.model_provider_profile_id)?;
+        // Without a Provider there is nothing to project an endpoint or a
+        // credential from. The runtime half still applies, so the binding keeps its
+        // launch contract; only the Provider-derived state is left alone.
+        let Some(provider) =
+            optional_model_provider(conn, binding.model_provider_profile_id.as_ref())?
+        else {
+            return persist_projection_state_if_changed(conn, &binding, None);
+        };
         let runtime = require_runtime(conn, &binding.runtime_profile_id)?;
         let resolution =
             AgentProviderProjectionRegistry::builtin()?.resolve(&runtime.version_identity)?;
@@ -4503,7 +4524,13 @@ fn load_projection_input(
 )> {
     let binding = require_binding(conn, binding_id)?;
     let runtime = require_runtime(conn, &binding.runtime_profile_id)?;
-    let provider = require_model_provider(conn, &binding.model_provider_profile_id)?;
+    let provider = optional_model_provider(conn, binding.model_provider_profile_id.as_ref())?
+        .ok_or_else(|| {
+            VibexError::validation(
+                "agent_projection_requires_provider",
+                "this binding has no Provider to project from",
+            )
+        })?;
     let resolution =
         AgentProviderProjectionRegistry::builtin()?.resolve(&runtime.version_identity)?;
     if binding.projection_descriptor_id != resolution.descriptor.id {
@@ -4513,6 +4540,22 @@ fn load_projection_input(
         ));
     }
     Ok((provider, runtime, binding, resolution.descriptor))
+}
+
+/// The Provider a binding names, when it names one.
+///
+/// A binding with no Provider is not an error: an Agent that authenticates as
+/// itself has a launch command and no endpoint. Callers that need a Provider check
+/// the `Option`; callers that only annotate a projection let `None` mean "no
+/// endpoint to describe".
+fn optional_model_provider(
+    conn: &vibex_db::DbConnection,
+    id: Option<&ModelProviderProfileId>,
+) -> VibexResult<Option<ModelProviderProfile>> {
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    ModelProviderProfileRepository::get(conn, id)
 }
 
 fn require_model_provider(
@@ -5985,7 +6028,7 @@ mod tests {
             legacy_provider_profile_id: None,
             agent_id: descriptor.route.agent_id.clone(),
             runtime_profile_id: runtime.id.clone(),
-            model_provider_profile_id: provider.id.clone(),
+            model_provider_profile_id: Some(provider.id.clone()),
             projection_descriptor_id: descriptor.id.clone(),
             projection_overrides: AgentProviderProjectionOverrides::default(),
             configured_models: vec![AgentConfiguredModelBinding {
@@ -6387,7 +6430,7 @@ mod tests {
             legacy_provider_profile_id: None,
             agent_id: descriptor.route.agent_id.clone(),
             runtime_profile_id: runtime_id,
-            model_provider_profile_id: provider_id,
+            model_provider_profile_id: Some(provider_id),
             projection_descriptor_id: descriptor.id.clone(),
             projection_overrides: AgentProviderProjectionOverrides::default(),
             configured_models: vec![AgentConfiguredModelBinding {
