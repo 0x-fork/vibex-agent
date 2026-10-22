@@ -838,6 +838,16 @@ pub fn backfill_direct_routes(conn: &Connection) -> VibexResult<usize> {
         // from this Profile. A Profile written after the last backfill has no
         // such row yet, so materialise it before the member's foreign key looks
         // for it. This is the same mapping the launch path uses.
+        //
+        // A row an Agent materialised from a shared Provider is skipped: it
+        // already points at that Provider, and deriving a record from it would
+        // create a second Provider and a second direct route for one connection.
+        if let Some(existing) =
+            super::AgentModelProviderBindingRepository::get_by_legacy_profile(conn, &profile.id)?
+            && existing.model_provider_profile_id != super::legacy_model_provider_id(&profile.id)?
+        {
+            continue;
+        }
         super::ProviderProjectionCompatibilityRepository::sync_legacy_profile(conn, &profile)?;
         super::ModelRouteRepository::insert(conn, &route)?;
         created += 1;

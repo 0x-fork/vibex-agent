@@ -1847,8 +1847,15 @@ impl ProviderConfigService {
     /// protocol-specific address decides it, and a record with only a
     /// provider-wide address leaves the pin unset, which the projection then
     /// resolves from the Agent's own first supported interface.
+    /// The same, on a connection the caller already holds.
+    ///
+    /// The connection matters: opening one runs the migrations, and their backfill
+    /// projects every unbound launch row into a shared record. Materialising on a
+    /// private connection therefore created a second shared record before the
+    /// caller could link the new row to the Provider it belongs to.
     fn materialize_legacy_profile_for_agent(
         &self,
+        conn: &vibex_db::DbConnection,
         shared: &vibex_core::ModelProviderProfile,
         agent_id: &AgentId,
     ) -> VibexResult<ProviderProfile> {
@@ -1951,7 +1958,11 @@ impl ProviderConfigService {
             updated_at_ms: now,
             deleted_at_ms: None,
         };
-        ProviderProfileRepository::insert(&self.open_connection()?, &profile)?;
+        // Inserted on the caller's connection. Opening one here ran the
+        // migrations, whose backfill projected this brand-new launch row into a
+        // second shared record before the caller could link it to the Provider it
+        // belongs to — one Provider, one row per Agent.
+        ProviderProfileRepository::insert(conn, &profile)?;
         Ok(profile)
     }
 
@@ -1987,9 +1998,31 @@ impl ProviderConfigService {
                     })?;
                 // The materialised row already belongs to the target Agent, so
                 // there is nothing left to copy: it is the answer itself.
-                let created =
-                    self.materialize_legacy_profile_for_agent(&shared, &request.agent_id)?;
-                self.sync_legacy_projection(&conn, &created)?;
+                let before = vibex_db::ModelProviderProfileRepository::list(&conn)?.len();
+                eprintln!("PROBE before materialize: {before}");
+                let created = self.materialize_legacy_profile_for_agent(
+                    &conn,
+                    &shared,
+                    &request.agent_id,
+                )?;
+
+                // Bind before anything can re-open the database: a connection
+                // runs the migrations, and their backfill projects every *unbound*
+                // launch row into its own shared record. Linking first is what
+                // makes this row read as "already belongs to a Provider".
+                vibex_db::ProviderProjectionCompatibilityRepository::sync_legacy_profile_into_shared(
+                    &conn, &created, &shared.id,
+                )?;
+                let after_materialize =
+                    vibex_db::ModelProviderProfileRepository::list(&conn)?.len();
+                eprintln!("PROBE materialize: {before} -> {after_materialize}");
+                // Projected onto the shared record rather than deriving a new one:
+                // the second Agent to bind a Provider gets its own launch row, but
+                // the Provider it reaches is the same. Deriving here gave one
+                // Provider one record per Agent on the Providers page.
+                vibex_db::ProviderProjectionCompatibilityRepository::sync_legacy_profile_into_shared(
+                    &conn, &created, &shared.id,
+                )?;
                 if request.make_default {
                     self.set_agent_model_provider_default(
                         vibex_core::AgentModelProviderSetDefaultRequest {
@@ -2003,6 +2036,7 @@ impl ProviderConfigService {
                         },
                     )?;
                 }
+
                 self.notify_profile_saved(&created);
                 return Ok(created);
             }

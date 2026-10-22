@@ -1277,7 +1277,7 @@ impl ProviderConfigService {
         Ok(())
     }
 
-    fn refresh_bindings_for_model_provider(
+    pub(crate) fn refresh_bindings_for_model_provider(
         &self,
         conn: &vibex_db::DbConnection,
         provider_id: &ModelProviderProfileId,
@@ -8287,19 +8287,19 @@ mod shared_provider_launch_tests {
                     kind: vibex_core::ModelProviderEndpointKind::Api,
                     url: "https://api.example.com/v1".to_string(),
                     wire_protocol_id: Some(
-                        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
+                        vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
                     ),
                 }],
                 proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
                 credentials: Vec::new(),
                 configured_models: vec![vibex_core::ModelProviderCatalogEntry {
-                    id: "claude-sonnet".to_string(),
+                    id: "shared-model".to_string(),
                     display_name: None,
                     enabled: true,
                     capabilities: Default::default(),
                     metadata: Default::default(),
                 }],
-                default_model_id: Some("claude-sonnet".to_string()),
+                default_model_id: Some("shared-model".to_string()),
                 headers: Vec::new(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
             })
@@ -8888,6 +8888,83 @@ mod provider_delete_tests {
                 .iter()
                 .all(|profile| profile.id != created.id),
             "a globally created Provider must be deletable too"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod shared_provider_reuse_tests {
+    use super::*;
+
+    /// Binding one shared Provider to a second Agent must not create a second row.
+    ///
+    /// The Providers page lists shared records, so a duplicate there means a
+    /// duplicate record — not a duplicate row in the list. This reproduces the
+    /// report: one Provider enabled for two Agents showed up twice.
+    #[test]
+    fn binding_one_provider_to_two_agents_keeps_one_shared_row() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-shared-reuse-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        let shared = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Shared".to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://api.example.com/v1".to_string(),
+                    wire_protocol_id: Some(
+                        vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    ),
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "shared-model".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    capabilities: Default::default(),
+                    metadata: Default::default(),
+                }],
+                default_model_id: Some("shared-model".to_string()),
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        for agent in ["goose", "opencode"] {
+            service
+                .bind_provider_to_agent(vibex_core::AgentModelProviderBindRequest {
+                    provider_profile_id: vibex_core::ProviderProfileId::new(),
+                    model_provider_profile_id: Some(shared.id.clone()),
+                    agent_id: vibex_core::AgentId::parse(agent).unwrap(),
+                    make_default: false,
+                })
+                .unwrap();
+        }
+
+        let listed = service
+            .list_model_provider_profiles()
+            .unwrap()
+            .into_iter()
+            .filter(|profile| profile.display_name == "Shared")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed.len(),
+            1,
+            "one shared Provider bound to two Agents must stay one record, found: {:?}",
+            listed
+                .iter()
+                .map(|profile| profile.id.as_str())
+                .collect::<Vec<_>>()
         );
 
         std::fs::remove_dir_all(&dir).ok();

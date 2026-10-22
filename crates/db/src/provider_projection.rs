@@ -669,12 +669,65 @@ impl ProviderProjectionCompatibilityRepository {
         for profile in profiles {
             let before =
                 AgentModelProviderBindingRepository::get_by_legacy_profile(conn, &profile.id)?;
+            // A launch row an Agent materialised from a shared Provider already
+            // points at that Provider, and the v2 id derived from this row is not
+            // the record it belongs to. Projecting it would create a second
+            // Provider, so one Provider would appear once per Agent on the
+            // Providers page. Repair still happens for the ordinary case: a row
+            // whose binding points at its own derived record.
+            if let Some(existing) = before.as_ref()
+                && existing.model_provider_profile_id != legacy_model_provider_id(&profile.id)?
+            {
+                continue;
+            }
             Self::sync_legacy_profile(conn, &profile)?;
             if before.is_none() {
                 changed += 1;
             }
         }
         Ok(changed)
+    }
+
+    /// Projects a legacy Profile onto an *existing* shared record.
+    ///
+    /// The ordinary backfill derives a v2 id from the legacy id, which is right
+    /// when the legacy Profile is the source of truth. It is wrong for the second
+    /// Agent that binds a shared Provider: that Agent gets its own launch row, but
+    /// the Provider it reaches is the same one. Deriving a v2 record from the new
+    /// row made one Provider appear once per Agent on the Providers page, which is
+    /// the opposite of what that page exists to show.
+    ///
+    /// So this maps the records the same way and then redirects the model-provider
+    /// and binding onto the shared record the caller names.
+    pub fn sync_legacy_profile_into_shared(
+        conn: &Connection,
+        legacy: &ProviderProfile,
+        shared_id: &ModelProviderProfileId,
+    ) -> VibexResult<LegacyProviderProjectionRecords> {
+        let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "provider_projection_backfill_transaction_failed",
+                "failed to start provider projection compatibility transaction",
+            ))?;
+        let mut records = map_legacy_projection_records(&transaction, legacy)?;
+        // Keep the shared record; this legacy Profile contributes a binding and a
+        // runtime, not a second Provider.
+        records.model_provider.id = shared_id.clone();
+        let agent_runtime = upsert_legacy_agent_runtime(&transaction, records.agent_runtime)?;
+        let mut binding = records.binding;
+        binding.model_provider_profile_id = shared_id.clone();
+        binding.runtime_profile_id = agent_runtime.id.clone();
+        let binding = upsert_legacy_binding(&transaction, binding)?;
+        transaction.commit().map_err(storage_err(
+            "provider_projection_backfill_commit_failed",
+            "failed to commit provider projection compatibility records",
+        ))?;
+        Ok(LegacyProviderProjectionRecords {
+            model_provider: ModelProviderProfileRepository::get(conn, shared_id)?
+                .unwrap_or(records.model_provider),
+            agent_runtime,
+            binding,
+        })
     }
 
     pub fn sync_legacy_profile(
@@ -2245,7 +2298,9 @@ fn looks_native_agent_command(command: &str, expected_name: &str) -> bool {
         .is_some_and(|name| name == expected_name || name.starts_with(&format!("{expected_name}.")))
 }
 
-fn legacy_model_provider_id(id: &ProviderProfileId) -> VibexResult<ModelProviderProfileId> {
+pub(crate) fn legacy_model_provider_id(
+    id: &ProviderProfileId,
+) -> VibexResult<ModelProviderProfileId> {
     ModelProviderProfileId::parse(format!("model_provider_legacy_{}", id.as_str()))
 }
 
