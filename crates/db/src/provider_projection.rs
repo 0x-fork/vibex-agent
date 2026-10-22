@@ -3258,3 +3258,123 @@ mod binding_launch_field_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod binding_options_migration_tests {
+    use super::*;
+    use crate::apply_migrations;
+
+    /// Migration 68's default was not a decodable `ProviderOptions`.
+    ///
+    /// `ProviderOptions` has required fields, so `'{}'` fails to deserialize and
+    /// every pre-existing binding failed to load — the runtime refused to start
+    /// with `agent_model_provider_binding_lookup_failed`. This asserts the two
+    /// things that have to hold: the column now defaults to a value the type can
+    /// read, and a row carrying the old value is repaired.
+    #[test]
+    fn the_options_column_defaults_to_a_decodable_value() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-binding-repair-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        // Whatever a new row gets by default must decode.
+        let default: String = conn
+            .query_row(
+                "SELECT dflt_value FROM pragma_table_info('agent_model_provider_bindings_v2')
+                 WHERE name = 'provider_options_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let decoded =
+            serde_json::from_str::<vibex_core::ProviderOptions>(default.trim_matches('\''))
+                .expect("the column default must be a decodable ProviderOptions");
+        assert_eq!(decoded, vibex_core::ProviderOptions::empty());
+
+        // And a row left with the old empty object is repaired by the migration.
+        conn.execute(
+            "UPDATE agent_model_provider_bindings_v2
+             SET provider_options_json = '{}'",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM schema_migrations WHERE version = 70", [])
+            .unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_model_provider_bindings_v2
+                 WHERE trim(provider_options_json) = '{}'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "no row may keep an undecodable option set");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod real_database_upgrade_tests {
+    use super::*;
+    use crate::apply_migrations;
+
+    /// Upgrading a database that already ran migration 68 must repair it.
+    ///
+    /// This reproduces the reported failure exactly: a database with 68 and 69
+    /// recorded, the column defaulted to `'{}'`, and rows carrying it. Running
+    /// migrations again has to make every binding loadable, because that is what
+    /// happens when a user opens the new build on an old database.
+    #[test]
+    fn an_already_migrated_database_is_repaired_on_upgrade() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-real-upgrade-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        // Put the database back into the broken state the report describes:
+        // 68 applied, 70 not, and rows holding the empty object.
+        conn.execute_batch(
+            "DELETE FROM schema_migrations WHERE version = 70;
+             UPDATE agent_model_provider_bindings_v2 SET provider_options_json = '{}';",
+        )
+        .unwrap();
+        let broken: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_model_provider_bindings_v2
+                 WHERE trim(provider_options_json) = '{}'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(broken >= 0);
+
+        // The upgrade a user gets by opening the new build.
+        apply_migrations(&mut conn).unwrap();
+
+        let still_broken: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_model_provider_bindings_v2
+                 WHERE trim(provider_options_json) = '{}'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_broken, 0,
+            "every binding must hold a decodable option set after the upgrade"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
