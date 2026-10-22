@@ -2126,6 +2126,14 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   hovered slot still outranks the reading emphasis for its own slot and owns the
   preview card, and the reading emphasis outranks the pointer's neighbourhood
   fade.
+- The rail's preview card is mounted inside the hovered slot, so moving the
+  pointer from one tick to the next remounts it under a different slot id. Its
+  content is rebuilt for the newly hovered turn, but the card must not carry an
+  id-keyed entrance transition: that oneshot restarts from transparent on every
+  remount, so sweeping along the rail blinked the card out and back in instead of
+  swapping its content. The rail's own reveal is the only entrance the card takes
+  part in; a slot switch repaints the card at full opacity with the new turn's
+  title, summary and files.
 - Session-row rename/delete controls capture the target `VibexSessionId` before
   opening their dialog and call the typed manager mutation for that id. They must
   not silently retarget the currently selected session; successful non-selected

@@ -755,7 +755,6 @@ const AGENT_TURN_PREVIEW_CARD_MIN_WIDTH: f32 = 248.0;
 const AGENT_TURN_PREVIEW_CARD_VIEWPORT_INSET: f32 = 80.0;
 const AGENT_TURN_PREVIEW_VISIBLE_FILE_COUNT: usize = 2;
 const AGENT_TURN_PREVIEW_RAIL_TRANSITION_DURATION: Duration = Duration::from_millis(160);
-const AGENT_TURN_PREVIEW_CARD_TRANSITION_DURATION: Duration = Duration::from_millis(150);
 const AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX: f32 = 96.0;
 const AGENT_TIMELINE_BOTTOM_CONTROL_REVEAL_THRESHOLD_PX: f32 = 240.0;
 const AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX: f32 = 32.0;
@@ -53504,16 +53503,13 @@ impl VibexWorkbench {
                                 .child(content.message.clone()),
                         )
                         .when_some(file_summary, |this, summary| this.child(summary));
-                    let card = if reduced_motion {
-                        card.into_any_element()
-                    } else {
-                        Transition::new(AGENT_TURN_PREVIEW_CARD_TRANSITION_DURATION)
-                            .ease(motion::EASE_OUT_EXPO.easing())
-                            .slide_x(px(-7.2), px(0.0))
-                            .fade(0.0, 1.0)
-                            .apply(card, format!("turn-preview-card-open-{preview_index}"))
-                            .into_any_element()
-                    };
+                    // No entrance transition of its own. The card is mounted
+                    // inside the hovered slot, so moving to the next tick
+                    // unmounts it there and mounts it again under that slot's
+                    // id — an id-keyed oneshot would restart from transparent
+                    // on every switch and read as the card blinking instead of
+                    // its content changing. The rail's own reveal still brings
+                    // the first card in; afterwards a switch is a plain swap.
                     div()
                         .absolute()
                         .top_1_2()
@@ -105924,6 +105920,36 @@ mod tests {
         assert!(renderer.contains("} else if visible_slots.contains(&preview_index) {"));
         assert!(renderer.contains("(23.2, 2.88, foreground.opacity(0.5))"));
         assert!(renderer.contains("let preview_card = hovered.then(|| {"));
+    }
+
+    /// Moving the pointer from one rail tick to the next must read as the
+    /// preview card changing its content, not as one card leaving and another
+    /// arriving.
+    ///
+    /// The card is mounted inside the hovered slot, so every switch remounts it
+    /// under a different slot id. An id-keyed entrance transition therefore
+    /// restarts from fully transparent on each switch and the card blinks. The
+    /// swap has to be plain: the rail's own reveal is the only entrance the card
+    /// takes part in.
+    #[test]
+    fn turn_preview_card_swaps_content_instead_of_replaying_an_entrance() {
+        let source = include_str!("app.rs");
+        let renderer = source
+            .split_once("    fn render_agent_turn_preview_rail(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_workbench("))
+            .map(|(body, _)| body)
+            .expect("turn preview renderer should remain inspectable");
+
+        assert!(!renderer.contains("turn-preview-card-open"));
+        assert!(
+            !renderer.contains("AGENT_TURN_PREVIEW_CARD_TRANSITION_DURATION"),
+            "the card must not replay a per-slot entrance on every hover switch"
+        );
+        assert_eq!(renderer.matches("Transition::new(").count(), 1);
+        assert!(
+            renderer.contains("agent-turn-preview-rail-open"),
+            "the rail reveal stays the card's only entrance"
+        );
     }
 
     #[test]
