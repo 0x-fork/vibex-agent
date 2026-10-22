@@ -95,7 +95,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 73;
+pub const CURRENT_SCHEMA_VERSION: i64 = 74;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -4332,7 +4332,6 @@ impl ProviderProfileRepository {
         conn: &Connection,
         configurable_agent_ids: Option<&BTreeSet<AgentId>>,
     ) -> VibexResult<Vec<ProviderProfile>> {
-        Self::ensure_local_defaults(conn)?;
         let mut stmt = conn
             .prepare(
                 "
@@ -4381,7 +4380,6 @@ impl ProviderProfileRepository {
         agent_id: &AgentId,
         include_disabled: bool,
     ) -> VibexResult<Vec<ProviderProfile>> {
-        Self::ensure_local_defaults(conn)?;
         let disabled_status = enum_to_db(&ProviderProfileStatus::Disabled)?;
         let mut stmt = conn
             .prepare(
@@ -4433,7 +4431,6 @@ impl ProviderProfileRepository {
         conn: &Connection,
         agent_id: &AgentId,
     ) -> VibexResult<Option<ProviderProfile>> {
-        Self::ensure_local_defaults(conn)?;
         let enabled_status = enum_to_db(&ProviderProfileStatus::Enabled)?;
         let mut profile = conn
             .query_row(
@@ -4468,7 +4465,6 @@ impl ProviderProfileRepository {
         conn: &Connection,
         provider_profile_id: &ProviderProfileId,
     ) -> VibexResult<Option<ProviderProfile>> {
-        Self::ensure_local_defaults(conn)?;
         let mut profile = conn
             .query_row(
                 "
@@ -4759,7 +4755,6 @@ impl ProviderDefaultProfileRepository {
         scope: ProviderProfileDefaultScope,
         provider_kind: ProviderKind,
     ) -> VibexResult<ProviderProfileDefaultSelection> {
-        ProviderProfileRepository::ensure_local_defaults(conn)?;
         let scope_kind = enum_to_db(&scope.kind)?;
         let scope_id = scope.storage_key();
         let row = conn
@@ -4797,7 +4792,6 @@ impl ProviderDefaultProfileRepository {
         conn: &Connection,
         request: ProviderProfileSetDefaultRequest,
     ) -> VibexResult<ProviderProfileDefaultSelection> {
-        ProviderProfileRepository::ensure_local_defaults(conn)?;
         if ProviderProfileRepository::get(conn, &request.provider_profile_id)?.is_none() {
             return Err(VibexError::validation(
                 "provider_profile_not_found",
@@ -4846,7 +4840,6 @@ impl AgentDefaultModelProviderProfileRepository {
         scope: ProviderProfileDefaultScope,
         agent_id: AgentId,
     ) -> VibexResult<AgentModelProviderDefaultSelection> {
-        ProviderProfileRepository::ensure_local_defaults(conn)?;
         let scope_kind = enum_to_db(&scope.kind)?;
         let scope_id = scope.storage_key();
         let row = conn
@@ -4886,7 +4879,6 @@ impl AgentDefaultModelProviderProfileRepository {
         agent_id: AgentId,
         provider_profile_id: ProviderProfileId,
     ) -> VibexResult<AgentModelProviderDefaultSelection> {
-        ProviderProfileRepository::ensure_local_defaults(conn)?;
         let now = unix_timestamp_ms();
         let scope_kind = enum_to_db(&scope.kind)?;
         let scope_id = scope.storage_key();
@@ -4927,7 +4919,6 @@ impl AgentModelProviderFailoverRepository {
         conn: &Connection,
         agent_id: &AgentId,
     ) -> VibexResult<Vec<AgentModelProviderFailoverEntry>> {
-        ProviderProfileRepository::ensure_local_defaults(conn)?;
         let mut stmt = conn
             .prepare(
                 "
@@ -4972,7 +4963,6 @@ impl AgentModelProviderFailoverRepository {
         agent_id: &AgentId,
         entries: &[AgentModelProviderFailoverEntry],
     ) -> VibexResult<Vec<AgentModelProviderFailoverEntry>> {
-        ProviderProfileRepository::ensure_local_defaults(conn)?;
         let tx = conn.transaction().map_err(storage_err(
             "agent_model_provider_failover_transaction_failed",
             "failed to start agent model provider failover transaction",
@@ -12458,11 +12448,12 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_bound_provider_kind_repair(conn, &mut applied)?;
     apply_runtime_profile_acp_catalog(conn, &mut applied)?;
     apply_v2_authority_cutover(conn, &mut applied)?;
+    apply_drop_local_default_placeholders(conn, &mut applied)?;
 
-    // Seed compatibility Profiles before the v37 backfill while no caller
-    // transaction is active. Repository reads may run inside a transaction and
-    // must not start the backfill's own transaction.
-    ProviderProfileRepository::ensure_local_defaults(conn)?;
+    // Seeding the per-kind placeholders used to happen here, before the backfill,
+    // so a caller always had a Provider id to fall back on. They are gone: a missing
+    // Provider is reported as missing rather than stood in for by a row with no
+    // address and no Key.
     ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(conn)?;
     // Turns the gateway's pre-route upstream list into one reusable route, once.
     model_route::backfill_first_route(conn)?;
@@ -12470,6 +12461,75 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // route graph can show direct connections beside gateway ones.
     model_route::backfill_direct_routes(conn)?;
     Ok(applied)
+}
+
+/// Removes the per-kind `local default` placeholders.
+///
+/// They existed so a caller always had a Provider id to fall back on. That id named
+/// a row with no address, no Key and no models, so every step that received it had
+/// to know it was fake — and the Providers page drew it as a Supplier nobody added.
+/// A missing Provider is now reported as missing, which is what the reader needs to
+/// know anyway.
+///
+/// The rows are deleted rather than soft-deleted: nothing references them by design,
+/// and leaving a tombstone would keep the placeholder id resolvable for a caller that
+/// was supposed to stop asking for it.
+fn apply_drop_local_default_placeholders(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 74;
+    const NAME: &str = "drop_local_default_placeholders";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    // The binding and the shared record that projected from each placeholder go
+    // first; the placeholder is what they were built from, not what they contain.
+    conn.execute(
+        "DELETE FROM agent_model_provider_bindings_v2
+         WHERE legacy_provider_profile_id LIKE 'provider_local_default_%'",
+        [],
+    )
+    .map_err(storage_err(
+        "local_default_binding_delete_failed",
+        "failed to delete the bindings of the local default placeholders",
+    ))?;
+    conn.execute(
+        "DELETE FROM agent_runtime_profiles
+         WHERE legacy_provider_profile_id LIKE 'provider_local_default_%'",
+        [],
+    )
+    .map_err(storage_err(
+        "local_default_runtime_delete_failed",
+        "failed to delete the runtime rows of the local default placeholders",
+    ))?;
+    conn.execute(
+        "DELETE FROM model_provider_profiles
+         WHERE legacy_provider_profile_id LIKE 'provider_local_default_%'",
+        [],
+    )
+    .map_err(storage_err(
+        "local_default_shared_delete_failed",
+        "failed to delete the shared records of the local default placeholders",
+    ))?;
+    conn.execute(
+        "DELETE FROM provider_profiles WHERE provider_profile_id LIKE 'provider_local_default_%'",
+        [],
+    )
+    .map_err(storage_err(
+        "local_default_delete_failed",
+        "failed to delete the local default placeholders",
+    ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the local default removal",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }
 
 /// Marks the point where the shared record becomes authoritative.
@@ -18075,6 +18135,7 @@ mod tests {
                 "71:bound_provider_kind_repair",
                 "72:runtime_profile_acp_catalog",
                 "73:v2_authority_cutover",
+                "74:drop_local_default_placeholders",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -18232,6 +18293,7 @@ mod tests {
                 "71:bound_provider_kind_repair",
                 "72:runtime_profile_acp_catalog",
                 "73:v2_authority_cutover",
+                "74:drop_local_default_placeholders",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -18370,6 +18432,7 @@ mod tests {
                 "71:bound_provider_kind_repair",
                 "72:runtime_profile_acp_catalog",
                 "73:v2_authority_cutover",
+                "74:drop_local_default_placeholders",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -18546,6 +18609,7 @@ mod tests {
                 "71:bound_provider_kind_repair",
                 "72:runtime_profile_acp_catalog",
                 "73:v2_authority_cutover",
+                "74:drop_local_default_placeholders",
             ]
         );
         assert_eq!(
@@ -19982,6 +20046,7 @@ mod tests {
                 "71:bound_provider_kind_repair",
                 "72:runtime_profile_acp_catalog",
                 "73:v2_authority_cutover",
+                "74:drop_local_default_placeholders",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

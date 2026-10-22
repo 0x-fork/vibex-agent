@@ -9444,15 +9444,17 @@ mod visible_shared_provider_tests {
             )
             .unwrap();
 
-        // The scaffolding the agent bootstrap created alongside it.
+        // With the per-kind placeholders gone, a fresh database holds only what the
+        // reader added. The filter still earns its place — the `ACP` launch configs
+        // and the gateway's own Profile are machinery — but it no longer has to hide
+        // a placeholder per Provider kind.
         let every = service.list_model_provider_profiles().unwrap();
         let visible = service.list_visible_model_provider_profiles().unwrap();
 
-        assert!(
-            every.len() > visible.len(),
-            "the store must hold more rows than the page shows: every {}, visible {}",
+        assert_eq!(
             every.len(),
-            visible.len()
+            visible.len(),
+            "nothing seeded should need hiding: every {every:?}"
         );
         assert!(
             visible

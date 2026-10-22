@@ -1122,7 +1122,13 @@ pub async fn assemble_management_snapshot(
     // This is one read of the whole table, not one read per Agent. The same
     // rows are then grouped in memory for the per-Agent details below, so the
     // bundle costs one binding query instead of one per configured Agent.
-    let model_provider_profiles = provider.list_model_provider_profiles()?;
+    // The list the Config Center draws, not the raw table: the store also holds the
+    // per-kind local defaults, the per-Agent `ACP` launch configs and the gateway's
+    // own Profile. They have to exist, but they are not Suppliers anyone added and
+    // drawing them made the page look like it contained entries nobody created.
+    //
+    // The gateway reads its upstreams separately and still sees the whole table.
+    let model_provider_profiles = provider.list_visible_model_provider_profiles()?;
     let agent_model_provider_bindings = provider.list_all_agent_model_provider_bindings()?;
     // Routes and their bindings are read once for the whole bundle, like the
     // Provider lists above: the Agent page renders every route its Agent may

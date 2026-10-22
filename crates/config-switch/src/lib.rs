@@ -12781,22 +12781,22 @@ Authorization = "Bearer should-not-be-stored"
     }
 
     #[test]
-    fn seeds_local_defaults_for_runtime_compatibility_only() {
+    fn no_longer_seeds_local_default_placeholders() {
         let dir = tempdir().unwrap();
         let service = ProviderConfigService::new(dir.path().join("vibex.db"));
-        let runtime_profiles = service.list_runtime_profiles().unwrap();
-        let visible_profiles = service.list_profiles().unwrap();
+        let profiles = service.list_profiles().unwrap();
 
+        // A per-kind placeholder used to be seeded so a caller always had an id. It
+        // named a row with no address, no Key and no models, and every step that
+        // received it had to know it was fake. Nothing creates one now, so the first
+        // read of a fresh database finds no Providers at all — which is the truth.
         for kind in [ProviderKind::Codex, ProviderKind::Claude, ProviderKind::Acp] {
             assert!(
-                runtime_profiles
+                profiles
                     .iter()
-                    .any(|profile| { profile.id.as_str() == kind.local_default_profile_id() })
-            );
-            assert!(
-                visible_profiles
-                    .iter()
-                    .all(|profile| { profile.id.as_str() != kind.local_default_profile_id() })
+                    .all(|profile| profile.id.as_str() != kind.local_default_profile_id()),
+                "{} must not be seeded",
+                kind.local_default_profile_id()
             );
         }
     }

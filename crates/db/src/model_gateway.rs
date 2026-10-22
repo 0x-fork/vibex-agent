@@ -1042,12 +1042,36 @@ mod tests {
         (path, conn)
     }
 
+    /// A Provider to point the gateway at.
+    ///
+    /// It creates one rather than taking the first row: nothing is seeded any more,
+    /// because a per-kind placeholder with no address was standing in for Providers
+    /// the reader had not added.
     fn profile(conn: &Connection) -> ModelProviderProfileId {
-        crate::ModelProviderProfileRepository::list(conn)
-            .unwrap()
-            .first()
-            .map(|profile| profile.id.clone())
-            .expect("local default profiles are seeded")
+        let profile = vibex_core::ModelProviderProfile {
+            id: vibex_core::ModelProviderProfileId::new(),
+            legacy_provider_profile_id: None,
+            display_name: "fixture".to_string(),
+            vendor_hint: None,
+            endpoints: vec![vibex_core::ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: vibex_core::ModelProviderEndpointKind::Api,
+                url: "https://api.example.invalid/v1".to_string(),
+                wire_protocol_id: None,
+            }],
+            proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+            credentials: Vec::new(),
+            configured_models: Vec::new(),
+            default_model_id: None,
+            headers: Vec::new(),
+            status: vibex_core::ModelProviderProfileStatus::Enabled,
+            revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            deleted_at_ms: None,
+        };
+        crate::ModelProviderProfileRepository::insert(conn, &profile).unwrap();
+        profile.id
     }
 
     #[test]

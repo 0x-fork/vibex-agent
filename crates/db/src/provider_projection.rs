@@ -2641,7 +2641,13 @@ mod tests {
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         schema_through(&mut conn, 36);
 
+        // An ordinary Profile, not the per-kind placeholder: the placeholder is
+        // gone, and using its id here would make the test depend on a row the
+        // product no longer creates.
         let mut profile = ProviderProfile::local_default(ProviderKind::Claude);
+        // The builder still describes the shape; only the placeholder id is not
+        // reused, because the product no longer creates a row under it.
+        profile.id = ProviderProfileId::new();
         profile.status = ProviderProfileStatus::Enabled;
         profile.base_url = Some("https://api.example.invalid".to_string());
         profile.default_model = Some("claude-test".to_string());
@@ -2960,31 +2966,25 @@ mod tests {
     }
 
     #[test]
-    fn fresh_migration_seeds_and_projects_local_defaults() {
+    fn a_fresh_migration_creates_no_placeholder_providers() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
 
         apply_migrations(&mut conn).unwrap();
 
-        let profiles = ProviderProfileRepository::list(&conn).unwrap();
-        assert_eq!(profiles.len(), 3);
-        for profile in profiles {
-            assert!(
-                ModelProviderProfileRepository::get_by_legacy_profile(&conn, &profile.id)
-                    .unwrap()
-                    .is_some()
-            );
-            assert!(
-                AgentRuntimeProfileRepository::get_by_legacy_profile(&conn, &profile.id)
-                    .unwrap()
-                    .is_some()
-            );
-            assert!(
-                AgentModelProviderBindingRepository::get_by_legacy_profile(&conn, &profile.id)
-                    .unwrap()
-                    .is_some()
-            );
-        }
+        // A fresh database has no Providers, because none were added. The per-kind
+        // placeholders used to be seeded here so a caller always had an id; they are
+        // gone, and "no Provider" is now reported as such.
+        assert!(
+            ProviderProfileRepository::list(&conn).unwrap().is_empty(),
+            "a fresh database must not seed Provider rows"
+        );
+        assert!(
+            ModelProviderProfileRepository::list(&conn)
+                .unwrap()
+                .is_empty(),
+            "and must not seed shared records either"
+        );
     }
 
     #[test]
@@ -3145,14 +3145,18 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         apply_migrations(&mut conn).unwrap();
-        let profile_id =
-            ProviderProfileId::parse(ProviderKind::Codex.local_default_profile_id().to_string())
-                .unwrap();
+        // Any Profile will do; the subject is that reading one inside a caller's
+        // transaction does not try to start a nested one. It is created here because
+        // nothing is seeded any more.
+        let mut profile = ProviderProfile::local_default(ProviderKind::Codex);
+        profile.id = ProviderProfileId::new();
+        ProviderProfileRepository::insert(&conn, &profile).unwrap();
+        let profile_id = profile.id.clone();
 
         let transaction = conn.transaction().unwrap();
-        let profile = ProviderProfileRepository::get(&transaction, &profile_id).unwrap();
+        let read = ProviderProfileRepository::get(&transaction, &profile_id).unwrap();
 
-        assert!(profile.is_some());
+        assert!(read.is_some());
         transaction.commit().unwrap();
     }
 

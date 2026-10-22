@@ -6353,12 +6353,16 @@ fn resolve_provider_profile_id(
         return Ok(profile.id);
     }
 
-    ProviderProfileId::parse(provider_kind.local_default_profile_id().to_string()).map_err(|_| {
-        VibexError::storage(
-            "provider_default_profile_id_invalid",
-            "local default provider profile id is invalid",
-        )
-    })
+    // No Provider, and no placeholder standing in for one. A per-kind `local
+    // default` used to be returned here so the caller always had an id, but it named
+    // a row with no address, no Key and no models: every later step had to know it
+    // was fake. Saying so is more useful than an id that cannot launch.
+    Err(VibexError::validation(
+        "provider_profile_not_configured",
+        "this Agent has no model provider configured yet",
+    )
+    .with_diagnostic("agentId", agent_id.as_str())
+    .with_diagnostic("providerKind", provider_kind.to_string()))
 }
 
 fn provider_profile_default_scopes(
