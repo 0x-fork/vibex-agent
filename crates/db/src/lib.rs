@@ -95,7 +95,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 72;
+pub const CURRENT_SCHEMA_VERSION: i64 = 73;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12457,6 +12457,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_binding_provider_options_repair(conn, &mut applied)?;
     apply_bound_provider_kind_repair(conn, &mut applied)?;
     apply_runtime_profile_acp_catalog(conn, &mut applied)?;
+    apply_v2_authority_cutover(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -12469,6 +12470,37 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // route graph can show direct connections beside gateway ones.
     model_route::backfill_direct_routes(conn)?;
     Ok(applied)
+}
+
+/// Marks the point where the shared record becomes authoritative.
+///
+/// Before this, the compatibility backfill re-projected every legacy row on each
+/// migration run, which meant a change made on the v2 side was overwritten the next
+/// time any connection opened. That is why v2 could not become the authority even
+/// though it held the data: the write direction was still v1 → v2.
+///
+/// After this version is recorded, the backfill leaves an existing shared record
+/// alone: it creates records that are missing, and repairs ones that were never
+/// written, but it does not overwrite one that already exists. Writing v2 first and
+/// projecting to v1 is then the only direction that changes anything.
+fn apply_v2_authority_cutover(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 73;
+    const NAME: &str = "v2_authority_cutover";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    // Nothing to rewrite: the cutover is a recorded decision that the backfill
+    // reads. Recording it is what makes the next connection stop overwriting.
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the v2 authority cutover",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }
 
 /// Adds the ACP catalogue fields `AcpProviderConfig` carries to the runtime Profile.
@@ -18038,6 +18070,7 @@ mod tests {
                 "70:binding_provider_options_repair",
                 "71:bound_provider_kind_repair",
                 "72:runtime_profile_acp_catalog",
+                "73:v2_authority_cutover",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -18194,6 +18227,7 @@ mod tests {
                 "70:binding_provider_options_repair",
                 "71:bound_provider_kind_repair",
                 "72:runtime_profile_acp_catalog",
+                "73:v2_authority_cutover",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -18331,6 +18365,7 @@ mod tests {
                 "70:binding_provider_options_repair",
                 "71:bound_provider_kind_repair",
                 "72:runtime_profile_acp_catalog",
+                "73:v2_authority_cutover",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -18506,6 +18541,7 @@ mod tests {
                 "70:binding_provider_options_repair",
                 "71:bound_provider_kind_repair",
                 "72:runtime_profile_acp_catalog",
+                "73:v2_authority_cutover",
             ]
         );
         assert_eq!(
@@ -19941,6 +19977,7 @@ mod tests {
                 "70:binding_provider_options_repair",
                 "71:bound_provider_kind_repair",
                 "72:runtime_profile_acp_catalog",
+                "73:v2_authority_cutover",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

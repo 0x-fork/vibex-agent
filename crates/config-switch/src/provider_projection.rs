@@ -1262,7 +1262,11 @@ impl ProviderConfigService {
             AgentRuntimeProfileRepository::get_by_legacy_profile(conn, &legacy.id)?;
         let previous_binding =
             AgentModelProviderBindingRepository::get_by_legacy_profile(conn, &legacy.id)?;
-        let records = ProviderProjectionCompatibilityRepository::sync_legacy_profile(conn, legacy)?;
+        // An explicit write: this runs when a v1 entry point edits a Profile, and
+        // the edit has to reach the authoritative record. A backfill must not
+        // overwrite it, an edit must.
+        let records =
+            ProviderProjectionCompatibilityRepository::sync_legacy_profile_from_edit(conn, legacy)?;
         let projection_rows_changed = previous_model_provider.as_ref()
             != Some(&records.model_provider)
             || previous_agent_runtime.as_ref() != Some(&records.agent_runtime)
@@ -9541,6 +9545,142 @@ mod launch_reads_v2_tests {
         assert_eq!(launch.disabled_tools, legacy.disabled_tools);
         assert_eq!(launch.process_strategy, legacy.process_strategy);
         assert_eq!(launch.terminal_tools, legacy.terminal_tools);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod shared_record_authority_tests {
+    use super::*;
+
+    /// After the cutover, a change made on the v2 side is not overwritten.
+    ///
+    /// This is what makes the shared record authoritative rather than merely equal.
+    /// Before migration 73 recorded the decision, every connection ran the backfill,
+    /// which re-projected the legacy row over the v2 one — so a v2 edit survived only
+    /// until the next read.
+    #[test]
+    fn a_v2_edit_survives_reopening_the_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-authority-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+        let agent_id = vibex_core::AgentId::parse("opencode").unwrap();
+
+        let created = service
+            .create_agent_model_provider_profile(
+                vibex_core::AgentModelProviderProfileCreateRequest {
+                    agent_id: agent_id.clone(),
+                    display_name: "design".to_string(),
+                    account_alias: None,
+                    base_url: Some("https://api.example.com/v1".to_string()),
+                    default_model: Some("model-a".to_string()),
+                    small_model: None,
+                    large_model: None,
+                    configured_models: vec![vibex_core::ProviderConfiguredModel {
+                        id: "model-a".to_string(),
+                        display_name: None,
+                        enabled: true,
+                        wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions),
+                        capabilities: Default::default(),
+                    }],
+                    reasoning_effort: None,
+                    sandbox_defaults: None,
+                    network_defaults: None,
+                    permission_defaults: None,
+                    provider_options: None,
+                    secret_references: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        // Change the shared record only, the way a v2-side edit would.
+        let conn = service.open_connection().unwrap();
+        let mut shared =
+            vibex_db::ModelProviderProfileRepository::get_by_legacy_profile(&conn, &created.id)
+                .unwrap()
+                .expect("the shared record must exist");
+        shared.display_name = "renamed-on-v2".to_string();
+        shared.revision = shared.revision.saturating_add(1);
+        shared.updated_at_ms = shared.updated_at_ms.saturating_add(1);
+        vibex_db::ModelProviderProfileRepository::update(&conn, &shared, shared.revision - 1)
+            .unwrap();
+        drop(conn);
+
+        // Reopening runs the migrations, and with them the backfill that used to
+        // overwrite this.
+        let conn = service.open_connection().unwrap();
+        let after =
+            vibex_db::ModelProviderProfileRepository::get_by_legacy_profile(&conn, &created.id)
+                .unwrap()
+                .expect("the shared record must still exist");
+        assert_eq!(
+            after.display_name, "renamed-on-v2",
+            "the shared record is authoritative after the cutover; the backfill must not rewrite it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The backfill still creates a record that is missing.
+    ///
+    /// Authority is not the same as "stop projecting": a legacy row with no shared
+    /// record yet still needs one, or its Provider would vanish from the v2 side.
+    #[test]
+    fn the_backfill_still_creates_a_missing_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-authority-missing-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        // A legacy row written directly, with no projection behind it.
+        let conn = service.open_connection().unwrap();
+        let legacy = vibex_core::ProviderProfile {
+            id: vibex_core::ProviderProfileId::new(),
+            agent_id: vibex_core::AgentId::parse("opencode").unwrap(),
+            kind: vibex_core::ProviderKind::Acp,
+            display_name: "orphan".to_string(),
+            status: vibex_core::ProviderProfileStatus::Enabled,
+            account_alias: None,
+            base_url: Some("https://api.example.com/v1".to_string()),
+            default_model: Some("model-a".to_string()),
+            small_model: None,
+            large_model: None,
+            configured_models: vec![vibex_core::ProviderConfiguredModel {
+                id: "model-a".to_string(),
+                display_name: None,
+                enabled: true,
+                wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions),
+                capabilities: Default::default(),
+            }],
+            reasoning_effort: None,
+            sandbox_defaults: vibex_core::ProviderSandboxDefaults::workspace_write_ask_on_risk(),
+            network_defaults: vibex_core::ProviderNetworkDefaults::local_default(),
+            permission_defaults: vibex_core::ProviderPermissionDefaults::ask_on_risk(),
+            provider_options: vibex_core::ProviderOptions::empty(),
+            secrets: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            deleted_at_ms: None,
+        };
+        vibex_db::ProviderProfileRepository::insert(&conn, &legacy).unwrap();
+        drop(conn);
+
+        let conn = service.open_connection().unwrap();
+        let projected =
+            vibex_db::ModelProviderProfileRepository::get_by_legacy_profile(&conn, &legacy.id)
+                .unwrap();
+        assert!(
+            projected.is_some(),
+            "a legacy row with no shared record must still be projected"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

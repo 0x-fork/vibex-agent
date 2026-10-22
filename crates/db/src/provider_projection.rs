@@ -741,9 +741,30 @@ impl ProviderProjectionCompatibilityRepository {
         })
     }
 
+    /// Projects a legacy Profile onto v2 as an explicit write, not a backfill.
+    ///
+    /// The difference matters after the cutover: a backfill must not overwrite the
+    /// authoritative shared record, but an edit the user just made through a v1
+    /// entry point must reach it, or the two would disagree the moment they edit.
+    /// So this variant forces the write.
+    pub fn sync_legacy_profile_from_edit(
+        conn: &Connection,
+        legacy: &ProviderProfile,
+    ) -> VibexResult<LegacyProviderProjectionRecords> {
+        Self::sync_legacy_profile_inner(conn, legacy, true)
+    }
+
     pub fn sync_legacy_profile(
         conn: &Connection,
         legacy: &ProviderProfile,
+    ) -> VibexResult<LegacyProviderProjectionRecords> {
+        Self::sync_legacy_profile_inner(conn, legacy, false)
+    }
+
+    fn sync_legacy_profile_inner(
+        conn: &Connection,
+        legacy: &ProviderProfile,
+        explicit: bool,
     ) -> VibexResult<LegacyProviderProjectionRecords> {
         let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
             .map_err(storage_err(
@@ -751,7 +772,8 @@ impl ProviderProjectionCompatibilityRepository {
                 "failed to start provider projection compatibility transaction",
             ))?;
         let records = map_legacy_projection_records(&transaction, legacy)?;
-        let model_provider = upsert_legacy_model_provider(&transaction, records.model_provider)?;
+        let model_provider =
+            upsert_legacy_model_provider(&transaction, records.model_provider, explicit)?;
         let agent_runtime = upsert_legacy_agent_runtime(&transaction, records.agent_runtime)?;
         let mut binding = records.binding;
         binding.model_provider_profile_id = model_provider.id.clone();
@@ -1726,6 +1748,7 @@ fn pinned_catalog_command_version(
 fn upsert_legacy_model_provider(
     conn: &Connection,
     mut candidate: ModelProviderProfile,
+    explicit: bool,
 ) -> VibexResult<ModelProviderProfile> {
     let Some(legacy_id) = candidate.legacy_provider_profile_id.as_ref() else {
         return Err(VibexError::validation(
@@ -1738,6 +1761,14 @@ fn upsert_legacy_model_provider(
         insert_model_provider_profile(conn, &candidate)?;
         return Ok(candidate);
     };
+    // After the cutover the shared record is authoritative: an existing one is not
+    // overwritten from the legacy row it projected from. The binding and the runtime
+    // below still repair, because those are derived data the shared record owns —
+    // skipping them would leave a stale protocol in place, which is what three tests
+    // check.
+    if !explicit && crate::migration_applied(conn, 73)? {
+        return Ok(existing);
+    }
     candidate.id = existing.id.clone();
     candidate.created_at_ms = existing.created_at_ms;
     candidate.revision = existing.revision;

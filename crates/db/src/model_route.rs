@@ -842,9 +842,14 @@ pub fn backfill_direct_routes(conn: &Connection) -> VibexResult<usize> {
         // A row an Agent materialised from a shared Provider is skipped: it
         // already points at that Provider, and deriving a record from it would
         // create a second Provider and a second direct route for one connection.
+        // Two reasons to leave a row alone: it was materialised from a shared
+        // Provider and already points elsewhere, or the cutover has happened and the
+        // shared record it projected from is now authoritative.
         if let Some(existing) =
             super::AgentModelProviderBindingRepository::get_by_legacy_profile(conn, &profile.id)?
-            && existing.model_provider_profile_id != super::legacy_model_provider_id(&profile.id)?
+            && (crate::migration_applied(conn, 73)?
+                || existing.model_provider_profile_id
+                    != super::legacy_model_provider_id(&profile.id)?)
         {
             continue;
         }
