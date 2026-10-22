@@ -9042,11 +9042,13 @@ mod shared_bind_route_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The launch row a bind creates is never an `Acp` Profile.
+    /// A row materialised from a shared Provider takes the Agent's own kind.
     ///
-    /// This is why an Agent's own list can show the Provider while the composer's
-    /// selector does not: the selector lists `Acp` Profiles only, and a bind for
-    /// claude or codex produces a `Claude` or `Codex` row.
+    /// This is the *bind* path. It differs from the Agent page's own create path
+    /// on purpose: binding a shared Provider has to write into the config file the
+    /// Agent actually owns, so `claude` and `codex` get their own kinds here. That
+    /// is why such a Provider appears in the Agent's list but not in the
+    /// composer's selector, which lists `Acp` Profiles only.
     #[test]
     fn a_bound_row_takes_the_agents_own_kind() {
         let dir = std::env::temp_dir().join(format!(
@@ -9100,6 +9102,78 @@ mod shared_bind_route_tests {
                 })
                 .unwrap();
             assert_eq!(bound.kind, expected, "{agent} must get its own kind");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod agent_page_provider_kind_tests {
+    use super::*;
+
+    /// A Provider added on an Agent page is always `Acp`, whichever Agent it is.
+    ///
+    /// That is what makes it selectable in the composer: the selector lists `Acp`
+    /// Profiles. The `Claude` and `Codex` kinds appear elsewhere — in the hook
+    /// installer and the native-import reader, which need to know which config
+    /// file an Agent owns — and a Provider added for claude or codex from the
+    /// Agent page is not one of those.
+    #[test]
+    fn a_provider_added_for_claude_or_codex_is_still_acp() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-agent-page-kind-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        // One protocol each Agent can speak: the create path validates that even
+        // though it does not consult the Agent for the kind.
+        for (agent, wire_api) in [
+            (
+                "claude",
+                vibex_core::ProviderModelWireApi::AnthropicMessages,
+            ),
+            ("codex", vibex_core::ProviderModelWireApi::OpenaiResponses),
+            (
+                "goose",
+                vibex_core::ProviderModelWireApi::OpenaiChatCompletions,
+            ),
+        ] {
+            let created = service
+                .create_agent_model_provider_profile(
+                    vibex_core::AgentModelProviderProfileCreateRequest {
+                        agent_id: vibex_core::AgentId::parse(agent).unwrap(),
+                        display_name: format!("For {agent}"),
+                        account_alias: None,
+                        base_url: Some("https://api.example.com/v1".to_string()),
+                        default_model: Some("shared-model".to_string()),
+                        small_model: None,
+                        large_model: None,
+                        configured_models: vec![vibex_core::ProviderConfiguredModel {
+                            id: "shared-model".to_string(),
+                            display_name: None,
+                            enabled: true,
+                            wire_api: Some(wire_api),
+                            capabilities: Default::default(),
+                        }],
+                        reasoning_effort: None,
+                        sandbox_defaults: None,
+                        network_defaults: None,
+                        permission_defaults: None,
+                        provider_options: None,
+                        secret_references: Vec::new(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                created.kind,
+                vibex_core::ProviderKind::Acp,
+                "{agent} must still get an Acp Profile from this entry point, or it would \
+                 not appear in the composer's selector"
+            );
         }
 
         std::fs::remove_dir_all(&dir).ok();
