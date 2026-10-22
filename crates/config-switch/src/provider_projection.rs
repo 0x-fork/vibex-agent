@@ -8317,6 +8317,74 @@ mod shared_provider_launch_tests {
 }
 
 #[cfg(test)]
+mod provider_scope_tests {
+    use super::*;
+
+    /// A Provider created on the Agent page is visible on the Providers page.
+    ///
+    /// This is the question the two entry points raise: are they the same thing?
+    /// They are. The Agent page writes a per-Agent legacy row and its projection
+    /// creates the shared record, and the Providers page lists shared records. So
+    /// a Provider added while configuring one Agent is a global Provider that any
+    /// other Agent can then bind.
+    #[test]
+    fn a_provider_added_for_one_agent_is_global() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-provider-scope-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        let before = service.list_model_provider_profiles().unwrap().len();
+        service
+            .create_agent_model_provider_profile(
+                vibex_core::AgentModelProviderProfileCreateRequest {
+                    agent_id: vibex_core::AgentId::parse("codex").unwrap(),
+                    display_name: "From the Agent page".to_string(),
+                    account_alias: None,
+                    base_url: Some("https://api.example.com/v1".to_string()),
+                    default_model: Some("gpt-5".to_string()),
+                    small_model: None,
+                    large_model: None,
+                    configured_models: vec![vibex_core::ProviderConfiguredModel {
+                        id: "gpt-5".to_string(),
+                        display_name: None,
+                        enabled: true,
+                        wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiResponses),
+                        capabilities: Default::default(),
+                    }],
+                    reasoning_effort: None,
+                    sandbox_defaults: None,
+                    network_defaults: None,
+                    permission_defaults: None,
+                    provider_options: None,
+                    secret_references: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let after = service.list_model_provider_profiles().unwrap();
+        assert_eq!(
+            after.len(),
+            before + 1,
+            "a Provider added from the Agent page must appear in the global list"
+        );
+        let shared = after
+            .iter()
+            .find(|profile| profile.display_name == "From the Agent page")
+            .expect("the new Provider must be listed globally");
+        assert!(
+            shared.legacy_provider_profile_id.is_some(),
+            "and it must carry the per-Agent launch row behind it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
 mod v2_authority_tests {
     use super::*;
 
