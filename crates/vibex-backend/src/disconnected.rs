@@ -919,6 +919,13 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn delete_model_provider_profile(
+        &self,
+        _request: MutationRequest<vibex_core::ModelProviderProfileId>,
+    ) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
     fn clear_model_gateway_requests(&self) -> BackendFuture<'_, usize> {
         disconnected_future!()
     }

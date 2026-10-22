@@ -96,6 +96,71 @@ impl ModelProviderProfileRepository {
         ))
     }
 
+    /// Soft-deletes a shared Provider and everything that points at it.
+    ///
+    /// A Provider is not deletable on its own: its bindings would outlive it and
+    /// a runtime reading one would find a dangling reference. So the bindings go
+    /// first, in the same transaction, and the row is marked rather than removed —
+    /// a session that ran through it still has a ledger naming it.
+    pub fn soft_delete(
+        conn: &Connection,
+        provider_id: &ModelProviderProfileId,
+        deleted_at_ms: i64,
+    ) -> VibexResult<()> {
+        let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "model_provider_profile_delete_transaction_failed",
+                "failed to start the Provider delete transaction",
+            ))?;
+        // Only the bindings carry a link to this Provider. Their configured models
+        // hang off the binding with `ON DELETE CASCADE`, so marking the binding is
+        // enough; and the runtime profiles are per Agent, not per Provider, so
+        // deleting one from here would take away a launch contract the Agent still
+        // needs.
+        transaction
+            .execute(
+                "UPDATE agent_model_provider_bindings_v2 SET deleted_at_ms = ?2
+                 WHERE model_provider_profile_id = ?1 AND deleted_at_ms IS NULL",
+                params![provider_id.as_str(), deleted_at_ms],
+            )
+            .map_err(storage_err(
+                "model_provider_profile_delete_cascade_failed",
+                "failed to delete the bindings that point at this Provider",
+            ))?;
+        // The legacy row goes too, and for a reason that is easy to miss: the
+        // compatibility backfill re-projects every *live* legacy Profile, so a
+        // deleted shared record whose legacy row survived would be rebuilt on the
+        // next open and the delete would look like it never happened.
+        transaction
+            .execute(
+                "UPDATE provider_profiles SET deleted_at_ms = ?2
+                 WHERE provider_profile_id IN (
+                     SELECT legacy_provider_profile_id FROM model_provider_profiles
+                     WHERE model_provider_profile_id = ?1
+                 ) AND deleted_at_ms IS NULL",
+                params![provider_id.as_str(), deleted_at_ms],
+            )
+            .map_err(storage_err(
+                "model_provider_profile_delete_legacy_failed",
+                "failed to delete the launch row behind this Provider",
+            ))?;
+        transaction
+            .execute(
+                "UPDATE model_provider_profiles SET deleted_at_ms = ?2
+                 WHERE model_provider_profile_id = ?1 AND deleted_at_ms IS NULL",
+                params![provider_id.as_str(), deleted_at_ms],
+            )
+            .map_err(storage_err(
+                "model_provider_profile_delete_failed",
+                "failed to delete the Provider",
+            ))?;
+        transaction.commit().map_err(storage_err(
+            "model_provider_profile_delete_commit_failed",
+            "failed to commit the Provider delete",
+        ))?;
+        Ok(())
+    }
+
     pub fn list(conn: &Connection) -> VibexResult<Vec<ModelProviderProfile>> {
         let mut stmt = conn
             .prepare(

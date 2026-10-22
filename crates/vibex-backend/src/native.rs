@@ -3241,6 +3241,22 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn delete_model_provider_profile(
+        &self,
+        request: MutationRequest<vibex_core::ModelProviderProfileId>,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .delete_model_provider_profile(&request.payload)
+                .map_err(Into::into)
+        })
+    }
+
     fn clear_model_gateway_requests(&self) -> BackendFuture<'_, usize> {
         let runtime = self.runtime.clone();
         Box::pin(async move {

@@ -711,6 +711,8 @@ enum ManagementMutation {
     /// Binding a route to the Agent, or choosing which one is its default.
     RouteBind(String),
     RouteDefault(String),
+    /// Deleting a shared Provider from its own page.
+    ProviderDelete(String),
     ProfileCreate,
     ProfileUpdate(String),
     ProfileDelete(String),
@@ -864,6 +866,7 @@ impl ManagementMutation {
             Self::RouteDelete(id) => format!("route:delete:{id}"),
             Self::RouteBind(id) => format!("route:bind:{id}"),
             Self::RouteDefault(id) => format!("route:default:{id}"),
+            Self::ProviderDelete(id) => format!("provider:delete:{id}"),
             Self::ProfileCreate => "profile:create".into(),
             Self::ProfileUpdate(id) => format!("profile:update:{id}"),
             Self::ProfileDelete(id) => format!("profile:delete:{id}"),
@@ -11993,6 +11996,66 @@ impl ManagementCenter {
             cx,
         ));
 
+        // Deletion lives at the bottom of the page, apart from the editing
+        // controls: it is the one action here that cannot be undone, and putting
+        // it beside Save or Test is how it gets clicked by accident.
+        let delete_id = profile.id.clone();
+        let delete_label = profile.display_name.clone();
+        let used_by = row.agents.len();
+        let pending = self.mutation.is_some();
+        body = body.child(management_card_with_icon(
+            management_locale_text("Delete", "删除", "刪除"),
+            if used_by == 0 {
+                management_locale_text(
+                    "No Agent uses this Provider, so deleting it changes nothing else.",
+                    "没有 Agent 使用该供应商，删除不会影响其他配置。",
+                    "沒有 Agent 使用該供應商，刪除不會影響其他設定。",
+                )
+            } else {
+                management_locale_text(
+                    "Deleting removes this Provider and unbinds it from every Agent that uses it.",
+                    "删除会移除该供应商，并从所有使用它的 Agent 上解绑。",
+                    "刪除會移除該供應商，並從所有使用它的 Agent 上解綁。",
+                )
+            },
+            "icons/vibex/trash-2.svg",
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "The models it served stop being available to those Agents.",
+                            "它提供的模型将不再对那些 Agent 可用。",
+                            "它提供的模型將不再對那些 Agent 可用。",
+                        )),
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "management-provider-delete-{}",
+                        delete_id.as_str()
+                    )))
+                    .xsmall()
+                    .danger()
+                    .label(management_delete_profile_label())
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.confirm_delete_shared_provider(
+                            delete_id.clone(),
+                            delete_label.clone(),
+                            window,
+                            cx,
+                        )
+                    })),
+                )
+                .into_any_element(),
+            cx,
+        ));
+
         v_flex()
             .id("management-provider-page")
             .w_full()
@@ -12000,6 +12063,105 @@ impl ManagementCenter {
             .gap_3()
             .child(body)
             .into_any_element()
+    }
+
+    /// Asks before deleting a shared Provider.
+    ///
+    /// The dialog names how many Agents lose their model source, because that is
+    /// the consequence the reader cannot see from this page.
+    fn confirm_delete_shared_provider(
+        &mut self,
+        provider_id: vibex_core::ModelProviderProfileId,
+        label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.weak_entity();
+        let active_locale = locale::current_locale();
+        let title = match active_locale {
+            ResolvedLocale::En => format!("Delete {label}?"),
+            ResolvedLocale::ZhCn => format!("删除“{label}”？"),
+            ResolvedLocale::ZhTw => format!("刪除「{label}」？"),
+        };
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let provider_id = provider_id.clone();
+            dialog
+                .title(title.clone())
+                .child(management_locale_text_for(
+                    active_locale,
+                    "Every Agent that uses this Provider will lose it, and its models stop being selectable for them.",
+                    "使用该供应商的 Agent 都会失去它，那些模型也不再能被它们选择。",
+                    "使用該供應商的 Agent 都會失去它，那些模型也不再能被它們選擇。",
+                ))
+                .footer(
+                    gpui_component::dialog::DialogFooter::new()
+                        .child(gpui_component::dialog::DialogClose::new().child(
+                            Button::new("cancel-shared-provider-delete")
+                                .outline()
+                                .label(management_locale_text_for(
+                                    active_locale,
+                                    "Cancel",
+                                    "取消",
+                                    "取消",
+                                )),
+                        ))
+                        .child(gpui_component::dialog::DialogAction::new().child(
+                            Button::new("confirm-shared-provider-delete")
+                                .danger()
+                                .label(management_delete_profile_label()),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.delete_shared_provider(provider_id.clone(), cx)
+                    });
+                    true
+                })
+        });
+    }
+
+    /// Deletes a shared Provider and clears the selection that pointed at it.
+    fn delete_shared_provider(
+        &mut self,
+        provider_id: vibex_core::ModelProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::ProviderDelete(
+            provider_id.as_str().to_string(),
+        ));
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .delete_model_provider_profile(vibex_backend::MutationRequest::new(
+                    provider_id.clone(),
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(()) => {
+                        // The page's subject is gone, so fall back to the pinned
+                        // gateway row rather than leaving a detail pane that
+                        // describes nothing.
+                        this.selected_global_provider_id = None;
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
     }
 
     /// Gives another Agent its own Profile for this Provider.

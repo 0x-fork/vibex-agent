@@ -4107,6 +4107,16 @@ impl ManagementBackend for WebRemoteBackend {
         )
     }
 
+    fn delete_model_provider_profile(
+        &self,
+        _request: MutationRequest<vibex_core::ModelProviderProfileId>,
+    ) -> BackendFuture<'_, ()> {
+        self.unsupported(
+            "model_provider_delete_remote_unsupported",
+            "this runtime does not accept Provider deletion over the remote protocol yet",
+        )
+    }
+
     fn model_gateway_inflight(&self) -> BackendFuture<'_, Vec<vibex_core::GatewayInflight>> {
         // In-flight state is the authority's live memory; the remote protocol
         // does not stream it yet. An empty list would read as "nothing is

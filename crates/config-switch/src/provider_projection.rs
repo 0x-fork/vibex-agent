@@ -665,6 +665,21 @@ impl ProviderConfigService {
         Ok(profile)
     }
 
+    /// Deletes a shared Provider and its bindings.
+    ///
+    /// The whole reason this exists separately from `delete_profile`: a Provider
+    /// created on the global page has no legacy row, so the legacy delete path has
+    /// nothing to reach. Both end up marking the same records; only the entry
+    /// point differs.
+    pub fn delete_model_provider_profile(
+        &self,
+        provider_id: &ModelProviderProfileId,
+    ) -> VibexResult<()> {
+        let conn = self.open_connection()?;
+        ModelProviderProfileRepository::soft_delete(&conn, provider_id, unix_timestamp_ms())?;
+        Ok(())
+    }
+
     pub fn update_model_provider_profile(
         &self,
         request: ModelProviderProfileUpdateRequest,
@@ -8317,6 +8332,54 @@ mod shared_provider_launch_tests {
 }
 
 #[cfg(test)]
+mod provider_delete_scope_tests {
+    use super::*;
+
+    /// A Provider created on the global page has no legacy row to delete through.
+    ///
+    /// This is why adding a delete action to its detail pane is not just a button:
+    /// the only delete path today is `delete_profile`, which soft-deletes a legacy
+    /// row and marks its projection. A Provider created on the global page has no
+    /// legacy row at all, so nothing that path can reach exists.
+    #[test]
+    fn a_globally_created_provider_has_no_legacy_row() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-delete-scope-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        let created = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Global only".to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://api.example.com/v1".to_string(),
+                    wire_protocol_id: None,
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: Vec::new(),
+                default_model_id: None,
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+
+        assert!(
+            created.legacy_provider_profile_id.is_none(),
+            "a globally created Provider has no launch row, so `delete_profile` has nothing to reach"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
 mod provider_scope_tests {
     use super::*;
 
@@ -8699,6 +8762,132 @@ mod legacy_edit_projection_tests {
                 .iter()
                 .any(|endpoint| endpoint.url == "https://api.example.com/v1"),
             "and must not drop the address either"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod provider_delete_tests {
+    use super::*;
+
+    /// Deleting a shared Provider removes it from the list and from its Agent.
+    ///
+    /// The detail page offers this action, so it has to do what the page says: the
+    /// Provider disappears, and the Agent that bound it stops listing it rather
+    /// than pointing at a row that no longer resolves.
+    #[test]
+    fn deleting_a_shared_provider_removes_it_and_its_bindings() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-provider-delete-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        // Created through the Agent path, so it has a launch row and a binding —
+        // the case where a delete has to clean up more than one table.
+        let created = service
+            .create_agent_model_provider_profile(
+                vibex_core::AgentModelProviderProfileCreateRequest {
+                    agent_id: vibex_core::AgentId::parse("codex").unwrap(),
+                    display_name: "Doomed".to_string(),
+                    account_alias: None,
+                    base_url: Some("https://api.example.com/v1".to_string()),
+                    default_model: Some("gpt-5".to_string()),
+                    small_model: None,
+                    large_model: None,
+                    configured_models: vec![vibex_core::ProviderConfiguredModel {
+                        id: "gpt-5".to_string(),
+                        display_name: None,
+                        enabled: true,
+                        wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiResponses),
+                        capabilities: Default::default(),
+                    }],
+                    reasoning_effort: None,
+                    sandbox_defaults: None,
+                    network_defaults: None,
+                    permission_defaults: None,
+                    provider_options: None,
+                    secret_references: Vec::new(),
+                },
+            )
+            .unwrap();
+        let shared = service
+            .list_model_provider_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.legacy_provider_profile_id.as_ref() == Some(&created.id))
+            .expect("the shared record must exist");
+
+        service.delete_model_provider_profile(&shared.id).unwrap();
+
+        let conn = service.open_connection().unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM model_provider_profiles
+                 WHERE model_provider_profile_id = ?1 AND deleted_at_ms IS NULL",
+                rusqlite::params![shared.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "a deleted Provider must leave the active set");
+        let bindings =
+            AgentModelProviderBindingRepository::list_for_model_provider(&conn, &shared.id)
+                .unwrap();
+        assert!(
+            bindings.is_empty(),
+            "and its bindings must go with it: {bindings:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A Provider created on the global page has no legacy row to delete through.
+    ///
+    /// This is why the global page needed its own delete path: the only delete
+    /// that existed, `delete_profile`, soft-deletes a legacy row, and this Provider
+    /// has none.
+    #[test]
+    fn a_globally_created_provider_has_no_legacy_row_to_delete() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-provider-delete-global-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = ProviderConfigService::new(dir.join("state.db"));
+        service.open_connection().unwrap();
+
+        let created = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "Global only".to_string(),
+                vendor_hint: None,
+                endpoints: vec![vibex_core::ModelProviderEndpoint {
+                    id: "api".to_string(),
+                    kind: vibex_core::ModelProviderEndpointKind::Api,
+                    url: "https://api.example.com/v1".to_string(),
+                    wire_protocol_id: None,
+                }],
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: Vec::new(),
+                default_model_id: None,
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap();
+        assert!(created.legacy_provider_profile_id.is_none());
+
+        service.delete_model_provider_profile(&created.id).unwrap();
+        assert!(
+            service
+                .list_model_provider_profiles()
+                .unwrap()
+                .iter()
+                .all(|profile| profile.id != created.id),
+            "a globally created Provider must be deletable too"
         );
 
         std::fs::remove_dir_all(&dir).ok();

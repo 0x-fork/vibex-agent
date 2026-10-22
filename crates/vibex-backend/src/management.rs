@@ -242,6 +242,12 @@ pub trait ManagementBackend: BackendBound {
     /// The requests the gateway is serving right now.
     fn model_gateway_inflight(&self) -> BackendFuture<'_, Vec<vibex_core::GatewayInflight>>;
 
+    /// Deletes a shared Provider and the bindings that point at it.
+    fn delete_model_provider_profile(
+        &self,
+        request: MutationRequest<vibex_core::ModelProviderProfileId>,
+    ) -> BackendFuture<'_, ()>;
+
     /// Clears the gateway ledger.
     fn clear_model_gateway_requests(&self) -> BackendFuture<'_, usize>;
 

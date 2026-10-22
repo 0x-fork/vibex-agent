@@ -17931,7 +17931,8 @@ mod tests {
                 "66:model_gateway_agents",
                 "67:model_routes",
                 "68:binding_launch_fields",
-                "69:route_launch_policy", "70:binding_provider_options_repair",
+                "69:route_launch_policy",
+                "70:binding_provider_options_repair",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -18084,7 +18085,8 @@ mod tests {
                 "66:model_gateway_agents",
                 "67:model_routes",
                 "68:binding_launch_fields",
-                "69:route_launch_policy", "70:binding_provider_options_repair",
+                "69:route_launch_policy",
+                "70:binding_provider_options_repair",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -18218,7 +18220,8 @@ mod tests {
                 "66:model_gateway_agents",
                 "67:model_routes",
                 "68:binding_launch_fields",
-                "69:route_launch_policy", "70:binding_provider_options_repair",
+                "69:route_launch_policy",
+                "70:binding_provider_options_repair",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -18390,7 +18393,8 @@ mod tests {
                 "66:model_gateway_agents",
                 "67:model_routes",
                 "68:binding_launch_fields",
-                "69:route_launch_policy", "70:binding_provider_options_repair",
+                "69:route_launch_policy",
+                "70:binding_provider_options_repair",
             ]
         );
         assert_eq!(
@@ -19822,7 +19826,8 @@ mod tests {
                 "66:model_gateway_agents",
                 "67:model_routes",
                 "68:binding_launch_fields",
-                "69:route_launch_policy", "70:binding_provider_options_repair",
+                "69:route_launch_policy",
+                "70:binding_provider_options_repair",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

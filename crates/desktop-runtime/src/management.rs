@@ -137,6 +137,15 @@ impl ProviderManagementFacade {
         self.service.list_all_agent_model_route_bindings()
     }
 
+    /// Deletes a shared Provider and the bindings that point at it.
+    pub fn delete_model_provider_profile(
+        &self,
+        provider_id: &vibex_core::ModelProviderProfileId,
+    ) -> VibexResult<()> {
+        let _claim = self.mutation_guard.claim("provider:model-profile:delete")?;
+        self.service.delete_model_provider_profile(provider_id)
+    }
+
     pub fn create_model_provider_profile(
         &self,
         request: vibex_core::ModelProviderProfileCreateRequest,
