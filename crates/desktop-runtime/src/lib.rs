@@ -1507,12 +1507,13 @@ mod management_snapshot_tests {
         .await
         .expect("the Config Center bundle must assemble without any Providers");
 
-        // The runtime seeds a local Agent profile on first boot, so the point
-        // is not "nothing exists" but "whatever exists is reported": the
-        // unfiltered binding read used to fail the whole bundle even here.
+        // An empty home is the honest start now that the local default
+        // placeholders are gone. The point is not that something exists but
+        // that an empty answer is reported as empty: the unfiltered binding
+        // read used to fail the whole bundle even here.
         assert!(
-            !snapshot.model_provider_profiles.is_empty(),
-            "the seeded Provider must be reported, not dropped with the bundle"
+            snapshot.model_provider_profiles.is_empty(),
+            "a home with no Providers must report none, not a placeholder"
         );
         // An absent gateway would make the desktop fall back to a default
         // snapshot, which is what disguised the failure as "starting".

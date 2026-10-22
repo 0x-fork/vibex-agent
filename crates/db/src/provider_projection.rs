@@ -3576,7 +3576,6 @@ mod binding_launch_field_tests {
 
 #[cfg(test)]
 mod binding_options_migration_tests {
-    use super::*;
     use crate::apply_migrations;
 
     /// Migration 68's default was not a decodable `ProviderOptions`.
@@ -3637,7 +3636,6 @@ mod binding_options_migration_tests {
 
 #[cfg(test)]
 mod real_database_upgrade_tests {
-    use super::*;
     use crate::apply_migrations;
 
     /// Upgrading a database that already ran migration 68 must repair it.

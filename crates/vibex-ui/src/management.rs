@@ -1396,6 +1396,13 @@ mod tests {
             error_future()
         }
 
+        fn delete_model_provider_profile(
+            &self,
+            _request: MutationRequest<vibex_core::ModelProviderProfileId>,
+        ) -> BackendFuture<'_, ()> {
+            error_future()
+        }
+
         fn create_model_provider_profile(
             &self,
             _request: MutationRequest<vibex_core::ModelProviderProfileCreateRequest>,

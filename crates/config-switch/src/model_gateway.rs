@@ -287,11 +287,33 @@ impl ProviderConfigService {
         Ok(models
             .into_iter()
             .map(|model| {
-                let Some(route) = routes.iter().find(|route| route.model_id() == model.id) else {
+                if let Some(route) = routes.iter().find(|route| route.model_id() == model.id) {
+                    return ProviderConfiguredModel {
+                        capabilities: route_capabilities(conn, &profiles, route),
+                        ..model
+                    };
+                }
+                // A provider group publishes `group/<id>/<model>`, so its
+                // capabilities come from the Providers that serve that one
+                // model rather than from the group as a whole.
+                let Some(parsed) = vibex_core::provider_group_model_ref(&model.id) else {
                     return model;
                 };
+                let Some(route) = routes.iter().find(|route| {
+                    route.is_provider_group() && route.id.as_str() == parsed.group_id
+                }) else {
+                    return model;
+                };
+                let caps = vibex_core::provider_group_models(route, &profiles)
+                    .into_iter()
+                    .find(|entry| entry.model_id == parsed.model_id)
+                    .map(|entry| entry.capabilities)
+                    .unwrap_or_default();
                 ProviderConfiguredModel {
-                    capabilities: route_capabilities(conn, &profiles, route),
+                    capabilities: vibex_core::ProviderModelCapabilities {
+                        context_tokens: route.context_tokens.or(caps.context_tokens),
+                        ..caps
+                    },
                     ..model
                 }
             })
@@ -361,7 +383,7 @@ impl ProviderConfigService {
             // A direct route describes a connection that bypasses the gateway.
             // Publishing it here would invite an Agent to call the gateway for
             // something whose whole point is not to go through it.
-            if route.kind != vibex_core::RouteKind::Gateway {
+            if !route.kind.via_gateway() {
                 continue;
             }
             // A route whose members all point at Providers that no longer exist
@@ -376,6 +398,27 @@ impl ProviderConfigService {
                 })
                 .count();
             if served == 0 {
+                continue;
+            }
+            if route.is_provider_group() {
+                // A group is several models, so it publishes one entry per
+                // shared model. The model is part of the id because the group
+                // itself is not a model.
+                let models = vibex_core::provider_group_models(&route, &profiles);
+                if models.is_empty() {
+                    continue;
+                }
+                let model_count = models.len();
+                for model in models {
+                    catalog.push(GatewayCatalogModel {
+                        route_id: Some(route.id.as_str().to_string()),
+                        display_name: route.display_name.clone(),
+                        model: route.group_model_id(&model.model_id),
+                        kind: route.kind,
+                        source_count: model.provider_profile_ids.len(),
+                        model_count,
+                    });
+                }
                 continue;
             }
             catalog.push(GatewayCatalogModel {

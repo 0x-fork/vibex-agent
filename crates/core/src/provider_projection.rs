@@ -2659,7 +2659,7 @@ mod tests {
             legacy_provider_profile_id: None,
             agent_id: AgentId::parse("deepseek-harness").unwrap(),
             runtime_profile_id: AgentRuntimeProfileId::new(),
-            model_provider_profile_id: ModelProviderProfileId::new(),
+            model_provider_profile_id: Some(ModelProviderProfileId::new()),
             projection_descriptor_id: descriptor_id,
             projection_overrides: AgentProviderProjectionOverrides::default(),
             configured_models: vec![AgentConfiguredModelBinding {
@@ -2724,7 +2724,7 @@ mod tests {
             legacy_provider_profile_id: None,
             agent_id: AgentId::parse("codex").unwrap(),
             runtime_profile_id: AgentRuntimeProfileId::new(),
-            model_provider_profile_id: ModelProviderProfileId::new(),
+            model_provider_profile_id: Some(ModelProviderProfileId::new()),
             projection_descriptor_id: descriptor.id.clone(),
             projection_overrides: AgentProviderProjectionOverrides::default(),
             configured_models: vec![AgentConfiguredModelBinding {

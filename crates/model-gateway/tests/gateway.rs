@@ -1375,16 +1375,27 @@ fn failure_classification_is_shared_with_the_service() {
     );
 }
 
+/// One persisted Provider, for the tests that need a real foreign key.
+///
+/// The local default placeholders were removed, so a migrated database starts
+/// with no Providers at all. A test that needs a row seeds its own rather than
+/// relying on a fixture that no longer exists.
+fn seed_persisted_provider(connection: &vibex_db::DbConnection) -> ModelProviderProfileId {
+    let profile = vibex_core::ModelProviderProfile {
+        display_name: "Test Provider".to_string(),
+        status: vibex_core::ModelProviderProfileStatus::Enabled,
+        ..Default::default()
+    };
+    vibex_db::ModelProviderProfileRepository::insert(connection, &profile).unwrap();
+    profile.id
+}
+
 #[test]
 fn pins_round_trip_through_the_database() {
     let path = database_path();
     let mut connection = open_database(&path).unwrap();
     apply_migrations(&mut connection).unwrap();
-    let upstream = vibex_db::ModelProviderProfileRepository::list(&connection)
-        .unwrap()
-        .first()
-        .map(|profile| profile.id.clone())
-        .expect("seeded profiles");
+    let upstream = seed_persisted_provider(&connection);
     let now = vibex_core::unix_timestamp_ms();
     GatewayConversationPinRepository::upsert(
         &connection,
@@ -1410,11 +1421,7 @@ fn ledger_retention_is_seven_days() {
     let path = database_path();
     let mut connection = open_database(&path).unwrap();
     apply_migrations(&mut connection).unwrap();
-    let upstream = vibex_db::ModelProviderProfileRepository::list(&connection)
-        .unwrap()
-        .first()
-        .map(|profile| profile.id.clone())
-        .expect("seeded profiles");
+    let upstream = seed_persisted_provider(&connection);
     let now = vibex_core::unix_timestamp_ms();
     for age in [0, vibex_core::ModelGatewayRequestLog::RETENTION_MS + 1] {
         ModelGatewayRequestLogRepository::insert(
@@ -1839,6 +1846,190 @@ fn seed_route_with_timeout(
     };
     vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
     route.id.clone()
+}
+
+/// Seeds a provider group: Providers rather than `(Provider, model)` pairs.
+fn seed_provider_group(
+    path: &std::path::Path,
+    name: &str,
+    providers: &[ModelProviderProfileId],
+    strategy: vibex_core::RouteStrategy,
+) -> vibex_core::ModelRouteId {
+    let mut connection = open_database(path).unwrap();
+    apply_migrations(&mut connection).unwrap();
+    let route = vibex_core::ModelRoute {
+        display_name: name.to_string(),
+        kind: vibex_core::RouteKind::ProviderGroup,
+        strategy,
+        status: vibex_core::RouteStatus::Enabled,
+        members: providers
+            .iter()
+            .enumerate()
+            .map(|(index, provider)| {
+                vibex_core::ModelRouteMember::provider(provider.clone(), index as i64)
+            })
+            .collect(),
+        ..Default::default()
+    };
+    vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
+    route.id.clone()
+}
+
+/// A provider group offers only the models every Provider serves, and a
+/// request for one is answered by a Provider that serves it.
+///
+/// The group is ordered so the second Provider would answer a plain model id
+/// first; the point is that the model — not the Provider — is what the Agent
+/// names, and the group's membership decides who may answer.
+#[tokio::test]
+async fn a_provider_group_routes_a_shared_model_to_a_serving_provider() {
+    let path = database_path();
+    let (left_url, left_recorder, left_task) = mock_upstream(200, chat_stream(), None).await;
+    let (right_url, right_recorder, right_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let left = seed_upstream(
+        &config,
+        &left_url,
+        WireProtocol::ChatCompletions,
+        &["shared-model"],
+        "sk-left",
+    );
+    let right = seed_upstream(
+        &config,
+        &right_url,
+        WireProtocol::ChatCompletions,
+        &["shared-model"],
+        "sk-right",
+    );
+    point_gateway_at(&path, left.clone(), GatewayPolicy::default());
+    let group_id = seed_provider_group(
+        &path,
+        "Team",
+        &[left.clone(), right.clone()],
+        vibex_core::RouteStrategy::Ordered,
+    );
+
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+    // The group's own catalogue must publish the shared model, spelled the way
+    // a session selects it.
+    let served = service.read_snapshot().unwrap();
+    let selected = format!("group/{}/shared-model", group_id.as_str());
+    let group = served
+        .group_for_model(&selected)
+        .expect("the group is in the snapshot");
+    assert_eq!(group.1, "shared-model");
+    assert_eq!(group.0.models.len(), 1, "one shared model");
+
+    let status = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": format!("group/{}/shared-model", group_id.as_str()),
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(
+        status, 200,
+        "a shared model must be routable through the group"
+    );
+    assert!(
+        !left_recorder.lock().await.path.is_empty(),
+        "the first Provider in the group should answer"
+    );
+    assert!(
+        right_recorder.lock().await.path.is_empty(),
+        "the ordered group only fails over when it must"
+    );
+
+    gateway_task.abort();
+    left_task.abort();
+    right_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A model only one Provider of the group serves is not part of the group.
+///
+/// This is the intersection contract: offering it would let the group's policy
+/// send a request to a Provider that has never heard of the model.
+#[tokio::test]
+async fn a_provider_group_refuses_a_model_only_one_provider_serves() {
+    let path = database_path();
+    let (left_url, _, left_task) = mock_upstream(200, chat_stream(), None).await;
+    let (right_url, _, right_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let left = seed_upstream(
+        &config,
+        &left_url,
+        WireProtocol::ChatCompletions,
+        &["shared-model", "left-only"],
+        "sk-left",
+    );
+    let right = seed_upstream(
+        &config,
+        &right_url,
+        WireProtocol::ChatCompletions,
+        &["shared-model"],
+        "sk-right",
+    );
+    point_gateway_at(&path, left.clone(), GatewayPolicy::default());
+    let group_id = seed_provider_group(
+        &path,
+        "Team",
+        &[left, right],
+        vibex_core::RouteStrategy::Ordered,
+    );
+
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+    let served = service.read_snapshot().unwrap();
+    let group = served
+        .groups
+        .get(group_id.as_str())
+        .expect("the group is in the snapshot");
+    assert_eq!(
+        group
+            .models
+            .iter()
+            .map(|model| model.model.as_str())
+            .collect::<Vec<_>>(),
+        vec!["shared-model"],
+        "only the intersection is offered"
+    );
+    assert!(
+        served
+            .group_for_model(&format!("group/{}/left-only", group_id.as_str()))
+            .is_none(),
+        "a model one Provider serves is not group-shaped"
+    );
+
+    let status = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": format!("group/{}/left-only", group_id.as_str()),
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(
+        status, 404,
+        "a model the group does not offer must be refused"
+    );
+
+    gateway_task.abort();
+    left_task.abort();
+    right_task.abort();
+    service.shutdown().await;
+    cleanup(path);
 }
 
 /// A route's second member answers when the first one cannot.

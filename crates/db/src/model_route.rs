@@ -977,18 +977,23 @@ pub fn legacy_profile_for_route(
             let profile = super::ProviderProfileRepository::get(conn, &legacy_id)?;
             Ok(profile.filter(|profile| &profile.agent_id == agent_id))
         }
-        vibex_core::RouteKind::Gateway => {
+        vibex_core::RouteKind::Gateway | vibex_core::RouteKind::ProviderGroup => {
             // The gateway Profile is per Agent and already lists every route
-            // id it serves.
+            // id it serves. A group contributes one entry per shared model, so
+            // the check is by prefix rather than by the single route id.
+            let prefix = match route.kind {
+                vibex_core::RouteKind::ProviderGroup => route.model_id(),
+                vibex_core::RouteKind::Gateway | vibex_core::RouteKind::Direct => route.model_id(),
+            };
             let profiles = super::ProviderProfileRepository::list_by_agent(conn, agent_id, true)?;
             Ok(profiles
                 .into_iter()
                 .find(is_gateway_profile)
                 .filter(|profile| {
-                    profile
-                        .configured_models
-                        .iter()
-                        .any(|model| model.id == route.model_id())
+                    profile.configured_models.iter().any(|model| {
+                        model.id == prefix
+                            || (route.is_provider_group() && model.id.starts_with(&prefix))
+                    })
                 }))
         }
     }
@@ -1057,6 +1062,49 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// A provider group stores Providers rather than models, and reads back
+    /// with the empty model ids intact.
+    ///
+    /// This is the one part of the group shape storage has to tolerate: the
+    /// member table's `model_id` is NOT NULL, so the empty string is what says
+    /// "this member is a Provider, not a model".
+    #[test]
+    fn a_provider_group_round_trips_its_providers() {
+        let conn = migrated_connection();
+        let left = seed_provider(&conn, "DeepSeek");
+        let right = seed_provider(&conn, "Kimi");
+        let route = ModelRoute {
+            display_name: "Team".to_string(),
+            kind: RouteKind::ProviderGroup,
+            status: RouteStatus::Enabled,
+            strategy: RouteStrategy::RoundRobin,
+            members: vec![
+                ModelRouteMember::provider(left.clone(), 0),
+                ModelRouteMember::provider(right.clone(), 1),
+            ],
+            ..Default::default()
+        };
+        ModelRouteRepository::insert(&conn, &route).unwrap();
+        let loaded = ModelRouteRepository::get(&conn, &route.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.kind, RouteKind::ProviderGroup);
+        assert_eq!(loaded.strategy, RouteStrategy::RoundRobin);
+        assert_eq!(
+            loaded
+                .members
+                .iter()
+                .map(|member| member.model_provider_profile_id.clone())
+                .collect::<Vec<_>>(),
+            vec![left, right],
+            "provider order is the attempt order"
+        );
+        assert!(
+            loaded.members.iter().all(|member| !member.names_model()),
+            "a group member names a Provider, not a model"
+        );
     }
 
     #[test]

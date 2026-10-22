@@ -164,6 +164,17 @@ impl ProviderConfigService {
                         .any(|model| model.id == route.model_id())
                 }))
             }
+            vibex_core::RouteKind::ProviderGroup => {
+                // A group contributes one catalogue entry per shared model, so
+                // the Profile carries the group's prefix rather than one id.
+                let prefix = route.model_id();
+                Ok(self.gateway_legacy_profile(agent_id)?.filter(|profile| {
+                    profile
+                        .configured_models
+                        .iter()
+                        .any(|model| model.id.starts_with(&prefix))
+                }))
+            }
         }
     }
 

@@ -1110,7 +1110,7 @@ mod shared_projection_tests {
     ) -> vibex_core::AgentModelProviderBinding {
         vibex_core::AgentModelProviderBinding {
             agent_id: vibex_core::AgentId::parse(agent).unwrap(),
-            model_provider_profile_id: provider.id.clone(),
+            model_provider_profile_id: Some(provider.id.clone()),
             account_alias: Some("Work".to_string()),
             ..Default::default()
         }

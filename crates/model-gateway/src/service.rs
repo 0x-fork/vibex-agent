@@ -94,6 +94,63 @@ pub struct GatewaySnapshot {
     pub gateway_used_tokens: u64,
     /// Enabled routes, by id. A request that names `route/<id>` resolves here.
     pub routes: BTreeMap<String, GatewayRoute>,
+    /// Enabled provider groups, by id.
+    ///
+    /// Kept apart from `routes` because the two are addressed differently: a
+    /// route is one model, a group is a set of models. Merging them would make
+    /// every caller ask which shape it holds.
+    pub groups: BTreeMap<String, GatewayProviderGroup>,
+}
+
+/// One provider group as the gateway serves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayProviderGroup {
+    pub group_id: String,
+    pub display_name: String,
+    pub strategy: vibex_core::RouteStrategy,
+    pub first_token_timeout_ms: Option<u64>,
+    pub pin: vibex_core::GatewayPinScope,
+    pub token_limit: Option<vibex_core::GatewayTokenLimit>,
+    /// The Providers in attempt order, already filtered to the ones that exist.
+    pub providers: Vec<crate::route::RouteMemberRef>,
+    /// The models every Provider serves, and which Providers serve each.
+    pub models: Vec<GatewayGroupModel>,
+}
+
+/// One model a provider group offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayGroupModel {
+    pub model: String,
+    /// The Providers serving the model, in the group's attempt order.
+    pub providers: Vec<ModelProviderProfileId>,
+}
+
+impl GatewayProviderGroup {
+    /// The id a request names for one of this group's models.
+    pub fn model_id(&self, model: &str) -> String {
+        format!(
+            "{}{}/{}",
+            vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
+            self.group_id,
+            model
+        )
+    }
+
+    /// The model this request names, when the request names this group.
+    pub fn model_of<'a>(&self, requested: &'a str) -> Option<&'a str> {
+        vibex_core::provider_group_model_ref(requested)
+            .filter(|parsed| parsed.group_id == self.group_id)
+            .map(|parsed| parsed.model_id)
+    }
+
+    /// The Providers that may answer for one model.
+    pub fn providers_for(&self, model: &str) -> Vec<ModelProviderProfileId> {
+        self.models
+            .iter()
+            .find(|entry| entry.model == model)
+            .map(|entry| entry.providers.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// One route as the gateway serves it.
@@ -127,6 +184,25 @@ impl GatewaySnapshot {
         self.routes.keys().cloned().collect()
     }
 
+    /// The group a model id names, when it names a model the group offers.
+    ///
+    /// The membership check is what makes the intersection real: a model only
+    /// one of the group's Providers serves is not addressable through the
+    /// group, and resolving it would let the strategy pick a Provider that has
+    /// never heard of it.
+    pub fn group_for_model<'a>(
+        &'a self,
+        requested: &'a str,
+    ) -> Option<(&'a GatewayProviderGroup, &'a str)> {
+        let parsed = vibex_core::provider_group_model_ref(requested)?;
+        let group = self.groups.get(parsed.group_id)?;
+        group
+            .models
+            .iter()
+            .any(|model| model.model == parsed.model_id)
+            .then_some((group, parsed.model_id))
+    }
+
     pub fn upstream(&self, profile: &ModelProviderProfileId) -> Option<&GatewayUpstream> {
         self.upstreams
             .iter()
@@ -156,6 +232,19 @@ impl GatewaySnapshot {
                 provider_name: route.display_name.clone(),
             })
             .collect::<Vec<_>>();
+        // A group contributes one entry per shared model rather than one entry
+        // for the group: the group is not a model, and an Agent must be able to
+        // name the model it wants.
+        for group in self.groups.values() {
+            for model in &group.models {
+                entries.push(GatewayModelEntry {
+                    id: group.model_id(&model.model),
+                    model: model.model.clone(),
+                    provider: ModelProviderProfileId::new(),
+                    provider_name: group.display_name.clone(),
+                });
+            }
+        }
         let namespaces = self.model_namespaces();
         for upstream in &self.upstreams {
             let Some(namespace) = namespaces
@@ -440,10 +529,11 @@ impl ModelGatewayService {
         // Provider twice — once as an upstream, once as a member — and the
         // second one would be invisible in the gateway's own configuration.
         let mut referenced = settings.upstreams.clone();
-        for route in vibex_db::ModelRouteRepository::list_enabled(&connection)? {
+        let enabled_routes = vibex_db::ModelRouteRepository::list_enabled(&connection)?;
+        for route in &enabled_routes {
             // A direct route is not served here, so its Providers are not
             // upstreams of this listener.
-            if route.kind != vibex_core::RouteKind::Gateway {
+            if !route.kind.via_gateway() {
                 continue;
             }
             for member in route.enabled_members() {
@@ -507,9 +597,8 @@ impl ModelGatewayService {
         // Provider no longer in the snapshot keeps its members out: a member
         // whose upstream is gone cannot be called, and pretending otherwise
         // would fail deep inside `prepare_member`.
-        let routes = vibex_db::ModelRouteRepository::list_enabled(&connection)?
-            .into_iter()
-            // Only a gateway route is resolved through this listener.
+        let routes = enabled_routes
+            .iter()
             .filter(|route| route.kind == vibex_core::RouteKind::Gateway)
             .filter_map(|route| {
                 let members = route
@@ -535,8 +624,68 @@ impl ModelGatewayService {
                         strategy: route.strategy,
                         first_token_timeout_ms: route.first_token_timeout_ms,
                         pin: route.pin,
-                        token_limit: route.token_limit.clone(),
+                        token_limit: route.token_limit,
                         members,
+                    },
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        // A provider group offers the intersection of its Providers'
+        // catalogues. The models are computed here, once, from the same
+        // profiles the request will be prepared against: computing them at
+        // request time would let the catalogue and the router disagree about
+        // which model is available.
+        let group_profiles = profiles.values().cloned().collect::<Vec<_>>();
+        let groups = enabled_routes
+            .iter()
+            .filter(|route| route.is_provider_group())
+            .filter_map(|route| {
+                let providers = route
+                    .enabled_members()
+                    .filter_map(|member| {
+                        profiles
+                            .get(&member.model_provider_profile_id)
+                            .map(|profile| {
+                                crate::route::RouteMemberRef {
+                                    profile: profile.id.clone(),
+                                    // A group member names a Provider, so the router
+                                    // substitutes the model per request.
+                                    model: String::new(),
+                                    reasoning_effort: member.reasoning_effort.clone(),
+                                }
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                if providers.len() < 2 {
+                    // One Provider is a direct connection, not a group: there
+                    // is nothing to choose between, and calling it a group
+                    // would promise failover the composition cannot deliver.
+                    return None;
+                }
+                let models = vibex_core::provider_group_models(route, &group_profiles)
+                    .into_iter()
+                    .map(|model| GatewayGroupModel {
+                        model: model.model_id,
+                        providers: model.provider_profile_ids,
+                    })
+                    .collect::<Vec<_>>();
+                if models.is_empty() {
+                    // No shared model means the group cannot answer anything,
+                    // which is a broken composition rather than a usable one.
+                    return None;
+                }
+                Some((
+                    route.id.as_str().to_string(),
+                    GatewayProviderGroup {
+                        group_id: route.id.as_str().to_string(),
+                        display_name: route.display_name.clone(),
+                        strategy: route.strategy,
+                        first_token_timeout_ms: route.first_token_timeout_ms,
+                        pin: route.pin,
+                        token_limit: route.token_limit,
+                        providers,
+                        models,
                     },
                 ))
             })
@@ -547,6 +696,7 @@ impl ModelGatewayService {
             upstreams,
             gateway_used_tokens,
             routes,
+            groups,
         })
     }
 
@@ -954,7 +1104,7 @@ impl ModelGatewayService {
         let route_token_limit = resolved_model_route_id(&request.model).and_then(|route_id| {
             snapshot
                 .route(&route_id)
-                .and_then(|route| route.token_limit.clone())
+                .and_then(|route| route.token_limit)
         });
         let ceiling = route_token_limit
             .as_ref()
@@ -1069,6 +1219,54 @@ impl ModelGatewayService {
         snapshot: &GatewaySnapshot,
         request: &CanonicalRequest,
     ) -> GatewayResult<Vec<ResolvedMember>> {
+        if let Some((group, model)) = snapshot.group_for_model(&request.model) {
+            // A group is addressed by `group/<id>/<model>`: the model is part
+            // of the id because the group itself is not a model. Only the
+            // Providers that serve this model are candidates, so the group's
+            // strategy never picks one that has never heard of it.
+            let model = model.to_string();
+            let mut candidates = group
+                .providers
+                .iter()
+                .filter(|provider| {
+                    group
+                        .providers_for(&model)
+                        .iter()
+                        .any(|serving| serving == &provider.profile)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                return Err(GatewayError::ModelNotFound {
+                    model: request.model.clone(),
+                    closest: group
+                        .models
+                        .iter()
+                        .map(|entry| group.model_id(&entry.model))
+                        .collect(),
+                });
+            }
+            let plans = crate::route::plan_members_with_usage(
+                &candidates,
+                group.strategy,
+                self.member_rotation.fetch_add(1, Ordering::Relaxed),
+                &self.member_usage(snapshot),
+            );
+            for candidate in &mut candidates {
+                if let Some(plan) = plans.iter().find(|plan| plan.profile == candidate.profile) {
+                    candidate.reasoning_effort = plan.reasoning_effort.clone();
+                }
+            }
+            return Ok(plans
+                .into_iter()
+                .map(|member| ResolvedMember {
+                    profile: member.profile,
+                    model: model.clone(),
+                    reasoning_effort: member.reasoning_effort,
+                    first_token_timeout_ms: group.first_token_timeout_ms,
+                })
+                .collect());
+        }
         if let Some(route_id) = resolved_model_route_id(&request.model) {
             let Some(route) = snapshot.route(&route_id) else {
                 return Err(GatewayError::ModelNotFound {
@@ -2696,6 +2894,7 @@ mod tests {
             upstreams: vec![left, right],
             gateway_used_tokens: 0,
             routes: BTreeMap::new(),
+            groups: BTreeMap::new(),
         };
         let catalog = snapshot.model_catalog();
         assert_eq!(catalog.len(), 2);

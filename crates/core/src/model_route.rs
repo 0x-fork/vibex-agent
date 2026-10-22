@@ -9,6 +9,10 @@
 //!
 //! - [`RouteKind::Gateway`] — the route is served by the local gateway, which
 //!   may fail over across its members and translate protocols.
+//! - [`RouteKind::ProviderGroup`] — the route composes whole Providers: every
+//!   model their enabled catalogues share is offered once, and a request for
+//!   that model is routed across the Providers that serve it. This is what
+//!   makes a Provider set look like one Provider to a session.
 //! - [`RouteKind::Direct`] — the route names exactly one Provider and skips the
 //!   gateway entirely. Its `base_url` is the Provider's, not the loopback one.
 //! - An account (`RuntimeAuthSource::AgentAccount`) is *not* a route. Its
@@ -39,22 +43,40 @@ pub const MAX_ROUTE_MEMBERS: usize = 16;
 /// composition, and past this many the picker stops being a picker.
 pub const MAX_ROUTES: usize = 32;
 
+/// The prefix a plain route's model id carries.
+pub const ROUTE_MODEL_PREFIX: &str = "route/";
+
+/// The prefix a provider group's model ids carry.
+///
+/// The two prefixes are distinct so a group and a single-model route can never
+/// be mistaken for one another, even when their ids collide.
+pub const PROVIDER_GROUP_MODEL_PREFIX: &str = "group/";
+
 /// How a route delivers a model to an Agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteKind {
     /// Served by the local gateway: members fail over, protocols translate.
+    #[default]
     Gateway,
+    /// Served by the local gateway, composed from whole Providers.
+    ///
+    /// Unlike a gateway route, a provider group names no models of its own:
+    /// its members are Providers, and the models it offers are the intersection
+    /// of their enabled catalogues. One model id may therefore be served by
+    /// several Providers, and the group's strategy picks which one answers.
+    ProviderGroup,
     /// One Provider, called directly. The gateway is not involved.
     Direct,
 }
 
 impl RouteKind {
-    pub const ALL: [Self; 2] = [Self::Gateway, Self::Direct];
+    pub const ALL: [Self; 3] = [Self::Gateway, Self::ProviderGroup, Self::Direct];
 
     pub const fn id(self) -> &'static str {
         match self {
             Self::Gateway => "gateway",
+            Self::ProviderGroup => "provider_group",
             Self::Direct => "direct",
         }
     }
@@ -63,10 +85,17 @@ impl RouteKind {
         Self::ALL.into_iter().find(|kind| kind.id() == value.trim())
     }
 
+    /// Whether the local gateway serves this kind.
+    ///
+    /// A direct route is the one shape that never reaches the listener.
+    pub const fn via_gateway(self) -> bool {
+        matches!(self, Self::Gateway | Self::ProviderGroup)
+    }
+
     /// Direct routes carry exactly one member; gateway routes may carry more.
     pub const fn member_limit(self) -> usize {
         match self {
-            Self::Gateway => MAX_ROUTE_MEMBERS,
+            Self::Gateway | Self::ProviderGroup => MAX_ROUTE_MEMBERS,
             Self::Direct => 1,
         }
     }
@@ -142,20 +171,21 @@ impl ModelRouteMember {
         }
     }
 
+    /// One Provider as a member of a provider group.
+    ///
+    /// A group names Providers, not models: its model list is the intersection
+    /// of their catalogues, so the member carries an empty model id and the
+    /// provider is the whole address.
+    pub fn provider(model_provider_profile_id: ModelProviderProfileId, order_index: i64) -> Self {
+        Self::new(model_provider_profile_id, "", order_index)
+    }
+
+    /// Whether this member names a model rather than only a Provider.
+    pub fn names_model(&self) -> bool {
+        !self.model_id.trim().is_empty()
+    }
+
     pub fn validate(&self) -> VibexResult<()> {
-        let model = self.model_id.trim();
-        if model.is_empty() {
-            return Err(VibexError::validation(
-                "route_member_model_invalid",
-                "a route member must name a model",
-            ));
-        }
-        if model.chars().count() > 256 {
-            return Err(VibexError::validation(
-                "route_member_model_invalid",
-                "a route member model id is longer than the supported length",
-            ));
-        }
         if self.order_index < 0 {
             return Err(VibexError::validation(
                 "route_member_order_invalid",
@@ -170,6 +200,24 @@ impl ModelRouteMember {
                     "a route member reasoning effort must be non-empty and bounded",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// The model checks that only apply to a member that names one.
+    fn validate_model(&self) -> VibexResult<()> {
+        let model = self.model_id.trim();
+        if model.is_empty() {
+            return Err(VibexError::validation(
+                "route_member_model_invalid",
+                "a route member must name a model",
+            ));
+        }
+        if model.chars().count() > 256 {
+            return Err(VibexError::validation(
+                "route_member_model_invalid",
+                "a route member model id is longer than the supported length",
+            ));
         }
         Ok(())
     }
@@ -287,14 +335,23 @@ impl ModelRoute {
     /// A member is a `(Provider, model)` pair, so one model configured at three
     /// Providers appears three times in `members` and once here. This is what
     /// the model picker lists inside the route's group.
+    ///
+    /// A provider group has no model-carrying members at all: its models are
+    /// derived from the Providers' catalogues by
+    /// [`intersect_provider_group_models`], so this reads empty for it.
     pub fn distinct_models(&self) -> Vec<&str> {
         let mut seen = Vec::new();
-        for member in self.enabled_members() {
+        for member in self.enabled_members().filter(|member| member.names_model()) {
             if !seen.contains(&member.model_id.as_str()) {
                 seen.push(member.model_id.as_str());
             }
         }
         seen
+    }
+
+    /// Whether this route composes whole Providers.
+    pub fn is_provider_group(&self) -> bool {
+        self.kind == RouteKind::ProviderGroup
     }
 
     /// How many sources back this route.
@@ -307,8 +364,26 @@ impl ModelRoute {
     /// One route is one selectable model: the Agent never sees the members.
     /// That is what keeps failover invisible to it — a member change must not
     /// require a new selection.
+    ///
+    /// A provider group is several selectable models rather than one, so its
+    /// ids carry the model after the route: `group/<id>/<model>`. The model has
+    /// to live in the id because the group itself is not a model; the provider
+    /// is chosen per request, which is exactly what the id's first half leaves
+    /// out.
     pub fn model_id(&self) -> String {
-        format!("route/{}", self.id.as_str())
+        match self.kind {
+            RouteKind::ProviderGroup => {
+                format!("{}{}/", PROVIDER_GROUP_MODEL_PREFIX, self.id.as_str())
+            }
+            RouteKind::Gateway | RouteKind::Direct => {
+                format!("{}{}", ROUTE_MODEL_PREFIX, self.id.as_str())
+            }
+        }
+    }
+
+    /// The id one model of a provider group is selected by.
+    pub fn group_model_id(&self, model_id: &str) -> String {
+        format!("{}{}", self.model_id(), model_id.trim().trim_matches('/'))
     }
 
     /// Sorts members into attempt order. Callers mutate freely; `validate`
@@ -351,6 +426,19 @@ impl ModelRoute {
         let mut seen_orders = Vec::new();
         for member in &self.members {
             member.validate()?;
+            // A provider group names Providers, so a model on a member would be
+            // a second, conflicting way to say which models it offers. A route
+            // without groups names models, so the model is required there.
+            if self.is_provider_group() {
+                if member.names_model() {
+                    return Err(VibexError::validation(
+                        "route_group_member_model_unexpected",
+                        "a provider group member names a Provider, not a model",
+                    ));
+                }
+            } else {
+                member.validate_model()?;
+            }
             if seen_ids.contains(&member.id.as_str()) {
                 return Err(VibexError::validation(
                     "route_member_duplicate",
@@ -366,6 +454,18 @@ impl ModelRoute {
                 ));
             }
             seen_orders.push(order);
+        }
+        if self.is_provider_group() {
+            let mut seen_providers: Vec<ModelProviderProfileId> = Vec::new();
+            for member in &self.members {
+                if seen_providers.contains(&member.model_provider_profile_id) {
+                    return Err(VibexError::validation(
+                        "route_group_provider_duplicate",
+                        "a provider group lists the same Provider twice",
+                    ));
+                }
+                seen_providers.push(member.model_provider_profile_id.clone());
+            }
         }
         if self.first_token_timeout_ms == Some(0) {
             return Err(VibexError::validation(
@@ -476,6 +576,103 @@ fn intersect_reasoning_efforts(
         return None;
     }
     Some(crate::ProviderModelReasoningEfforts(levels))
+}
+
+/// One model a provider group offers, with the Providers that serve it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderGroupModel {
+    pub model_id: String,
+    /// The Providers whose enabled catalogue carries the model, in the group's
+    /// attempt order. A request for this model may be answered by any of them.
+    pub provider_profile_ids: Vec<ModelProviderProfileId>,
+    /// The capabilities shared by every Provider serving this model.
+    pub capabilities: crate::ProviderModelCapabilities,
+}
+
+/// The models a provider group offers: the intersection of its Providers'
+/// enabled catalogues.
+///
+/// Intersection rather than union is the whole contract. A session that picks a
+/// model from the group is promised the same model whichever Provider answers,
+/// so a model only one Provider serves cannot be offered: a strategy that
+/// routes per request would eventually send it to a Provider that never heard
+/// of it.
+///
+/// The model order follows the group's member order, then each catalogue's own
+/// order, so the picker is stable across reads.
+pub fn provider_group_models(
+    route: &ModelRoute,
+    providers: &[crate::ModelProviderProfile],
+) -> Vec<ProviderGroupModel> {
+    let members = route
+        .enabled_members()
+        .filter_map(|member| {
+            providers
+                .iter()
+                .find(|profile| profile.id == member.model_provider_profile_id)
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = members.first() else {
+        return Vec::new();
+    };
+    let mut models = Vec::new();
+    for model in first.configured_models.iter().filter(|model| model.enabled) {
+        let mut serving = vec![first.id.clone()];
+        let mut capabilities = vec![model.capabilities.clone()];
+        let mut every_provider_serves = true;
+        for provider in members.iter().skip(1) {
+            let Some(entry) = provider
+                .configured_models
+                .iter()
+                .find(|entry| entry.enabled && entry.id == model.id)
+            else {
+                every_provider_serves = false;
+                break;
+            };
+            serving.push(provider.id.clone());
+            capabilities.push(entry.capabilities.clone());
+        }
+        if !every_provider_serves {
+            continue;
+        }
+        models.push(ProviderGroupModel {
+            model_id: model.id.clone(),
+            provider_profile_ids: serving,
+            capabilities: intersect_route_capabilities(capabilities),
+        });
+    }
+    models
+}
+
+/// A model id that names a provider group, split into the group and the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderGroupModelRef<'a> {
+    pub group_id: &'a str,
+    pub model_id: &'a str,
+}
+
+/// Splits a `group/<id>/<model>` model id.
+///
+/// Returns `None` for anything that is not group-shaped, so an ordinary
+/// Provider model keeps resolving the way it did.
+pub fn provider_group_model_ref(requested: &str) -> Option<ProviderGroupModelRef<'_>> {
+    let rest = requested.strip_prefix(PROVIDER_GROUP_MODEL_PREFIX)?;
+    let (group_id, model_id) = rest.split_once('/')?;
+    let group_id = group_id.trim();
+    let model_id = model_id.trim();
+    (!group_id.is_empty() && !model_id.is_empty())
+        .then_some(ProviderGroupModelRef { group_id, model_id })
+}
+
+/// Splits a `route/<id>` model id.
+///
+/// Returns `None` when the id is not route-shaped, so a caller falls back to
+/// ordinary Provider resolution. It returns `Some(None)` for a well-formed
+/// prefix with an empty id, which is a malformed request rather than a Provider
+/// lookup.
+pub fn route_id_from_model(requested: &str) -> Option<Option<&str>> {
+    let rest = requested.strip_prefix(ROUTE_MODEL_PREFIX)?;
+    Some((!rest.trim().is_empty()).then_some(rest.trim()))
 }
 
 /// Replaces a route, including its member order.
@@ -659,5 +856,121 @@ mod tests {
         let silent = crate::ProviderModelCapabilities::default();
         let merged = intersect_route_capabilities([declared, silent]);
         assert_eq!(merged.reasoning, None, "absent is not yes");
+    }
+
+    fn group(providers: Vec<ModelProviderProfileId>) -> ModelRoute {
+        ModelRoute {
+            display_name: "Team".to_string(),
+            kind: RouteKind::ProviderGroup,
+            members: providers
+                .into_iter()
+                .enumerate()
+                .map(|(index, provider)| ModelRouteMember::provider(provider, index as i64))
+                .collect(),
+            status: RouteStatus::Enabled,
+            ..Default::default()
+        }
+    }
+
+    fn provider(
+        models: &[(&str, crate::ProviderModelCapabilities)],
+    ) -> crate::ModelProviderProfile {
+        crate::ModelProviderProfile {
+            display_name: "DeepSeek".to_string(),
+            status: crate::ModelProviderProfileStatus::Enabled,
+            configured_models: models
+                .iter()
+                .map(|(id, capabilities)| crate::ModelProviderCatalogEntry {
+                    id: (*id).to_string(),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities: capabilities.clone(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_provider_group_offers_only_the_models_every_provider_serves() {
+        let left = provider(&[
+            ("shared", Default::default()),
+            ("left-only", Default::default()),
+        ]);
+        let right = provider(&[
+            ("shared", Default::default()),
+            ("right-only", Default::default()),
+        ]);
+        let route = group(vec![left.id.clone(), right.id.clone()]);
+        assert!(route.validate().is_ok());
+        let models = provider_group_models(&route, &[left.clone(), right.clone()]);
+        assert_eq!(models.len(), 1, "only the intersection survives");
+        assert_eq!(models[0].model_id, "shared");
+        assert_eq!(
+            models[0].provider_profile_ids,
+            vec![left.id.clone(), right.id.clone()]
+        );
+    }
+
+    #[test]
+    fn a_provider_group_claims_the_capabilities_all_serving_providers_share() {
+        let left = provider(&[(
+            "shared",
+            crate::ProviderModelCapabilities {
+                context_tokens: Some(128_000),
+                image_input: Some(true),
+                ..Default::default()
+            },
+        )]);
+        let right = provider(&[(
+            "shared",
+            crate::ProviderModelCapabilities {
+                context_tokens: Some(32_000),
+                ..Default::default()
+            },
+        )]);
+        let route = group(vec![left.id.clone(), right.id.clone()]);
+        let models = provider_group_models(&route, &[left, right]);
+        assert_eq!(models[0].capabilities.context_tokens, Some(32_000));
+        assert_eq!(models[0].capabilities.image_input, None);
+    }
+
+    #[test]
+    fn a_provider_group_member_names_a_provider_not_a_model() {
+        let provider = ModelProviderProfileId::new();
+        let mut route = group(vec![provider.clone()]);
+        assert!(route.validate().is_ok());
+
+        route.members[0].model_id = "deepseek-chat".to_string();
+        assert_eq!(
+            route.validate().unwrap_err().code,
+            "route_group_member_model_unexpected"
+        );
+    }
+
+    #[test]
+    fn a_provider_group_lists_a_provider_once() {
+        let provider = ModelProviderProfileId::new();
+        let route = group(vec![provider.clone(), provider]);
+        assert_eq!(
+            route.validate().unwrap_err().code,
+            "route_group_provider_duplicate"
+        );
+    }
+
+    #[test]
+    fn a_provider_group_model_id_names_the_group_and_the_model() {
+        let route = group(vec![ModelProviderProfileId::new()]);
+        assert_eq!(route.model_id(), format!("group/{}/", route.id.as_str()));
+        assert_eq!(
+            route.group_model_id("deepseek-chat"),
+            format!("group/{}/deepseek-chat", route.id.as_str())
+        );
+        let id = route.group_model_id("deepseek-chat");
+        let parsed = provider_group_model_ref(&id).expect("a group id parses");
+        assert_eq!(parsed.group_id, route.id.as_str());
+        assert_eq!(parsed.model_id, "deepseek-chat");
+        assert!(provider_group_model_ref("route/standard").is_none());
     }
 }

@@ -14,9 +14,8 @@ use crate::typography::code_font_weight;
 use gpui::{
     AccessibleAction, Anchor, AnyElement, App, ClickEvent, Context, DragMoveEvent, Empty, Entity,
     EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    Orientation, PathBuilder, Rems, Render, Role, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Subscription, Task, WeakEntity, Window, canvas, div, point,
-    prelude::*, px, rems,
+    Orientation, Rems, Render, Role, ScrollHandle, SharedString, StatefulInteractiveElement as _,
+    Subscription, Task, WeakEntity, Window, div, prelude::*, px, rems,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size,
@@ -705,12 +704,6 @@ struct AgentProviderProjectionState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ManagementMutation {
     Gateway,
-    /// Updating a route, or moving its members.
-    RouteUpdate(String),
-    RouteDelete(String),
-    /// Binding a route to the Agent, or choosing which one is its default.
-    RouteBind(String),
-    RouteDefault(String),
     /// Deleting a shared Provider from its own page.
     ProviderDelete(String),
     ProfileCreate,
@@ -862,10 +855,6 @@ impl ManagementMutation {
     fn key(&self) -> String {
         match self {
             Self::Gateway => "gateway".into(),
-            Self::RouteUpdate(id) => format!("route:update:{id}"),
-            Self::RouteDelete(id) => format!("route:delete:{id}"),
-            Self::RouteBind(id) => format!("route:bind:{id}"),
-            Self::RouteDefault(id) => format!("route:default:{id}"),
             Self::ProviderDelete(id) => format!("provider:delete:{id}"),
             Self::ProfileCreate => "profile:create".into(),
             Self::ProfileUpdate(id) => format!("profile:update:{id}"),
@@ -979,26 +968,16 @@ pub struct ManagementCenter {
     model_routes: Vec<vibex_core::ModelRoute>,
     /// Which routes each Agent may use.
     agent_model_route_bindings: Vec<vibex_core::AgentModelRouteBinding>,
-    /// The member whose recent requests the graph is listing, if any.
-    ///
-    /// Playback belongs beside the member rather than on the gateway page: the
-    /// question "why did this one not answer" is asked while looking at it.
-    gateway_member_history: Option<(String, vibex_core::ModelProviderProfileId)>,
-    /// Requests the gateway is serving right now, newest last.
-    ///
-    /// Kept here rather than re-read on every event: a request emits several
-    /// events a second, and the graph is the only surface that draws them.
-    gateway_inflight: Vec<vibex_core::GatewayInflight>,
-    /// The route whose members the graph's right column shows.
-    ///
-    /// Selection is by route, not by node: clicking the gateway says nothing
-    /// about which of its routes to expand, so the gateway node itself is not
-    /// selectable.
-    selected_route_graph_route: Option<String>,
     /// Which shared Provider the global Providers page has selected.
     selected_global_provider_id: Option<String>,
     /// The gateway's most recent requests, as the authority recorded them.
     gateway_requests: Vec<vibex_core::GatewayRequestSummary>,
+    /// Requests the gateway is serving right now, newest last.
+    ///
+    /// The ledger draws them ahead of finished rows: a request that is still
+    /// running is the answer to "what is happening" while the page is open,
+    /// and it is gone from every later read once it finishes.
+    gateway_inflight: Vec<vibex_core::GatewayInflight>,
     /// The ledger row whose detail is open, if any. A request carries no
     /// prompt and no reply, so this expands an explanation, not a transcript.
     gateway_request_detail: Option<vibex_core::RequestId>,
@@ -1069,6 +1048,22 @@ pub struct ManagementCenter {
     /// The picker's filter. It matches id, name, and address, because those
     /// are the three things a user remembers about a vendor.
     provider_preset_query: Entity<InputState>,
+    /// Whether the Provider card is drawing its route-group editor.
+    ///
+    /// The editor is a view of the card rather than a modal: a group is a
+    /// composition of the Providers the card is already listing, and showing
+    /// it beside them is what makes the relationship visible.
+    route_group_editor_open: bool,
+    /// The group being edited; `None` means a new one.
+    route_group_editing_id: Option<vibex_core::ModelRouteId>,
+    /// The group draft's name.
+    route_group_name: Entity<InputState>,
+    /// A rejected group name, shown beside its field.
+    route_group_name_error: Option<String>,
+    /// The Providers the draft composes, in attempt order.
+    route_group_members: Vec<vibex_core::ModelProviderProfileId>,
+    /// The draft's strategy.
+    route_group_strategy: vibex_core::RouteStrategy,
     /// The catalogue's suggestion for the Model currently being edited.
     ///
     /// It is only ever a suggestion: nothing here is applied until the user
@@ -1496,6 +1491,13 @@ impl ManagementCenter {
                 "Search vendors",
                 "搜索厂商",
                 "搜尋廠商",
+            ))
+        });
+        let route_group_name = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Route group name",
+                "路由组名称",
+                "路由組名稱",
             ))
         });
         let profile_model_edit_id = cx.new(|cx| {
@@ -2079,10 +2081,8 @@ impl ManagementCenter {
             provider_bindings: Vec::new(),
             model_routes: Vec::new(),
             agent_model_route_bindings: Vec::new(),
-            selected_route_graph_route: None,
-            gateway_inflight: Vec::new(),
-            gateway_member_history: None,
             gateway_requests: Vec::new(),
+            gateway_inflight: Vec::new(),
             gateway_request_detail: None,
             gateway_limit_inputs: BTreeMap::new(),
             gateway_limits_error: None,
@@ -2109,6 +2109,12 @@ impl ManagementCenter {
             provider_preset_picker: false,
             provider_editor_shared: false,
             provider_preset_query,
+            route_group_editor_open: false,
+            route_group_editing_id: None,
+            route_group_name,
+            route_group_name_error: None,
+            route_group_members: Vec::new(),
+            route_group_strategy: vibex_core::RouteStrategy::Ordered,
             model_capability_suggestion: None,
             selected_global_provider_id: None,
             profile_editor_open: false,
@@ -12738,9 +12744,9 @@ impl ManagementCenter {
         }));
     }
 
-    /// Applies one gateway request event to the graph's live state.
+    /// Applies one gateway request event to the ledger's live state.
     ///
-    /// The graph is the only surface that draws a request while it runs, so
+    /// The ledger is the only surface that draws a request while it runs, so
     /// this keeps a small table rather than re-reading the gateway on every
     /// event: a request can emit three events in a second, and a round trip for
     /// each would be slower than the thing it describes.
@@ -12775,776 +12781,11 @@ impl ManagementCenter {
         cx.notify();
     }
 
-    /// Makes a route the Agent's default.
+    /// Changes how the gateway picks among an upstream's Keys.
     ///
-    /// This is the one route edit that changes what the next session uses, so
-    /// it is also the one that can require a restart: another route of the same
-    /// kind keeps the same `base_url`, a direct one does not.
-    fn set_route_graph_default(&mut self, route_id: String, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let Some(agent_id) = self.selected_agent_id.clone() else {
-            return;
-        };
-        let Some(route_id) = vibex_core::ModelRouteId::parse(route_id).ok() else {
-            return;
-        };
-        if self.mutation.is_some() {
-            return;
-        }
-        self.mutation = Some(ManagementMutation::RouteDefault(
-            route_id.as_str().to_string(),
-        ));
-        self.error = None;
-        let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let parsed_agent = match vibex_core::AgentId::parse(agent_id.clone()) {
-                Ok(agent) => agent,
-                Err(error) => {
-                    this.update(cx, |this, cx| {
-                        this.mutation = None;
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    });
-                    return;
-                }
-            };
-            let outcome = backend
-                .management()
-                .set_agent_default_model_route(vibex_backend::MutationRequest::new(
-                    vibex_core::AgentModelRouteDefaultRequest {
-                        agent_id: parsed_agent,
-                        model_route_id: route_id,
-                    },
-                ))
-                .await;
-            this.update(cx, |this, cx| {
-                this.mutation = None;
-                match outcome {
-                    Ok(()) => {
-                        this.selected_route_graph_route = None;
-                        this.refresh(cx);
-                    }
-                    Err(error) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    }
-                }
-            });
-        }));
-    }
-
-    /// Switches the Agent's default route, confirming first when it restarts.
-    ///
-    /// The restart is the whole point of the check. Moving between gateway
-    /// routes keeps the same loopback address, so the Agent keeps running;
-    /// moving to or from a direct route changes the address it launches with,
-    /// which tears down whatever conversation is in flight. Confirming only the
-    /// second case is what makes the gateway's benefit visible instead of a
-    /// nuisance.
-    fn request_route_graph_default(
-        &mut self,
-        route_id: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let will_restart = self
-            .model_routes
-            .iter()
-            .find(|route| route.id.as_str() == route_id)
-            .is_some_and(|route| route.kind == vibex_core::RouteKind::Direct)
-            || self
-                .agent_model_route_bindings
-                .iter()
-                .find(|binding| {
-                    binding.is_default
-                        && self.selected_agent_id.as_deref() == Some(binding.agent_id.as_str())
-                })
-                .and_then(|binding| {
-                    self.model_routes
-                        .iter()
-                        .find(|route| route.id == binding.model_route_id)
-                })
-                .is_some_and(|route| route.kind == vibex_core::RouteKind::Direct);
-        if !will_restart {
-            self.set_route_graph_default(route_id, cx);
-            return;
-        }
-        let entity = cx.weak_entity();
-        let agent_label = self
-            .selected_agent_id
-            .clone()
-            .unwrap_or_else(|| "Agent".to_string());
-        let active_locale = locale::current_locale();
-        let body_en = format!(
-            "Switching {agent_label} to or from a direct route restarts it, and any conversation in progress will be interrupted. Routes that go through the gateway keep the same address and do not restart."
-        );
-        let body_zh_cn = format!(
-            "把 {agent_label} 切到直连路由（或切离）会重启它，正在进行的对话会中断。经过网关的路由地址不变，不会重启。"
-        );
-        let body_zh_tw = format!(
-            "把 {agent_label} 切到直連路由（或切離）會重新啟動它，正在進行的對話會中斷。經過閘道的路由位址不變，不會重新啟動。"
-        );
-        // Built per locale rather than through the shared helper: the helper
-        // borrows its arguments, and these are formatted, so the result has to
-        // own its text.
-        let body = match active_locale {
-            ResolvedLocale::En => body_en,
-            ResolvedLocale::ZhCn => body_zh_cn,
-            ResolvedLocale::ZhTw => body_zh_tw,
-        };
-        window.open_dialog(cx, move |dialog, _, _| {
-            let entity = entity.clone();
-            let route_id = route_id.clone();
-            let body = body.clone();
-            dialog
-                .title(management_locale_text_for(
-                    active_locale,
-                    "Switching restarts this Agent",
-                    "切换会重启这个 Agent",
-                    "切換會重新啟動這個 Agent",
-                ))
-                .child(body.clone())
-                .footer(
-                    gpui_component::dialog::DialogFooter::new()
-                        .child(gpui_component::dialog::DialogClose::new().child(
-                            Button::new("cancel-route-switch").outline().label(
-                                management_locale_text_for(active_locale, "Cancel", "取消", "取消"),
-                            ),
-                        ))
-                        .child(gpui_component::dialog::DialogAction::new().child(
-                            Button::new("confirm-route-switch").label(management_locale_text_for(
-                                active_locale,
-                                "Switch",
-                                "切换",
-                                "切換",
-                            )),
-                        )),
-                )
-                .on_ok(move |_, _, cx| {
-                    let _ = entity.update(cx, |this, cx| {
-                        this.set_route_graph_default(route_id.clone(), cx)
-                    });
-                    true
-                })
-        });
-    }
-
-    /// Binds a route to the Agent, so the graph lists it.
-    fn bind_route_graph_route(&mut self, route_id: String, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let Some(agent_id) = self.selected_agent_id.clone() else {
-            return;
-        };
-        let Some(route_id) = vibex_core::ModelRouteId::parse(route_id).ok() else {
-            return;
-        };
-        if self.mutation.is_some() {
-            return;
-        }
-        self.mutation = Some(ManagementMutation::RouteBind(route_id.as_str().to_string()));
-        self.error = None;
-        let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let parsed_agent = match vibex_core::AgentId::parse(agent_id.clone()) {
-                Ok(agent) => agent,
-                Err(error) => {
-                    this.update(cx, |this, cx| {
-                        this.mutation = None;
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    });
-                    return;
-                }
-            };
-            let outcome = backend
-                .management()
-                .bind_agent_model_route(vibex_backend::MutationRequest::new(
-                    vibex_core::AgentModelRouteBindRequest {
-                        agent_id: parsed_agent,
-                        model_route_id: route_id,
-                        make_default: false,
-                    },
-                ))
-                .await;
-            this.update(cx, |this, cx| {
-                this.mutation = None;
-                match outcome {
-                    Ok(_) => this.refresh(cx),
-                    Err(error) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    }
-                }
-            });
-        }));
-    }
-
-    /// Removes a route from the Agent's graph. The route itself stays, because
-    /// another Agent may be using it.
-    fn unbind_route_graph_route(&mut self, route_id: String, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let Some(agent_id) = self.selected_agent_id.clone() else {
-            return;
-        };
-        let Some(route_id) = vibex_core::ModelRouteId::parse(route_id).ok() else {
-            return;
-        };
-        if self.mutation.is_some() {
-            return;
-        }
-        self.mutation = Some(ManagementMutation::RouteDelete(
-            route_id.as_str().to_string(),
-        ));
-        self.error = None;
-        let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let parsed_agent = match vibex_core::AgentId::parse(agent_id.clone()) {
-                Ok(agent) => agent,
-                Err(error) => {
-                    this.update(cx, |this, cx| {
-                        this.mutation = None;
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    });
-                    return;
-                }
-            };
-            let outcome = backend
-                .management()
-                .unbind_agent_model_route(vibex_backend::MutationRequest::new(
-                    vibex_core::AgentModelRouteUnbindRequest {
-                        agent_id: parsed_agent,
-                        model_route_id: route_id,
-                    },
-                ))
-                .await;
-            this.update(cx, |this, cx| {
-                this.mutation = None;
-                match outcome {
-                    Ok(_) => {
-                        this.selected_route_graph_route = None;
-                        this.refresh(cx);
-                    }
-                    Err(error) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    }
-                }
-            });
-        }));
-    }
-
-    /// Moves one member of a route up or down.
-    ///
-    /// Reordering rewrites the whole member list, because the repository
-    /// replaces it wholesale: an order is a property of the list, not of a row.
-    fn move_route_graph_member(
-        &mut self,
-        route_id: String,
-        member_id: String,
-        up: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let Some(route) = self
-            .model_routes
-            .iter()
-            .find(|route| route.id.as_str() == route_id)
-            .cloned()
-        else {
-            return;
-        };
-        if self.mutation.is_some() {
-            return;
-        }
-        let Some(index) = route
-            .members
-            .iter()
-            .position(|member| member.id.as_str() == member_id)
-        else {
-            return;
-        };
-        let target = if up {
-            index.checked_sub(1)
-        } else {
-            (index + 1 < route.members.len()).then_some(index + 1)
-        };
-        let Some(target) = target else {
-            return;
-        };
-        let mut next = route.clone();
-        next.members.swap(index, target);
-        for (order, member) in next.members.iter_mut().enumerate() {
-            member.order_index = order as i64;
-        }
-        let expected_revision = route.revision;
-        let route_id_for_clear = route.id.as_str().to_string();
-        self.mutation = Some(ManagementMutation::RouteUpdate(route_id_for_clear));
-        self.error = None;
-        let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .update_model_route(vibex_backend::MutationRequest::new(
-                    vibex_core::ModelRouteUpdateRequest {
-                        route: next,
-                        expected_revision,
-                    },
-                ))
-                .await;
-            this.update(cx, |this, cx| {
-                this.mutation = None;
-                match outcome {
-                    Ok(_) => this.refresh(cx),
-                    Err(error) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    }
-                }
-            });
-        }));
-    }
-
-    /// Adds one model from a Provider's catalogue to a route.
-    ///
-    /// The list is built from what the Providers actually declare, not from a
-    /// free-text field: a member naming a model the Provider does not serve is
-    /// refused at save time, so offering only real models keeps the two in
-    /// step.
-    fn add_route_graph_member(
-        &mut self,
-        route_id: String,
-        provider_id: vibex_core::ModelProviderProfileId,
-        model_id: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let Some(route) = self
-            .model_routes
-            .iter()
-            .find(|route| route.id.as_str() == route_id)
-            .cloned()
-        else {
-            return;
-        };
-        if self.mutation.is_some() {
-            return;
-        }
-        if route.members.len() >= vibex_core::MAX_ROUTE_MEMBERS {
-            self.error = Some(
-                management_locale_text(
-                    "This route already holds as many models as it supports.",
-                    "这份路由的成员数已达上限。",
-                    "這份路由的成員數已達上限。",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        }
-        if route.members.iter().any(|member| {
-            member.model_provider_profile_id == provider_id && member.model_id == model_id
-        }) {
-            self.error = Some(
-                management_locale_text(
-                    "That model is already in this route.",
-                    "这个模型已经在这份路由里了。",
-                    "這個模型已經在這份路由裡了。",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        }
-        let mut next = route.clone();
-        next.members.push(vibex_core::ModelRouteMember::new(
-            provider_id,
-            model_id,
-            next.members.len() as i64,
-        ));
-        let expected_revision = route.revision;
-        self.mutation = Some(ManagementMutation::RouteUpdate(route_id));
-        self.error = None;
-        let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .update_model_route(vibex_backend::MutationRequest::new(
-                    vibex_core::ModelRouteUpdateRequest {
-                        route: next,
-                        expected_revision,
-                    },
-                ))
-                .await;
-            this.update(cx, |this, cx| {
-                this.mutation = None;
-                match outcome {
-                    Ok(_) => this.refresh(cx),
-                    Err(error) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    }
-                }
-            });
-        }));
-    }
-
-    /// Creates a route from one Provider's model and binds it to this Agent.
-    ///
-    /// One member is the smallest useful route, and it is what a reader who has
-    /// just picked a Provider wants: a route they can then extend. Composition
-    /// over several Providers is an edit of this route, not a second creation
-    /// path.
-    fn create_route_graph_route(
-        &mut self,
-        provider_id: vibex_core::ModelProviderProfileId,
-        model_id: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let Some(agent_id) = self.selected_agent_id.clone() else {
-            return;
-        };
-        if self.mutation.is_some() {
-            return;
-        }
-        let display_name = self
-            .providers
-            .iter()
-            .find(|profile| profile.id == provider_id)
-            .map(|profile| format!("{} · {model_id}", profile.display_name))
-            .unwrap_or_else(|| model_id.clone());
-        let route = vibex_core::ModelRoute {
-            display_name,
-            kind: vibex_core::RouteKind::Gateway,
-            members: vec![vibex_core::ModelRouteMember::new(provider_id, model_id, 0)],
-            strategy: vibex_core::RouteStrategy::Ordered,
-            status: vibex_core::RouteStatus::Enabled,
-            ..Default::default()
-        };
-        self.mutation = Some(ManagementMutation::RouteUpdate(
-            route.id.as_str().to_string(),
-        ));
-        self.error = None;
-        let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let parsed_agent = match vibex_core::AgentId::parse(agent_id.clone()) {
-                Ok(agent) => agent,
-                Err(error) => {
-                    this.update(cx, |this, cx| {
-                        this.mutation = None;
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    });
-                    return;
-                }
-            };
-            let created = backend
-                .management()
-                .create_model_route(vibex_backend::MutationRequest::new(route))
-                .await;
-            let created = match created {
-                Ok(created) => created,
-                Err(error) => {
-                    this.update(cx, |this, cx| {
-                        this.mutation = None;
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    });
-                    return;
-                }
-            };
-            // The new route is bound right away: a route no Agent uses is a
-            // draft, and this path exists because the reader is on an Agent's
-            // page trying to give it a model.
-            let bound = backend
-                .management()
-                .bind_agent_model_route(vibex_backend::MutationRequest::new(
-                    vibex_core::AgentModelRouteBindRequest {
-                        agent_id: parsed_agent,
-                        model_route_id: created.id.clone(),
-                        make_default: false,
-                    },
-                ))
-                .await;
-            this.update(cx, |this, cx| {
-                this.mutation = None;
-                match bound {
-                    Ok(_) => {
-                        this.selected_route_graph_route = Some(created.id.as_str().to_string());
-                        this.refresh(cx);
-                    }
-                    Err(error) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    }
-                }
-            });
-        }));
-    }
-
-    /// Changes how a route picks among its members.
-    fn set_route_graph_strategy(
-        &mut self,
-        route_id: String,
-        strategy: vibex_core::RouteStrategy,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let Some(route) = self
-            .model_routes
-            .iter()
-            .find(|route| route.id.as_str() == route_id)
-            .cloned()
-        else {
-            return;
-        };
-        if self.mutation.is_some() || route.strategy == strategy {
-            return;
-        }
-        let mut next = route.clone();
-        next.strategy = strategy;
-        let expected_revision = route.revision;
-        self.mutation = Some(ManagementMutation::RouteUpdate(route_id));
-        self.error = None;
-        let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .update_model_route(vibex_backend::MutationRequest::new(
-                    vibex_core::ModelRouteUpdateRequest {
-                        route: next,
-                        expected_revision,
-                    },
-                ))
-                .await;
-            this.update(cx, |this, cx| {
-                this.mutation = None;
-                match outcome {
-                    Ok(_) => this.refresh(cx),
-                    Err(error) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    }
-                }
-            });
-        }));
-    }
-
-    /// Opens or closes the recent requests served by one member.
-    fn toggle_route_graph_member_history(
-        &mut self,
-        route_id: String,
-        provider_id: vibex_core::ModelProviderProfileId,
-        cx: &mut Context<Self>,
-    ) {
-        let key = (route_id, provider_id);
-        if self.gateway_member_history.as_ref() == Some(&key) {
-            self.gateway_member_history = None;
-        } else {
-            self.gateway_member_history = Some(key);
-        }
-        cx.notify();
-    }
-
-    /// Applies a change to a route's own launch policy.
-    ///
-    /// One method for pin, token ceiling and first-token timeout: they are the
-    /// same edit — a field on the route record — and giving each its own mutation
-    /// would be three copies of the same revision check.
-    fn update_route_graph_policy(
-        &mut self,
-        route_id: String,
-        edit: impl FnOnce(&mut vibex_core::ModelRoute),
-        cx: &mut Context<Self>,
-    ) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let Some(route) = self
-            .model_routes
-            .iter()
-            .find(|route| route.id.as_str() == route_id)
-            .cloned()
-        else {
-            return;
-        };
-        if self.mutation.is_some() {
-            return;
-        }
-        let mut next = route.clone();
-        edit(&mut next);
-        if next == route {
-            return;
-        }
-        let expected_revision = route.revision;
-        self.mutation = Some(ManagementMutation::RouteUpdate(route_id));
-        self.error = None;
-        let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .update_model_route(vibex_backend::MutationRequest::new(
-                    vibex_core::ModelRouteUpdateRequest {
-                        route: next,
-                        expected_revision,
-                    },
-                ))
-                .await;
-            this.update(cx, |this, cx| {
-                this.mutation = None;
-                match outcome {
-                    Ok(_) => this.refresh(cx),
-                    Err(error) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    }
-                }
-            });
-        }));
-    }
-
-    /// Removes one member from a route.
-    ///
-    /// A route must keep at least one member, so the last one is refused here
-    /// rather than at the service: the reader gets the reason beside the row
-    /// instead of a failed save.
-    fn remove_route_graph_member(
-        &mut self,
-        route_id: String,
-        member_id: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let Some(route) = self
-            .model_routes
-            .iter()
-            .find(|route| route.id.as_str() == route_id)
-            .cloned()
-        else {
-            return;
-        };
-        if self.mutation.is_some() {
-            return;
-        }
-        if route.members.len() <= 1 {
-            self.error = Some(
-                management_locale_text(
-                    "A route needs at least one model. Delete the route instead.",
-                    "路由至少要保留一个模型。要移除它就删掉整份路由。",
-                    "路由至少要保留一個模型。要移除它就刪掉整份路由。",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        }
-        let mut next = route.clone();
-        next.members
-            .retain(|member| member.id.as_str() != member_id);
-        for (order, member) in next.members.iter_mut().enumerate() {
-            member.order_index = order as i64;
-        }
-        let expected_revision = route.revision;
-        self.mutation = Some(ManagementMutation::RouteUpdate(route_id));
-        self.error = None;
-        let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .update_model_route(vibex_backend::MutationRequest::new(
-                    vibex_core::ModelRouteUpdateRequest {
-                        route: next,
-                        expected_revision,
-                    },
-                ))
-                .await;
-            this.update(cx, |this, cx| {
-                this.mutation = None;
-                match outcome {
-                    Ok(_) => this.refresh(cx),
-                    Err(error) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    }
-                }
-            });
-        }));
-    }
-
-    /// Turns one member on or off without removing it.
-    fn toggle_route_graph_member(
-        &mut self,
-        route_id: String,
-        member_id: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let Some(route) = self
-            .model_routes
-            .iter()
-            .find(|route| route.id.as_str() == route_id)
-            .cloned()
-        else {
-            return;
-        };
-        if self.mutation.is_some() {
-            return;
-        }
-        let mut next = route.clone();
-        let Some(member) = next
-            .members
-            .iter_mut()
-            .find(|member| member.id.as_str() == member_id)
-        else {
-            return;
-        };
-        member.enabled = !member.enabled;
-        let expected_revision = route.revision;
-        self.mutation = Some(ManagementMutation::RouteUpdate(route_id));
-        self.error = None;
-        let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .update_model_route(vibex_backend::MutationRequest::new(
-                    vibex_core::ModelRouteUpdateRequest {
-                        route: next,
-                        expected_revision,
-                    },
-                ))
-                .await;
-            this.update(cx, |this, cx| {
-                this.mutation = None;
-                match outcome {
-                    Ok(_) => this.refresh(cx),
-                    Err(error) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    }
-                }
-            });
-        }));
-    }
-
+    /// The gateway is the only place this setting lives now: every route group
+    /// that walks through it inherits the choice, so there is one control
+    /// rather than one per composition.
     fn set_gateway_routing(
         &mut self,
         routing: vibex_core::GatewayRoutingStrategy,
@@ -13553,6 +12794,7 @@ impl ManagementCenter {
         self.update_gateway_settings(|request| request.routing = routing, cx);
     }
 
+    /// Holds a conversation on one Key, or re-picks one per request.
     fn set_gateway_pin(&mut self, pinned: bool, cx: &mut Context<Self>) {
         self.update_gateway_settings(
             |request| {
@@ -19538,14 +18780,14 @@ impl ManagementCenter {
         let pending =
             self.mutation.is_some() || self.agent_mutations.contains_key(&selected_agent_id);
         let updating = self.editing_profile_id.is_some();
-        // Creating a Provider asks what to start from before it asks for
-        // fields. There is nothing to save yet, so the step owns the body and
-        // the only action that ends it is Cancel.
+        // Creating a Provider starts from "which existing one, or a new one?".
+        // The step owns the body because there is nothing to save yet; the only
+        // action that ends it is Cancel.
         if !updating && self.provider_preset_picker {
             return v_flex()
                 .size_full()
                 .min_h_0()
-                .child(self.render_provider_preset_picker(window, cx))
+                .child(self.render_provider_picker_step(window, cx))
                 .child(
                     h_flex()
                         .w_full()
@@ -19557,7 +18799,7 @@ impl ManagementCenter {
                         .border_color(cx.theme().border)
                         .pt_3()
                         .child(
-                            Button::new("provider-preset-close")
+                            Button::new("provider-picker-close")
                                 .small()
                                 .ghost()
                                 .label(management_locale_text("Cancel", "取消", "取消"))
@@ -19766,23 +19008,166 @@ impl ManagementCenter {
     }
 
     /// Identity: name, note, and website. Name gets the primary emphasis.
-    /// The picker a new Provider starts on.
+    /// The first step of adding a Provider to an Agent.
     ///
-    /// It is a step in the same dialog rather than a second modal: the dialog
-    /// owns the draft, the draft is what both steps write, and a nested modal
-    /// would make the draft's owner ambiguous.
-    fn render_provider_preset_picker(
+    /// Two things belong on this step and neither can be inferred from the
+    /// other. A Provider the user already configured globally is the common
+    /// case — they want this Agent to use it, not a second copy of it — so the
+    /// list of existing records comes first and is searchable. Creating one is
+    /// the fallback, and it keeps the preset library behind it.
+    fn render_provider_picker_step(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pending = self.mutation.is_some();
         let query = self.provider_preset_query.read(cx).value().to_string();
-        let groups = provider_preset_picker_groups(vibex_core::provider_presets(), &query);
-        let matched = !groups.is_empty();
+        let normalized = query.trim().to_lowercase();
+        // A shared Provider appears once here however many Agents bind it. It
+        // is hidden only when *this* Agent already launches through it, because
+        // choosing it again would be a no-op dressed up as an action.
+        let already_bound = self
+            .selected_agent_id
+            .as_deref()
+            .and_then(|agent_id| vibex_core::AgentId::parse(agent_id.to_string()).ok())
+            .map(|agent_id| agent_bound_profile_ids(&agent_id, &self.provider_bindings))
+            .unwrap_or_default();
+        let mut existing = self
+            .providers
+            .iter()
+            .filter(|profile| profile.status == vibex_core::ModelProviderProfileStatus::Enabled)
+            .filter(|profile| {
+                profile
+                    .legacy_provider_profile_id
+                    .as_ref()
+                    .is_none_or(|legacy| !already_bound.contains(legacy.as_str()))
+            })
+            .filter(|profile| {
+                if normalized.is_empty() {
+                    return true;
+                }
+                profile.display_name.to_lowercase().contains(&normalized)
+                    || profile
+                        .vendor_hint
+                        .as_deref()
+                        .is_some_and(|vendor| vendor.to_lowercase().contains(&normalized))
+                    || profile
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.url.to_lowercase().contains(&normalized))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        existing.sort_by(|left, right| {
+            left.display_name
+                .to_lowercase()
+                .cmp(&right.display_name.to_lowercase())
+        });
+
         let mut rows = v_flex().w_full().gap_1();
-        for group in groups {
+        for profile in &existing {
+            let profile_id = profile.id.clone();
+            let model_count = profile
+                .configured_models
+                .iter()
+                .filter(|m| m.enabled)
+                .count();
+            let detail = format!(
+                "{} · {}",
+                profile
+                    .vendor_hint
+                    .clone()
+                    .or_else(|| {
+                        profile
+                            .endpoints
+                            .iter()
+                            .map(|endpoint| endpoint.url.clone())
+                            .next()
+                    })
+                    .unwrap_or_else(|| management_locale_text("Local", "本地", "本機").to_string()),
+                management_model_count(model_count)
+            );
             rows = rows.child(
+                h_flex()
+                    .id(SharedString::from(format!(
+                        "management-provider-existing-{}",
+                        profile.id.as_str()
+                    )))
+                    .w_full()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .rounded(px(6.0))
+                    .when(!pending, |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().muted.opacity(0.4)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.use_existing_provider(profile_id.clone(), cx)
+                            }))
+                    })
+                    .child(management_profile_glyph(
+                        vibex_core::ProviderKind::Acp,
+                        &profile.display_name,
+                        false,
+                        cx,
+                    ))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_medium()
+                                    .child(profile.display_name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(detail),
+                            ),
+                    )
+                    .child(
+                        Tag::secondary()
+                            .xsmall()
+                            .child(management_locale_text("Use", "使用", "使用")),
+                    ),
+            );
+        }
+        if existing.is_empty() {
+            rows = rows.child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if normalized.is_empty() {
+                        management_locale_text(
+                            "No Provider is configured yet. Create one below.",
+                            "还没有配置任何供应商，可在下方创建。",
+                            "還沒有設定任何供應商，可在下方建立。",
+                        )
+                    } else {
+                        management_locale_text(
+                            "No configured Provider matches this search.",
+                            "没有已配置的供应商匹配这个搜索。",
+                            "沒有已設定的供應商符合這個搜尋。",
+                        )
+                    }),
+            );
+        }
+
+        let mut create_rows = v_flex().w_full().gap_1();
+        for group in provider_preset_picker_groups(vibex_core::provider_presets(), &query) {
+            create_rows = create_rows.child(
                 div()
                     .px_2()
                     .pt_2()
@@ -19794,7 +19179,7 @@ impl ManagementCenter {
             for row in group.rows {
                 let preset_id = row.id.clone();
                 let plan_note = row.plan_note.clone();
-                rows = rows.child(
+                create_rows = create_rows.child(
                     h_flex()
                         .id(SharedString::from(format!(
                             "management-provider-preset-{}",
@@ -19838,9 +19223,6 @@ impl ManagementCenter {
                         .when_some(plan_note, |this, note| {
                             this.child(Tag::secondary().xsmall().child(note))
                         })
-                        // The limits are the reason a plan is grouped apart, so
-                        // the marker says a limit exists without repeating it
-                        // here; choosing the preset states it in full.
                         .when(row.has_caveat, |this| {
                             this.child(
                                 Icon::new(IconName::Info)
@@ -19851,46 +19233,7 @@ impl ManagementCenter {
                 );
             }
         }
-        if !matched {
-            // The term is echoed back: from inside a filtered list, a vendor
-            // that is not in the library and a typo look the same.
-            rows = rows.child(
-                v_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_center()
-                    .gap_1()
-                    .py_8()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().foreground.opacity(0.8))
-                            .child(format!(
-                                "{} \u{201c}{query}\u{201d}",
-                                management_locale_text("No match for", "没有匹配", "沒有符合")
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text(
-                                "Try a vendor name, or start a custom Provider.",
-                                "试试厂商名，或直接创建自定义供应商。",
-                                "試試廠商名稱，或直接新增自訂供應商。",
-                            )),
-                    ),
-            );
-        }
-        let list = v_flex()
-            .id("provider-preset-picker-list")
-            .w_full()
-            .min_h_0()
-            .flex_1()
-            .overflow_y_scrollbar()
-            .scroll_gutter()
-            .pb_2()
-            .child(rows);
+        let _ = window;
 
         v_flex()
             .w_full()
@@ -19898,12 +19241,53 @@ impl ManagementCenter {
             .flex_1()
             .gap_2()
             .child(management_field_label(management_locale_text(
-                "Add a provider",
-                "添加供应商",
-                "新增供應商",
+                "Use a Provider",
+                "使用供应商",
+                "使用供應商",
             )))
             .child(management_search_input(&self.provider_preset_query, cx))
-            .child(list)
+            .child(
+                div()
+                    .id("provider-picker-list")
+                    .w_full()
+                    .min_h_0()
+                    .flex_1()
+                    .overflow_y_scrollbar()
+                    .scroll_gutter()
+                    .pb_2()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "Already configured",
+                                        "已配置的供应商",
+                                        "已設定的供應商",
+                                    )),
+                            )
+                            .child(rows)
+                            .child(
+                                div()
+                                    .px_2()
+                                    .pt_2()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "Create a new Provider for this Agent",
+                                        "为这个 Agent 新建供应商",
+                                        "為這個 Agent 新增供應商",
+                                    )),
+                            )
+                            .child(create_rows),
+                    ),
+            )
             .child(
                 // The manual path never disappears: a preset library that
                 // covered every Provider would still be a wall, not a shortcut.
@@ -19949,6 +19333,33 @@ impl ManagementCenter {
                     ),
             )
             .into_any_element()
+    }
+
+    /// Gives this Agent an existing shared Provider.
+    ///
+    /// The write is a bind, not a copy: the Provider stays one record, and this
+    /// Agent becomes another of its users. That is what the global page means
+    /// by "use for this Agent", reached from the Agent instead.
+    fn use_existing_provider(
+        &mut self,
+        provider_id: vibex_core::ModelProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent_id) = self.selected_agent_id.clone() else {
+            return;
+        };
+        let Ok(agent_id) = vibex_core::AgentId::parse(agent_id) else {
+            return;
+        };
+        let profile_id = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == provider_id)
+            .and_then(|profile| profile.legacy_provider_profile_id.clone())
+            .unwrap_or_else(vibex_core::ProviderProfileId::new);
+        self.provider_preset_picker = false;
+        self.profile_editor_open = false;
+        self.bind_provider_to_agent(agent_id, profile_id, Some(provider_id), cx);
     }
 
     /// Enters the form with one preset applied.
@@ -20724,1284 +20135,6 @@ impl ManagementCenter {
     /// what state each source is in right now. The gateway is one node because
     /// there is one listener, and its routes are listed beneath it — drawing a
     /// node per route would suggest they could be started independently.
-    fn render_agent_route_graph(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(agent_id) = self.selected_agent_id.clone() else {
-            return div().into_any_element();
-        };
-        let account = self.agent_auth_context.clone();
-        let nodes = route_graph_nodes(
-            &agent_id,
-            &self.model_routes,
-            &self.agent_model_route_bindings,
-            &self.providers,
-            &self.gateway,
-            account.as_ref(),
-        );
-        let selected = self.selected_route_graph_route.clone();
-        // The right column follows the selected route. Nothing selected yet
-        // means the Agent's default is the honest thing to show: it is what the
-        // next session would use.
-        let shown_route = selected
-            .as_deref()
-            .and_then(|id| {
-                nodes.iter().find_map(|node| match node {
-                    RouteGraphNode::Gateway { routes, .. } => {
-                        routes.iter().find(|route| route.id() == id)
-                    }
-                    RouteGraphNode::Direct(route) if route.id() == id => Some(route),
-                    _ => None,
-                })
-            })
-            .or_else(|| {
-                nodes.iter().find_map(|node| match node {
-                    RouteGraphNode::Gateway { routes, .. } => {
-                        routes.iter().find(|route| route.is_default)
-                    }
-                    RouteGraphNode::Direct(route) if route.is_default => Some(route),
-                    _ => None,
-                })
-            })
-            .cloned();
-
-        let copy_agent = management_locale_text("Agent", "Agent", "Agent");
-        let copy_path = management_locale_text("Routing", "通路", "通路");
-        let copy_target = management_locale_text("Models", "模型", "模型");
-
-        let mut middle = v_flex().w_full().min_w_0().gap_2();
-        // The three empty cases are kept apart on purpose. Showing "no Providers
-        // yet" to someone whose Providers page has a dozen entries is the most
-        // confusing failure this panel can produce, and it comes from treating
-        // "nothing here" as one state when it is three.
-        let any_provider = !self.providers.is_empty();
-        // Every route this Agent holds whose members are all switched off or
-        // whose Providers are gone: a route that exists but cannot answer.
-        let broken_routes = self
-            .agent_model_route_bindings
-            .iter()
-            .filter(|binding| {
-                binding.agent_id.as_str() == agent_id && binding.deleted_at_ms.is_none()
-            })
-            .filter(|binding| {
-                self.model_routes
-                    .iter()
-                    .find(|route| route.id == binding.model_route_id)
-                    .is_some_and(|route| {
-                        route.enabled_members().count() == 0
-                            || route.enabled_members().all(|member| {
-                                !self.providers.iter().any(|provider| {
-                                    provider.id == member.model_provider_profile_id
-                                        && provider.status
-                                            == vibex_core::ModelProviderProfileStatus::Enabled
-                                })
-                            })
-                    })
-            })
-            .count();
-        if nodes.is_empty() {
-            // Only the Agent's own account is drawn when it manages its own
-            // Providers: a gateway route cannot apply to it, and a direct one
-            // would be a Provider it never configured.
-            if !any_provider {
-                middle = middle.child(management_route_graph_empty_state(
-                    management_locale_text("No Providers yet", "还没有供应商", "還沒有供應商"),
-                    management_locale_text(
-                        "Add an API Key, or let Vibex import one from another tool.",
-                        "添加一个 API Key，或让 Vibex 从其他工具导入。",
-                        "新增一個 API Key，或讓 Vibex 從其他工具匯入。",
-                    ),
-                    management_locale_text("Add provider", "添加供应商", "新增供應商"),
-                    cx,
-                ));
-            } else if broken_routes > 0
-                && broken_routes
-                    == self
-                        .agent_model_route_bindings
-                        .iter()
-                        .filter(|binding| {
-                            binding.agent_id.as_str() == agent_id && binding.deleted_at_ms.is_none()
-                        })
-                        .count()
-            {
-                middle = middle.child(management_route_graph_empty_state(
-                    management_locale_text(
-                        "No usable model in this route",
-                        "路由里没有可用的模型",
-                        "路由裡沒有可用的模型",
-                    ),
-                    management_locale_text(
-                        "Every member is switched off, or its Provider was deleted.",
-                        "成员都停用了，或者供应商已被删除。",
-                        "成員都停用了，或者供應商已被刪除。",
-                    ),
-                    management_locale_text("Fix route", "修复路由", "修復路由"),
-                    cx,
-                ));
-            } else {
-                middle = middle.child(management_route_graph_empty_state(
-                    management_locale_text(
-                        "This Agent has no route yet",
-                        "这个 Agent 还没有路由",
-                        "這個 Agent 還沒有路由",
-                    ),
-                    management_locale_text(
-                        "Pick a few models from the Providers you already have, put them in order, and it works.",
-                        "从已有供应商里挑几个模型，排好顺序，就能用了。",
-                        "從已有供應商裡挑幾個模型，排好順序，就能用了。",
-                    ),
-                    management_locale_text("New route", "新建路由", "新增路由"),
-                    cx,
-                ));
-            }
-        }
-        for node in &nodes {
-            match node {
-                RouteGraphNode::Gateway {
-                    display_name,
-                    port,
-                    routes,
-                } => {
-                    let address =
-                        port.map(|port| format!("127.0.0.1:{port}"))
-                            .unwrap_or_else(|| {
-                                management_locale_text("not running", "未运行", "未執行")
-                                    .to_string()
-                            });
-                    // A gateway that is not listening affects every route under
-                    // it, so the warning belongs on the node rather than on each
-                    // route: a per-route mark would read as "this one route is
-                    // degraded" while the others look fine.
-                    let listener_down = port.is_none();
-                    middle = middle.child(
-                        v_flex()
-                            .id("route-graph-gateway")
-                            .w_full()
-                            .min_w_0()
-                            .gap_1()
-                            .rounded(px(8.0))
-                            .border_1()
-                            .border_color(if listener_down {
-                                cx.theme().warning
-                            } else {
-                                cx.theme().border
-                            })
-                            .p_2()
-                            .when(listener_down, |this| {
-                                this.child(
-                                    div()
-                                        .w_full()
-                                        .rounded(px(4.0))
-                                        .bg(cx.theme().warning.opacity(0.12))
-                                        .px_2()
-                                        .py_1()
-                                        .text_xs()
-                                        .text_color(cx.theme().warning)
-                                        .child(management_locale_text(
-                                            "The gateway is not listening, so every route under it is unavailable. Direct routes and the Agent account are not affected.",
-                                            "网关没有在监听，它下面的路由都不可用。直连路由和 Agent 账户不受影响。",
-                                            "閘道沒有在監聽，它下面的路由都不可用。直連路由和 Agent 賬戶不受影響。",
-                                        )),
-                                )
-                            })
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(
-                                        Icon::default().path("icons/vibex/git-branch.svg").small(),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_sm()
-                                            .font_semibold()
-                                            .child(display_name.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(management_route_count_label(routes.len())),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(address),
-                            )
-                            .children(self.render_route_graph_entries(routes, &selected, cx)),
-                    );
-                }
-                RouteGraphNode::Direct(route) => {
-                    middle = middle.child(self.render_route_graph_direct_row(route, &selected, cx));
-                }
-                RouteGraphNode::Account {
-                    label,
-                    account_hint,
-                } => {
-                    middle = middle.child(
-                        h_flex()
-                            .id("route-graph-account")
-                            .w_full()
-                            .min_w_0()
-                            .gap_2()
-                            .items_center()
-                            .rounded(px(8.0))
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .px_2()
-                            .py_1p5()
-                            .child(Icon::new(IconName::User).size(px(14.0)))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_sm()
-                                    .child(label.clone()),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(account_hint.clone().unwrap_or_else(|| {
-                                        management_locale_text("signed out", "未登录", "未登入")
-                                            .to_string()
-                                    })),
-                            ),
-                    );
-                }
-            }
-        }
-
-        // Routes that exist but are not bound to this Agent. Listing them here
-        // is what makes a route reusable: without it, "share a route between
-        // Agents" has no surface.
-        let unbound = self.model_routes.iter().filter(|route| {
-            route.status == vibex_core::RouteStatus::Enabled
-                && !self.agent_model_route_bindings.iter().any(|binding| {
-                    binding.agent_id.as_str() == agent_id
-                        && binding.model_route_id == route.id
-                        && binding.deleted_at_ms.is_none()
-                })
-        });
-        let mut add_row = h_flex().w_full().flex_wrap().items_center().gap_1();
-        let mut unbound_count = 0usize;
-        for route in unbound {
-            unbound_count += 1;
-            if unbound_count > 4 {
-                break;
-            }
-            let id = route.id.as_str().to_string();
-            let name = route.display_name.clone();
-            add_row = add_row.child(
-                Button::new(SharedString::from(format!("route-graph-add-{id}")))
-                    .xsmall()
-                    .secondary()
-                    .label(SharedString::from(format!("+ {name}")))
-                    .disabled(self.mutation.is_some())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.bind_route_graph_route(id.clone(), cx)
-                    })),
-            );
-        }
-        // Creating a route from scratch: the reader picks a Provider model and
-        // gets a one-member route bound to this Agent. Extending it to several
-        // sources is an edit of that route, so there is one creation path.
-        let mut new_choices = self
-            .providers
-            .iter()
-            .filter(|profile| profile.status == vibex_core::ModelProviderProfileStatus::Enabled)
-            .flat_map(|profile| {
-                profile
-                    .configured_models
-                    .iter()
-                    .filter(|model| model.enabled)
-                    .map(move |model| {
-                        (
-                            profile.id.clone(),
-                            profile.display_name.clone(),
-                            model.id.clone(),
-                        )
-                    })
-            })
-            .collect::<Vec<_>>();
-        let has_new_choices = !new_choices.is_empty();
-        if has_new_choices {
-            new_choices.truncate(60);
-            let center = cx.entity();
-            let pending = self.mutation.is_some();
-            add_row = add_row.child(
-                Button::new("route-graph-new-route")
-                    .xsmall()
-                    .secondary()
-                    .label(management_locale_text("New route", "新建路由", "新增路由"))
-                    .disabled(pending)
-                    .dropdown_menu(move |menu, _, _| {
-                        let mut menu = menu;
-                        for (provider_id, provider_name, model_id) in &new_choices {
-                            let provider_id = provider_id.clone();
-                            let model_id = model_id.clone();
-                            let center = center.clone();
-                            let label = format!("{provider_name} · {model_id}");
-                            menu =
-                                menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                                    let provider_id = provider_id.clone();
-                                    let model_id = model_id.clone();
-                                    center.update(cx, |this, cx| {
-                                        this.create_route_graph_route(provider_id, model_id, cx)
-                                    });
-                                }));
-                        }
-                        menu
-                    }),
-            );
-        }
-        if unbound_count > 0 || has_new_choices {
-            middle = middle.child(
-                v_flex()
-                    .w_full()
-                    .gap_1()
-                    .pt_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text(
-                                "Add a route this Agent does not use yet, or make a new one",
-                                "添加这个 Agent 尚未使用的路由，或新建一份",
-                                "新增這個 Agent 尚未使用的路由，或新建一份",
-                            )),
-                    )
-                    .child(add_row),
-            );
-        }
-
-        let target = self.render_route_graph_target(shown_route.as_ref(), cx);
-        let agent_row = v_flex()
-            .w_full()
-            .min_w_0()
-            .gap_1()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(cx.theme().border)
-            .p_2()
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .font_semibold()
-                    .child(management_agent_label(&agent_id, &self.snapshot.agents)),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_route_graph_mode_label(&nodes, cx)),
-            );
-
-        // One curve from the Agent to the paths column. It is drawn as a
-        // connector rather than as three lines, because the Agent has exactly
-        // one relationship with its routes: it picks one of them.
-        let connector_color = cx.theme().border;
-        let connector = canvas(
-            |_, _, _| (),
-            move |bounds: gpui::Bounds<gpui::Pixels>, _, window: &mut Window, _| {
-                let height = f32::from(bounds.size.height);
-                if height <= 0.0 {
-                    return;
-                }
-                let mut path = PathBuilder::stroke(px(1.0));
-                path.move_to(point(bounds.origin.x, bounds.origin.y));
-                path.cubic_bezier_to(
-                    point(
-                        bounds.origin.x + bounds.size.width,
-                        bounds.origin.y + px(height / 2.0),
-                    ),
-                    point(bounds.origin.x, bounds.origin.y + px(height / 2.0)),
-                    point(
-                        bounds.origin.x + bounds.size.width,
-                        bounds.origin.y + bounds.size.height,
-                    ),
-                );
-                if let Ok(path) = path.build() {
-                    window.paint_path(path, connector_color);
-                }
-            },
-        )
-        .w(px(24.0))
-        .flex_none()
-        .h(px(72.0));
-
-        let body = h_flex()
-            .w_full()
-            .min_w_0()
-            .items_start()
-            .gap_2()
-            .child(
-                v_flex()
-                    .w(px(180.0))
-                    .flex_none()
-                    .gap_2()
-                    .child(management_route_column_header(copy_agent, cx))
-                    .child(agent_row),
-            )
-            .child(connector)
-            .child(
-                v_flex()
-                    .min_w_0()
-                    .flex_1()
-                    .gap_2()
-                    .child(management_route_column_header(copy_path, cx))
-                    .child(middle),
-            )
-            .child(
-                v_flex()
-                    .w(px(280.0))
-                    .flex_none()
-                    .gap_2()
-                    .child(management_route_column_header(copy_target, cx))
-                    .child(target),
-            );
-
-        management_card_with_icon(
-            management_locale_text("Routing", "路由", "路由"),
-            management_locale_text(
-                "Every way this Agent can reach a model, in the order it tries them",
-                "这个 Agent 拿到模型的全部方式，以及尝试顺序",
-                "這個 Agent 拿到模型的全部方式，以及嘗試順序",
-            ),
-            "icons/vibex/git-branch.svg",
-            body.into_any_element(),
-            cx,
-        )
-    }
-
-    /// The routes under the gateway node.
-    fn render_route_graph_entries(
-        &mut self,
-        routes: &[RouteGraphRoute],
-        selected: &Option<String>,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let visible = routes.len().min(ROUTE_GRAPH_VISIBLE_ROUTES);
-        let mut rows = routes[..visible]
-            .iter()
-            .map(|route| self.render_route_graph_entry(route, selected, false, cx))
-            .collect::<Vec<_>>();
-        if routes.len() > visible {
-            rows.push(
-                div()
-                    .pl(px(22.0))
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_route_overflow_label(routes.len() - visible))
-                    .into_any_element(),
-            );
-        }
-        rows
-    }
-
-    /// One route, as a row the graph can select.
-    fn render_route_graph_entry(
-        &mut self,
-        route: &RouteGraphRoute,
-        selected: &Option<String>,
-        direct: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let id = route.id().to_string();
-        let is_selected = selected.as_deref() == Some(id.as_str());
-        let default_badge = route.is_default.then(|| {
-            div()
-                .flex_none()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(management_locale_text("default", "默认", "預設"))
-        });
-        let member_summary = management_route_member_summary(route);
-        Button::new(SharedString::from(format!("route-graph-{id}")))
-            .small()
-            .ghost()
-            .w_full()
-            .px_1()
-            .justify_start()
-            .selected(is_selected)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.selected_route_graph_route = Some(id.clone());
-                cx.notify();
-            }))
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .when(direct, |this| {
-                        this.child(
-                            Icon::default()
-                                .path("icons/vibex/plug-zap.svg")
-                                .size(px(14.0)),
-                        )
-                    })
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_sm()
-                            .child(route.route.display_name.clone()),
-                    )
-                    .children(default_badge)
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(member_summary),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    /// The recent requests one member served, newest first.
-    ///
-    /// Read from the ledger the Config Center already holds rather than from a
-    /// new query: the same rows the gateway page lists, filtered to this
-    /// Provider, so the two surfaces cannot disagree about what happened.
-    fn render_route_graph_member_history(
-        &mut self,
-        route: &RouteGraphRoute,
-        member: &RouteGraphMember,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let mut recent = self
-            .gateway_requests
-            .iter()
-            // By id, not by name: two Providers may share a display name, and
-            // a playback that conflated them would show another source's
-            // history under this member.
-            .filter(|request| request.model_provider_profile_id == member.provider_profile_id)
-            .take(5)
-            .collect::<Vec<_>>();
-        let shown = recent.len();
-        let mut body = v_flex().w_full().min_w_0().gap_1().pt_1().pl(px(16.0));
-        if recent.is_empty() {
-            body = body.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "No recent requests from this model.",
-                        "这个模型最近没有请求。",
-                        "這個模型最近沒有請求。",
-                    )),
-            );
-        }
-        for request in recent.drain(..) {
-            let route_lines = gateway_route_lines(request, locale::current_locale());
-            let mut lines = v_flex().w_full().min_w_0().gap_0p5();
-            for line in route_lines {
-                lines = lines.child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(line),
-                );
-            }
-            body =
-                body.child(
-                    v_flex()
-                        .w_full()
-                        .min_w_0()
-                        .gap_0p5()
-                        .rounded(px(4.0))
-                        .bg(cx.theme().background.opacity(0.6))
-                        .px_2()
-                        .py_1()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(div().min_w_0().flex_1().truncate().text_xs().child(
-                                    management_route_history_time_label(request.created_at_ms),
-                                ))
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!(
-                                            "{} · {} ms",
-                                            management_route_outcome_label(request.outcome),
-                                            request.latency_ms.unwrap_or(0)
-                                        )),
-                                ),
-                        )
-                        .child(lines),
-                );
-        }
-        if shown > 0 {
-            body = body.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Recent requests from this model",
-                        "这个模型最近的请求",
-                        "這個模型最近的請求",
-                    )),
-            );
-        }
-        let _ = route;
-        body.into_any_element()
-    }
-
-    /// Marks the member a request is currently answering from.
-    ///
-    /// This is the whole point of the live channel: a route's members look
-    /// identical on disk, and only the running request says which one is doing
-    /// the work. The first-token event turns "starting" into "answering", so a
-    /// stalled member is visibly stalled rather than quietly busy.
-    fn render_route_graph_live_badge(
-        &mut self,
-        route: &RouteGraphRoute,
-        member: &RouteGraphMember,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let live = self.gateway_inflight.iter().rev().find(|inflight| {
-            // The route is known when the request named one; a direct Provider
-            // request has no route, so a member of a route cannot be its match.
-            inflight.model_route_id.as_deref() == Some(route.id())
-                && inflight.model_provider_profile_id == member.provider_profile_id
-        })?;
-        let (label, color) = if live.has_first_token() {
-            (
-                management_locale_text("answering…", "回答中…", "回答中…"),
-                cx.theme().success,
-            )
-        } else {
-            (
-                management_locale_text("waiting…", "等待首个 token", "等待首個 token"),
-                cx.theme().info,
-            )
-        };
-        Some(
-            div()
-                .flex_none()
-                .rounded(px(4.0))
-                .bg(color.opacity(0.14))
-                .px_1()
-                .py(px(1.0))
-                .text_xs()
-                .text_color(color)
-                // The attempt number is what makes a failover legible: "the
-                // second source is answering" is the fact a reader needs when
-                // the first one was expected to.
-                .child(if live.attempt > 1 {
-                    format!("{} · #{}", label, live.attempt)
-                } else {
-                    label.to_string()
-                })
-                .into_any_element(),
-        )
-    }
-
-    /// A member's own controls: enable, and move within the order.
-    ///
-    /// Moving is two buttons rather than a drag: the member list is short, the
-    /// order is the whole point of the list, and a drag inside a two-column
-    /// layout competes with selecting the route.
-    fn render_route_graph_member_actions(
-        &mut self,
-        route: &RouteGraphRoute,
-        member: &RouteGraphMember,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let member_id = member.member_id.clone();
-        let enabled = member.enabled;
-        let pending = self.mutation.is_some();
-        let route_up = route.id().to_string();
-        let route_down = route.id().to_string();
-        let route_toggle = route.id().to_string();
-        let id_up = member_id.clone();
-        let id_down = member_id.clone();
-        let id_toggle = member_id.clone();
-        let mut actions = Vec::new();
-        actions.push(
-            Button::new(SharedString::from(format!(
-                "route-graph-toggle-{member_id}"
-            )))
-            .xsmall()
-            .ghost()
-            .compact()
-            .icon(IconName::Check)
-            .selected(enabled)
-            .tooltip(management_locale_text("Enabled", "已启用", "已啟用"))
-            .disabled(pending)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_route_graph_member(route_toggle.clone(), id_toggle.clone(), cx)
-            }))
-            .into_any_element(),
-        );
-        let route_remove = route.id().to_string();
-        let id_remove = member_id.clone();
-        actions.push(
-            Button::new(SharedString::from(format!(
-                "route-graph-remove-{member_id}"
-            )))
-            .xsmall()
-            .ghost()
-            .compact()
-            .icon(Icon::default().path("icons/vibex/trash-2.svg"))
-            .tooltip(management_locale_text(
-                "Remove this model",
-                "移除这个模型",
-                "移除這個模型",
-            ))
-            .disabled(pending || route.source_count() <= 1)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.remove_route_graph_member(route_remove.clone(), id_remove.clone(), cx)
-            }))
-            .into_any_element(),
-        );
-        let route_history = route.id().to_string();
-        let id_history = member.provider_profile_id.clone();
-        let history_open = self.gateway_member_history.as_ref()
-            == Some(&(route.id().to_string(), member.provider_profile_id.clone()));
-        actions.push(
-            Button::new(SharedString::from(format!(
-                "route-graph-history-{member_id}"
-            )))
-            .xsmall()
-            .ghost()
-            .compact()
-            .icon(Icon::default().path("icons/vibex/clock.svg"))
-            .selected(history_open)
-            .tooltip(management_locale_text(
-                "Recent requests",
-                "最近的请求",
-                "最近的請求",
-            ))
-            .disabled(pending)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_route_graph_member_history(
-                    route_history.clone(),
-                    id_history.clone(),
-                    cx,
-                )
-            }))
-            .into_any_element(),
-        );
-        for (up, route_id, id, tooltip) in [
-            (
-                true,
-                route_up,
-                id_up,
-                management_locale_text("Move up", "上移", "上移"),
-            ),
-            (
-                false,
-                route_down,
-                id_down,
-                management_locale_text("Move down", "下移", "下移"),
-            ),
-        ] {
-            actions.push(
-                Button::new(SharedString::from(format!(
-                    "route-graph-move-{}{id}",
-                    if up { "up-" } else { "down-" }
-                )))
-                .xsmall()
-                .ghost()
-                .compact()
-                .icon(IconName::ArrowUp)
-                .tooltip(tooltip)
-                .disabled(pending)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.move_route_graph_member(route_id.clone(), id.clone(), up, cx)
-                }))
-                .into_any_element(),
-            );
-        }
-        actions
-    }
-
-    /// The per-route actions the graph offers beside a selected route.
-    ///
-    /// They are shown only for the selected route: a row of buttons on every
-    /// route would turn a choice into a toolbar, and the thing the reader is
-    /// doing is choosing.
-    fn render_route_graph_actions(
-        &mut self,
-        route: &RouteGraphRoute,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let pending = self.mutation.is_some();
-        let id_for_default = route.id().to_string();
-        let id_for_unbind = route.id().to_string();
-        let is_default = route.is_default;
-        h_flex()
-            .w_full()
-            .flex_wrap()
-            .items_center()
-            .gap_1()
-            .pt_1()
-            .when(!is_default, |this| {
-                this.child(
-                    Button::new(SharedString::from(format!(
-                        "route-graph-default-{}",
-                        route.id()
-                    )))
-                    .xsmall()
-                    .ghost()
-                    .label(management_locale_text(
-                        "Make default",
-                        "设为默认",
-                        "設為預設",
-                    ))
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.request_route_graph_default(id_for_default.clone(), window, cx)
-                    })),
-                )
-            })
-            .child(
-                Button::new(SharedString::from(format!(
-                    "route-graph-unbind-{}",
-                    route.id()
-                )))
-                .xsmall()
-                .ghost()
-                .label(management_locale_text(
-                    "Remove from this Agent",
-                    "从这个 Agent 移除",
-                    "從這個 Agent 移除",
-                ))
-                .disabled(pending)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.unbind_route_graph_route(id_for_unbind.clone(), cx)
-                })),
-            )
-            .into_any_element()
-    }
-
-    /// A direct route, drawn at the same level as the gateway rather than under
-    /// it: it never passes through the gateway, so nesting it would be a lie.
-    fn render_route_graph_direct_row(
-        &mut self,
-        route: &RouteGraphRoute,
-        selected: &Option<String>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        self.render_route_graph_entry(route, selected, true, cx)
-    }
-
-    /// The right column: the members of the selected route.
-    fn render_route_graph_target(
-        &mut self,
-        route: Option<&RouteGraphRoute>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(route) = route else {
-            return div()
-                .w_full()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(management_locale_text(
-                    "Select a route to see its models",
-                    "选择一份路由，查看它的模型",
-                    "選擇一份路由，查看它的模型",
-                ))
-                .into_any_element();
-        };
-        let mut rows = v_flex().w_full().min_w_0().gap_1();
-        let visible = if route.members.len() > ROUTE_GRAPH_MEMBER_FOLD_THRESHOLD {
-            ROUTE_GRAPH_VISIBLE_MEMBERS
-        } else {
-            route.members.len()
-        };
-        for member in &route.members[..visible] {
-            let (state_text, state_color) = match member.state() {
-                RouteGraphMemberState::Ready => (
-                    management_locale_text("ready", "就绪", "就緒").to_string(),
-                    cx.theme().success,
-                ),
-                RouteGraphMemberState::Cooling(count) => {
-                    (management_route_cooling_label(count), cx.theme().warning)
-                }
-                RouteGraphMemberState::Invalid(count) => {
-                    (management_route_invalid_label(count), cx.theme().danger)
-                }
-                RouteGraphMemberState::NoKeys => (
-                    management_locale_text("no key", "没有 Key", "沒有 Key").to_string(),
-                    cx.theme().muted_foreground,
-                ),
-            };
-            rows = rows.child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .rounded(px(6.0))
-                    .border_1()
-                    .border_color(cx.theme().border.opacity(0.7))
-                    .px_2()
-                    .py_1()
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .flex_1()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_sm()
-                                    .child(member.model_id.clone()),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(member.provider_name.clone()),
-                            ),
-                    )
-                    .children(self.render_route_graph_live_badge(route, member, cx))
-                    .when(member.shows_usage(), |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_route_token_label(member.used_tokens)),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(state_color)
-                            .child(state_text),
-                    )
-                    .children(self.render_route_graph_member_actions(route, member, cx)),
-            );
-            if self.gateway_member_history.as_ref()
-                == Some(&(route.id().to_string(), member.provider_profile_id.clone()))
-            {
-                rows = rows.child(self.render_route_graph_member_history(route, member, cx));
-            }
-        }
-        if route.members.len() > visible {
-            rows = rows.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_route_member_overflow_label(
-                        route.members.len() - visible,
-                    )),
-            );
-        }
-        if route.members.len() > 1 {
-            // The strategy only means something across several members: with
-            // one, "ordered", "rotate" and "least used" all pick it.
-            let route_id = route.id().to_string();
-            let current = route.route.strategy;
-            let pending = self.mutation.is_some();
-            let mut choices = h_flex().flex_wrap().items_center().gap_1();
-            for strategy in vibex_core::RouteStrategy::ALL {
-                let id = route_id.clone();
-                let label = management_route_strategy_label(strategy);
-                choices = choices.child(
-                    Button::new(SharedString::from(format!(
-                        "route-graph-strategy-{}-{}",
-                        route.id(),
-                        strategy.id()
-                    )))
-                    .xsmall()
-                    .ghost()
-                    .label(SharedString::from(label))
-                    .selected(strategy == current)
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_route_graph_strategy(id.clone(), strategy, cx)
-                    })),
-                );
-            }
-            rows = rows.child(
-                v_flex()
-                    .w_full()
-                    .gap_1()
-                    .pt_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text(
-                                "How to choose among models",
-                                "在模型之间如何选择",
-                                "在模型之間如何選擇",
-                            )),
-                    )
-                    .child(choices),
-            );
-        }
-        // The route's own launch policy. These are collapsed under "advanced"
-        // because they are tuned once and then left alone: pinning, a token
-        // ceiling and a first-token deadline are not what a reader opens this
-        // page to change, but leaving them uneditable is what made them fields
-        // with no surface.
-        // Every member without a usable Key: the route still exists and can be
-        // picked, but nothing can answer right now. Marked on the route rather
-        // than on any one member, because the reader's question is "will this
-        // work" and the answer is no for the whole composition.
-        let all_cooling = !route.members.is_empty()
-            && route
-                .members
-                .iter()
-                .all(|member| matches!(member.state(), RouteGraphMemberState::Cooling(_)));
-        if all_cooling {
-            rows = rows.child(div().pt_1().text_xs().text_color(cx.theme().warning).child(
-                management_locale_text(
-                    "Every member is cooling; this route will work again when one recovers.",
-                    "所有成员都在冷却；有成员恢复后这份路由就能用。",
-                    "所有成員都在冷卻；有成員恢復後這份路由就能用。",
-                ),
-            ));
-        }
-        let policy_route_id = route.id().to_string();
-        let pin_id = route.id().to_string();
-        let ceiling_id = route.id().to_string();
-        let timeout_id = route.id().to_string();
-        let pinned = route.route.pin == vibex_core::GatewayPinScope::Conversation;
-        let ceiling_text = route
-            .route
-            .token_limit
-            .as_ref()
-            .map(|limit| {
-                format!(
-                    "{} tokens · {}",
-                    limit.tokens,
-                    management_route_window_label(limit.window)
-                )
-            })
-            .unwrap_or_else(|| {
-                management_locale_text("no route ceiling", "无路由上限", "無路由上限").to_string()
-            });
-        let timeout_text = match route.route.first_token_timeout_ms {
-            Some(ms) => format!("{ms} ms"),
-            None => management_locale_text("no deadline", "无超时", "無逾時").to_string(),
-        };
-        let pending = self.mutation.is_some();
-        let mut advanced = v_flex().w_full().gap_1().pt_1();
-        advanced = advanced.child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(management_locale_text("Advanced", "高级", "進階")),
-        );
-        advanced = advanced.child(
-            h_flex()
-                .flex_wrap()
-                .items_center()
-                .gap_1()
-                // Conversation pinning: one Key until it is invalidated, or a new
-                // pick per request.
-                .child(
-                    Button::new(SharedString::from(format!("route-graph-pin-{pin_id}")))
-                        .xsmall()
-                        .ghost()
-                        .label(if pinned {
-                            management_locale_text("Pin conversation", "会话固定", "對話固定")
-                        } else {
-                            management_locale_text("Repick each request", "每次重选", "每次重選")
-                        })
-                        .selected(pinned)
-                        .disabled(pending)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let id = policy_route_id.clone();
-                            this.update_route_graph_policy(
-                                id,
-                                |route| {
-                                    route.pin =
-                                        if route.pin == vibex_core::GatewayPinScope::Conversation {
-                                            vibex_core::GatewayPinScope::Off
-                                        } else {
-                                            vibex_core::GatewayPinScope::Conversation
-                                        };
-                                },
-                                cx,
-                            )
-                        })),
-                )
-                // The token ceiling cycles through the offered windows, because
-                // a numeric input for a value that has a small fixed set would be
-                // more surface for the same answer.
-                .child(
-                    Button::new(SharedString::from(format!(
-                        "route-graph-ceiling-{ceiling_id}"
-                    )))
-                    .xsmall()
-                    .ghost()
-                    .label(SharedString::from(ceiling_text))
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let id = ceiling_id.clone();
-                        this.update_route_graph_policy(
-                            id,
-                            |route| {
-                                route.token_limit =
-                                    management_next_route_ceiling(route.token_limit.take());
-                            },
-                            cx,
-                        )
-                    })),
-                )
-                // The first-token deadline, likewise cycling a small set.
-                .child(
-                    Button::new(SharedString::from(format!(
-                        "route-graph-timeout-{timeout_id}"
-                    )))
-                    .xsmall()
-                    .ghost()
-                    .label(SharedString::from(timeout_text))
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let id = timeout_id.clone();
-                        this.update_route_graph_policy(
-                            id,
-                            |route| {
-                                route.first_token_timeout_ms =
-                                    management_next_route_timeout(route.first_token_timeout_ms);
-                            },
-                            cx,
-                        )
-                    })),
-                ),
-        );
-        rows = rows.child(advanced);
-        // Switching between gateway routes keeps the same loopback address, so
-        // the Agent keeps running. Switching to or from a direct route changes
-        // the address it launches with, which restarts it — the reader needs to
-        // know that before clicking, not after the conversation drops.
-        let restart_cost = route.route.kind == vibex_core::RouteKind::Direct;
-        rows = rows.child(
-            div()
-                .pt_1()
-                .text_xs()
-                .text_color(if restart_cost {
-                    cx.theme().warning
-                } else {
-                    cx.theme().muted_foreground
-                })
-                .child(if restart_cost {
-                    management_locale_text(
-                        "Switching to or from a direct route restarts this Agent.",
-                        "切换到或切离直连路由会重启这个 Agent。",
-                        "切換到或切離直連路由會重新啟動這個 Agent。",
-                    )
-                    .to_string()
-                } else {
-                    management_locale_text(
-                        "Switching between gateway routes does not restart the Agent.",
-                        "在网关路由之间切换不会重启 Agent。",
-                        "在閘道路由之間切換不會重新啟動 Agent。",
-                    )
-                    .to_string()
-                }),
-        );
-        // Every model a Provider declares is offered, minus the ones already in
-        // this route. Offering only real models keeps the picker and the
-        // service's own validation in step.
-        let already = route
-            .route
-            .members
-            .iter()
-            .map(|member| {
-                (
-                    member.model_provider_profile_id.clone(),
-                    member.model_id.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut add_choices = Vec::new();
-        for profile in &self.providers {
-            if profile.status != vibex_core::ModelProviderProfileStatus::Enabled {
-                continue;
-            }
-            for model in profile
-                .configured_models
-                .iter()
-                .filter(|model| model.enabled)
-            {
-                if already
-                    .iter()
-                    .any(|(provider, id)| provider == &profile.id && id == &model.id)
-                {
-                    continue;
-                }
-                add_choices.push((
-                    profile.id.clone(),
-                    profile.display_name.clone(),
-                    model.id.clone(),
-                ));
-            }
-        }
-        if !add_choices.is_empty() {
-            let route_id = route.id().to_string();
-            let center = cx.entity();
-            let pending = self.mutation.is_some();
-            rows = rows.child(
-                div().pt_1().child(
-                    Button::new(SharedString::from(format!(
-                        "route-graph-add-member-{}",
-                        route.id()
-                    )))
-                    .xsmall()
-                    .secondary()
-                    .label(management_locale_text("Add model", "添加模型", "新增模型"))
-                    .disabled(pending)
-                    .dropdown_menu(move |menu, _, _| {
-                        let mut menu = menu;
-                        for (provider_id, provider_name, model_id) in &add_choices {
-                            let route_id = route_id.clone();
-                            let provider_id = provider_id.clone();
-                            let model_id = model_id.clone();
-                            let center = center.clone();
-                            let label = format!("{provider_name} · {model_id}");
-                            menu =
-                                menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                                    let route_id = route_id.clone();
-                                    let provider_id = provider_id.clone();
-                                    let model_id = model_id.clone();
-                                    center.update(cx, |this, cx| {
-                                        this.add_route_graph_member(
-                                            route_id,
-                                            provider_id,
-                                            model_id,
-                                            cx,
-                                        )
-                                    });
-                                }));
-                        }
-                        menu
-                    }),
-                ),
-            );
-        }
-        rows = rows.child(self.render_route_graph_actions(route, cx));
-        rows.into_any_element()
-    }
-
     fn render_agent_authentication(
         &mut self,
         window: &mut Window,
@@ -23315,6 +21448,944 @@ impl ManagementCenter {
             .into_any_element()
     }
 
+    /// The gateway's state as the Provider card states it.
+    ///
+    /// The card used to say nothing about the gateway, and a separate routing
+    /// section said everything. Moving the gateway here means a reader sees the
+    /// address a route group would call and whether it can answer, without
+    /// leaving the page that lists the Providers it composes.
+    fn render_agent_gateway_summary(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.schedule_gateway_cooldown_refresh(cx);
+        let pending = self.mutation.is_some();
+        let snapshot = self.gateway.clone();
+        let status = &snapshot.runtime;
+        let address = status.base_url().unwrap_or_else(|| {
+            management_locale_text("not running", "未运行", "未執行").to_string()
+        });
+        let key_summary = gateway_overall_key_summary(&snapshot, locale::current_locale());
+        let switching = self.gateway_agent_pending.clone();
+        let selected_agent_id = self.selected_agent_id.clone();
+        let configurable = selected_agent_id
+            .as_deref()
+            .and_then(|agent_id| vibex_core::AgentId::parse(agent_id.to_string()).ok())
+            .is_some_and(|agent_id| {
+                vibex_core::model_provider_configurable_agent_ids()
+                    .map(|ids| ids.contains(&agent_id))
+                    .unwrap_or(false)
+            });
+        let binding = selected_agent_id.as_deref().and_then(|agent_id| {
+            snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.agent_id == agent_id)
+        });
+        let on_gateway = binding.is_some_and(|binding| binding.enabled);
+        let enable_toggle = configurable.then(|| {
+            let agent_id = selected_agent_id.clone().unwrap_or_default();
+            let busy = switching.as_deref() == Some(agent_id.as_str());
+            Switch::new("management-agent-gateway-enabled")
+                .small()
+                .checked(on_gateway)
+                .disabled(pending || busy)
+                .tooltip(management_locale_text(
+                    "Let this Agent use the gateway. Settings live on the Providers page.",
+                    "让这个 Agent 使用网关。设置位于供应商页面。",
+                    "讓這個 Agent 使用閘道。設定位於供應商頁面。",
+                ))
+                .on_click(cx.listener(move |this, checked, _, cx| {
+                    this.set_gateway_agent(agent_id.clone(), *checked, cx)
+                }))
+        });
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(if status.status.is_routable() {
+                cx.theme().border.opacity(0.7)
+            } else {
+                cx.theme().warning.opacity(0.7)
+            })
+            .px_2()
+            .py_1p5()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(Icon::default().path("icons/vibex/server.svg").small())
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_sm()
+                            .font_medium()
+                            .child(snapshot.settings.display_name.clone()),
+                    )
+                    .child(gateway_status_badge(status, cx))
+                    .children(enable_toggle),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("{address} · {key_summary}")),
+            )
+            .when(status.status.is_routable() && !on_gateway && configurable, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "This Agent uses its direct Providers. Turn the gateway on to let it use route groups.",
+                            "这个 Agent 正在使用直连供应商。打开网关后它才能使用路由组。",
+                            "這個 Agent 正在使用直連供應商。開啟閘道後它才能使用路由組。",
+                        )),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Opens the route-group editor on an empty draft.
+    fn open_route_group_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.route_group_editor_open = true;
+        self.route_group_editing_id = None;
+        self.route_group_name_error = None;
+        self.route_group_members.clear();
+        self.route_group_strategy = vibex_core::RouteStrategy::Ordered;
+        self.route_group_name.update(cx, |state, cx| {
+            state.set_value(
+                management_locale_text("Route group", "路由组", "路由組"),
+                window,
+                cx,
+            )
+        });
+        cx.notify();
+    }
+
+    /// Opens the editor on an existing group, with its Providers in order.
+    fn edit_route_group(
+        &mut self,
+        route_id: vibex_core::ModelRouteId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(route) = self
+            .model_routes
+            .iter()
+            .find(|route| route.id == route_id)
+            .cloned()
+        else {
+            return;
+        };
+        self.route_group_editor_open = true;
+        self.route_group_editing_id = Some(route.id.clone());
+        self.route_group_name_error = None;
+        self.route_group_members = route
+            .enabled_members()
+            .map(|member| member.model_provider_profile_id.clone())
+            .collect();
+        self.route_group_strategy = route.strategy;
+        self.route_group_name.update(cx, |state, cx| {
+            state.set_value(route.display_name.clone(), window, cx)
+        });
+        cx.notify();
+    }
+
+    fn close_route_group_editor(&mut self, cx: &mut Context<Self>) {
+        self.route_group_editor_open = false;
+        self.route_group_editing_id = None;
+        self.route_group_name_error = None;
+        self.route_group_members.clear();
+        cx.notify();
+    }
+
+    /// Adds or removes one Provider from the draft, keeping attempt order.
+    fn toggle_route_group_member(
+        &mut self,
+        provider_id: vibex_core::ModelProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self
+            .route_group_members
+            .iter()
+            .position(|member| member == &provider_id)
+        {
+            self.route_group_members.remove(index);
+        } else if self.route_group_members.len() < vibex_core::MAX_ROUTE_MEMBERS {
+            self.route_group_members.push(provider_id);
+        }
+        cx.notify();
+    }
+
+    /// Moves one Provider in the draft's attempt order.
+    fn move_route_group_member(&mut self, index: usize, up: bool, cx: &mut Context<Self>) {
+        let target = if up {
+            index.checked_sub(1)
+        } else {
+            (index + 1 < self.route_group_members.len()).then_some(index + 1)
+        };
+        let Some(target) = target else {
+            return;
+        };
+        self.route_group_members.swap(index, target);
+        cx.notify();
+    }
+
+    /// Writes the draft as a new group or as an edit of the open one.
+    ///
+    /// The group is bound to this Agent in the same action. A group nothing
+    /// uses is a draft, and this editor exists because the reader is on an
+    /// Agent's page trying to give it models.
+    fn save_route_group(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(agent_id) = self.selected_agent_id.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let name = self.route_group_name.read(cx).value().trim().to_string();
+        self.route_group_name_error = name.is_empty().then(|| {
+            management_error_text(
+                "A route group needs a name",
+                "请填写路由组名称",
+                "請填寫路由組名稱",
+            )
+            .to_string()
+        });
+        if self.route_group_name_error.is_some() {
+            cx.notify();
+            return;
+        }
+        if self.route_group_members.len() < 2 {
+            self.error = Some(
+                management_locale_text(
+                    "A route group needs at least two Providers; one Provider is a direct connection.",
+                    "路由组至少需要两个供应商；只有一个供应商就是直连。",
+                    "路由組至少需要兩個供應商；只有一個供應商就是直連。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let Ok(parsed_agent) = vibex_core::AgentId::parse(agent_id) else {
+            return;
+        };
+        let editing = self.route_group_editing_id.clone();
+        let existing = editing.as_ref().and_then(|id| {
+            self.model_routes
+                .iter()
+                .find(|route| &route.id == id)
+                .cloned()
+        });
+        let mut route = existing.clone().unwrap_or_default();
+        route.display_name = name;
+        route.kind = vibex_core::RouteKind::ProviderGroup;
+        route.strategy = self.route_group_strategy;
+        route.status = vibex_core::RouteStatus::Enabled;
+        route.members = self
+            .route_group_members
+            .iter()
+            .enumerate()
+            .map(|(index, provider)| {
+                vibex_core::ModelRouteMember::provider(provider.clone(), index as i64)
+            })
+            .collect();
+        let expected_revision = existing.as_ref().map(|route| route.revision).unwrap_or(0);
+        self.error = None;
+        self.mutation = Some(ManagementMutation::Gateway);
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let saved = match editing {
+                Some(_) => {
+                    backend
+                        .management()
+                        .update_model_route(vibex_backend::MutationRequest::new(
+                            vibex_core::ModelRouteUpdateRequest {
+                                route: route.clone(),
+                                expected_revision,
+                            },
+                        ))
+                        .await
+                }
+                None => {
+                    backend
+                        .management()
+                        .create_model_route(vibex_backend::MutationRequest::new(route.clone()))
+                        .await
+                }
+            };
+            let bound = match &saved {
+                Ok(saved) => backend
+                    .management()
+                    .bind_agent_model_route(vibex_backend::MutationRequest::new(
+                        vibex_core::AgentModelRouteBindRequest {
+                            agent_id: parsed_agent,
+                            model_route_id: saved.id.clone(),
+                            make_default: false,
+                        },
+                    ))
+                    .await
+                    .map(|_| saved.clone()),
+                Err(error) => Err(error.clone()),
+            };
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match bound {
+                    Ok(_) => {
+                        this.route_group_editor_open = false;
+                        this.route_group_editing_id = None;
+                        this.route_group_members.clear();
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    /// Deletes a group and every binding that pointed at it.
+    fn delete_route_group(
+        &mut self,
+        route_id: vibex_core::ModelRouteId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.backend.is_none() {
+            return;
+        }
+        if self.mutation.is_some() {
+            return;
+        }
+        let entity = cx.weak_entity();
+        let label = self
+            .model_routes
+            .iter()
+            .find(|route| route.id == route_id)
+            .map(|route| route.display_name.clone())
+            .unwrap_or_else(|| route_id.as_str().to_string());
+        let active_locale = locale::current_locale();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let route_id = route_id.clone();
+            let label = label.clone();
+            dialog
+                .title(management_locale_text_for(
+                    active_locale,
+                    "Delete this route group?",
+                    "删除这个路由组？",
+                    "刪除這個路由組？",
+                ))
+                .child(match active_locale {
+                    ResolvedLocale::En => format!(
+                        "\u{201c}{label}\u{201d} will be removed, and every Agent using it loses these models."
+                    ),
+                    ResolvedLocale::ZhCn => format!(
+                        "将移除“{label}”，所有使用它的 Agent 都会失去这些模型。"
+                    ),
+                    ResolvedLocale::ZhTw => format!(
+                        "將移除「{label}」，所有使用它的 Agent 都會失去這些模型。"
+                    ),
+                })
+                .footer(
+                    gpui_component::dialog::DialogFooter::new()
+                        .child(gpui_component::dialog::DialogClose::new().child(
+                            Button::new("cancel-route-group-delete")
+                                .outline()
+                                .label(management_locale_text_for(
+                                    active_locale,
+                                    "Cancel",
+                                    "取消",
+                                    "取消",
+                                )),
+                        ))
+                        .child(gpui_component::dialog::DialogAction::new().child(
+                            Button::new("confirm-route-group-delete").danger().label(
+                                management_locale_text_for(
+                                    active_locale,
+                                    "Delete",
+                                    "删除",
+                                    "刪除",
+                                ),
+                            ),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let entity = entity.clone();
+                    let route_id = route_id.clone();
+                    let _ = entity.update(cx, |this, cx| {
+                        let Some(backend) = this.backend.clone() else {
+                            return;
+                        };
+                        if this.mutation.is_some() {
+                            return;
+                        }
+                        this.mutation = Some(ManagementMutation::Gateway);
+                        let this_entity = cx.entity();
+                        this.mutation_task = Some(cx.spawn(async move |_, cx| {
+                            let outcome = backend
+                                .management()
+                                .delete_model_route(vibex_backend::MutationRequest::new(
+                                    vibex_core::ModelRouteDeleteRequest {
+                                        model_route_id: route_id,
+                                    },
+                                ))
+                                .await;
+                            this_entity.update(cx, |this, cx| {
+                                this.mutation = None;
+                                match outcome {
+                                    Ok(_) => {
+                                        this.route_group_editor_open = false;
+                                        this.route_group_editing_id = None;
+                                        this.refresh(cx);
+                                    }
+                                    Err(error) => {
+                                        this.error =
+                                            Some(format!("{}: {}", error.code, error.message));
+                                        cx.notify();
+                                    }
+                                }
+                            });
+                        }));
+                    });
+                    true
+                })
+        });
+    }
+
+    /// The route-group section of the Provider card.
+    ///
+    /// Groups sit above the Provider rows because they are a different kind of
+    /// answer to the same question: a row is one connection, a group is a way
+    /// of picking between several. Both belong on this card, so a reader no
+    /// longer has to visit a second section to find out which routes exist.
+    fn render_agent_route_groups(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if self.route_group_editor_open {
+            return self.render_route_group_editor(window, cx);
+        }
+        let Some(agent_id) = self.selected_agent_id.clone() else {
+            return div().into_any_element();
+        };
+        let pending = self.mutation.is_some();
+        let mut rows = v_flex().w_full().min_w_0().gap_2();
+        let mut groups = self
+            .model_routes
+            .iter()
+            .filter(|route| route.is_provider_group())
+            .filter(|route| route.status == vibex_core::RouteStatus::Enabled)
+            .cloned()
+            .collect::<Vec<_>>();
+        groups.sort_by(|left, right| {
+            left.display_name
+                .to_lowercase()
+                .cmp(&right.display_name.to_lowercase())
+        });
+        let mut any = false;
+        for route in groups {
+            let route_id = route.id.clone();
+            let is_bound = self.agent_model_route_bindings.iter().any(|binding| {
+                binding.agent_id.as_str() == agent_id
+                    && binding.model_route_id == route.id
+                    && binding.deleted_at_ms.is_none()
+            });
+            let models = vibex_core::provider_group_models(&route, &self.providers);
+            let providers = route
+                .enabled_members()
+                .filter_map(|member| {
+                    self.providers
+                        .iter()
+                        .find(|profile| profile.id == member.model_provider_profile_id)
+                        .map(|profile| profile.display_name.clone())
+                })
+                .collect::<Vec<_>>();
+            any = true;
+            let edit_id = route_id.clone();
+            let delete_id = route_id.clone();
+            rows = rows.child(
+                v_flex()
+                    .id(SharedString::from(format!(
+                        "management-route-group-{}",
+                        route_id.as_str()
+                    )))
+                    .w_full()
+                    .min_w_0()
+                    .gap_1()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(cx.theme().border.opacity(0.7))
+                    .p_2()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Icon::default()
+                                    .path("icons/vibex/git-branch.svg")
+                                    .size(px(16.0)),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(route.display_name.clone()),
+                            )
+                            .when(is_bound, |this| {
+                                this.child(
+                                    Tag::success().xsmall().child(management_locale_text(
+                                        "In use",
+                                        "使用中",
+                                        "使用中",
+                                    )),
+                                )
+                            })
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "management-route-group-edit-{}",
+                                    route_id.as_str()
+                                )))
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                                .tooltip(management_locale_text("Edit group", "编辑路由组", "編輯路由組"))
+                                .accessibility_label(management_locale_text(
+                                    "Edit route group",
+                                    "编辑路由组",
+                                    "編輯路由組",
+                                ))
+                                .disabled(pending)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.edit_route_group(edit_id.clone(), window, cx)
+                                })),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "management-route-group-delete-{}",
+                                    route_id.as_str()
+                                )))
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                                .tooltip(management_locale_text(
+                                    "Delete group",
+                                    "删除路由组",
+                                    "刪除路由組",
+                                ))
+                                .accessibility_label(management_locale_text(
+                                    "Delete route group",
+                                    "删除路由组",
+                                    "刪除路由組",
+                                ))
+                                .disabled(pending)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.delete_route_group(delete_id.clone(), window, cx)
+                                })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "{} · {} · {}",
+                                providers.join(" + "),
+                                management_route_group_model_count(models.len()),
+                                management_route_strategy_label(route.strategy)
+                            )),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if models.is_empty() {
+                                management_locale_text(
+                                    "These Providers share no enabled model, so the group cannot answer.",
+                                    "这些供应商没有共同启用的模型，路由组无法工作。",
+                                    "這些供應商沒有共同啟用的模型，路由組無法運作。",
+                                )
+                                .to_string()
+                            } else {
+                                models
+                                    .iter()
+                                    .map(|model| model.model_id.clone())
+                                    .collect::<Vec<_>>()
+                                    .join(" · ")
+                            }),
+                    ),
+            );
+        }
+        if !any {
+            rows = rows.child(
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .rounded(px(6.0))
+                    .bg(cx.theme().muted.opacity(0.25))
+                    .p_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .child(management_locale_text(
+                                "No route group yet",
+                                "还没有路由组",
+                                "還沒有路由組",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "A group combines several Providers. Its models are the ones they all serve, and the group's policy picks which Provider answers.",
+                                "路由组把多个供应商组合起来：可用模型是它们共同提供的部分，由路由策略决定哪个供应商来回答。",
+                                "路由組把多個供應商組合起來：可用模型是它們共同提供的部分，由路由策略決定哪個供應商來回答。",
+                            )),
+                    ),
+            );
+        }
+        rows = rows.child(
+            h_flex()
+                .w_full()
+                .flex_wrap()
+                .items_center()
+                .justify_end()
+                .gap_2()
+                .child(
+                    Button::new("management-route-group-new")
+                        .xsmall()
+                        .secondary()
+                        .icon(IconName::Plus)
+                        .label(management_locale_text(
+                            "New route group",
+                            "新建路由组",
+                            "新增路由組",
+                        ))
+                        .disabled(pending)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_route_group_editor(window, cx)
+                        })),
+                ),
+        );
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text("Route groups", "路由组", "路由組")),
+            )
+            .child(rows)
+            .into_any_element()
+    }
+
+    /// The route-group draft: a name, its Providers in order, and its policy.
+    fn render_route_group_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let editing = self.route_group_editing_id.is_some();
+        let mut rows = v_flex().w_full().min_w_0().gap_2();
+        rows = rows.child(management_input_field_with_error(
+            management_locale_text("Group name", "路由组名称", "路由組名稱"),
+            &self.route_group_name,
+            false,
+            self.route_group_name_error.as_deref(),
+            cx,
+        ));
+        // The chosen Providers, in attempt order. Order is the policy for an
+        // ordered group, so it is edited here rather than left to the list the
+        // Providers happened to be clicked in.
+        let mut chosen = v_flex().w_full().min_w_0().gap_1();
+        let members = self.route_group_members.clone();
+        for (index, provider_id) in members.iter().enumerate() {
+            let name = self
+                .providers
+                .iter()
+                .find(|profile| &profile.id == provider_id)
+                .map(|profile| profile.display_name.clone())
+                .unwrap_or_else(|| provider_id.as_str().to_string());
+            let toggle_id = provider_id.clone();
+            let up = index > 0;
+            let down = index + 1 < members.len();
+            chosen = chosen.child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(cx.theme().border.opacity(0.7))
+                    .px_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{}", index + 1)),
+                    )
+                    .child(div().min_w_0().flex_1().truncate().text_sm().child(name))
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-route-group-up-{index}"
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .icon(IconName::ArrowUp)
+                        .disabled(pending || !up)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.move_route_group_member(index, true, cx)
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-route-group-down-{index}"
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .icon(IconName::ArrowDown)
+                        .disabled(pending || !down)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.move_route_group_member(index, false, cx)
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-route-group-remove-{}",
+                            toggle_id.as_str()
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                        .tooltip(management_locale_text(
+                            "Remove Provider",
+                            "移除供应商",
+                            "移除供應商",
+                        ))
+                        .accessibility_label(management_locale_text(
+                            "Remove Provider",
+                            "移除供应商",
+                            "移除供應商",
+                        ))
+                        .disabled(pending)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_route_group_member(toggle_id.clone(), cx)
+                        })),
+                    ),
+            );
+        }
+        rows = rows.child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text(
+                    "Providers in this group",
+                    "组内供应商",
+                    "組內供應商",
+                )),
+        );
+        rows = rows.child(chosen);
+        if self.route_group_members.len() < 2 {
+            rows = rows.child(div().text_xs().text_color(cx.theme().warning).child(
+                management_locale_text(
+                    "Pick at least two Providers. One Provider is a direct connection.",
+                    "至少选择两个供应商；只有一个就是直连。",
+                    "至少選擇兩個供應商；只有一個就是直連。",
+                ),
+            ));
+        }
+        // The Providers that could still join, minus the ones already in.
+        let mut choices = h_flex().w_full().flex_wrap().items_center().gap_1();
+        for profile in &self.providers {
+            if profile.status != vibex_core::ModelProviderProfileStatus::Enabled {
+                continue;
+            }
+            if self.route_group_members.contains(&profile.id) {
+                continue;
+            }
+            let provider_id = profile.id.clone();
+            choices = choices.child(
+                Button::new(SharedString::from(format!(
+                    "management-route-group-add-{}",
+                    provider_id.as_str()
+                )))
+                .xsmall()
+                .outline()
+                .label(profile.display_name.clone())
+                .disabled(pending)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_route_group_member(provider_id.clone(), cx)
+                })),
+            );
+        }
+        rows = rows.child(choices);
+        if self.route_group_members.len() >= 2 {
+            let current = self.route_group_strategy;
+            let mut policies = h_flex().w_full().flex_wrap().items_center().gap_1();
+            for strategy in vibex_core::RouteStrategy::ALL {
+                policies = policies.child(
+                    Button::new(SharedString::from(format!(
+                        "management-route-group-strategy-{}",
+                        strategy.id()
+                    )))
+                    .xsmall()
+                    .ghost()
+                    .label(management_route_strategy_label(strategy))
+                    .selected(strategy == current)
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.route_group_strategy = strategy;
+                        cx.notify();
+                    })),
+                );
+            }
+            rows = rows.child(
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "How to choose among Providers",
+                                "在供应商之间如何选择",
+                                "在供應商之間如何選擇",
+                            )),
+                    )
+                    .child(policies),
+            );
+            // What the composition would offer, before it is saved: a group
+            // whose Providers share no model is a mistake worth seeing here.
+            let draft = vibex_core::ModelRoute {
+                display_name: self.route_group_name.read(cx).value().to_string(),
+                kind: vibex_core::RouteKind::ProviderGroup,
+                members: self
+                    .route_group_members
+                    .iter()
+                    .enumerate()
+                    .map(|(index, provider)| {
+                        vibex_core::ModelRouteMember::provider(provider.clone(), index as i64)
+                    })
+                    .collect(),
+                strategy: self.route_group_strategy,
+                status: vibex_core::RouteStatus::Enabled,
+                ..Default::default()
+            };
+            let models = vibex_core::provider_group_models(&draft, &self.providers);
+            rows = rows.child(
+                div()
+                    .w_full()
+                    .text_xs()
+                    .text_color(if models.is_empty() {
+                        cx.theme().warning
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .child(if models.is_empty() {
+                        management_locale_text(
+                            "These Providers share no enabled model, so the group would have nothing to serve.",
+                            "这些供应商没有共同启用的模型，路由组将没有可用模型。",
+                            "這些供應商沒有共同啟用的模型，路由組將沒有可用模型。",
+                        )
+                        .to_string()
+                    } else {
+                        format!(
+                            "{} · {}",
+                            management_route_group_model_count(models.len()),
+                            models
+                                .iter()
+                                .map(|model| model.model_id.clone())
+                                .collect::<Vec<_>>()
+                                .join(" · ")
+                        )
+                    }),
+            );
+        }
+        rows = rows.child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_end()
+                .gap_2()
+                .child(
+                    Button::new("management-route-group-cancel")
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text("Cancel", "取消", "取消"))
+                        .disabled(pending)
+                        .on_click(cx.listener(|this, _, _, cx| this.close_route_group_editor(cx))),
+                )
+                .child(
+                    Button::new("management-route-group-save")
+                        .xsmall()
+                        .primary()
+                        .label(if editing {
+                            management_locale_text("Save group", "保存路由组", "儲存路由組")
+                        } else {
+                            management_locale_text("Create group", "创建路由组", "建立路由組")
+                        })
+                        .disabled(pending || self.route_group_members.len() < 2)
+                        .on_click(cx.listener(|this, _, _, cx| this.save_route_group(cx))),
+                ),
+        );
+        let _ = window;
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if editing {
+                        management_locale_text("Edit route group", "编辑路由组", "編輯路由組")
+                    } else {
+                        management_locale_text("New route group", "新建路由组", "新增路由組")
+                    }),
+            )
+            .child(rows)
+            .into_any_element()
+    }
+
     fn render_providers(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let copy = management_copy();
         if self.custom_agent_editor_open {
@@ -23829,39 +22900,6 @@ impl ManagementCenter {
             profile_rows = profile_rows.child(row);
         }
 
-        // The one line that answers "is this Agent on the gateway right
-        // now?", before any Provider row is read. It is computed from the
-        // snapshot the switches write, so it changes with them.
-        let agent_gateway_mode = {
-            let binding = self
-                .gateway
-                .agents
-                .iter()
-                .find(|agent| agent.agent_id == selected_id);
-            let configurable = vibex_core::model_provider_configurable_agent_ids()
-                .map(|agents| agents.iter().any(|id| id.as_str() == selected_id))
-                .unwrap_or(false);
-            let direct_provider = self
-                .agent_profile_states
-                .iter()
-                .find(|state| state.agent_id == selected_id && state.is_default)
-                .and_then(|state| {
-                    self.snapshot
-                        .profiles
-                        .iter()
-                        .find(|profile| profile.id.as_str() == state.profile_id)
-                })
-                .map(|profile| profile.display_name.clone());
-            agent_gateway_mode(
-                binding,
-                self.gateway.is_routable(),
-                &self.gateway.settings.display_name,
-                direct_provider.as_deref(),
-                configurable,
-                locale::current_locale(),
-            )
-        };
-
         let installation = self.render_agent_installation_card(&selected_agent, window, cx);
         let provider_configuration = if profiles.is_empty() {
             EmptyState::new()
@@ -23982,38 +23020,55 @@ impl ManagementCenter {
                 .child(profile_rows)
                 .into_any_element()
         };
-        // The mode line used to sit here. It said what the routing section now
-        // draws: which path this Agent takes. Keeping both would be the same fact
-        // stated twice, and they could disagree — so the section above owns it.
-        //
-        // `agent_gateway_mode` itself stays: §7.7 records that the routing
-        // section reuses its wording and its four states.
-        let _ = &agent_gateway_mode;
-        let provider_configuration = provider_configuration;
+        // Route groups sit beside the direct Providers inside the same card:
+        // both answer "which model will this Agent use", and the gateway is
+        // what a group is served by. Keeping them together is what makes the
+        // relationship legible instead of a separate section that named routes
+        // while this one named Providers.
+        let route_groups = self.render_agent_route_groups(window, cx);
+        let gateway_summary = self.render_agent_gateway_summary(cx);
+        let provider_configuration = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .child(gateway_summary)
+            .child(route_groups)
+            .child(
+                div()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Direct Providers",
+                        "直连供应商",
+                        "直連供應商",
+                    )),
+            )
+            .child(provider_configuration)
+            .into_any_element();
         let provider_configuration = management_card_with_icon(
             copy.provider_configuration,
             management_locale_text(
-                "Configure credentials and models for external model services",
-                "配置外部模型服务所需的凭证与模型",
-                "設定外部模型服務所需的憑證與模型",
+                "Credentials, models, route groups, and the gateway they may use",
+                "凭证、模型、路由组，以及它们可能使用的网关",
+                "憑證、模型、路由組，以及它們可能使用的閘道",
             ),
             "icons/vibex/database.svg",
             provider_configuration,
             cx,
         );
-        let route_graph = self.render_agent_route_graph(cx);
         let authentication = self.render_agent_authentication(window, cx);
 
+        // The Provider card owns every way this Agent reaches a model now:
+        // direct Providers, route groups, and the local gateway that serves
+        // them. Routing is no longer a section of its own, so there is no
+        // second surface that could describe the same choice differently.
         v_flex()
             .w_full()
             .min_w_0()
             .gap_4()
             .child(agent_header)
             .child(installation)
-            // Routing sits before the Provider card: the question this page is
-            // usually opened for is "which model will this Agent use", and that
-            // is a routing answer, not a Provider-listing one.
-            .child(route_graph)
             .child(authentication)
             .child(provider_configuration)
             .into_any_element()
@@ -29299,560 +28354,15 @@ fn parse_optional_limit(value: &str) -> Result<Option<u32>, &'static str> {
     }
 }
 
+/// The most in-flight requests the ledger keeps, matching the gateway's own
+/// bound so a client never holds a request the gateway has already dropped.
+const DESKTOP_MAX_INFLIGHT: usize = 8;
+
 /// The Providers page's selection id for its pinned gateway row.
 ///
 /// Provider ids carry the `model_provider_` prefix, so a bare `gateway` can
 /// never collide with one.
 const GATEWAY_ROW_ID: &str = "gateway";
-
-/// One node in an Agent's route graph.
-///
-/// The graph has three kinds of node and only two of them are records. A
-/// gateway is a single listener every gateway route shares; a direct route is
-/// one Provider; an account is the Agent's own sign-in, which has no route row
-/// because its destination is an auth context, not a Provider.
-#[derive(Clone, PartialEq, Eq, Debug)]
-enum RouteGraphNode {
-    /// The one gateway, with the routes it serves.
-    Gateway {
-        display_name: String,
-        /// Absent when the listener is not running.
-        port: Option<u16>,
-        routes: Vec<RouteGraphRoute>,
-    },
-    /// A route that names one Provider and skips the gateway.
-    Direct(RouteGraphRoute),
-    /// The Agent's own account.
-    Account {
-        label: String,
-        /// The account name the Agent reported, when it reported one.
-        account_hint: Option<String>,
-    },
-}
-
-/// One route as the graph draws it.
-#[derive(Clone, PartialEq, Eq, Debug)]
-struct RouteGraphRoute {
-    route: vibex_core::ModelRoute,
-    /// The members that can still answer, in attempt order.
-    members: Vec<RouteGraphMember>,
-    /// The models this route offers, deduplicated.
-    models: Vec<String>,
-    /// Whether this route is the Agent's default.
-    is_default: bool,
-}
-
-impl RouteGraphRoute {
-    fn id(&self) -> &str {
-        self.route.id.as_str()
-    }
-
-    /// How many sources back this route.
-    fn source_count(&self) -> usize {
-        self.members.len()
-    }
-}
-
-/// One member of a route, with what the graph says about it.
-#[derive(Clone, PartialEq, Eq, Debug)]
-struct RouteGraphMember {
-    provider_name: String,
-    /// The Provider this member calls, so a live request can be matched to it.
-    provider_profile_id: vibex_core::ModelProviderProfileId,
-    model_id: String,
-    /// Whether the route still routes to this member.
-    enabled: bool,
-    /// The route member row this describes, so an action addresses it directly.
-    member_id: String,
-    /// The Key states that can still answer.
-    ready_keys: usize,
-    cooling_keys: usize,
-    invalid_keys: usize,
-    /// Tokens this Provider has spent in the current window.
-    ///
-    /// Read from the same figure the token ceiling uses, so "how much has this
-    /// source burned" is answered by the number that decides whether it may
-    /// still answer.
-    used_tokens: u64,
-}
-
-impl RouteGraphMember {
-    /// Whether this member has spent enough tokens to be worth saying.
-    ///
-    /// A zero is noise on every fresh Provider, so the graph draws the count
-    /// only once there is one.
-    fn shows_usage(&self) -> bool {
-        self.used_tokens > 0
-    }
-
-    /// The one-line state the graph appends to a member.
-    fn state(&self) -> RouteGraphMemberState {
-        if self.ready_keys > 0 {
-            RouteGraphMemberState::Ready
-        } else if self.cooling_keys > 0 {
-            RouteGraphMemberState::Cooling(self.cooling_keys)
-        } else if self.invalid_keys > 0 {
-            RouteGraphMemberState::Invalid(self.invalid_keys)
-        } else {
-            RouteGraphMemberState::NoKeys
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RouteGraphMemberState {
-    Ready,
-    Cooling(usize),
-    Invalid(usize),
-    NoKeys,
-}
-
-/// The most in-flight requests the graph keeps, matching the gateway's own
-/// bound so a client never holds a request the gateway has already dropped.
-const DESKTOP_MAX_INFLIGHT: usize = 8;
-
-/// How many routes the graph lists before folding the rest away.
-///
-/// The middle column answers "which one do I pick", so it stays short; a route
-/// list long enough to scroll is a list, and reading it is what the Providers
-/// page is for.
-const ROUTE_GRAPH_VISIBLE_ROUTES: usize = 5;
-/// How many members a route draws before folding the rest away.
-/// How many members the graph's right column draws before folding the rest.
-///
-/// The design's threshold is "more than eight", with the first seven staying —
-/// the eighth row is the overflow line. Members and routes use different
-/// thresholds on purpose: the middle column is "which one", where a long list
-/// crowds, and the right column is "how it composes", where the reader needs to
-/// see the shape.
-const ROUTE_GRAPH_VISIBLE_MEMBERS: usize = 7;
-/// The count above which the member fold engages.
-const ROUTE_GRAPH_MEMBER_FOLD_THRESHOLD: usize = 8;
-
-/// Builds the nodes an Agent's route graph draws, in reading order.
-///
-/// The order is fixed: the gateway first because it is shared machinery, then
-/// the direct routes, then the account. A node the Agent cannot use is still
-/// returned — the graph explains why it is unavailable rather than hiding it,
-/// because "there is nothing else" and "the other thing is broken" are
-/// different answers.
-fn route_graph_nodes(
-    agent_id: &str,
-    routes: &[vibex_core::ModelRoute],
-    bindings: &[vibex_core::AgentModelRouteBinding],
-    providers: &[vibex_core::ModelProviderProfile],
-    gateway: &vibex_core::GatewaySnapshot,
-    account: Option<&vibex_core::AgentAuthContext>,
-) -> Vec<RouteGraphNode> {
-    let bound = bindings
-        .iter()
-        .filter(|binding| binding.agent_id.as_str() == agent_id && binding.deleted_at_ms.is_none())
-        .collect::<Vec<_>>();
-    let bound_route = |route_id: &vibex_core::ModelRouteId| {
-        bound
-            .iter()
-            .find(|binding| &binding.model_route_id == route_id)
-            .copied()
-    };
-
-    let to_graph = |route: &vibex_core::ModelRoute| RouteGraphRoute {
-        route: route.clone(),
-        members: route
-            .enabled_members()
-            .filter_map(|member| {
-                let profile = providers.iter().find(|profile| {
-                    profile.id == member.model_provider_profile_id
-                        && profile.status == vibex_core::ModelProviderProfileStatus::Enabled
-                })?;
-                let keys = gateway
-                    .upstreams
-                    .iter()
-                    .find(|upstream| upstream.model_provider_profile_id == profile.id)
-                    .map(|upstream| upstream.keys.as_slice())
-                    .unwrap_or(&[]);
-                Some(RouteGraphMember {
-                    provider_name: profile.display_name.clone(),
-                    provider_profile_id: profile.id.clone(),
-                    model_id: member.model_id.clone(),
-                    enabled: member.enabled,
-                    member_id: member.id.as_str().to_string(),
-                    ready_keys: keys.iter().filter(|key| key.state.is_ready()).count(),
-                    used_tokens: keys.first().map(|key| key.used_tokens).unwrap_or(0),
-                    cooling_keys: keys
-                        .iter()
-                        .filter(|key| {
-                            matches!(key.state, vibex_core::GatewayKeyState::Cooling { .. })
-                        })
-                        .count(),
-                    invalid_keys: keys
-                        .iter()
-                        .filter(|key| key.state == vibex_core::GatewayKeyState::Invalid)
-                        .count(),
-                })
-            })
-            .collect(),
-        models: route
-            .distinct_models()
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-        is_default: bound_route(&route.id).is_some_and(|binding| binding.is_default),
-    };
-
-    let mut nodes = Vec::new();
-    // The gateway holds every gateway route this Agent may use, whether or not
-    // it is running: a stopped listener still has routes, and the graph says so
-    // instead of making them vanish.
-    let gateway_routes = bound
-        .iter()
-        .filter_map(|binding| {
-            routes.iter().find(|route| {
-                route.id == binding.model_route_id
-                    && route.status == vibex_core::RouteStatus::Enabled
-                    && route.kind == vibex_core::RouteKind::Gateway
-            })
-        })
-        .map(&to_graph)
-        .collect::<Vec<_>>();
-    if !gateway_routes.is_empty() {
-        nodes.push(RouteGraphNode::Gateway {
-            display_name: gateway.settings.display_name.clone(),
-            port: gateway.runtime.port,
-            routes: gateway_routes,
-        });
-    }
-
-    let direct = bound
-        .iter()
-        .filter_map(|binding| {
-            routes.iter().find(|route| {
-                route.id == binding.model_route_id
-                    && route.status == vibex_core::RouteStatus::Enabled
-                    && route.kind == vibex_core::RouteKind::Direct
-            })
-        })
-        .map(&to_graph)
-        .collect::<Vec<_>>();
-    nodes.extend(direct.into_iter().map(RouteGraphNode::Direct));
-
-    if let Some(account) = account {
-        nodes.push(RouteGraphNode::Account {
-            label: vibex_core::AGENT_ACCOUNT_LABEL.to_string(),
-            account_hint: account.account_hint.clone(),
-        });
-    }
-    nodes
-}
-
-/// A graph column's heading.
-fn management_route_column_header(
-    label: &'static str,
-    cx: &mut Context<ManagementCenter>,
-) -> AnyElement {
-    div()
-        .text_xs()
-        .font_semibold()
-        .text_color(cx.theme().muted_foreground)
-        .child(label)
-        .into_any_element()
-}
-
-/// `s` for anything but one, so a count reads as a sentence.
-fn management_route_plural(count: usize) -> &'static str {
-    if count == 1 { "" } else { "s" }
-}
-
-/// The Agent's own label, falling back to its id when the roster has no row.
-fn management_agent_label(agent_id: &str, agents: &[vibex_core::AgentSnapshotEntry]) -> String {
-    agents
-        .iter()
-        .find(|agent| agent.id.as_str() == agent_id)
-        .map(|agent| agent.label.clone())
-        .unwrap_or_else(|| agent_id.to_string())
-}
-
-/// A token count, thousands separated: the graph shows these inline and a bare
-/// `1234567` is unreadable at a glance.
-fn management_route_token_label(tokens: u64) -> String {
-    let digits = tokens.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, ch) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    match locale::current_locale() {
-        ResolvedLocale::ZhCn => format!("{out} token"),
-        ResolvedLocale::ZhTw => format!("{out} token"),
-        ResolvedLocale::En => format!("{out} tokens"),
-    }
-}
-
-/// A request time, as the graph's playback shows it.
-///
-/// Only the clock time is shown: playback lists the last few requests, so the
-/// date is the same for all of them and would be noise.
-fn management_route_history_time_label(at_ms: i64) -> String {
-    let seconds = at_ms.div_euclid(1000);
-    let day = seconds.div_euclid(86_400);
-    let in_day = seconds.rem_euclid(86_400);
-    let hours = in_day / 3_600;
-    let minutes = (in_day % 3_600) / 60;
-    let secs = in_day % 60;
-    let _ = day;
-    format!("{hours:02}:{minutes:02}:{secs:02}")
-}
-
-/// How a finished request ended, in the reader's terms.
-fn management_route_outcome_label(outcome: vibex_core::GatewayRequestOutcome) -> String {
-    let label = match (outcome, locale::current_locale()) {
-        (vibex_core::GatewayRequestOutcome::Ok, ResolvedLocale::En) => "ok",
-        (vibex_core::GatewayRequestOutcome::Ok, ResolvedLocale::ZhCn) => "成功",
-        (vibex_core::GatewayRequestOutcome::Ok, ResolvedLocale::ZhTw) => "成功",
-        (vibex_core::GatewayRequestOutcome::Failover, ResolvedLocale::En) => "switched",
-        (vibex_core::GatewayRequestOutcome::Failover, ResolvedLocale::ZhCn) => "已切换",
-        (vibex_core::GatewayRequestOutcome::Failover, ResolvedLocale::ZhTw) => "已切換",
-        (vibex_core::GatewayRequestOutcome::Cooldown, ResolvedLocale::En) => "cooling",
-        (vibex_core::GatewayRequestOutcome::Cooldown, ResolvedLocale::ZhCn) => "冷却中",
-        (vibex_core::GatewayRequestOutcome::Cooldown, ResolvedLocale::ZhTw) => "冷卻中",
-        (vibex_core::GatewayRequestOutcome::Rejected, ResolvedLocale::En) => "refused",
-        (vibex_core::GatewayRequestOutcome::Rejected, ResolvedLocale::ZhCn) => "已拒绝",
-        (vibex_core::GatewayRequestOutcome::Rejected, ResolvedLocale::ZhTw) => "已拒絕",
-        (vibex_core::GatewayRequestOutcome::Failed, ResolvedLocale::En) => "failed",
-        (vibex_core::GatewayRequestOutcome::Failed, ResolvedLocale::ZhCn) => "失败",
-        (vibex_core::GatewayRequestOutcome::Failed, ResolvedLocale::ZhTw) => "失敗",
-    };
-    label.to_string()
-}
-
-/// How many routes the gateway node serves.
-fn management_route_count_label(count: usize) -> String {
-    match locale::current_locale() {
-        ResolvedLocale::ZhCn => format!("{count} 份路由"),
-        ResolvedLocale::ZhTw => format!("{count} 份路由"),
-        ResolvedLocale::En => format!("{count} route{}", management_route_plural(count)),
-    }
-}
-
-/// "3 sources · 2 models", or just the sources when they agree.
-///
-/// A member is a `(Provider, model)` pair, so one model at three Providers is
-/// three sources and one model. Saying which is which stops the reader from
-/// thinking they have three models.
-fn management_route_member_summary(route: &RouteGraphRoute) -> String {
-    let sources = route.source_count();
-    let models = route.models.len();
-    match locale::current_locale() {
-        ResolvedLocale::ZhCn | ResolvedLocale::ZhTw => {
-            if sources == models {
-                format!("{sources} 个来源")
-            } else {
-                format!("{sources} 个来源 · {models} 个模型")
-            }
-        }
-        ResolvedLocale::En => {
-            if sources == models {
-                format!("{sources} source{}", management_route_plural(sources))
-            } else {
-                format!(
-                    "{sources} source{} · {models} model{}",
-                    management_route_plural(sources),
-                    management_route_plural(models)
-                )
-            }
-        }
-    }
-}
-
-fn management_route_cooling_label(count: usize) -> String {
-    match locale::current_locale() {
-        ResolvedLocale::ZhCn => format!("{count} 个冷却中"),
-        ResolvedLocale::ZhTw => format!("{count} 個冷卻中"),
-        ResolvedLocale::En => format!("{count} cooling"),
-    }
-}
-
-fn management_route_invalid_label(count: usize) -> String {
-    match locale::current_locale() {
-        ResolvedLocale::ZhCn => format!("{count} 个已失效"),
-        ResolvedLocale::ZhTw => format!("{count} 個已失效"),
-        ResolvedLocale::En => format!("{count} invalid"),
-    }
-}
-
-fn management_route_overflow_label(hidden: usize) -> String {
-    match locale::current_locale() {
-        ResolvedLocale::ZhCn => format!("还有 {hidden} 份路由"),
-        ResolvedLocale::ZhTw => format!("還有 {hidden} 份路由"),
-        ResolvedLocale::En => format!("{hidden} more route{}", management_route_plural(hidden)),
-    }
-}
-
-fn management_route_member_overflow_label(hidden: usize) -> String {
-    match locale::current_locale() {
-        ResolvedLocale::ZhCn => format!("还有 {hidden} 个成员"),
-        ResolvedLocale::ZhTw => format!("還有 {hidden} 個成員"),
-        ResolvedLocale::En => format!("{hidden} more member{}", management_route_plural(hidden)),
-    }
-}
-
-/// A titled empty state for the route graph.
-///
-/// Kept as one helper so the three cases read as the same kind of message: a
-/// title saying what is missing, a line saying why, and one action.
-fn management_route_graph_empty_state(
-    title: &'static str,
-    body: &'static str,
-    action: &'static str,
-    cx: &mut Context<ManagementCenter>,
-) -> AnyElement {
-    v_flex()
-        .w_full()
-        .gap_1()
-        .rounded(px(6.0))
-        .bg(cx.theme().muted.opacity(0.25))
-        .p_3()
-        .child(div().text_sm().child(title))
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(body),
-        )
-        .child(
-            div()
-                .pt_1()
-                .text_xs()
-                .text_color(cx.theme().accent)
-                .child(action),
-        )
-        .into_any_element()
-}
-
-/// The token window a route ceiling applies over.
-fn management_route_window_label(window: vibex_core::GatewayTokenWindow) -> &'static str {
-    match (window, locale::current_locale()) {
-        (vibex_core::GatewayTokenWindow::Day, ResolvedLocale::En) => "day",
-        (vibex_core::GatewayTokenWindow::Day, ResolvedLocale::ZhCn) => "天",
-        (vibex_core::GatewayTokenWindow::Day, ResolvedLocale::ZhTw) => "天",
-        (vibex_core::GatewayTokenWindow::Week, ResolvedLocale::En) => "week",
-        (vibex_core::GatewayTokenWindow::Week, ResolvedLocale::ZhCn) => "周",
-        (vibex_core::GatewayTokenWindow::Week, ResolvedLocale::ZhTw) => "週",
-        (vibex_core::GatewayTokenWindow::Month, ResolvedLocale::En) => "month",
-        (vibex_core::GatewayTokenWindow::Month, ResolvedLocale::ZhCn) => "月",
-        (vibex_core::GatewayTokenWindow::Month, ResolvedLocale::ZhTw) => "月",
-    }
-}
-
-/// The next ceiling in the cycle: none, then a day, week and month at a fixed
-/// size.
-///
-/// A cycle rather than a numeric field because the useful answers are few and a
-/// text box would need parsing, validation and an error state for each of them.
-fn management_next_route_ceiling(
-    current: Option<vibex_core::GatewayTokenLimit>,
-) -> Option<vibex_core::GatewayTokenLimit> {
-    const STEPS: [(vibex_core::GatewayTokenWindow, u64); 3] = [
-        (vibex_core::GatewayTokenWindow::Day, 1_000_000),
-        (vibex_core::GatewayTokenWindow::Week, 5_000_000),
-        (vibex_core::GatewayTokenWindow::Month, 20_000_000),
-    ];
-    let next = match current {
-        None => 0,
-        Some(limit) => STEPS
-            .iter()
-            .position(|(window, tokens)| *window == limit.window && *tokens == limit.tokens)
-            .map(|index| index + 1)
-            .unwrap_or(0),
-    };
-    if next >= STEPS.len() {
-        return None;
-    }
-    let (window, tokens) = STEPS[next];
-    Some(vibex_core::GatewayTokenLimit { window, tokens })
-}
-
-/// The next first-token deadline in the cycle.
-///
-/// A deadline guards a vendor that accepts a connection and then stalls; the
-/// useful values are few, and going past the last one turns the guard off.
-fn management_next_route_timeout(current: Option<u64>) -> Option<u64> {
-    const STEPS: [u64; 3] = [8_000, 20_000, 60_000];
-    match current {
-        None => Some(STEPS[0]),
-        Some(value) => STEPS
-            .iter()
-            .position(|step| *step == value)
-            .map(|index| STEPS.get(index + 1).copied())
-            .unwrap_or(None),
-    }
-}
-
-fn management_route_strategy_label(strategy: vibex_core::RouteStrategy) -> String {
-    let label = match (strategy, locale::current_locale()) {
-        (vibex_core::RouteStrategy::Ordered, ResolvedLocale::En) => "in order",
-        (vibex_core::RouteStrategy::Ordered, ResolvedLocale::ZhCn) => "按顺序",
-        (vibex_core::RouteStrategy::Ordered, ResolvedLocale::ZhTw) => "按順序",
-        (vibex_core::RouteStrategy::RoundRobin, ResolvedLocale::En) => "rotate",
-        (vibex_core::RouteStrategy::RoundRobin, ResolvedLocale::ZhCn) => "轮换",
-        (vibex_core::RouteStrategy::RoundRobin, ResolvedLocale::ZhTw) => "輪換",
-        (vibex_core::RouteStrategy::LeastUsed, ResolvedLocale::En) => "least used",
-        (vibex_core::RouteStrategy::LeastUsed, ResolvedLocale::ZhCn) => "用得最少",
-        (vibex_core::RouteStrategy::LeastUsed, ResolvedLocale::ZhTw) => "用得最少",
-    };
-    label.to_string()
-}
-
-/// The one line that says how this Agent reaches a model.
-///
-/// The graph shows every path, so the line names the one in effect rather than
-/// repeating the whole set: "gateway" when a gateway route is the default, the
-/// route's own name when a direct one is.
-fn management_route_graph_mode_label(
-    nodes: &[RouteGraphNode],
-    cx: &mut Context<ManagementCenter>,
-) -> String {
-    let _ = cx;
-    for node in nodes {
-        match node {
-            RouteGraphNode::Gateway {
-                display_name,
-                routes,
-                ..
-            } => {
-                if let Some(route) = routes.iter().find(|route| route.is_default) {
-                    return match locale::current_locale() {
-                        ResolvedLocale::ZhCn => {
-                            format!("当前：{}（走网关）", route.route.display_name)
-                        }
-                        ResolvedLocale::ZhTw => {
-                            format!("目前：{}（走閘道）", route.route.display_name)
-                        }
-                        ResolvedLocale::En => {
-                            format!("Current: {} (via {display_name})", route.route.display_name)
-                        }
-                    };
-                }
-            }
-            RouteGraphNode::Direct(route) if route.is_default => {
-                return match locale::current_locale() {
-                    ResolvedLocale::ZhCn => format!("当前：{}（直连）", route.route.display_name),
-                    ResolvedLocale::ZhTw => format!("目前：{}（直連）", route.route.display_name),
-                    ResolvedLocale::En => {
-                        format!("Current: {} (direct)", route.route.display_name)
-                    }
-                };
-            }
-            _ => {}
-        }
-    }
-    match locale::current_locale() {
-        ResolvedLocale::ZhCn => "当前：没有路由".to_string(),
-        ResolvedLocale::ZhTw => "目前：沒有路由".to_string(),
-        ResolvedLocale::En => "Current: no route".to_string(),
-    }
-}
 
 /// One row of the global Providers page.
 #[derive(Clone)]
@@ -30109,123 +28619,6 @@ impl GatewayTranslation {
             Self::Gemini => policy.google_generative_ai = allowed,
         }
     }
-}
-
-/// How an Agent is reaching its models right now, and whether that is a
-/// healthy answer or one the user has to act on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentGatewayModeTone {
-    Normal,
-    Warning,
-    Muted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AgentGatewayMode {
-    text: String,
-    tone: AgentGatewayModeTone,
-}
-
-/// The mode line at the top of an Agent's provider card.
-///
-/// `None` means the gateway snapshot has not loaded yet: saying "direct" then
-/// would be a guess that flips a moment later. `configurable` separates an
-/// Agent that genuinely manages its own provider from one the snapshot merely
-/// has not reported yet.
-fn agent_gateway_mode(
-    binding: Option<&vibex_core::GatewayAgentBinding>,
-    routable: bool,
-    gateway_name: &str,
-    direct_provider: Option<&str>,
-    configurable: bool,
-    locale: ResolvedLocale,
-) -> Option<AgentGatewayMode> {
-    match binding {
-        Some(binding) if binding.enabled => Some(AgentGatewayMode {
-            tone: if routable && binding.active {
-                AgentGatewayModeTone::Normal
-            } else {
-                AgentGatewayModeTone::Warning
-            },
-            text: if routable && binding.active {
-                match locale {
-                    ResolvedLocale::En => format!("Current mode: gateway ({gateway_name})"),
-                    ResolvedLocale::ZhCn => format!("当前模式：走网关（{gateway_name}）"),
-                    ResolvedLocale::ZhTw => format!("目前模式：走閘道（{gateway_name}）"),
-                }
-            } else {
-                management_locale_text_for(
-                    locale,
-                    "Current mode: gateway unavailable, using the direct connection",
-                    "当前模式：网关不可用，已回退直连",
-                    "目前模式：閘道無法使用，已退回直連",
-                )
-                .to_string()
-            },
-        }),
-        Some(_) => {
-            let provider = direct_provider.unwrap_or_else(|| {
-                management_locale_text_for(
-                    locale,
-                    "its own Provider",
-                    "自己的供应商",
-                    "自己的供應商",
-                )
-            });
-            Some(AgentGatewayMode {
-                tone: AgentGatewayModeTone::Normal,
-                text: match locale {
-                    ResolvedLocale::En => format!("Current mode: direct ({provider})"),
-                    ResolvedLocale::ZhCn => format!("当前模式：直连（{provider}）"),
-                    ResolvedLocale::ZhTw => format!("目前模式：直連（{provider}）"),
-                },
-            })
-        }
-        None if !configurable => Some(AgentGatewayMode {
-            tone: AgentGatewayModeTone::Muted,
-            text: management_locale_text_for(
-                locale,
-                "Current mode: direct (this Agent manages its own provider)",
-                "当前模式：直连（该 Agent 自己管理供应商）",
-                "目前模式：直連（該 Agent 自己管理供應商）",
-            )
-            .to_string(),
-        }),
-        None => None,
-    }
-}
-
-/// The mode line, in the colour its answer deserves.
-/// Renders the old mode line.
-///
-/// No longer called: the routing section above draws the current path, and this
-/// line was the same fact stated twice. Kept because its wording is the reference
-/// the routing section's copy follows — §7.7 says not to delete it for that
-/// reason, and `allow` records that the absence of a caller is deliberate.
-#[allow(dead_code)]
-fn render_agent_gateway_mode(mode: &AgentGatewayMode, cx: &App) -> AnyElement {
-    let color = match mode.tone {
-        AgentGatewayModeTone::Normal => cx.theme().foreground,
-        AgentGatewayModeTone::Warning => cx.theme().warning,
-        AgentGatewayModeTone::Muted => cx.theme().muted_foreground,
-    };
-    h_flex()
-        .w_full()
-        .items_center()
-        .gap_2()
-        .rounded(px(6.0))
-        .border_1()
-        .border_color(cx.theme().border)
-        .px_3()
-        .py_2()
-        .child(
-            div()
-                .text_xs()
-                .font_medium()
-                .text_color(color)
-                .child(mode.text.clone()),
-        )
-        .into_any_element()
 }
 
 fn gateway_key_summary_text(
@@ -33164,6 +31557,31 @@ fn management_route_count_for_agent(count: usize) -> String {
         ResolvedLocale::ZhCn => format!("{count} 份路由"),
         ResolvedLocale::ZhTw => format!("{count} 份路由"),
     }
+}
+
+/// How many models a route group offers.
+fn management_route_group_model_count(count: usize) -> String {
+    match locale::current_locale() {
+        ResolvedLocale::En => format!("{count} model{}", if count == 1 { "" } else { "s" }),
+        ResolvedLocale::ZhCn => format!("{count} 个模型"),
+        ResolvedLocale::ZhTw => format!("{count} 個模型"),
+    }
+}
+
+/// How a route picks among its members, in the reader's terms.
+fn management_route_strategy_label(strategy: vibex_core::RouteStrategy) -> String {
+    let label = match (strategy, locale::current_locale()) {
+        (vibex_core::RouteStrategy::Ordered, ResolvedLocale::En) => "In order",
+        (vibex_core::RouteStrategy::Ordered, ResolvedLocale::ZhCn) => "按顺序",
+        (vibex_core::RouteStrategy::Ordered, ResolvedLocale::ZhTw) => "按順序",
+        (vibex_core::RouteStrategy::RoundRobin, ResolvedLocale::En) => "Rotate",
+        (vibex_core::RouteStrategy::RoundRobin, ResolvedLocale::ZhCn) => "轮换",
+        (vibex_core::RouteStrategy::RoundRobin, ResolvedLocale::ZhTw) => "輪換",
+        (vibex_core::RouteStrategy::LeastUsed, ResolvedLocale::En) => "Least used",
+        (vibex_core::RouteStrategy::LeastUsed, ResolvedLocale::ZhCn) => "用得最少",
+        (vibex_core::RouteStrategy::LeastUsed, ResolvedLocale::ZhTw) => "用得最少",
+    };
+    label.to_string()
 }
 
 fn management_profile_count(count: usize) -> String {
@@ -37410,11 +35828,13 @@ mod tests {
         assert!(!authentication.contains("content.when_some(provider_configuration"));
         assert!(render.contains("let provider_configuration = management_card_with_icon("));
         assert!(render.contains("icons/vibex/database.svg"));
+        // The card body is assembled before the detail stack, so the stack's
+        // own ordering is the last pair of children, not the first mention.
         let authentication_position = render
-            .find(".child(authentication)")
+            .rfind(".child(authentication)")
             .expect("native credentials should render in the Agent detail stack");
         let provider_position = render
-            .find(".child(provider_configuration)")
+            .rfind(".child(provider_configuration)")
             .expect("provider configuration should render in the Agent detail stack");
         assert!(
             authentication_position < provider_position,
@@ -39376,14 +37796,16 @@ mod gateway_surface_tests {
     /// Creating a Provider starts on the picker, and the manual path leaves it.
     ///
     /// The step is the feature: an empty form used to be what "add a provider"
-    /// meant, which hid the fact that the fields it asks for are the ones a
-    /// preset already knows.
+    /// meant, which hid both that an existing Provider could be reused and that
+    /// the fields a preset fills are known already.
     #[test]
-    fn a_new_provider_starts_on_the_preset_picker() {
+    fn a_new_provider_starts_on_the_provider_picker() {
         let source = include_str!("management.rs");
         let opening = source
             .split_once("    fn open_profile_creator(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// The picker a new Provider starts on."))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The first step of adding a Provider to an Agent.")
+            })
             .map(|(body, _)| body)
             .expect("the creator should remain inspectable");
         assert!(opening.contains("self.provider_preset_picker = true;"));
@@ -39391,21 +37813,47 @@ mod gateway_surface_tests {
 
         let dialog = source
             .split_once("    fn render_profile_editor_dialog(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// The picker a new Provider starts on."))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The first step of adding a Provider to an Agent.")
+            })
             .map(|(body, _)| body)
             .expect("the dialog should remain inspectable");
         assert!(dialog.contains("!updating && self.provider_preset_picker"));
-        assert!(dialog.contains("render_provider_preset_picker(window, cx)"));
+        assert!(dialog.contains("render_provider_picker_step(window, cx)"));
         // The picker step creates nothing: the save action belongs to the form
         // that follows it.
         let (_, after_picker) = dialog
-            .split_once("render_provider_preset_picker(window, cx)")
+            .split_once("render_provider_picker_step(window, cx)")
             .expect("the picker step is rendered");
         let picker_step = after_picker
             .split_once("let saving")
             .expect("the form follows the picker")
             .0;
         assert!(!picker_step.contains("save_profile(cx)"));
+
+        // Existing Providers are the first list on the step, and choosing one
+        // is a bind rather than a second copy.
+        let picker = source
+            .split_once("    fn render_provider_picker_step(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Gives this Agent an existing shared Provider.")
+            })
+            .map(|(body, _)| body)
+            .expect("the picker step should remain inspectable");
+        assert!(picker.contains("management-provider-existing-"));
+        assert!(picker.contains("use_existing_provider(profile_id.clone(), cx)"));
+        assert!(picker.contains("Already configured"));
+        assert!(picker.contains("provider_preset_picker_groups"));
+
+        let reusing = source
+            .split_once("    fn use_existing_provider(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Enters the form with one preset applied.")
+            })
+            .map(|(body, _)| body)
+            .expect("the existing-Provider path should remain inspectable");
+        assert!(reusing.contains("bind_provider_to_agent("));
+        assert!(reusing.contains("Some(provider_id)"));
 
         let picking = source
             .split_once("    fn choose_provider_preset(")
@@ -39430,16 +37878,68 @@ mod gateway_surface_tests {
         );
         assert!(custom.contains("self.provider_preset_picker = false;"));
 
-        let picker = source
-            .split_once("    fn render_provider_preset_picker(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Enters the form with one preset applied.")
-            })
-            .map(|(body, _)| body)
-            .expect("the picker should remain inspectable");
         assert!(picker.contains("management-provider-preset-custom"));
         assert!(picker.contains("management_search_input"));
         assert!(picker.contains("provider_preset_picker_groups"));
+    }
+
+    /// A route group is composed from Providers, and its available models are
+    /// the ones they all serve.
+    ///
+    /// The draft is validated before it is written: a group of fewer than two
+    /// Providers is a direct connection, and a group with no shared model has
+    /// nothing to offer. Both are refused where the reader can see why.
+    #[test]
+    fn a_route_group_draft_is_composed_from_providers() {
+        let source = include_str!("management.rs");
+        let editor = source
+            .split_once("    fn render_route_group_editor(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_providers("))
+            .map(|(body, _)| body)
+            .expect("the group editor should remain inspectable");
+        assert!(editor.contains("management-route-group-save"));
+        assert!(editor.contains("management-route-group-add-"));
+        assert!(editor.contains("management-route-group-strategy-"));
+        assert!(editor.contains("provider_group_models"));
+        assert!(editor.contains("RouteKind::ProviderGroup"));
+        assert!(editor.contains("RouteStrategy::ALL"));
+
+        let saving = source
+            .split_once("    fn save_route_group(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Deletes a group and every binding that pointed at it.")
+            })
+            .map(|(body, _)| body)
+            .expect("the group save path should remain inspectable");
+        assert!(
+            saving.contains("self.route_group_members.len() < 2"),
+            "one Provider is a direct connection, not a group"
+        );
+        assert!(saving.contains("create_model_route"));
+        assert!(saving.contains("update_model_route"));
+        assert!(saving.contains("bind_agent_model_route"));
+        assert!(saving.contains("ModelRouteMember::provider("));
+    }
+
+    /// The Provider card owns route groups, and the routing section is gone.
+    #[test]
+    fn the_provider_card_owns_route_groups() {
+        let source = include_str!("management.rs");
+        let render = source
+            .split_once("    fn render_providers(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp("))
+            .map(|(body, _)| body)
+            .expect("the provider page should remain inspectable");
+        assert!(render.contains("render_agent_route_groups(window, cx)"));
+        assert!(render.contains("render_agent_gateway_summary(cx)"));
+        assert!(
+            !render.contains(".child(route_graph)"),
+            "the routing section must not come back"
+        );
+        assert!(
+            !render.contains("render_agent_route_graph"),
+            "the routing section is gone, not merely reordered"
+        );
     }
 
     /// The token ceiling is edited, not only displayed.
@@ -39459,94 +37959,6 @@ mod gateway_surface_tests {
         assert!(editor.contains("save_gateway_token_limit(cx)"));
         assert!(editor.contains("confirm_clear_gateway_token_limit(window, cx)"));
         assert!(editor.contains("Input::new(&limit_input)"));
-    }
-
-    /// The mode line names all four relationships, and only warns when the
-    /// gateway actually cannot serve.
-    #[test]
-    fn an_agent_mode_line_covers_gateway_direct_and_agent_managed() {
-        let binding = |enabled| vibex_core::GatewayAgentBinding {
-            agent_id: "claude".to_string(),
-            display_name: "Claude Code".to_string(),
-            enabled,
-            active: enabled,
-            unsupported: false,
-            wire_protocol_id: String::new(),
-        };
-
-        let serving = agent_gateway_mode(
-            Some(&binding(true)),
-            true,
-            "Vibex Gateway",
-            Some("DeepSeek"),
-            true,
-            ResolvedLocale::En,
-        )
-        .unwrap();
-        assert_eq!(serving.tone, AgentGatewayModeTone::Normal);
-        assert!(serving.text.contains("Vibex Gateway"), "{}", serving.text);
-
-        // Configured for the gateway, but the gateway cannot route (disabled,
-        // no upstream, or no ready Key): say what is actually happening.
-        let falling_back = agent_gateway_mode(
-            Some(&binding(true)),
-            false,
-            "Vibex Gateway",
-            Some("DeepSeek"),
-            true,
-            ResolvedLocale::ZhCn,
-        )
-        .unwrap();
-        assert_eq!(falling_back.tone, AgentGatewayModeTone::Warning);
-        assert!(
-            falling_back.text.contains("不可用") && falling_back.text.contains("直连"),
-            "{}",
-            falling_back.text
-        );
-
-        let direct = agent_gateway_mode(
-            Some(&binding(false)),
-            true,
-            "Vibex Gateway",
-            Some("DeepSeek"),
-            true,
-            ResolvedLocale::En,
-        )
-        .unwrap();
-        assert_eq!(direct.tone, AgentGatewayModeTone::Normal);
-        assert!(direct.text.contains("DeepSeek"), "{}", direct.text);
-
-        // An Agent that manages its own provider gets an explanation, not a
-        // gateway row that silently refuses to work.
-        let managed = agent_gateway_mode(
-            None,
-            true,
-            "Vibex Gateway",
-            Some("DeepSeek"),
-            false,
-            ResolvedLocale::En,
-        )
-        .unwrap();
-        assert_eq!(managed.tone, AgentGatewayModeTone::Muted);
-        assert!(
-            managed.text.contains("manages its own provider"),
-            "{}",
-            managed.text
-        );
-
-        // A configurable Agent the snapshot has not reported yet is loading,
-        // not "direct": guessing would flip under the reader a moment later.
-        assert!(
-            agent_gateway_mode(
-                None,
-                true,
-                "Vibex Gateway",
-                Some("DeepSeek"),
-                true,
-                ResolvedLocale::En
-            )
-            .is_none()
-        );
     }
 
     /// Changing an Agent's mode goes through the confirmation, and says why.
@@ -39855,575 +38267,5 @@ mod gateway_surface_tests {
         // The detail is a reading of one row; it must not offer a mutation.
         assert!(!detail.contains("Button::new"));
         assert!(!detail.contains("on_click"));
-    }
-}
-
-#[cfg(test)]
-mod route_graph_tests {
-    use super::*;
-
-    fn route(name: &str, kind: vibex_core::RouteKind, models: &[&str]) -> vibex_core::ModelRoute {
-        let provider = vibex_core::ModelProviderProfileId::new();
-        vibex_core::ModelRoute {
-            display_name: name.to_string(),
-            kind,
-            status: vibex_core::RouteStatus::Enabled,
-            members: models
-                .iter()
-                .enumerate()
-                .map(|(index, model)| {
-                    vibex_core::ModelRouteMember::new(provider.clone(), *model, index as i64)
-                })
-                .collect(),
-            ..Default::default()
-        }
-    }
-
-    fn bound(
-        agent: &str,
-        route: &vibex_core::ModelRoute,
-        is_default: bool,
-    ) -> vibex_core::AgentModelRouteBinding {
-        let mut binding = vibex_core::AgentModelRouteBinding::new(
-            vibex_core::AgentId::parse(agent).unwrap(),
-            route.id.clone(),
-        );
-        binding.is_default = is_default;
-        binding
-    }
-
-    fn provider_for(route: &vibex_core::ModelRoute) -> Vec<vibex_core::ModelProviderProfile> {
-        route
-            .members
-            .iter()
-            .map(|member| vibex_core::ModelProviderProfile {
-                id: member.model_provider_profile_id.clone(),
-                display_name: "DeepSeek".to_string(),
-                status: vibex_core::ModelProviderProfileStatus::Enabled,
-                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
-                    id: member.model_id.clone(),
-                    display_name: None,
-                    enabled: true,
-                    metadata: Vec::new(),
-                    capabilities: Default::default(),
-                }],
-                ..Default::default()
-            })
-            .collect()
-    }
-
-    fn gateway(port: Option<u16>) -> vibex_core::GatewaySnapshot {
-        vibex_core::GatewaySnapshot {
-            settings: vibex_core::ModelGatewaySettings {
-                display_name: "Vibex Gateway".to_string(),
-                ..Default::default()
-            },
-            runtime: match port {
-                Some(port) => vibex_core::ModelGatewayRuntimeState::running(port, 1),
-                None => vibex_core::ModelGatewayRuntimeState::default(),
-            },
-            ..Default::default()
-        }
-    }
-
-    /// Three routes under one gateway draw as one node with three entries.
-    ///
-    /// This is the shape the design asks for: one listener serves every
-    /// gateway route, so a node per route would claim an independence the
-    /// runtime does not have.
-    #[test]
-    fn three_gateway_routes_are_one_node_with_three_entries() {
-        let routes = vec![
-            route("Standard", vibex_core::RouteKind::Gateway, &["m"]),
-            route("Long context", vibex_core::RouteKind::Gateway, &["m"]),
-            route("Cheap", vibex_core::RouteKind::Gateway, &["m"]),
-        ];
-        let bindings = routes
-            .iter()
-            .map(|route| bound("codex", route, false))
-            .collect::<Vec<_>>();
-        let providers = routes.iter().flat_map(provider_for).collect::<Vec<_>>();
-
-        let nodes = route_graph_nodes(
-            "codex",
-            &routes,
-            &bindings,
-            &providers,
-            &gateway(Some(3425)),
-            None,
-        );
-        assert_eq!(
-            nodes
-                .iter()
-                .filter(|node| matches!(node, RouteGraphNode::Gateway { .. }))
-                .count(),
-            1,
-            "one gateway, however many routes it serves"
-        );
-        match &nodes[0] {
-            RouteGraphNode::Gateway { routes, port, .. } => {
-                assert_eq!(routes.len(), 3, "all three are listed under it");
-                assert_eq!(*port, Some(3425));
-            }
-            other => panic!("expected the gateway node first, got {other:?}"),
-        }
-    }
-
-    /// A direct route is a sibling of the gateway, not a child of it.
-    #[test]
-    fn a_direct_route_is_not_nested_under_the_gateway() {
-        let gateway_route = route("Standard", vibex_core::RouteKind::Gateway, &["m"]);
-        let direct_route = route("Direct", vibex_core::RouteKind::Direct, &["m"]);
-        let bindings = vec![
-            bound("codex", &gateway_route, true),
-            bound("codex", &direct_route, false),
-        ];
-        let providers = provider_for(&gateway_route)
-            .into_iter()
-            .chain(provider_for(&direct_route))
-            .collect::<Vec<_>>();
-
-        let nodes = route_graph_nodes(
-            "codex",
-            &[gateway_route, direct_route],
-            &bindings,
-            &providers,
-            &gateway(Some(3425)),
-            None,
-        );
-        assert_eq!(nodes.len(), 2);
-        assert!(matches!(nodes[0], RouteGraphNode::Gateway { .. }));
-        assert!(
-            matches!(nodes[1], RouteGraphNode::Direct(_)),
-            "a direct route sits beside the gateway, because it never enters it"
-        );
-    }
-
-    /// The account is drawn last, and only when the Agent has one.
-    #[test]
-    fn an_account_is_drawn_after_the_routes() {
-        let only = route("Standard", vibex_core::RouteKind::Gateway, &["m"]);
-        let bindings = vec![bound("codex", &only, true)];
-        let providers = provider_for(&only);
-        let account = vibex_core::AgentAuthContext {
-            id: vibex_core::AgentAuthContextId::new(),
-            agent_id: vibex_core::AgentId::parse("codex").unwrap(),
-            status: vibex_core::AgentAuthContextStatus::Authenticated,
-            account_hint: Some("pro@example.test".to_string()),
-            authenticated_via_method: None,
-            revision: 1,
-            last_verified_at_ms: None,
-            created_at_ms: 1,
-            updated_at_ms: 1,
-        };
-
-        let nodes = route_graph_nodes(
-            "codex",
-            std::slice::from_ref(&only),
-            &bindings,
-            &providers,
-            &gateway(Some(3425)),
-            Some(&account),
-        );
-        assert_eq!(nodes.len(), 2);
-        match nodes.last() {
-            Some(RouteGraphNode::Account { account_hint, .. }) => {
-                assert_eq!(
-                    account_hint.as_deref(),
-                    Some("pro@example.test"),
-                    "the graph names the account, not a generic label"
-                );
-            }
-            other => panic!("expected the account last, got {other:?}"),
-        }
-
-        // Without an account the node is absent rather than empty.
-        let nodes = route_graph_nodes(
-            "codex",
-            std::slice::from_ref(&only),
-            &bindings,
-            &providers,
-            &gateway(Some(3425)),
-            None,
-        );
-        assert_eq!(nodes.len(), 1);
-    }
-
-    /// A route bound to another Agent does not appear.
-    #[test]
-    fn only_this_agents_routes_are_drawn() {
-        let mine = route("Mine", vibex_core::RouteKind::Gateway, &["m"]);
-        let theirs = route("Theirs", vibex_core::RouteKind::Gateway, &["m"]);
-        let bindings = vec![bound("codex", &mine, true), bound("claude", &theirs, true)];
-        let providers = provider_for(&mine)
-            .into_iter()
-            .chain(provider_for(&theirs))
-            .collect::<Vec<_>>();
-
-        let nodes = route_graph_nodes(
-            "codex",
-            &[mine, theirs],
-            &bindings,
-            &providers,
-            &gateway(Some(3425)),
-            None,
-        );
-        match &nodes[0] {
-            RouteGraphNode::Gateway { routes, .. } => {
-                assert_eq!(routes.len(), 1);
-                assert_eq!(routes[0].route.display_name, "Mine");
-            }
-            other => panic!("expected the gateway, got {other:?}"),
-        }
-    }
-
-    /// A stopped listener still has routes, and the node says it is not running.
-    #[test]
-    fn a_stopped_gateway_still_lists_its_routes() {
-        let only = route("Standard", vibex_core::RouteKind::Gateway, &["m"]);
-        let bindings = vec![bound("codex", &only, true)];
-        let providers = provider_for(&only);
-
-        let nodes = route_graph_nodes(
-            "codex",
-            std::slice::from_ref(&only),
-            &bindings,
-            &providers,
-            &gateway(None),
-            None,
-        );
-        match &nodes[0] {
-            RouteGraphNode::Gateway { routes, port, .. } => {
-                assert_eq!(*port, None);
-                assert_eq!(
-                    routes.len(),
-                    1,
-                    "hiding the routes of a stopped gateway would look like deleting them"
-                );
-            }
-            other => panic!("expected the gateway, got {other:?}"),
-        }
-    }
-
-    /// A disabled route is not offered, because the gateway would not serve it.
-    #[test]
-    fn a_disabled_route_is_not_drawn() {
-        let mut only = route("Standard", vibex_core::RouteKind::Gateway, &["m"]);
-        only.status = vibex_core::RouteStatus::Disabled;
-        let bindings = vec![bound("codex", &only, true)];
-        let providers = provider_for(&only);
-        let nodes = route_graph_nodes(
-            "codex",
-            std::slice::from_ref(&only),
-            &bindings,
-            &providers,
-            &gateway(Some(3425)),
-            None,
-        );
-        assert!(nodes.is_empty());
-    }
-
-    /// A member with no ready Key reports the state that explains it.
-    #[test]
-    fn a_member_reports_why_it_cannot_answer() {
-        let member = RouteGraphMember {
-            provider_name: "DeepSeek".to_string(),
-            provider_profile_id: vibex_core::ModelProviderProfileId::new(),
-            model_id: "m".to_string(),
-            enabled: true,
-            member_id: "model_route_member_test".to_string(),
-            ready_keys: 0,
-            cooling_keys: 2,
-            invalid_keys: 0,
-            used_tokens: 0,
-        };
-        assert_eq!(member.state(), RouteGraphMemberState::Cooling(2));
-
-        let member = RouteGraphMember {
-            ready_keys: 1,
-            cooling_keys: 2,
-            ..member
-        };
-        assert_eq!(
-            member.state(),
-            RouteGraphMemberState::Ready,
-            "one ready Key is enough to answer"
-        );
-    }
-
-    /// The summary distinguishes sources from models.
-    #[test]
-    fn a_route_summary_separates_sources_from_models() {
-        let mut route = route(
-            "Standard",
-            vibex_core::RouteKind::Gateway,
-            &["m", "m", "other"],
-        );
-        let providers = provider_for(&route);
-        let bindings = vec![bound("codex", &route, true)];
-        let nodes = route_graph_nodes(
-            "codex",
-            std::slice::from_ref(&route),
-            &bindings,
-            &providers,
-            &gateway(Some(3425)),
-            None,
-        );
-        let drawn = match &nodes[0] {
-            RouteGraphNode::Gateway { routes, .. } => routes[0].clone(),
-            other => panic!("expected the gateway, got {other:?}"),
-        };
-        assert_eq!(drawn.source_count(), 3, "three members");
-        assert_eq!(drawn.models.len(), 2, "but two distinct model names");
-        assert!(
-            management_route_member_summary(&drawn).contains('2')
-                && management_route_member_summary(&drawn).contains('3'),
-            "the summary names both numbers: {}",
-            management_route_member_summary(&drawn)
-        );
-        route.members.clear();
-    }
-}
-
-#[cfg(test)]
-mod route_graph_edit_tests {
-    use super::*;
-
-    /// A new route is created with one member and asks to be bound.
-    ///
-    /// One member is the smallest useful route; extending it is an edit of the
-    /// same record, so there is a single creation path.
-    #[test]
-    fn a_new_route_starts_with_one_enabled_member() {
-        let provider = vibex_core::ModelProviderProfileId::new();
-        let route = vibex_core::ModelRoute {
-            display_name: "DeepSeek · deepseek-chat".to_string(),
-            kind: vibex_core::RouteKind::Gateway,
-            members: vec![vibex_core::ModelRouteMember::new(
-                provider.clone(),
-                "deepseek-chat",
-                0,
-            )],
-            strategy: vibex_core::RouteStrategy::Ordered,
-            status: vibex_core::RouteStatus::Enabled,
-            ..Default::default()
-        };
-        assert!(route.validate().is_ok());
-        assert_eq!(route.members.len(), 1);
-        assert!(route.members[0].enabled);
-        assert_eq!(route.members[0].model_provider_profile_id, provider);
-    }
-
-    /// The same model cannot be added twice, and the last member cannot go.
-    ///
-    /// Both are refused before a write, so the reader learns the rule beside
-    /// the row rather than from a failed save.
-    #[test]
-    fn a_route_refuses_a_duplicate_member_and_an_empty_one() {
-        let provider = vibex_core::ModelProviderProfileId::new();
-        let mut route = vibex_core::ModelRoute {
-            display_name: "Standard".to_string(),
-            members: vec![vibex_core::ModelRouteMember::new(provider.clone(), "m", 0)],
-            status: vibex_core::RouteStatus::Enabled,
-            ..Default::default()
-        };
-        // Adding the same pair again is what the picker filters out; the record
-        // itself would still validate with two rows naming the same model at
-        // two Providers, which is legitimate.
-        route
-            .members
-            .push(vibex_core::ModelRouteMember::new(provider, "m", 1));
-        assert!(
-            route.validate().is_ok(),
-            "the same model at the same Provider is only refused by the picker"
-        );
-
-        // Removing every member is not a route.
-        route.members.clear();
-        assert_eq!(route.validate().unwrap_err().code, "route_member_missing");
-    }
-
-    /// A direct route cannot hold a second member, so the picker must not offer
-    /// one.
-    #[test]
-    fn a_direct_route_cannot_be_extended() {
-        let provider = vibex_core::ModelProviderProfileId::new();
-        let mut route = vibex_core::ModelRoute {
-            display_name: "Direct".to_string(),
-            kind: vibex_core::RouteKind::Direct,
-            members: vec![vibex_core::ModelRouteMember::new(provider.clone(), "m", 0)],
-            status: vibex_core::RouteStatus::Enabled,
-            ..Default::default()
-        };
-        assert!(route.validate().is_ok());
-        route
-            .members
-            .push(vibex_core::ModelRouteMember::new(provider, "n", 1));
-        assert_eq!(
-            route.validate().unwrap_err().code,
-            "route_direct_member_count_invalid"
-        );
-    }
-
-    /// The three strategies name what they do, and are all offered.
-    #[test]
-    fn the_strategy_labels_cover_every_strategy() {
-        for strategy in vibex_core::RouteStrategy::ALL {
-            assert!(
-                !management_route_strategy_label(strategy).is_empty(),
-                "{strategy:?} has no label"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod route_graph_live_tests {
-    use super::*;
-
-    fn member(provider: vibex_core::ModelProviderProfileId, used_tokens: u64) -> RouteGraphMember {
-        RouteGraphMember {
-            provider_name: "DeepSeek".to_string(),
-            provider_profile_id: provider,
-            model_id: "m".to_string(),
-            enabled: true,
-            member_id: "model_route_member_test".to_string(),
-            ready_keys: 1,
-            cooling_keys: 0,
-            invalid_keys: 0,
-            used_tokens,
-        }
-    }
-
-    /// Usage is drawn only once there is some.
-    ///
-    /// A zero beside every fresh Provider is noise, and the state line already
-    /// says whether the member can answer.
-    #[test]
-    fn usage_appears_only_after_tokens_are_spent() {
-        let provider = vibex_core::ModelProviderProfileId::new();
-        assert!(!member(provider.clone(), 0).shows_usage());
-        assert!(member(provider, 12).shows_usage());
-    }
-
-    /// A count is grouped so it can be read at a glance.
-    #[test]
-    fn a_token_count_is_thousands_separated() {
-        assert_eq!(management_route_token_label(999), "999 tokens");
-        assert_eq!(management_route_token_label(1_000), "1,000 tokens");
-        assert_eq!(management_route_token_label(1_234_567), "1,234,567 tokens");
-    }
-
-    /// A request is matched to the member by id, not by display name.
-    ///
-    /// Two Providers may share a name; matching on it would show one source's
-    /// history under the other.
-    #[test]
-    fn a_live_request_matches_its_member_by_id() {
-        let first = vibex_core::ModelProviderProfileId::new();
-        let second = vibex_core::ModelProviderProfileId::new();
-        let route = vibex_core::ModelRoute {
-            display_name: "Standard".to_string(),
-            ..Default::default()
-        };
-        let inflight = vibex_core::GatewayInflight {
-            request_id: vibex_core::RequestId::new(),
-            agent_id: Some("codex".to_string()),
-            model_route_id: Some(route.id.as_str().to_string()),
-            requested_model: route.model_id(),
-            model_provider_profile_id: second.clone(),
-            attempt: 2,
-            credential_id: None,
-            wire_protocol_id: vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
-            started_at_ms: 1,
-            first_token_at_ms: None,
-        };
-        // The same display name is not enough to claim the request.
-        let matched = inflight.model_provider_profile_id == second;
-        assert!(matched);
-        assert_ne!(
-            inflight.model_provider_profile_id, first,
-            "a same-named Provider must not be matched"
-        );
-    }
-
-    /// The attempt number starts at one, so a first source is not "#0".
-    #[test]
-    fn the_attempt_number_is_one_based() {
-        let inflight = vibex_core::GatewayInflight {
-            request_id: vibex_core::RequestId::new(),
-            agent_id: None,
-            model_route_id: None,
-            requested_model: "m".to_string(),
-            model_provider_profile_id: vibex_core::ModelProviderProfileId::new(),
-            attempt: 1,
-            credential_id: None,
-            wire_protocol_id: vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
-            started_at_ms: 1,
-            first_token_at_ms: None,
-        };
-        assert_eq!(inflight.attempt, 1);
-        // Only a retry is worth annotating; the first attempt is the norm.
-        assert!(inflight.attempt <= 1, "the first attempt is not annotated");
-    }
-}
-
-#[cfg(test)]
-mod route_policy_control_tests {
-    use super::*;
-
-    /// The token ceiling cycles through its offered values and back to none.
-    ///
-    /// A cycle rather than a text field because the useful answers are few; a
-    /// box would need parsing, validation and an error state for each of them.
-    #[test]
-    fn the_ceiling_cycles_and_ends_at_none() {
-        let first = management_next_route_ceiling(None).expect("the first step exists");
-        assert_eq!(first.window, vibex_core::GatewayTokenWindow::Day);
-
-        let second = management_next_route_ceiling(Some(first.clone())).expect("a second step");
-        assert_ne!(second, first);
-        let third = management_next_route_ceiling(Some(second.clone())).expect("a third step");
-        assert_ne!(third, second);
-
-        // Past the last step the ceiling turns off, so the cycle has an end
-        // rather than growing without bound.
-        assert!(
-            management_next_route_ceiling(Some(third)).is_none(),
-            "the cycle must return to no ceiling"
-        );
-        // And an unrecognised value restarts it rather than getting stuck.
-        assert!(
-            management_next_route_ceiling(Some(vibex_core::GatewayTokenLimit {
-                window: vibex_core::GatewayTokenWindow::Month,
-                tokens: 1,
-            }))
-            .is_some()
-        );
-    }
-
-    /// The first-token deadline cycles and then turns off.
-    #[test]
-    fn the_first_token_deadline_cycles_and_ends_at_none() {
-        let first = management_next_route_timeout(None).expect("the first step exists");
-        let second = management_next_route_timeout(Some(first)).expect("a second step");
-        let third = management_next_route_timeout(Some(second)).expect("a third step");
-        assert_ne!(first, second);
-        assert_ne!(second, third);
-        assert!(
-            management_next_route_timeout(Some(third)).is_none(),
-            "the cycle must return to no deadline"
-        );
-    }
-
-    /// A route ceiling names its window, so "5,000,000" alone is never shown.
-    #[test]
-    fn the_ceiling_label_names_its_window() {
-        for window in vibex_core::GatewayTokenWindow::ALL {
-            assert!(
-                !management_route_window_label(window).is_empty(),
-                "{window:?} has no label"
-            );
-        }
     }
 }

@@ -5388,3 +5388,101 @@ let (attempt, key) = service.open_attempt(&prepared).await?;
 // The Key lives for this attempt only; the ledger records its id, never its value.
 service.record(&prepared, &RequestOutcome { credential: Some(key.id), .. });
 ```
+
+## Scenario: Route Groups Compose Whole Providers
+
+### 1. Scope / Trigger
+
+- Trigger: the Config Center's per-Agent model-provider card adds, edits, or
+  deletes a route group.
+- Trigger: the gateway resolves a `group/<route>/<model>` model id.
+
+### 2. Signatures
+
+```text
+RouteKind::{Gateway, ProviderGroup, Direct}
+ModelRoute::model_id()               -> "route/<id>"        (plain routes)
+ModelRoute::group_model_id(&model)   -> "group/<id>/<model>" (provider groups)
+provider_group_models(&route, &providers) -> Vec<ProviderGroupModel>
+provider_group_model_ref(&str)       -> Option<{group_id, model_id}>
+GatewaySnapshot::group_for_model(&model)
+```
+
+### 3. Contracts
+
+- A `ProviderGroup` member names a **Provider**, not a model: its `model_id` is
+  empty and `validate` rejects a model on a group member. A group therefore
+  cannot say which models it offers; they are derived.
+- The group's models are the **intersection** of its enabled Providers'
+  enabled catalogues, in the group's member order, then each catalogue's order.
+  A model only one Provider serves is not part of the group.
+- A group needs at least two Providers to be served. One Provider is a direct
+  connection, and the snapshot drops a lone group rather than pretending it
+  fails over.
+- `group_for_model` resolves only models the group actually offers. Refusing
+  the rest is what keeps the strategy from picking a Provider that has never
+  heard of the model.
+- A group contributes one gateway catalogue entry and one session option per
+  shared model. A group is not a model, so the model lives in the id.
+- Group capabilities are the intersection of the capabilities of the Providers
+  serving that one model; an explicit route `context_tokens` overrides the
+  smallest-window rule.
+- A group is bound to an Agent like any route (`AgentModelRouteBinding`), and
+  its launch row is the Agent's gateway Profile. A request for one of its models
+  keeps the loopback address, so switching among group models does not restart
+  the Agent.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Group member names a model | `route_group_member_model_unexpected` |
+| Group lists one Provider twice | `route_group_provider_duplicate` |
+| Group has fewer than two Providers | Not served; absent from the gateway snapshot |
+| Group Providers share no enabled model | Not served; the editor shows the empty intersection |
+| Request names a model the intersection lacks | `404` from the gateway, not a Provider call |
+| Plain route member names no model | `route_member_model_invalid` |
+
+### 5. Good / Base / Bad Cases
+
+- Good: two Providers both list `deepseek-chat`; the group offers
+  `group/<id>/deepseek-chat` once, and `LeastUsed` picks the answering Provider.
+- Base: one Provider lists `deepseek-chat`, `left-only`; the other lists
+  `deepseek-chat`; the group offers only `deepseek-chat`.
+- Bad: offering the union and letting `RoundRobin` send `left-only` to the
+  second Provider, which answers `404`.
+
+### 6. Tests Required
+
+- `vibex-core` unit: intersection keeps only shared models; capabilities are
+  the shared subset; a group member rejects a model; a duplicate Provider is
+  rejected; `group/<id>/<model>` parses.
+- `vibex-db` unit: a group round-trips with empty member `model_id`s.
+- `vibex-model-gateway` integration: a shared model is routable through the
+  group and reaches a serving Provider; a model outside the intersection is
+  refused with `404`.
+- `vibex-agent-acp` unit: a group publishes one option per shared model and each
+  option's model id is `group/<id>/<model>`.
+- `vibex-desktop` unit: the provider card owns the group section and the old
+  routing section is not rendered; the group draft refuses fewer than two
+  Providers.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+// Offer every model any member serves; the strategy will pick one.
+let models = members.flat_map(|member| member.models()).unique();
+```
+
+This makes the group an unreliable union: the chosen Provider may not serve the
+model the session asked for.
+
+#### Correct
+
+```rust
+let models = vibex_core::provider_group_models(&route, &providers);
+let model_id = route.group_model_id(&models[0].model_id);
+// The gateway resolves only models actually in the intersection.
+```

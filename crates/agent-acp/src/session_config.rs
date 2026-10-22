@@ -849,9 +849,35 @@ pub struct RuntimeRouteFacts {
     /// How many members can answer.
     pub member_count: usize,
     /// The models the route offers, in the order it lists them.
+    ///
+    /// A provider group's models are the intersection of its Providers'
+    /// catalogues, so one entry here is one selectable model.
     pub models: Vec<String>,
     /// Whether the route reaches the gateway at all.
     pub via_gateway: bool,
+    /// The route's kind, so the catalogue can name a group's models the way a
+    /// request names them.
+    pub kind: vibex_core::RouteKind,
+}
+
+impl RuntimeRouteFacts {
+    /// The model id a session selects for one of this route's models.
+    ///
+    /// A plain route is one selectable model and keeps its own id. A group is
+    /// many models, so each carries the model in the id.
+    pub fn option_model_id(&self, route_id: &vibex_core::ModelRouteId, model: &str) -> String {
+        match self.kind {
+            vibex_core::RouteKind::ProviderGroup => format!(
+                "{}{}/{}",
+                vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
+                route_id.as_str(),
+                model
+            ),
+            vibex_core::RouteKind::Gateway | vibex_core::RouteKind::Direct => {
+                format!("{}route/{}", "", route_id.as_str())
+            }
+        }
+    }
 }
 
 /// The three route lookups the option builder reads.
@@ -885,12 +911,21 @@ fn route_fact_maps(
     (labels, counts, models)
 }
 
-/// The route a model id names, when it names one.
-fn route_source_for_model(model_id: &str) -> Option<String> {
+/// The option id a `route/` or `group/` entry names.
+fn route_model_ids(model_id: &str) -> Option<(vibex_core::ModelRouteId, Option<&str>)> {
+    if let Some(parsed) = vibex_core::provider_group_model_ref(model_id) {
+        let id = vibex_core::ModelRouteId::parse(parsed.group_id).ok()?;
+        return Some((id, Some(parsed.model_id)));
+    }
     let rest = model_id.strip_prefix("route/")?;
-    vibex_core::ModelRouteId::parse(rest)
-        .ok()
-        .map(|id| id.as_str().to_string())
+    let id = vibex_core::ModelRouteId::parse(rest).ok()?;
+    Some((id, None))
+}
+
+/// The route a model id names, when it names one.
+#[cfg(test)]
+fn route_source_for_model(model_id: &str) -> Option<String> {
+    route_model_ids(model_id).map(|(id, _)| id.as_str().to_string())
 }
 
 /// One auth source per route, for the Agents it is bound to.
@@ -1033,17 +1068,30 @@ pub fn build_runtime_option_catalog_for_agents(
                     .is_some_and(|model| !model.trim().is_empty()),
         );
         for (model_id, model_label) in model_ids {
-            // A gateway Profile carries one `route/<id>` entry per route. Each
-            // becomes its own group, because a route is what the reader picked:
-            // filing them under the gateway's name would show one group of
-            // unrelated compositions.
-            let route_source = route_source_for_model(&model_id);
-            let mut selection = match route_source.as_ref() {
-                Some(route_id) => SessionRuntimeSelection::model_route(
-                    agent.id.clone(),
-                    vibex_core::ModelRouteId::parse(route_id.clone())
-                        .expect("a parsed route id round-trips"),
-                ),
+            // A gateway Profile carries one `route/<id>` entry per route and one
+            // `group/<id>/<model>` entry per group model. Each becomes its own
+            // group, because a route is what the reader picked: filing them
+            // under the gateway's name would show one group of unrelated
+            // compositions.
+            let route_entry = route_model_ids(&model_id);
+            let route_source = route_entry.as_ref().map(|(id, _)| id.as_str().to_string());
+            // A group entry names one model, and that model is what the option
+            // must select: a group's route id alone is not a model.
+            let mut selection = match route_entry.as_ref() {
+                Some((route_id, Some(group_model))) => {
+                    let mut selection =
+                        SessionRuntimeSelection::model_route(agent.id.clone(), route_id.clone());
+                    selection.model = RuntimeModelSelection::explicit(format!(
+                        "{}{}/{}",
+                        vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
+                        route_id.as_str(),
+                        group_model
+                    ));
+                    selection
+                }
+                Some((route_id, None)) => {
+                    SessionRuntimeSelection::model_route(agent.id.clone(), route_id.clone())
+                }
                 None => SessionRuntimeSelection::provider(
                     agent.id.clone(),
                     profile.id.clone(),
@@ -1067,12 +1115,18 @@ pub fn build_runtime_option_catalog_for_agents(
                 agent_label: bounded_catalog_label(&agent.label),
                 auth_source_label,
                 // Inside a route group only the model name is shown: the
-                // Provider is the route's business.
-                model_label: route_source
-                    .as_ref()
-                    .and_then(|route_id| route_model_labels.get(route_id))
-                    .cloned()
-                    .unwrap_or(model_label),
+                // Provider is the route's business. A group entry already names
+                // one model, so it keeps that name rather than the whole
+                // catalogue joined into one label.
+                model_label: match route_entry.as_ref() {
+                    Some((_, Some(group_model))) => bounded_catalog_label(group_model),
+                    Some((_, None)) => route_source
+                        .as_ref()
+                        .and_then(|route_id| route_model_labels.get(route_id))
+                        .cloned()
+                        .unwrap_or(model_label),
+                    None => model_label,
+                },
                 reasoning_efforts: reasoning_efforts.clone(),
                 modes: modes.clone(),
                 features: features.clone(),
@@ -1311,6 +1365,8 @@ pub fn append_direct_route_runtime_options(
             let Some(agent) = agents_by_id.get(agent_id) else {
                 continue;
             };
+            // A route that skips the gateway is one selectable model, so it
+            // contributes exactly one option, named the way a request names it.
             let selection =
                 SessionRuntimeSelection::model_route(agent.id.clone(), route_id.clone());
             catalog.options.push(SessionRuntimeOption {
@@ -3531,6 +3587,7 @@ mod route_catalog_tests {
 
     fn route_facts(agent_id: &str, name: &str, count: usize) -> RuntimeRouteFacts {
         RuntimeRouteFacts {
+            kind: vibex_core::RouteKind::Gateway,
             display_name: name.to_string(),
             agent_ids: vec![AgentId::parse(agent_id).unwrap()],
             member_count: count,
@@ -3690,6 +3747,7 @@ mod selector_route_priority_tests {
                 member_count: 2,
                 models: vec!["m".to_string()],
                 via_gateway: true,
+                kind: vibex_core::RouteKind::Gateway,
             },
         )]
         .into_iter()
@@ -3714,6 +3772,92 @@ mod selector_route_priority_tests {
         );
         assert!(option.selection.auth_source.provider_profile_id().is_none());
         assert_eq!(option.auth_source_label, "Standard");
+    }
+
+    /// A provider group publishes one option per shared model, and each option
+    /// names the model in its id.
+    ///
+    /// A group is not a model. Collapsing its entries into one option would
+    /// give the session a selection the gateway cannot resolve, because the
+    /// group's id alone says nothing about which model to serve.
+    #[test]
+    fn a_provider_group_publishes_one_option_per_shared_model() {
+        let group_id = vibex_core::ModelRouteId::new();
+        let mut profile = acp_profile("codex", &[]);
+        profile.configured_models = vec![
+            ProviderConfiguredModel {
+                id: format!("group/{}/deepseek-chat", group_id.as_str()),
+                display_name: None,
+                enabled: true,
+                wire_api: None,
+                capabilities: Default::default(),
+            },
+            ProviderConfiguredModel {
+                id: format!("group/{}/kimi-k3", group_id.as_str()),
+                display_name: None,
+                enabled: true,
+                wire_api: None,
+                capabilities: Default::default(),
+            },
+        ];
+        let routes = [(
+            group_id.clone(),
+            RuntimeRouteFacts {
+                display_name: "Team".to_string(),
+                agent_ids: vec![AgentId::parse("codex").unwrap()],
+                member_count: 2,
+                models: vec!["deepseek-chat".to_string(), "kimi-k3".to_string()],
+                via_gateway: true,
+                kind: vibex_core::RouteKind::ProviderGroup,
+            },
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let catalog = build_runtime_option_catalog_for_agents(
+            &[agent("codex")],
+            &[profile],
+            &BTreeMap::new(),
+            &routes,
+        );
+        let mut labels = catalog
+            .options
+            .iter()
+            .filter_map(|option| {
+                option
+                    .selection
+                    .auth_source
+                    .model_route_id()
+                    .filter(|id| **id == group_id)
+                    .map(|_| {
+                        (
+                            option.selection.model_id().unwrap_or_default().to_string(),
+                            option.model_label.clone(),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        labels.sort();
+        assert_eq!(
+            labels,
+            vec![
+                (
+                    format!("group/{}/deepseek-chat", group_id.as_str()),
+                    "deepseek-chat".to_string()
+                ),
+                (
+                    format!("group/{}/kimi-k3", group_id.as_str()),
+                    "kimi-k3".to_string()
+                ),
+            ],
+            "each shared model is its own selectable option"
+        );
+        assert!(
+            catalog
+                .options
+                .iter()
+                .all(|option| option.auth_source_label == "Team"),
+            "every group model is filed under the group's name"
+        );
     }
 
     /// An ordinary ACP Profile keeps a Provider selection.
@@ -3764,6 +3908,11 @@ mod direct_route_option_tests {
 
     fn facts(agent_id: &str, name: &str, via_gateway: bool) -> RuntimeRouteFacts {
         RuntimeRouteFacts {
+            kind: if via_gateway {
+                vibex_core::RouteKind::Gateway
+            } else {
+                vibex_core::RouteKind::Direct
+            },
             display_name: name.to_string(),
             agent_ids: vec![AgentId::parse(agent_id).unwrap()],
             member_count: 1,
