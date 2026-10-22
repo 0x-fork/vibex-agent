@@ -1359,7 +1359,6 @@ fn assemble_gateway_snapshot(
     let runtime_state = service.runtime_state();
     let profiles = provider.list_model_provider_profiles()?;
     let catalog = provider.gateway_model_catalog().unwrap_or_default();
-    let enabled_agents = provider.gateway_agents()?;
     let account_states = management
         .providers()
         .service()
@@ -1434,15 +1433,19 @@ fn assemble_gateway_snapshot(
         })
         .collect::<Vec<_>>();
     let active_agents = provider.gateway_active_agents().unwrap_or_default();
+    let settings_enabled = settings.policy.enabled;
     let mut agents = Vec::new();
-    for (agent_id, _strategy, _enabled) in provider.gateway_agent_options()? {
+    for (agent_id, _strategy, _enabled, unsupported) in provider.gateway_agent_options()? {
+        let agent_id_text = agent_id.as_str().to_string();
         agents.push(vibex_core::GatewayAgentBinding {
-            agent_id: agent_id.as_str().to_string(),
-            display_name: agent_id.as_str().to_string(),
-            enabled: enabled_agents.contains(&agent_id),
+            display_name: agent_id_text.clone(),
+            // The switch is global, so every capable Agent reports the same
+            // intent. `unsupported` marks the ones the gateway cannot serve.
+            enabled: settings_enabled && !unsupported,
             active: active_agents.contains(&agent_id),
-            unsupported: false,
+            unsupported,
             wire_protocol_id: String::new(),
+            agent_id: agent_id_text,
         });
     }
     Ok(vibex_core::GatewaySnapshot {
@@ -1834,29 +1837,16 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
 
     async fn set_model_gateway_agent(
         &self,
-        request: vibex_core::GatewayAgentUpdateRequest,
+        _request: vibex_core::GatewayAgentUpdateRequest,
     ) -> VibexResult<vibex_core::GatewaySnapshot> {
-        let management = self.management.get().ok_or_else(|| {
-            VibexError::process(
-                "desktop_management_handle_unavailable",
-                "the runtime management handle is not installed yet",
-            )
-        })?;
-        let service = management.model_gateway();
-        let provider = management.providers().service();
-        let agent_id = vibex_core::AgentId::parse(request.agent_id.as_str())?;
-        let base_url = service.base_url();
-        let catalog = provider
-            .gateway_model_catalog()
-            .map(|catalog| {
-                catalog
-                    .into_iter()
-                    .map(|model| model.display_id())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        provider.set_gateway_agent(&agent_id, request.enabled, base_url.as_deref(), &catalog)?;
-        assemble_gateway_snapshot(management)
+        // The gateway is switched on or off for the whole installation. A
+        // per-Agent toggle would let one Agent believe it is routed while the
+        // listener serves the others, so the request is refused rather than
+        // silently ignored.
+        Err(VibexError::validation(
+            "model_gateway_agent_scope_removed",
+            "the gateway is a global setting; switch it on or off instead of per Agent",
+        ))
     }
 
     async fn model_gateway_requests(&self) -> VibexResult<Vec<vibex_core::GatewayRequestSummary>> {

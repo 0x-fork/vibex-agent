@@ -994,9 +994,6 @@ pub struct ManagementCenter {
     gateway_token_limit_window: Option<vibex_core::GatewayTokenWindow>,
     /// A rejected token ceiling, shown under its field.
     gateway_token_limit_error: Option<String>,
-    /// The Agent whose gateway switch is being written, if any. A process
-    /// restart is not instant, so the row says which one is in flight.
-    gateway_agent_pending: Option<String>,
     /// The one-shot wake-up for the soonest cooling Key. One at a time: a
     /// second timer would only repeat the first one's read.
     gateway_refresh_task: Option<Task<()>>,
@@ -2089,7 +2086,6 @@ impl ManagementCenter {
             gateway_token_limit_input: None,
             gateway_token_limit_window: None,
             gateway_token_limit_error: None,
-            gateway_agent_pending: None,
             gateway_refresh_task: None,
             gateway_name_editing: false,
             gateway_name_input: None,
@@ -13168,120 +13164,6 @@ impl ManagementCenter {
         );
     }
 
-    /// Asks before changing an Agent's provider mode.
-    ///
-    /// The mode is process configuration, so the Agent restarts when it moves:
-    /// a conversation in progress is interrupted. Saying so before the write is
-    /// the difference between a deliberate switch and a surprise.
-    fn confirm_gateway_agent_switch(
-        &mut self,
-        agent_id: String,
-        display_name: String,
-        enabled: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let entity = cx.weak_entity();
-        let active_locale = locale::current_locale();
-        let title = match (active_locale, enabled) {
-            (ResolvedLocale::En, true) => format!("Switch {display_name} to the gateway?"),
-            (ResolvedLocale::ZhCn, true) => format!("将“{display_name}”切到网关？"),
-            (ResolvedLocale::ZhTw, true) => format!("將「{display_name}」切到閘道？"),
-            (ResolvedLocale::En, false) => format!("Switch {display_name} to its own Provider?"),
-            (ResolvedLocale::ZhCn, false) => format!("将“{display_name}”切回自己的供应商？"),
-            (ResolvedLocale::ZhTw, false) => format!("將「{display_name}」切回自己的供應商？"),
-        };
-        window.open_dialog(cx, move |dialog, _, _| {
-            let entity = entity.clone();
-            let agent_id = agent_id.clone();
-            dialog
-                .title(title.clone())
-                .child(if enabled {
-                    management_locale_text_for(
-                        active_locale,
-                        "This rewrites the Agent's provider and restarts its process; a conversation in progress will be interrupted. The Agent will use the shared Providers and their keys.",
-                        "这会改写该 Agent 的供应商配置并重启进程；正在进行的对话会中断。之后它使用共享供应商及其 Key。",
-                        "這會改寫該 Agent 的供應商設定並重新啟動程序；正在進行的對話會中斷。之後它使用共享供應商及其 Key。",
-                    )
-                } else {
-                    management_locale_text_for(
-                        active_locale,
-                        "This restores the Agent's own provider and restarts its process; a conversation in progress will be interrupted.",
-                        "这会恢复该 Agent 自己的供应商配置并重启进程；正在进行的对话会中断。",
-                        "這會還原該 Agent 自己的供應商設定並重新啟動程序；正在進行的對話會中斷。",
-                    )
-                })
-                .footer(
-                    gpui_component::dialog::DialogFooter::new()
-                        .child(gpui_component::dialog::DialogClose::new().child(
-                            Button::new("cancel-gateway-agent-switch").outline().label(
-                                management_locale_text_for(
-                                    active_locale,
-                                    "Cancel",
-                                    "取消",
-                                    "取消",
-                                ),
-                            ),
-                        ))
-                        .child(gpui_component::dialog::DialogAction::new().child(
-                            Button::new("confirm-gateway-agent-switch").primary().label(
-                                management_locale_text_for(
-                                    active_locale,
-                                    "Switch",
-                                    "切换",
-                                    "切換",
-                                ),
-                            ),
-                        )),
-                )
-                .on_ok(move |_, _, cx| {
-                    let _ = entity.update(cx, |this, cx| {
-                        this.set_gateway_agent(agent_id.clone(), enabled, cx);
-                    });
-                    true
-                })
-        });
-    }
-
-    /// Points one Agent at the gateway, or takes it back to a direct Provider.
-    fn set_gateway_agent(&mut self, agent_id: String, enabled: bool, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        if self.mutation.is_some() {
-            return;
-        }
-        self.mutation = Some(ManagementMutation::Gateway);
-        self.error = None;
-        self.gateway_agent_pending = Some(agent_id.clone());
-        let this = cx.entity();
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = backend
-                .management()
-                .set_model_gateway_agent(vibex_backend::MutationRequest::new(
-                    vibex_core::GatewayAgentUpdateRequest {
-                        agent_id: agent_id.clone(),
-                        enabled,
-                    },
-                ))
-                .await;
-            this.update(cx, |this, cx| {
-                this.mutation = None;
-                this.gateway_agent_pending = None;
-                match outcome {
-                    Ok(gateway) => {
-                        this.gateway = gateway;
-                        this.refresh(cx);
-                    }
-                    Err(error) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
-                        cx.notify();
-                    }
-                }
-            });
-        }));
-    }
-
     /// The field that adds a key to one upstream.
     ///
     /// The value is masked by default and the field only exists while its own
@@ -14847,11 +14729,12 @@ impl ManagementCenter {
             cx,
         ));
 
-        // Which Agents walk through it.
+        // Which Agents the gateway serves. There is no switch per row: the
+        // gateway is on or off for the whole installation, so this card states
+        // the consequence of that one setting instead of pretending each Agent
+        // has its own choice.
         let mut agent_rows = v_flex().w_full().gap_1();
         for agent in &snapshot.agents {
-            let agent_id = agent.agent_id.clone();
-            let switching = self.gateway_agent_pending.as_deref() == Some(agent.agent_id.as_str());
             agent_rows = agent_rows.child(
                 h_flex()
                     .w_full()
@@ -14868,9 +14751,13 @@ impl ManagementCenter {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if switching {
-                                        management_locale_text("Switching…", "切换中…", "切換中…")
-                                    } else if agent.enabled && agent.active {
+                                    .child(if agent.unsupported {
+                                        management_locale_text(
+                                            "Uses its own Provider; the gateway cannot serve it",
+                                            "使用自己的供应商；网关无法接入",
+                                            "使用自己的供應商；閘道無法接入",
+                                        )
+                                    } else if agent.active {
                                         management_locale_text(
                                             "Uses the gateway",
                                             "走网关",
@@ -14891,28 +14778,13 @@ impl ManagementCenter {
                                     }),
                             ),
                     )
-                    .child(
-                        Switch::new(SharedString::from(format!(
-                            "management-gateway-agent-{}",
-                            agent.agent_id
+                    .when(agent.active, |row| {
+                        row.child(Tag::success().xsmall().child(management_locale_text(
+                            "Routed",
+                            "已接入",
+                            "已接入",
                         )))
-                        .small()
-                        .checked(agent.enabled)
-                        .disabled(pending || switching)
-                        .on_click(cx.listener({
-                            let agent_id = agent_id.clone();
-                            let display_name = agent.display_name.clone();
-                            move |this, checked, window, cx| {
-                                this.confirm_gateway_agent_switch(
-                                    agent_id.clone(),
-                                    display_name.clone(),
-                                    *checked,
-                                    window,
-                                    cx,
-                                )
-                            }
-                        })),
-                    ),
+                    }),
             );
         }
         if snapshot.agents.is_empty() {
@@ -21454,18 +21326,21 @@ impl ManagementCenter {
     /// section said everything. Moving the gateway here means a reader sees the
     /// address a route group would call and whether it can answer, without
     /// leaving the page that lists the Providers it composes.
+    ///
+    /// The switch itself is not here. The gateway is one installation-wide
+    /// setting, so it lives on the Providers page and nowhere else; this block
+    /// only reports the resulting state for the Agent being edited.
     fn render_agent_gateway_summary(&mut self, cx: &mut Context<Self>) -> AnyElement {
         self.schedule_gateway_cooldown_refresh(cx);
-        let pending = self.mutation.is_some();
         let snapshot = self.gateway.clone();
         let status = &snapshot.runtime;
         let address = status.base_url().unwrap_or_else(|| {
             management_locale_text("not running", "未运行", "未執行").to_string()
         });
         let key_summary = gateway_overall_key_summary(&snapshot, locale::current_locale());
-        let switching = self.gateway_agent_pending.clone();
-        let selected_agent_id = self.selected_agent_id.clone();
-        let configurable = selected_agent_id
+        let enabled = snapshot.settings.policy.enabled;
+        let configurable = self
+            .selected_agent_id
             .as_deref()
             .and_then(|agent_id| vibex_core::AgentId::parse(agent_id.to_string()).ok())
             .is_some_and(|agent_id| {
@@ -21473,36 +21348,13 @@ impl ManagementCenter {
                     .map(|ids| ids.contains(&agent_id))
                     .unwrap_or(false)
             });
-        let binding = selected_agent_id.as_deref().and_then(|agent_id| {
-            snapshot
-                .agents
-                .iter()
-                .find(|agent| agent.agent_id == agent_id)
-        });
-        let on_gateway = binding.is_some_and(|binding| binding.enabled);
-        let enable_toggle = configurable.then(|| {
-            let agent_id = selected_agent_id.clone().unwrap_or_default();
-            let busy = switching.as_deref() == Some(agent_id.as_str());
-            Switch::new("management-agent-gateway-enabled")
-                .small()
-                .checked(on_gateway)
-                .disabled(pending || busy)
-                .tooltip(management_locale_text(
-                    "Let this Agent use the gateway. Settings live on the Providers page.",
-                    "让这个 Agent 使用网关。设置位于供应商页面。",
-                    "讓這個 Agent 使用閘道。設定位於供應商頁面。",
-                ))
-                .on_click(cx.listener(move |this, checked, _, cx| {
-                    this.set_gateway_agent(agent_id.clone(), *checked, cx)
-                }))
-        });
         v_flex()
             .w_full()
             .min_w_0()
             .gap_1()
             .rounded(px(8.0))
             .border_1()
-            .border_color(if status.status.is_routable() {
+            .border_color(if status.status.is_routable() && enabled {
                 cx.theme().border.opacity(0.7)
             } else {
                 cx.theme().warning.opacity(0.7)
@@ -21525,8 +21377,7 @@ impl ManagementCenter {
                             .font_medium()
                             .child(snapshot.settings.display_name.clone()),
                     )
-                    .child(gateway_status_badge(status, cx))
-                    .children(enable_toggle),
+                    .child(gateway_status_badge(status, cx)),
             )
             .child(
                 div()
@@ -21537,15 +21388,35 @@ impl ManagementCenter {
                     .text_color(cx.theme().muted_foreground)
                     .child(format!("{address} · {key_summary}")),
             )
-            .when(status.status.is_routable() && !on_gateway && configurable, |this| {
+            .when(!enabled || !status.status.is_routable(), |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if !enabled {
+                            management_locale_text(
+                                "The gateway is off. Route groups need it, so turn it on from the Providers page.",
+                                "网关已关闭。路由组需要它，请在供应商页面打开。",
+                                "閘道已關閉。路由組需要它，請在供應商頁面開啟。",
+                            )
+                        } else {
+                            management_locale_text(
+                                "The gateway is not running. Turn it on from the Providers page.",
+                                "网关未运行，请在供应商页面打开。",
+                                "閘道未執行，請在供應商頁面開啟。",
+                            )
+                        }),
+                )
+            })
+            .when(configurable && enabled && status.status.is_routable(), |this| {
                 this.child(
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(management_locale_text(
-                            "This Agent uses its direct Providers. Turn the gateway on to let it use route groups.",
-                            "这个 Agent 正在使用直连供应商。打开网关后它才能使用路由组。",
-                            "這個 Agent 正在使用直連供應商。開啟閘道後它才能使用路由組。",
+                            "This Agent uses the gateway. Turning it off is a global setting on the Providers page.",
+                            "该 Agent 正在使用网关。关闭它是供应商页面上的全局设置。",
+                            "該 Agent 正在使用閘道。關閉它是供應商頁面上的全域設定。",
                         )),
                 )
             })
@@ -21666,12 +21537,12 @@ impl ManagementCenter {
             cx.notify();
             return;
         }
-        if self.route_group_members.len() < 2 {
+        if self.route_group_members.is_empty() {
             self.error = Some(
                 management_locale_text(
-                    "A route group needs at least two Providers; one Provider is a direct connection.",
-                    "路由组至少需要两个供应商；只有一个供应商就是直连。",
-                    "路由組至少需要兩個供應商；只有一個供應商就是直連。",
+                    "A route group needs at least one Provider.",
+                    "路由组至少需要一个供应商。",
+                    "路由組至少需要一個供應商。",
                 )
                 .to_string(),
             );
@@ -22222,14 +22093,28 @@ impl ManagementCenter {
                 )),
         );
         rows = rows.child(chosen);
-        if self.route_group_members.len() < 2 {
+        if self.route_group_members.is_empty() {
             rows = rows.child(div().text_xs().text_color(cx.theme().warning).child(
                 management_locale_text(
-                    "Pick at least two Providers. One Provider is a direct connection.",
-                    "至少选择两个供应商；只有一个就是直连。",
-                    "至少選擇兩個供應商；只有一個就是直連。",
+                    "Pick at least one Provider.",
+                    "至少选择一个供应商。",
+                    "至少選擇一個供應商。",
                 ),
             ));
+        } else if self.route_group_members.len() == 1 {
+            // One Provider is legitimate: the group is then a way to put the
+            // gateway — and its protocol translation — in front of a single
+            // upstream. Say so instead of implying a missing choice.
+            rows = rows.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "One Provider: requests go through the gateway, which can translate protocols. Add a second one to let the policy choose between them.",
+                        "只有一个供应商：请求会走网关，可使用协议转换。再加一个，路由策略才能在它们之间选择。",
+                        "只有一個供應商：請求會走閘道，可使用協定轉換。再加一個，路由策略才能在它們之間選擇。",
+                    )),
+            );
         }
         // The Providers that could still join, minus the ones already in.
         let mut choices = h_flex().w_full().flex_wrap().items_center().gap_1();
@@ -22362,7 +22247,7 @@ impl ManagementCenter {
                         } else {
                             management_locale_text("Create group", "创建路由组", "建立路由組")
                         })
-                        .disabled(pending || self.route_group_members.len() < 2)
+                        .disabled(pending || self.route_group_members.is_empty())
                         .on_click(cx.listener(|this, _, _, cx| this.save_route_group(cx))),
                 ),
         );
@@ -37886,9 +37771,10 @@ mod gateway_surface_tests {
     /// A route group is composed from Providers, and its available models are
     /// the ones they all serve.
     ///
-    /// The draft is validated before it is written: a group of fewer than two
-    /// Providers is a direct connection, and a group with no shared model has
-    /// nothing to offer. Both are refused where the reader can see why.
+    /// The draft is validated before it is written: a group with no Provider
+    /// has nothing to serve, and a group whose members share no model offers
+    /// nothing either. One Provider is accepted, because a group of one is how
+    /// a single upstream gets the gateway's protocol translation.
     #[test]
     fn a_route_group_draft_is_composed_from_providers() {
         let source = include_str!("management.rs");
@@ -37912,8 +37798,12 @@ mod gateway_surface_tests {
             .map(|(body, _)| body)
             .expect("the group save path should remain inspectable");
         assert!(
-            saving.contains("self.route_group_members.len() < 2"),
-            "one Provider is a direct connection, not a group"
+            saving.contains("self.route_group_members.is_empty()"),
+            "a group needs a Provider, and one Provider is enough"
+        );
+        assert!(
+            !saving.contains("route_group_members.len() < 2"),
+            "a single Provider is a valid group: it is how one upstream gets the gateway's protocol translation"
         );
         assert!(saving.contains("create_model_route"));
         assert!(saving.contains("update_model_route"));
@@ -37961,34 +37851,64 @@ mod gateway_surface_tests {
         assert!(editor.contains("Input::new(&limit_input)"));
     }
 
-    /// Changing an Agent's mode goes through the confirmation, and says why.
+    /// The gateway is switched on or off once, and no Agent row offers its own
+    /// switch.
     ///
-    /// The switch used to write directly; the mode is process configuration,
-    /// so that write restarts the Agent and interrupts its conversation.
+    /// A per-Agent toggle let one Agent believe it was routed while the listener
+    /// served the others. The setting is installation-wide, so this test asserts
+    /// the absence of that control rather than its wiring.
     #[test]
-    fn an_agent_gateway_switch_asks_before_restarting() {
+    fn the_gateway_is_not_switched_per_agent() {
         let source = include_str!("management.rs");
         let row = source
             .split_once("        for agent in &snapshot.agents {")
             .and_then(|(_, tail)| tail.split_once("\n        if snapshot.agents.is_empty()"))
             .map(|(body, _)| body)
             .expect("the gateway Agent row should remain inspectable");
-        assert!(row.contains("confirm_gateway_agent_switch("));
-        assert!(
-            !row.contains("this.set_gateway_agent(agent_id.clone(), *checked, cx)"),
-            "the switch must not write before the confirmation"
-        );
-        assert!(row.contains("gateway_agent_pending"));
-        assert!(row.contains("Switching"));
+        assert!(!row.contains("Switch::new"));
+        assert!(!row.contains("set_gateway_agent"));
+        assert!(row.contains("agent.active"));
+        // The confirmation dialog and the pending marker are gone from the
+        // source, not merely unused: a leftover helper is how the control
+        // quietly comes back.
+        for removed in [
+            concat!("fn confirm_gateway_", "agent_switch("),
+            concat!("gateway_", "agent_pending"),
+        ] {
+            assert!(
+                !source.contains(removed),
+                "{removed} should no longer exist"
+            );
+        }
 
-        let confirm = source
-            .split_once("    fn confirm_gateway_agent_switch(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// Points one Agent at the gateway"))
+        // The one global switch still lives on the Providers page.
+        let gateway_page = source
+            .split_once("    fn render_gateway(&mut self")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_content("))
             .map(|(body, _)| body)
-            .expect("the confirmation should remain inspectable");
-        assert!(confirm.contains("restarts its process"));
-        assert!(confirm.contains("interrupted"));
-        assert!(confirm.contains("set_gateway_agent(agent_id.clone(), enabled, cx)"));
+            .expect("the gateway page should remain inspectable");
+        assert!(gateway_page.contains("management-gateway-enabled"));
+        assert!(gateway_page.contains("set_gateway_enabled(true, cx)"));
+    }
+
+    /// The Agent's Provider card reports the gateway but does not switch it.
+    #[test]
+    fn the_provider_card_reports_the_gateway_without_switching_it() {
+        let source = include_str!("management.rs");
+        let summary = source
+            .split_once("    fn render_agent_gateway_summary(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Opens the route-group editor on an empty draft.")
+            })
+            .map(|(body, _)| body)
+            .expect("the gateway summary should remain inspectable");
+        assert!(
+            !summary.contains("Switch::new"),
+            "the Agent card must not control the global gateway"
+        );
+        assert!(!summary.contains("set_gateway_agent"));
+        assert!(summary.contains("turn it on from the Providers page"));
+        assert!(summary.contains("gateway_status_badge"));
     }
 
     /// The three destructive gateway actions ask first, and the harmless

@@ -657,10 +657,12 @@ impl ModelGatewayService {
                             })
                     })
                     .collect::<Vec<_>>();
-                if providers.len() < 2 {
-                    // One Provider is a direct connection, not a group: there
-                    // is nothing to choose between, and calling it a group
-                    // would promise failover the composition cannot deliver.
+                if providers.is_empty() {
+                    // A group with no reachable Provider has nothing to serve.
+                    // One Provider *is* useful, though: a group of one is how a
+                    // single upstream gets the gateway's protocol translation
+                    // without pretending there is a second source to fail over
+                    // to.
                     return None;
                 }
                 let models = vibex_core::provider_group_models(route, &group_profiles)

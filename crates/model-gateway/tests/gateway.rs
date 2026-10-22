@@ -1953,6 +1953,67 @@ async fn a_provider_group_routes_a_shared_model_to_a_serving_provider() {
     cleanup(path);
 }
 
+/// A group of one Provider is served: the gateway still fronts it, which is
+/// what gives a single upstream the gateway's protocol translation.
+#[tokio::test]
+async fn a_provider_group_of_one_is_served_through_the_gateway() {
+    let path = database_path();
+    let (url, recorder, upstream_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let only = seed_upstream(
+        &config,
+        &url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-only",
+    );
+    point_gateway_at(&path, only.clone(), GatewayPolicy::default());
+    let group_id = seed_provider_group(
+        &path,
+        "Single",
+        std::slice::from_ref(&only),
+        vibex_core::RouteStrategy::Ordered,
+    );
+
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+    let served = service.read_snapshot().unwrap();
+    let group = served
+        .groups
+        .get(group_id.as_str())
+        .expect("a one-Provider group must be in the snapshot");
+    assert_eq!(group.models.len(), 1);
+    assert_eq!(group.models[0].model, "deepseek-chat");
+    assert_eq!(
+        group.models[0].providers,
+        vec![only.clone()],
+        "the lone Provider is the only source"
+    );
+
+    let status = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": format!("group/{}/deepseek-chat", group_id.as_str()),
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 200, "a single-Provider group must answer");
+    assert!(
+        !recorder.lock().await.path.is_empty(),
+        "the request should have reached the Provider through the gateway"
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
 /// A model only one Provider of the group serves is not part of the group.
 ///
 /// This is the intersection contract: offering it would let the group's policy

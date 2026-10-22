@@ -1174,17 +1174,20 @@ fn read_gateway_snapshot(
             });
         }
     }
-    let enabled_agents = provider.gateway_agents()?;
     let active_agents = provider.gateway_active_agents().unwrap_or_default();
+    let settings_enabled = settings.policy.enabled;
     let mut agents = Vec::new();
-    for (agent_id, _strategy, _enabled) in provider.gateway_agent_options()? {
+    for (agent_id, _strategy, _enabled, unsupported) in provider.gateway_agent_options()? {
+        let agent_id_text = agent_id.as_str().to_string();
         agents.push(vibex_core::GatewayAgentBinding {
-            display_name: agent_id.as_str().to_string(),
-            enabled: enabled_agents.contains(&agent_id),
+            display_name: agent_id_text.clone(),
+            // The switch is global, so every capable Agent reports the same
+            // intent; `unsupported` marks the ones it cannot serve.
+            enabled: settings_enabled && !unsupported,
             active: active_agents.contains(&agent_id),
-            unsupported: false,
+            unsupported,
             wire_protocol_id: String::new(),
-            agent_id: agent_id.as_str().to_string(),
+            agent_id: agent_id_text,
         });
     }
     let catalog = provider.list_model_provider_profiles().unwrap_or_default();
@@ -3195,25 +3198,17 @@ impl ManagementBackend for NativeBackend {
 
     fn set_model_gateway_agent(
         &self,
-        request: MutationRequest<GatewayAgentUpdateRequest>,
+        _request: MutationRequest<GatewayAgentUpdateRequest>,
     ) -> BackendFuture<'_, GatewaySnapshot> {
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            runtime.ensure_accepting_actions()?;
-            request.validate()?;
-            let payload = request.payload;
-            let service = runtime.model_gateway();
-            let provider = runtime.providers().service();
-            let agent_id = vibex_core::AgentId::parse(payload.agent_id.as_str())?;
-            let base_url = service.base_url();
-            let catalog = gateway_catalog(&provider)?;
-            provider.set_gateway_agent(
-                &agent_id,
-                payload.enabled,
-                base_url.as_deref(),
-                &catalog,
-            )?;
-            read_gateway_snapshot(&runtime).map_err(Into::into)
+        // The gateway is switched on or off for the whole installation. This
+        // entry point is kept only so an older client gets a clear refusal
+        // instead of a silent no-op.
+        Box::pin(async {
+            Err(vibex_core::VibexError::validation(
+                "model_gateway_agent_scope_removed",
+                "the gateway is a global setting; switch it on or off instead of per Agent",
+            )
+            .into())
         })
     }
 

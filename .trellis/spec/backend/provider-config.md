@@ -5389,6 +5389,105 @@ let (attempt, key) = service.open_attempt(&prepared).await?;
 service.record(&prepared, &RequestOutcome { credential: Some(key.id), .. });
 ```
 
+## Scenario: The Gateway Is One Global Setting
+
+### 1. Scope / Trigger
+
+- Trigger: the Config Center switches the local model gateway on or off.
+- Trigger: an Agent is pointed at the gateway, or a running listener's address
+  moves.
+
+### 2. Signatures
+
+```text
+ProviderConfigService::gateway_agents()            -> Set<AgentId>   (intent)
+ProviderConfigService::gateway_active_agents()     -> Set<AgentId>   (projection)
+ProviderConfigService::attach_gateway_to_agents(&url, &catalog) -> Vec<AgentId>
+ProviderConfigService::detach_gateway_from_agents() -> Vec<AgentId>
+ProviderConfigService::refresh_gateway_profiles(&url, &catalog) -> Vec<AgentId>
+```
+
+### 3. Contracts
+
+- The gateway is enabled **once, for the whole installation**, through
+  `GatewayPolicy::enabled`. There is no per-Agent switch. A per-Agent toggle let
+  one Agent believe it was routed while the listener served the others.
+- `gateway_agents()` reports intent and is derived: when the policy is enabled it
+  is every gateway-capable Agent (configurable, and speaking one of the four
+  protocols the gateway serves). When disabled it is empty. It does not read a
+  per-Agent table.
+- Enabling attaches every capable Agent in one pass; disabling detaches all of
+  them. `detach_gateway_from_agents` scans the existing hidden Profiles, not the
+  intent set, because it has to run precisely when the intent set is empty.
+- `attach_gateway_to_agents` refuses an empty address and, when the policy is
+  disabled, detaches instead of attaching: a disabled gateway must never leave a
+  Profile pointing at it even if a listener is still bound.
+- Attaching is per-Agent fault tolerant. An Agent that is merely unconfigured
+  (an ACP Agent with no runtime config yet) is skipped and keeps its direct
+  Provider; it must not deny the gateway to every other Agent.
+- `set_model_gateway_agent` is refused with `model_gateway_agent_scope_removed`.
+  Keeping a working per-Agent write would reintroduce the split authority the
+  global switch exists to remove.
+- The gateway switch is rendered on the Providers page only. The Agent's
+  Provider card reports the resulting state (address, key health, routed or
+  not) and never offers a switch.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Attach with an empty address | `model_gateway_unavailable` |
+| Attach while the policy is disabled | Detach instead; no Profile points at the gateway |
+| Attach for an Agent lacking ACP configuration | Skipped; that Agent keeps its direct Provider |
+| Any per-Agent gateway write | `model_gateway_agent_scope_removed` |
+| Policy disabled | `gateway_agents()` is empty and every hidden Profile is removed |
+
+### 5. Good / Base / Bad Cases
+
+- Good: the user turns the gateway on once; every capable Agent is pointed at it
+  and the Config Center lists them as routed.
+- Base: one ACP Agent has no runtime configuration yet; it is skipped, the
+  rest attach, and the switch still works.
+- Bad: a per-Agent toggle turns the gateway on for one Agent while the listener
+  is off, so the Agent is paused while the UI claims it is routed.
+
+### 6. Tests Required
+
+- `vibex-config-switch`: enabling attaches every capable Agent at once; a second
+  attach updates the same hidden Profiles; detaching removes all of them; the
+  intent follows the global switch; a stopped listener removes the Profiles but
+  keeps the switch; an Agent owning its Provider is never attached; an empty
+  address is refused.
+- `vibex-desktop`: no Agent row or Provider-card gateway block renders a
+  `Switch`; the per-Agent confirmation and pending marker no longer exist; the
+  one global switch still lives on the gateway page.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+// Remember which Agents the user routed, and project only those.
+ModelGatewayAgentRepository::set(&conn, agent_id, true)?;
+```
+
+This creates a second authority next to the gateway policy: the listener can be
+off while an Agent's row says it is routed.
+
+#### Correct
+
+```rust
+if !settings.policy.enabled {
+    return self.deactivate_gateway_profiles();
+}
+for agent_id in self.gateway_capable_agents()? {
+    let _ = self.ensure_gateway_profile(&agent_id, base_url, catalog);
+}
+```
+
+The policy decides; the hidden Profiles are its projection, and a failure for
+one Agent is local to that Agent.
+
 ## Scenario: Route Groups Compose Whole Providers
 
 ### 1. Scope / Trigger
@@ -5416,9 +5515,11 @@ GatewaySnapshot::group_for_model(&model)
 - The group's models are the **intersection** of its enabled Providers'
   enabled catalogues, in the group's member order, then each catalogue's order.
   A model only one Provider serves is not part of the group.
-- A group needs at least two Providers to be served. One Provider is a direct
-  connection, and the snapshot drops a lone group rather than pretending it
-  fails over.
+- A group needs at least **one** Provider. A group of one is deliberate: it
+  puts the gateway — and therefore its protocol translation — in front of a
+  single upstream, which is something a direct Provider cannot do. It must not
+  claim failover (`auto_routes` stays false, `member_count` is 1), and the
+  editor says so instead of implying a missing choice.
 - `group_for_model` resolves only models the group actually offers. Refusing
   the rest is what keeps the strategy from picking a Provider that has never
   heard of the model.
@@ -5438,7 +5539,8 @@ GatewaySnapshot::group_for_model(&model)
 | --- | --- |
 | Group member names a model | `route_group_member_model_unexpected` |
 | Group lists one Provider twice | `route_group_provider_duplicate` |
-| Group has fewer than two Providers | Not served; absent from the gateway snapshot |
+| Group has no Provider | Not served; absent from the gateway snapshot |
+| Group has one Provider | Served; no failover is claimed |
 | Group Providers share no enabled model | Not served; the editor shows the empty intersection |
 | Request names a model the intersection lacks | `404` from the gateway, not a Provider call |
 | Plain route member names no model | `route_member_model_invalid` |
@@ -5447,6 +5549,8 @@ GatewaySnapshot::group_for_model(&model)
 
 - Good: two Providers both list `deepseek-chat`; the group offers
   `group/<id>/deepseek-chat` once, and `LeastUsed` picks the answering Provider.
+- Good: one Provider in a group; the group offers its whole enabled catalogue
+  through the gateway, which may translate the protocol on the way out.
 - Base: one Provider lists `deepseek-chat`, `left-only`; the other lists
   `deepseek-chat`; the group offers only `deepseek-chat`.
 - Bad: offering the union and letting `RoundRobin` send `left-only` to the
@@ -5464,8 +5568,8 @@ GatewaySnapshot::group_for_model(&model)
 - `vibex-agent-acp` unit: a group publishes one option per shared model and each
   option's model id is `group/<id>/<model>`.
 - `vibex-desktop` unit: the provider card owns the group section and the old
-  routing section is not rendered; the group draft refuses fewer than two
-  Providers.
+  routing section is not rendered; the group draft accepts one Provider and
+  refuses none.
 
 ### 7. Wrong vs Correct
 

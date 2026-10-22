@@ -913,6 +913,31 @@ mod tests {
         );
     }
 
+    /// One Provider is a valid group: it is how a single upstream is put behind
+    /// the gateway for its protocol translation.
+    ///
+    /// Nothing about the intersection breaks — the intersection of one set is
+    /// that set — so the group simply offers the Provider's own catalogue.
+    #[test]
+    fn a_provider_group_may_hold_a_single_provider() {
+        let only = provider(&[
+            ("shared", Default::default()),
+            ("another", Default::default()),
+        ]);
+        let route = group(vec![only.id.clone()]);
+        assert!(route.validate().is_ok(), "one Provider must validate");
+        let models = provider_group_models(&route, std::slice::from_ref(&only));
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shared", "another"],
+            "a lone Provider offers its whole enabled catalogue"
+        );
+        assert_eq!(models[0].provider_profile_ids, vec![only.id.clone()]);
+    }
+
     #[test]
     fn a_provider_group_claims_the_capabilities_all_serving_providers_share() {
         let left = provider(&[(
