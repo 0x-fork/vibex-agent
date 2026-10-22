@@ -12618,9 +12618,11 @@ fn apply_binding_provider_options_repair(
 ) -> VibexResult<()> {
     const VERSION: i64 = 70;
     const NAME: &str = "binding_provider_options_repair";
-    if migration_applied(conn, VERSION)? {
-        return Ok(());
-    }
+    // Repaired on every run, not only the first. The empty object is not only a
+    // legacy value: a write path that builds the column from an empty map produces
+    // it again, and one such row makes every binding fail to load — which is a
+    // startup failure, not a bad field. A one-shot repair left the next occurrence
+    // unnoticed until a user hit it.
     conn.execute(
         "UPDATE agent_model_provider_bindings_v2
          SET provider_options_json = '{\"schemaVersion\":1,\"entries\":[]}'
@@ -12631,15 +12633,17 @@ fn apply_binding_provider_options_repair(
         "binding_provider_options_repair_failed",
         "failed to repair binding provider options written with an empty default",
     ))?;
-    conn.execute(
-        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
-        params![VERSION, NAME, unix_timestamp_ms()],
-    )
-    .map_err(storage_err(
-        "migration_record_failed",
-        "failed to record the binding provider options repair",
-    ))?;
-    applied.push(format!("{VERSION}:{NAME}"));
+    if !migration_applied(conn, VERSION)? {
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![VERSION, NAME, unix_timestamp_ms()],
+        )
+        .map_err(storage_err(
+            "migration_record_failed",
+            "failed to record the binding provider options repair",
+        ))?;
+        applied.push(format!("{VERSION}:{NAME}"));
+    }
     Ok(())
 }
 

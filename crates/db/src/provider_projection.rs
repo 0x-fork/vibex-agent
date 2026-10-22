@@ -3494,15 +3494,15 @@ mod binding_options_migration_tests {
                 .expect("the column default must be a decodable ProviderOptions");
         assert_eq!(decoded, vibex_core::ProviderOptions::empty());
 
-        // And a row left with the old empty object is repaired by the migration.
+        // And a row left with the old empty object is repaired — even though the
+        // repair migration is already recorded, which is the case that matters: the
+        // empty object can be written again long after the first migration ran.
         conn.execute(
             "UPDATE agent_model_provider_bindings_v2
              SET provider_options_json = '{}'",
             [],
         )
         .unwrap();
-        conn.execute("DELETE FROM schema_migrations WHERE version = 70", [])
-            .unwrap();
         apply_migrations(&mut conn).unwrap();
         let remaining: i64 = conn
             .query_row(
