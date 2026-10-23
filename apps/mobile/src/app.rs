@@ -143,6 +143,27 @@ const TIMELINE_SHIMMER_SPREAD: f32 = 0.42;
 const AGENT_THINKING_LABEL_MAX_CHARS: usize = 48;
 /// Reasoning preview cache bounds — one entry per visible reasoning row.
 const REASONING_SUMMARY_CACHE_LIMIT: usize = 64;
+/// One full sweep of the connecting page's wordmark. Desktop parity:
+/// `STARTUP_WORDMARK_SHIMMER_DURATION` — the launch page and the phone's
+/// connecting page are the same brand moment, so they breathe at the same pace.
+const CONNECTING_WORDMARK_SHIMMER_DURATION: Duration = Duration::from_secs(12);
+/// How many sweep passes that loop carries. Desktop parity:
+/// `SHIMMER_SCAN_PASSES`.
+const CONNECTING_WORDMARK_SCAN_PASSES: f32 = 10.0;
+/// Highlight half-width, as a fraction of the lockup's walk from the mark's
+/// start to the label's end. Desktop parity: `STARTUP_WORDMARK_SHIMMER_SPREAD`.
+const CONNECTING_WORDMARK_SCAN_SPREAD: f32 = 0.42;
+/// Frames per second the sweep is sampled at. Desktop parity:
+/// `REPEATING_ANIMATION_MAX_FPS`; a slow sweep looks identical at half the
+/// repaints, and the connecting page is otherwise static.
+const CONNECTING_WORDMARK_SHIMMER_MAX_FPS: f32 = 30.0;
+/// The label size of the connecting page's wordmark, in points.
+///
+/// A step over the pairing page's [`theme::FONT_WORDMARK`]: the connecting
+/// screen has no other content while it works, so the lockup is what says the
+/// product is alive. The mark is scaled from this size by
+/// [`theme::wordmark_mark`], the same authored geometry the other lockups use.
+const CONNECTING_WORDMARK_FONT: f32 = 48.0;
 
 #[derive(Clone)]
 struct ReasoningRowSummary {
@@ -15644,6 +15665,82 @@ impl MobileApp {
             .into_any_element()
     }
 
+    /// The connecting page's product wordmark.
+    ///
+    /// While the connection is being made the lockup carries the desktop launch
+    /// page's own effect: a band of light sweeps through the mark and the label
+    /// as one object. The sweep belongs to the working state alone — a failed
+    /// connection is a page to read and act on, and a mark that kept moving
+    /// would suggest something was still happening. Reduce Motion and a
+    /// backgrounded app park it on the idle tone, the same rule the sidebar's
+    /// activity marks follow.
+    fn render_connecting_brand(&self, scanning: bool) -> impl IntoElement {
+        // Desktop parity: the launch wordmark idles in the muted foreground at
+        // 75% and sweeps toward the foreground, so the mark is present but
+        // quiet when the effect is parked.
+        let base = theme::text_muted().opacity(0.75);
+        let glow = theme::text_primary();
+        let font = theme::scaled_px(CONNECTING_WORDMARK_FONT);
+        let mark = theme::wordmark_mark(font);
+        // The label's four letters divide the sweep's remaining range, exactly
+        // as the desktop's lockup does: the mark paints from 0.0 and its
+        // letters land on 0.25..1.0, so the light crosses the gap between them
+        // rather than restarting on the word.
+        let label_positions = "ibex".chars().count().max(1) as f32;
+
+        let lockup = move |scan_position: Option<f32>| {
+            let color_at = |position| {
+                scan_position.map_or(base, |scan_position| {
+                    connecting_wordmark_color(base, glow, position, scan_position)
+                })
+            };
+            div()
+                .debug_selector(|| "connecting-brand".to_string())
+                .flex()
+                .items_center()
+                .gap(px(1.0))
+                .text_size(font)
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(
+                    svg()
+                        .path("icons/vibex-mark.svg")
+                        .w(mark.width)
+                        .h(mark.height)
+                        .mt(mark.margin_top)
+                        .relative()
+                        .top(mark.top_offset)
+                        .flex_shrink_0()
+                        .text_color(color_at(0.0)),
+                )
+                .child(div().flex().children("ibex".chars().enumerate().map(
+                    |(index, character)| {
+                        div()
+                            .flex_none()
+                            // Desktop parity: `(index + 1) / 4` across the
+                            // four letters.
+                            .text_color(color_at((index + 1) as f32 / label_positions))
+                            .child(character.to_string())
+                    },
+                )))
+        };
+
+        let container = div().mb(px(theme::SPACING_LG));
+        if !scanning || theme::reduce_motion() || crate::lifecycle::is_backgrounded() {
+            return container.child(lockup(None)).into_any_element();
+        }
+        container
+            .with_animation(
+                "mobile-connecting-wordmark-shimmer",
+                Animation::new(CONNECTING_WORDMARK_SHIMMER_DURATION)
+                    .repeat()
+                    .with_max_fps(CONNECTING_WORDMARK_SHIMMER_MAX_FPS),
+                move |this, delta| {
+                    this.child(lockup(Some(connecting_wordmark_scan_position(delta))))
+                },
+            )
+            .into_any_element()
+    }
+
     fn render_connecting(
         &self,
         sheets: OverlaySheets,
@@ -15660,13 +15757,7 @@ impl MobileApp {
             .px(px(theme::SPACING_XL))
             .track_focus(&self.root_focus)
             .on_action(cx.listener(Self::handle_navigate_back))
-            .child(
-                svg()
-                    .path("brand/logo.svg")
-                    .size(px(44.0))
-                    .text_color(theme::text_muted())
-                    .mb(px(theme::SPACING_LG)),
-            )
+            .child(self.render_connecting_brand(self.operation_busy))
             .child(
                 div()
                     .w_full()
@@ -15701,6 +15792,7 @@ impl MobileApp {
                             .child(
                                 div()
                                     .id("retry-desktop-connection")
+                                    .debug_selector(|| "retry-desktop-connection".to_string())
                                     .w_full()
                                     .h(px(theme::TOUCH_TARGET))
                                     .rounded(px(theme::RADIUS_CONTROL))
@@ -15710,12 +15802,20 @@ impl MobileApp {
                                     .flex()
                                     .items_center()
                                     .justify_center()
+                                    .gap(px(theme::SPACING_SM))
                                     .text_color(theme::text_primary())
                                     .cursor_pointer()
                                     .active(|style| style.bg(theme::row_pressed_bg()))
                                     .on_mouse_up(
                                         MouseButton::Left,
                                         cx.listener(Self::retry_connection),
+                                    )
+                                    .child(
+                                        svg()
+                                            .path("icons/rotate-ccw.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .flex_shrink_0()
+                                            .text_color(theme::text_primary()),
                                     )
                                     .child(locale::common("Retry")),
                             )
@@ -15728,6 +15828,7 @@ impl MobileApp {
                                     .flex()
                                     .items_center()
                                     .justify_center()
+                                    .gap(px(theme::SPACING_SM))
                                     .text_color(theme::text_muted())
                                     .cursor_pointer()
                                     .active(|style| style.opacity(0.7))
@@ -15742,23 +15843,41 @@ impl MobileApp {
                                             this.disconnect_host(event, window, cx);
                                         }),
                                     )
+                                    .child(
+                                        svg()
+                                            .path("icons/plug-zap.svg")
+                                            .size(px(theme::ICON_SM))
+                                            .flex_shrink_0()
+                                            .text_color(theme::text_muted()),
+                                    )
                                     .child(locale::common("Disconnect")),
                             )
                             .when(!self.known_hosts.is_empty(), |panel| {
                                 panel.child(
                                     div()
                                         .id("switch-host-while-connecting")
+                                        .debug_selector(|| {
+                                            "switch-host-while-connecting".to_string()
+                                        })
                                         .h(px(theme::TOUCH_TARGET))
                                         .px(px(theme::SPACING_MD))
                                         .flex()
                                         .items_center()
                                         .justify_center()
+                                        .gap(px(theme::SPACING_SM))
                                         .text_color(theme::text_secondary())
                                         .cursor_pointer()
                                         .active(|style| style.opacity(0.7))
                                         .on_mouse_up(
                                             MouseButton::Left,
                                             cx.listener(Self::open_pairing),
+                                        )
+                                        .child(
+                                            svg()
+                                                .path("icons/chevrons-right-left.svg")
+                                                .size(px(theme::ICON_SM))
+                                                .flex_shrink_0()
+                                                .text_color(theme::text_secondary()),
                                         )
                                         .child(locale::common("Switch host")),
                                 )
@@ -34989,6 +35108,38 @@ const PAIRING_RUNTIMES_HEIGHT_RATIO: f32 = 0.34;
 /// the list is the page.
 const PAIRING_SWITCHER_RUNTIMES_HEIGHT_RATIO: f32 = 0.5;
 
+/// One pass of the connecting wordmark's light, as the desktop's launch page
+/// draws it.
+///
+/// The sweep starts a little left of the lockup, travels past its end, and
+/// repeats [`CONNECTING_WORDMARK_SCAN_PASSES`] times over the loop: the page is
+/// only on screen while something is happening, and a light that paused would
+/// read as a stalled connection.
+fn connecting_wordmark_scan_position(delta: f32) -> f32 {
+    const SCAN_LEAD: f32 = 0.35;
+    const SCAN_SPAN: f32 = 1.7;
+    -SCAN_LEAD + (delta * CONNECTING_WORDMARK_SCAN_PASSES).fract() * SCAN_SPAN
+}
+
+/// The colour a point of the wordmark paints, given where the sweep is.
+///
+/// `position` walks the lockup from the mark's own start (`0.0`) to the end of
+/// the label (`1.0`), so the light travels through the mark and the letters as
+/// one object. It is the desktop's `shimmer_color`: a smoothstepped falloff
+/// around the scan line, interpolated in HSLA so the sweep brightens the muted
+/// idle tone toward the foreground without passing through a grey.
+fn connecting_wordmark_color(base: Hsla, glow: Hsla, position: f32, scan_position: f32) -> Hsla {
+    let intensity =
+        (1.0 - (position - scan_position).abs() / CONNECTING_WORDMARK_SCAN_SPREAD).clamp(0.0, 1.0);
+    let intensity = intensity * intensity * (3.0 - 2.0 * intensity);
+    Hsla {
+        h: base.h + (glow.h - base.h) * intensity,
+        s: base.s + (glow.s - base.s) * intensity,
+        l: base.l + (glow.l - base.l) * intensity,
+        a: base.a + (glow.a - base.a) * intensity,
+    }
+}
+
 /// The busy indicator the pairing actions share.
 fn pairing_spinner(color: gpui::Hsla) -> gpui::AnyElement {
     svg()
@@ -39108,6 +39259,91 @@ mod tests {
         assert_eq!(mounted_hints(cx), 0, "disconnecting announces nothing");
     }
 
+    /// The unavailable page really lays out what its renderer builds: the
+    /// product wordmark, the failure line, and the three action rows — each
+    /// one wide enough for a glyph and a label — in that order down the page.
+    ///
+    /// The source test above pins the markup; this one pins the result, because
+    /// a glyph that is built but never laid out (an unregistered asset, a child
+    /// on a row that paints nothing) is silent in both GPUI and a source scan.
+    #[gpui::test]
+    fn the_unavailable_page_paints_its_wordmark_and_all_three_actions(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        // The locked-down anchor: the sweep is the working state's, so a parked
+        // lockup is what this page must paint. Reduce Motion also keeps the
+        // frame this test measures from moving under it.
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let mut bundle = host_bundle("runtime-a", "studio");
+        bundle.route = Some(crate::pairing::MobileRemoteRouteBundle {
+            local_network: None,
+            direct_candidates: vec![bundle.record.server_url.clone()],
+            relay: None,
+        });
+        let backend = bundle.backend().expect("valid saved runtime");
+        let (app, cx) = add_rooted_window_view(cx, |window, cx| {
+            let mut app = MobileApp::new_for_test(data_dir.path().to_path_buf(), window, cx);
+            app.remember_host(&bundle, RemoteServerKind::Desktop);
+            app.persist_known_hosts();
+            app.backend = Some(backend);
+            app.mode = RootMode::Connecting;
+            app.fail(BackendError::offline(
+                "remote_transport_unreachable",
+                "no route to host",
+            ));
+            app
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        clear_hints(cx);
+
+        let brand = cx
+            .debug_bounds("connecting-brand")
+            .expect("the failure page should wear the product wordmark");
+        let retry = cx
+            .debug_bounds("retry-desktop-connection")
+            .expect("the failed connection should offer Retry");
+        let disconnect = cx
+            .debug_bounds("disconnect-unavailable-desktop")
+            .expect("the failed connection should offer Disconnect");
+        let switch = cx
+            .debug_bounds("switch-host-while-connecting")
+            .expect("a saved runtime should be switchable");
+
+        // Brand above the actions, actions in the order the page reads.
+        assert!(
+            brand.bottom() <= retry.top(),
+            "the wordmark should sit above the actions, got {brand:?} and {retry:?}"
+        );
+        assert!(retry.bottom() <= disconnect.top());
+        assert!(disconnect.bottom() <= switch.top());
+
+        // A glyph and a label need the row's height and its inner width, and a
+        // row that collapsed to its text would leave the reader nothing to aim
+        // at.
+        for (name, bounds) in [
+            ("Retry", retry),
+            ("Disconnect", disconnect),
+            ("Switch host", switch),
+        ] {
+            assert!(
+                f32::from(bounds.size.height) >= theme::TOUCH_TARGET,
+                "{name} should keep its touch target, got {bounds:?}"
+            );
+            assert!(
+                f32::from(bounds.size.width) > theme::TOUCH_TARGET,
+                "{name} should be wide enough for its glyph and label, got {bounds:?}"
+            );
+        }
+
+        // The page is the unavailable one, not a spinner: the failure branch is
+        // what painted, so the wordmark is parked rather than sweeping.
+        assert!(!app.read_with(cx, |app, _| app.operation_busy));
+    }
+
     /// A phone that comes back to a connection the transport never recovers
     /// must not keep the page it left behind. Holding that stale workspace is
     /// what made a backgrounded app look as if it had closed; the phone drops
@@ -40132,6 +40368,133 @@ mod tests {
         for panel in ["PairingPanel::Nearby", "PairingPanel::Manual"] {
             assert!(sheet.contains(panel), "the sheet should serve {panel}");
         }
+    }
+
+    /// The connecting page wears the same lockup as every other brand moment,
+    /// and it is the launch page's sweep that runs through it while the phone
+    /// is actually connecting.
+    ///
+    /// The old mark was the bare `brand/logo.svg` glyph: no word, and no
+    /// indication that the screen was working rather than stuck. The sweep is
+    /// the desktop startup page's own effect, so the two products open the same
+    /// way, but it belongs to the working state only — the failure state is a
+    /// page the reader acts on.
+    #[test]
+    fn the_connecting_page_sweeps_its_wordmark_only_while_it_works() {
+        let source = include_str!("app.rs");
+        let page = renderer_source(source, "render_connecting");
+        // The wordmark replaces the old glyph lockup entirely.
+        assert!(!page.contains("brand/logo.svg"));
+        assert!(page.contains("self.render_connecting_brand(self.operation_busy)"));
+
+        let brand = renderer_source(source, "render_connecting_brand");
+        assert!(brand.contains("icons/vibex-mark.svg"));
+        assert!(brand.contains("\"ibex\""));
+        assert!(brand.contains("theme::wordmark_mark("));
+        assert!(brand.contains(".text_size(font)"));
+        assert!(brand.contains("CONNECTING_WORDMARK_SHIMMER_DURATION"));
+        assert!(brand.contains("with_max_fps(CONNECTING_WORDMARK_SHIMMER_MAX_FPS)"));
+        assert!(brand.contains(".repeat()"));
+        // Motion is parked for the reader who asked for less of it, and for an
+        // app with no frame to spend.
+        assert!(brand.contains("theme::reduce_motion()"));
+        assert!(brand.contains("crate::lifecycle::is_backgrounded()"));
+
+        // The sweep is the desktop's pace, not a faster phone-only variant.
+        assert_eq!(
+            CONNECTING_WORDMARK_SHIMMER_DURATION,
+            Duration::from_secs(12)
+        );
+        assert_eq!(CONNECTING_WORDMARK_SCAN_PASSES, 10.0);
+        assert_eq!(CONNECTING_WORDMARK_SCAN_SPREAD, 0.42);
+    }
+
+    /// Every action on the unavailable-connection page leads with a glyph, so
+    /// the three choices read at a glance instead of as three bare lines of
+    /// text.
+    ///
+    /// Each glyph is a different idea — the failure turns back, the link is cut,
+    /// the runtime changes — and each is the icon the app already uses for that
+    /// action elsewhere, so the screen does not invent a second vocabulary.
+    #[test]
+    fn the_unavailable_page_gives_each_action_its_glyph() {
+        let source = include_str!("app.rs");
+        let page = renderer_source(source, "render_connecting");
+        let failure = page
+            .split_once(".when(!self.operation_busy, |panel|")
+            .map(|(_, tail)| tail)
+            .expect("the unavailable page should keep its failure branch");
+
+        for (id, icon) in [
+            ("retry-desktop-connection", "icons/rotate-ccw.svg"),
+            ("disconnect-unavailable-desktop", "icons/plug-zap.svg"),
+            (
+                "switch-host-while-connecting",
+                "icons/chevrons-right-left.svg",
+            ),
+        ] {
+            let row = failure
+                .split_once(id)
+                .map(|(_, tail)| tail)
+                .unwrap_or_else(|| panic!("{id} should still exist"));
+            // The row ends at the next control, not at the page's end.
+            let row = row.split(".id(\"").next().unwrap_or(row);
+            assert!(
+                row.contains(icon),
+                "{id} should lead with {icon} instead of a bare label"
+            );
+            assert!(
+                row.contains(".gap(px(theme::SPACING_SM))"),
+                "{id} should space its glyph from its label"
+            );
+        }
+    }
+
+    /// The sweep's colour walks from the idle tone to the foreground, and the
+    /// scan position covers the whole lockup without ever resting on it.
+    #[test]
+    fn the_connecting_sweep_moves_and_never_washes_out_the_mark() {
+        let base = gpui::hsla(0.0, 0.0, 0.45, 1.0);
+        let glow = gpui::hsla(0.0, 0.0, 0.98, 1.0);
+
+        // Dead on the scan line the glyph takes the glow; far from it, the
+        // idle tone, unchanged.
+        assert_eq!(
+            connecting_wordmark_color(base, glow, 0.5, 0.5),
+            glow,
+            "the scan line is the highlight"
+        );
+        assert_eq!(
+            connecting_wordmark_color(base, glow, 0.0, 1.0),
+            base,
+            "a glyph the light left behind keeps the idle tone"
+        );
+
+        // Halfway out of the band the value is between the two, so the sweep
+        // reads as light rather than as a hard edge crossing the letters.
+        let edge = connecting_wordmark_color(base, glow, 0.5, 0.5 + 0.21);
+        assert!(edge.l > base.l && edge.l < glow.l);
+
+        // One loop is the desktop's ten passes, each starting left of the
+        // lockup and ending past its right edge.
+        let mut previous = connecting_wordmark_scan_position(0.0);
+        assert!(previous < 0.0, "the light enters from the left");
+        for step in 1..=200 {
+            let position = connecting_wordmark_scan_position(step as f32 / 200.0);
+            assert!(position.is_finite());
+            assert!(
+                (-0.35..=1.35).contains(&position),
+                "the sweep stays on the lockup, got {position}"
+            );
+            previous = position;
+        }
+        assert!(previous <= 1.35);
+        // A hundredth of the loop moves the light a visible distance: it is a
+        // sweep, not a hue that slowly drifts.
+        let moved = (connecting_wordmark_scan_position(0.20)
+            - connecting_wordmark_scan_position(0.19))
+        .abs();
+        assert!(moved > 0.05, "the light should travel, moved {moved}");
     }
 
     /// Some nearby runtimes for a fallback sheet to list.

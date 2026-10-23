@@ -513,6 +513,32 @@ The native bridge subscribers are process globals. If GPUI reports cross-test
 scheduler activity, execute each test case in its own process; serial Rust test
 threads still share those subscribers.
 
+### Convention: The Connecting Page Wears The Product Lockup
+
+`MobileApp::render_connecting` is the launch-time connection screen and the
+post-failure unavailable page; the two states share one renderer and differ only
+in `operation_busy`.
+
+- **One lockup, one geometry.** Both states wear the product wordmark: the
+  shipped `icons/vibex-mark.svg` supplies the capital "V" and the label
+  completes "Vibex". Size the mark with `theme::wordmark_mark`, never a frozen
+  pixel box, so the reader's text-size step keeps its point on the label's
+  baseline. Do not go back to the bare `brand/logo.svg` glyph: a wordless mark
+  neither names the product nor matches the desktop launch page.
+- **The sweep belongs to the working state.** While `operation_busy` the lockup
+  runs the desktop startup page's light scan (`CONNECTING_WORDMARK_*`: 12s loop,
+  ten passes, 0.42 spread, 30 fps cap). The unavailable page is a decision the
+  reader has to make, so its lockup is parked on the idle tone — motion there
+  would claim a connection attempt that has already failed. Honour
+  `theme::reduce_motion()` and `crate::lifecycle::is_backgrounded()`, the same
+  rule the sidebar activity marks follow.
+- **The three failure actions lead with a glyph.** Retry, Disconnect and Switch
+  host each draw the icon the app already uses for that action elsewhere
+  (`rotate-ccw`, `plug-zap`, `chevrons-right-left`), spaced from the label by
+  `SPACING_SM`, inside a row that keeps `theme::TOUCH_TARGET` height. Never
+  introduce an icon outside `MobileAssets`; an unregistered path paints nothing
+  without an error.
+
 
 ## Convention: Mobile Notices Are Toasts
 
