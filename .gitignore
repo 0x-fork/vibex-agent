@@ -17,6 +17,13 @@ crates/core/bindings/
 /coverage/
 *.log
 *.tmp
+# `makepkg` run inside packaging/aur/<pkg> leaves its downloaded sources, its
+# extracted tree, and the built package beside a PKGBUILD that IS tracked.
+packaging/aur/*/src/
+packaging/aur/*/pkg/
+packaging/aur/*/*.pkg.tar.*
+packaging/aur/*/*.deb
+packaging/aur/*/vibex-*
 # Backup copies left behind by patch/merge/edit tooling. A stray copy of a
 # source file must never reach the public repository.
 *.orig

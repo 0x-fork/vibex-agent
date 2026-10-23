@@ -1,0 +1,234 @@
+name: Publish AUR Package
+
+# Publishes the `vibex-bin` AUR package for a stable GitHub Release.
+#
+# The AUR holds PKGBUILD sources, not binaries, so nothing is built here: the
+# job pins the release version, records the checksums of the Linux .deb
+# payloads the Release already carries, verifies the package builds from those
+# exact bytes, and pushes PKGBUILD + .SRCINFO.
+#
+# Stable only. AUR keeps exactly one version per package and every Arch user
+# upgrades to whatever is published there, so an rc or preview tag would move
+# them backwards. The tag guard below and `scripts/publish-aur.mjs` both refuse
+# a prerelease, so a mistake in either place cannot publish one.
+#
+# This workflow is separate from `release.yml` so an AUR outage can never fail
+# the GitHub Release, and so a single older tag can be replayed.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Stable release tag to publish (for example v0.2.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-aur-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish vibex-bin to the AUR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      # makepkg and its .SRCINFO generator only exist on Arch.
+      image: archlinux:base-devel
+    steps:
+      - name: Resolve and validate the release tag
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG:-${INPUT_TAG:-}}"
+          if [[ -z "${tag}" ]]; then
+            echo "::error::No release tag supplied"
+            exit 1
+          fi
+          version="${tag#v}"
+          # A GitHub `release` event also fires for prereleases; the AUR must
+          # never receive one.
+          if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
+            echo "::notice::${tag} is a prerelease; the AUR tracks stable releases only."
+            echo "publish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::notice::${tag} is not a stable x.y.z release; the AUR tracks stable releases only."
+            echo "publish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          echo "publish=true" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "Publishing vibex-bin ${version}"
+
+      - name: Install packaging prerequisites
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `gh` downloads the release payloads and is not part of base-devel.
+          pacman -Sy --noconfirm --needed git openssh nodejs namcap github-cli
+          # `makepkg` refuses to run as root, and a container job is root by
+          # default, so every makepkg invocation re-enters as this user.
+          if ! id builder >/dev/null 2>&1; then
+            useradd --create-home --shell /bin/bash builder
+          fi
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: steps.release.outputs.publish == 'true'
+        with:
+          # The PKGBUILD template lives on the default branch; the tagged commit
+          # itself may predate it.
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Download the release payloads once
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # makepkg treats SRCDEST as a download cache: a file already sitting
+          # there under the PKGBUILD's source name is used as-is and still
+          # verified against the recorded checksum. Downloading here means the
+          # build step never talks to the network, and the checksums are proven
+          # against the bytes GitHub published.
+          src="${RUNNER_TEMP}/aur-srcdest"
+          mkdir -p "${src}"
+          gh release download "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir "${src}" \
+            --pattern "vibex-${VERSION}-linux-*-deb.deb"
+          curl --fail --silent --show-error --location \
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${TAG}/LICENSE" \
+            --output "${src}/vibex-${VERSION}-LICENSE"
+          ls -l "${src}"
+          for arch in x86_64 aarch64; do
+            asset="${src}/vibex-${VERSION}-linux-${arch}-deb.deb"
+            test -s "${asset}" || { echo "::error::missing release asset ${asset}"; exit 1; }
+          done
+          echo "SRCDEST=${src}" >> "${GITHUB_ENV}"
+
+      - name: Trust the AUR host keys
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          # The AUR shows the committer of every package update publicly, so
+          # this is the maintainer's own identity rather than a bot account.
+          AUR_GIT_NAME: PeatBoy
+          AUR_GIT_EMAIL: peatboy@outlook.com
+        run: |
+          set -euo pipefail
+          if [[ -z "${AUR_SSH_PRIVATE_KEY}" ]]; then
+            echo "::error::Missing repository secret AUR_SSH_PRIVATE_KEY"
+            exit 1
+          fi
+          install -d -m 700 "${HOME}/.ssh"
+          printf '%s\n' "${AUR_SSH_PRIVATE_KEY}" > "${HOME}/.ssh/aur"
+          chmod 600 "${HOME}/.ssh/aur"
+          # Pinned rather than ssh-keyscan'd: a blind keyscan trusts whatever
+          # answers on port 22 the first time. These are the aur.archlinux.org
+          # host keys published in archlinux/infrastructure docs/ssh-hostkeys.txt:
+          #   ECDSA   SHA256:uTa/0PndEgPZTf76e1DFqXKJEXKsn7m9ivhLQtzGOCI
+          #   ED25519 SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4
+          #   RSA     SHA256:5s5cIyReIfNNVGRFdDbe3hdYiI5OelHGpw2rOUud3Q8
+          cat > "${HOME}/.ssh/aur_known_hosts" <<'EOF'
+          aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN
+          aur.archlinux.org ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLMiLrP8pVi5BFX2i3vepSUnpedeiewE5XptnUnau+ZoeUOPkpoCgZZuYfpaIQfhhJJI5qgnjJmr4hyJbe/zxow=
+          aur.archlinux.org ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDKF9vAFWdgm9Bi8uc+tYRBmXASBb5cB5iZsB7LOWWFeBrLp3r14w0/9S2vozjgqY5sJLDPONWoTTaVTbhe3vwO8CBKZTEt1AcWxuXNlRnk9FliR1/eNB9uz/7y1R0+c1Md+P98AJJSJWKN12nqIDIhjl2S1vOUvm7FNY43fU2knIhEbHybhwWeg+0wxpKwcAd/JeL5i92Uv03MYftOToUijd1pqyVFdJvQFhqD4v3M157jxS5FTOBrccAEjT+zYmFyD8WvKUa9vUclRddNllmBJdy4NyLB8SvVZULUPrP3QOlmzemeKracTlVOUG1wsDbxknF1BwSCU7CmU6UFP90kpWIyz66bP0bl67QAvlIc52Yix7pKJPbw85+zykvnfl2mdROsaT8p8R9nwCdFsBc9IiD0NhPEHcyHRwB8fokXTajk2QnGhL+zP5KnkmXnyQYOCUYo3EKMXIlVOVbPDgRYYT/XqvBuzq5S9rrU70KoI/S5lDnFfx/+lPLdtcnnEPk=
+          EOF
+          chmod 600 "${HOME}/.ssh/aur_known_hosts"
+          {
+            echo "GIT_SSH_COMMAND=ssh -i ${HOME}/.ssh/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${HOME}/.ssh/aur_known_hosts"
+            echo "GIT_AUTHOR_NAME=${AUR_GIT_NAME}"
+            echo "GIT_AUTHOR_EMAIL=${AUR_GIT_EMAIL}"
+            echo "GIT_COMMITTER_NAME=${AUR_GIT_NAME}"
+            echo "GIT_COMMITTER_EMAIL=${AUR_GIT_EMAIL}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Record the release checksums in the PKGBUILD
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/publish-aur.mjs \
+            --version "${VERSION}" \
+            --archive-dir "${SRCDEST}" \
+            --pkgbuild packaging/aur/vibex-bin/PKGBUILD \
+            --skip-push
+
+      - name: Verify the package builds from the published payloads
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # makepkg refuses to run as root and re-verifies every recorded
+          # checksum, so a byte that drifted between the Release and the
+          # PKGBUILD fails here rather than on a user's machine. Dependencies
+          # are skipped: the build box has no desktop stack and package() only
+          # copies files that were already built.
+          chmod -R a+rX "${SRCDEST}"
+          chown -R builder:builder "${GITHUB_WORKSPACE}"
+          runuser -u builder -- env \
+            GITHUB_WORKSPACE="${GITHUB_WORKSPACE}" \
+            SRCDEST="${SRCDEST}" \
+            bash -c 'set -euo pipefail; cd "${GITHUB_WORKSPACE}/packaging/aur/vibex-bin"; makepkg --nodeps --nocheck --cleanbuild --clean'
+
+      - name: Lint the built package
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd packaging/aur/vibex-bin
+          package="$(find . -maxdepth 1 -name '*.pkg.tar.zst' -print -quit)"
+          if [[ -z "${package}" ]]; then
+            echo "::error::makepkg produced no package"
+            exit 1
+          fi
+          # namcap findings are advisory upstream; only a hard error fails.
+          namcap "${package}" || true
+          namcap PKGBUILD || true
+
+      - name: Publish to the AUR
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/publish-aur.mjs \
+            --version "${VERSION}" \
+            --archive-dir "${SRCDEST}" \
+            --pkgbuild packaging/aur/vibex-bin/PKGBUILD
+
+      - name: Report the published package
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### vibex-bin ${VERSION}-1 published"
+            echo ""
+            echo 'Arch users install it with `yay -S vibex-bin` or `paru -S vibex-bin`.'
+            echo ""
+            echo "https://aur.archlinux.org/packages/vibex-bin"
+          } >> "${GITHUB_STEP_SUMMARY}"

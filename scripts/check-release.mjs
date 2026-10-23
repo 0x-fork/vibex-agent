@@ -265,6 +265,51 @@ function validatePackaging() {
     latestTagRule.includes("refs/tags/") && latestTagRule.includes("contains(github.ref_name, '-')"),
     "container image workflow must not publish latest for a prerelease tag"
   );
+  // The AUR package republishes the release .deb. AUR carries exactly one
+  // version per package, so a prerelease pushed there downgrades every Arch
+  // user; keep the stable-only gate, the checksum recording, and the pinned
+  // host keys under contract.
+  const aurWorkflow = workflowSource(".github/workflows/publish-aur.yml");
+  for (const required of [
+    "types: [published]",
+    "packaging/aur/vibex-bin/PKGBUILD",
+    "scripts/publish-aur.mjs",
+    "makepkg",
+    "namcap",
+    "AUR_SSH_PRIVATE_KEY",
+    "aur.archlinux.org ssh-ed25519",
+    "RELEASE_PRERELEASE",
+    // `gh` downloads the release payloads; it is not part of base-devel.
+    "github-cli",
+    "gh release download",
+    // makepkg refuses to run as root, and the container job is root.
+    "runuser -u builder",
+    "useradd"
+  ]) {
+    assert(aurWorkflow.includes(required), `AUR workflow is missing ${required}`);
+  }
+  assert(
+    aurWorkflow.includes("is not a stable x.y.z release"),
+    "AUR workflow does not refuse a prerelease tag"
+  );
+  const aurPackage = source("packaging/aur/vibex-bin/PKGBUILD");
+  assert(
+    /^pkgname=vibex-bin$/mu.test(aurPackage),
+    "AUR package name drifted"
+  );
+  assert(
+    aurPackage.includes("license=('AGPL-3.0-or-later')"),
+    "AUR package lost its license declaration"
+  );
+  assert(
+    aurPackage.includes("StartupWMClass=dev.vibex.desktop"),
+    "AUR desktop entry must keep the stable window class"
+  );
+  assert(
+    !/^NoDisplay=true$/mu.test(aurPackage),
+    "AUR desktop entry must stay visible in application menus"
+  );
+
   for (const required of [
     "sign-android-release.sh",
     "VIBEX_ANDROID_KEYSTORE_BASE64",

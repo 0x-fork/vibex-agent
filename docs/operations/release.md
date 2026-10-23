@@ -200,3 +200,38 @@ list, and boots each published image once before the run succeeds.
   still private.
 - A release is not complete until both images answer their health endpoint from
   the published registry tag, not only from a local build.
+
+## AUR
+
+`.github/workflows/publish-aur.yml` publishes the `vibex-bin` AUR package from a
+stable GitHub Release, independently of `release.yml`: an AUR outage must not
+withhold the release, and a single older tag can be replayed with
+`workflow_dispatch`.
+
+The AUR stores packaging sources rather than binaries, so the job reuses the
+Linux `.deb` files the Release already carries:
+
+1. It refuses anything that is not a stable `x.y.z` tag. A GitHub `release`
+   event also fires for prereleases, and AUR carries exactly one version, so an
+   rc would move every Arch user backwards.
+2. `scripts/publish-aur.mjs` writes `pkgver`, records the SHA-256 of both
+   architecture payloads and the license, and regenerates `.SRCINFO`.
+3. `makepkg` rebuilds the package from those exact bytes against the recorded
+   checksums, so a payload that drifted from the Release fails in CI.
+4. `namcap` inspects the package and the PKGBUILD, then the script clones
+   `ssh://aur@aur.archlinux.org/vibex-bin.git`, commits `PKGBUILD` and
+   `.SRCINFO`, and pushes to `master`.
+
+The package installs the GUI plus the `vibex` terminal client and renders its
+own desktop entry: the packaged entry keeps `NoDisplay=true` and an empty
+`Categories` list, which would hide the application from every menu.
+
+Local dry run before a release:
+
+```bash
+node scripts/publish-aur.mjs --version 0.2.0 --dry-run
+```
+
+Configure the repository secret `AUR_SSH_PRIVATE_KEY` with the private key whose
+public half is registered on the AUR account that owns `vibex-bin`. The workflow
+pins the AUR host keys instead of scanning them.

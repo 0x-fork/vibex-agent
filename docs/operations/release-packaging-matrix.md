@@ -15,6 +15,7 @@ embeds the other product's assets.
 | iOS mobile | Unsigned simulator app + unsigned device IPA + XCFramework | `pnpm build:mobile:ios` and `pnpm package:mobile:ios` on macOS | Rust source, Cargo lock, pinned gpui-pre/gpui-pre-mobile revisions, XcodeGen project | `pnpm check:mobile-native`, simulator/device validation; the installer re-signs the IPA, see [Installing the Unsigned iOS Build](./ios-unsigned-install.md) |
 | Relay | Transport container | `pnpm smoke:relay:local` plus deployment scripts | Rust source and Cargo lock | Health/API smoke, TLS/NAT/operator validation |
 | Terminal (TUI) | Ships inside the desktop packages as a second, non-main `vibex` binary | Same package commands as the desktop channel | Same as the desktop channel | The binary must be reachable on `PATH` after install on Linux and macOS, and the console subsystem must be verified on Windows. |
+| AUR `vibex-bin` | `PKGBUILD` + `.SRCINFO` that unpack the published Linux `.deb` | `.github/workflows/publish-aur.yml`; local dry run is `node scripts/publish-aur.mjs --version <x.y.z> --dry-run` | Stable only; the checksums of the release `.deb` payloads | `makepkg` must build the package from the release assets, `namcap` runs on it, and `publish-aur.mjs` refuses a prerelease or a version that is not newer than the AUR's |
 
 ## Linux AppImage Packaging Rules
 
