@@ -214,7 +214,11 @@ impl ProviderConfigService {
         route.sort_members();
         route.validate()?;
         let conn = self.open_connection()?;
-        if ModelRouteRepository::list(&conn)?.len() >= MAX_ROUTES {
+        // Direct routes are materialised from the Provider Profiles an
+        // installation already holds, so they are not part of the budget the
+        // user spends when composing routes. Counting them here let a large
+        // Provider list exhaust the budget before a single group was saved.
+        if ModelRouteRepository::count_user_authored(&conn)? >= MAX_ROUTES {
             return Err(VibexError::validation(
                 "model_route_limit_exceeded",
                 "there are already as many routes as this build supports",
@@ -316,6 +320,11 @@ impl ProviderConfigService {
     /// This is the check a typo meets first. Without it the mistake surfaces as
     /// a 404 from the gateway at request time, long after the route was saved
     /// and attributed to a Provider that never had the model.
+    ///
+    /// A provider-group member names a Provider and no model, which `validate`
+    /// already requires, so there is no model to look up: the group's models are
+    /// the intersection of its Providers' catalogues and are derived later. Only
+    /// the Provider has to exist.
     fn require_members_are_served(
         &self,
         conn: &vibex_db::DbConnection,
@@ -336,6 +345,9 @@ impl ProviderConfigService {
                         member.model_provider_profile_id.as_str(),
                     )
                 })?;
+            if !member.names_model() {
+                continue;
+            }
             if !model_is_served(profile, &member.model_id) {
                 return Err(VibexError::validation(
                     "model_route_member_model_unknown",
@@ -715,6 +727,103 @@ mod tests {
         over.display_name = "Too many".to_string();
         let error = service.create_model_route(over).unwrap_err();
         assert_eq!(error.code, "route_member_limit_exceeded");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The route budget counts what the user composed, not what the backfill
+    /// materialised.
+    ///
+    /// An installation with many direct Providers used to exhaust `MAX_ROUTES`
+    /// before a single group was saved, because every direct Profile had become a
+    /// `Direct` route. Those are derived from the Provider list, so they must not
+    /// spend the budget the user needs for the routes they actually author.
+    #[test]
+    fn materialised_direct_routes_do_not_spend_the_route_budget() {
+        let (path, service) = service();
+        let deepseek = provider(&service, "DeepSeek", &["a"]);
+        let conn = service.open_connection().unwrap();
+        for index in 0..MAX_ROUTES + 8 {
+            let mut direct = gateway_route(deepseek.clone(), &["a"]);
+            direct.display_name = format!("Direct {index}");
+            direct.kind = RouteKind::Direct;
+            ModelRouteRepository::insert(&conn, &direct).unwrap();
+        }
+        drop(conn);
+
+        // The direct rows are already over the limit, but a group must still be
+        // saveable because none of them was composed by the user.
+        let group = ModelRoute {
+            display_name: "Group".to_string(),
+            kind: RouteKind::ProviderGroup,
+            strategy: RouteStrategy::Ordered,
+            status: RouteStatus::Enabled,
+            members: vec![ModelRouteMember::provider(deepseek, 0)],
+            ..Default::default()
+        };
+        assert!(service.create_model_route(group).is_ok());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A provider group names Providers, so there is no model to look up.
+    ///
+    /// `require_members_are_served` used to run the catalogue check on the empty
+    /// model id a group member carries, which refused every group once the route
+    /// budget stopped refusing it first.
+    #[test]
+    fn a_provider_group_is_not_refused_for_its_empty_member_model() {
+        let (path, service) = service();
+        let left = provider(&service, "DeepSeek", &["shared", "left-only"]);
+        let right = provider(&service, "Kimi", &["shared"]);
+        let group = ModelRoute {
+            display_name: "Team".to_string(),
+            kind: RouteKind::ProviderGroup,
+            strategy: RouteStrategy::RoundRobin,
+            status: RouteStatus::Enabled,
+            members: vec![
+                ModelRouteMember::provider(left, 0),
+                ModelRouteMember::provider(right, 1),
+            ],
+            ..Default::default()
+        };
+        let created = service.create_model_route(group).unwrap();
+        assert!(created.is_provider_group());
+        assert_eq!(created.members.len(), 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A group still has to name Providers that exist.
+    #[test]
+    fn a_group_member_naming_a_missing_provider_is_still_refused() {
+        let (path, service) = service();
+        let group = ModelRoute {
+            display_name: "Orphan".to_string(),
+            kind: RouteKind::ProviderGroup,
+            strategy: RouteStrategy::Ordered,
+            status: RouteStatus::Enabled,
+            members: vec![ModelRouteMember::provider(ModelProviderProfileId::new(), 0)],
+            ..Default::default()
+        };
+        let error = service.create_model_route(group).unwrap_err();
+        assert_eq!(error.code, "model_route_member_provider_missing");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The budget still bounds what the user authors: the thirty-third route is
+    /// refused, whichever kind it is.
+    #[test]
+    fn the_route_budget_still_bounds_user_authored_routes() {
+        let (path, service) = service();
+        let deepseek = provider(&service, "DeepSeek", &["a"]);
+        for index in 0..MAX_ROUTES {
+            let mut route = gateway_route(deepseek.clone(), &["a"]);
+            route.display_name = format!("Route {index}");
+            service.create_model_route(route).unwrap();
+        }
+
+        let mut over = gateway_route(deepseek, &["a"]);
+        over.display_name = "One too many".to_string();
+        let error = service.create_model_route(over).unwrap_err();
+        assert_eq!(error.code, "model_route_limit_exceeded");
         let _ = std::fs::remove_file(path);
     }
 

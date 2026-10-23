@@ -79,6 +79,30 @@ impl ModelRouteRepository {
         )
     }
 
+    /// How many live routes the user composed themselves.
+    ///
+    /// This is the number a route budget may count. A `Direct` route is not a
+    /// composition: `backfill_direct_routes` materialises one for every direct
+    /// Provider Profile an installation already has, so counting them would let
+    /// the backfill spend a budget it never asked for and leave a user with many
+    /// Providers no room to save a single route group. Provider groups and plain
+    /// gateway routes are the ones a user creates, and those are what the limit
+    /// exists to bound.
+    pub fn count_user_authored(conn: &Connection) -> VibexResult<usize> {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM model_routes
+                 WHERE deleted_at_ms IS NULL AND kind <> 'direct'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(storage_err(
+                "model_route_count_failed",
+                "failed to count the model routes a user authored",
+            ))?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
     /// Replaces every field of a route, including its member list.
     ///
     /// The caller must pass the revision it read; a mismatch means someone else
@@ -1105,6 +1129,51 @@ mod tests {
             loaded.members.iter().all(|member| !member.names_model()),
             "a group member names a Provider, not a model"
         );
+    }
+
+    /// The budget counts composed routes, not the direct ones the backfill
+    /// materialised from the Provider list.
+    ///
+    /// `backfill_direct_routes` writes one `Direct` row per direct Profile, and an
+    /// installation may hold more Profiles than the route budget allows. Counting
+    /// those rows as user-authored spent the budget on the user's behalf and left
+    /// the route-group editor failing with `model_route_limit_exceeded`.
+    #[test]
+    fn only_user_authored_routes_count_towards_the_route_budget() {
+        let conn = migrated_connection();
+        let provider = seed_provider(&conn, "DeepSeek");
+
+        let mut direct = route(&provider, &["a"]);
+        direct.kind = RouteKind::Direct;
+        direct.display_name = "Direct".to_string();
+        ModelRouteRepository::insert(&conn, &direct).unwrap();
+        assert_eq!(
+            ModelRouteRepository::count_user_authored(&conn).unwrap(),
+            0,
+            "a direct route is materialised, not composed"
+        );
+
+        let mut gateway = route(&provider, &["a"]);
+        gateway.display_name = "Composed".to_string();
+        ModelRouteRepository::insert(&conn, &gateway).unwrap();
+
+        let group = ModelRoute {
+            display_name: "Group".to_string(),
+            kind: RouteKind::ProviderGroup,
+            status: RouteStatus::Enabled,
+            members: vec![ModelRouteMember::provider(provider, 0)],
+            ..Default::default()
+        };
+        ModelRouteRepository::insert(&conn, &group).unwrap();
+        assert_eq!(
+            ModelRouteRepository::count_user_authored(&conn).unwrap(),
+            2,
+            "a plain route and a group are what the budget bounds"
+        );
+
+        // A soft-deleted route frees its place again.
+        ModelRouteRepository::delete(&conn, &gateway.id).unwrap();
+        assert_eq!(ModelRouteRepository::count_user_authored(&conn).unwrap(), 1);
     }
 
     #[test]

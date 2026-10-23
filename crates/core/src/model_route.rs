@@ -41,6 +41,12 @@ pub const MAX_ROUTE_MEMBERS: usize = 16;
 ///
 /// This bounds the route list rather than the graph: a route is a saved
 /// composition, and past this many the picker stops being a picker.
+///
+/// It counts the routes a user composed — plain gateway routes and provider
+/// groups. A `Direct` route is materialised from a Provider Profile by
+/// `backfill_direct_routes`, one per direct Profile already on the installation,
+/// so counting those would let a long Provider list exhaust the budget before a
+/// single route was authored. See `ModelRouteRepository::count_user_authored`.
 pub const MAX_ROUTES: usize = 32;
 
 /// The prefix a plain route's model id carries.

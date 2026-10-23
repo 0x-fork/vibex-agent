@@ -5532,6 +5532,18 @@ GatewaySnapshot::group_for_model(&model)
   its launch row is the Agent's gateway Profile. A request for one of its models
   keeps the loopback address, so switching among group models does not restart
   the Agent.
+- Creating or editing a group runs the same service rules as any route write.
+  The route budget (`MAX_ROUTES`) counts **user-authored** routes only: a
+  `Direct` row materialised by `backfill_direct_routes` is derived from the
+  Provider list, so it must not spend a budget the user never asked it to spend.
+  Counting them made an installation with many direct Providers fail a group
+  save with `model_route_limit_exceeded` even though the user had authored one
+  route.
+- The served-model check applies only to a member that names a model. A group
+  member names a Provider and carries an empty `model_id`, so there is nothing to
+  look up; the group's models are derived later from the Providers' catalogues.
+  Running the check on the empty id refused every group with
+  `model_route_member_model_unknown` once the budget stopped refusing it first.
 
 ### 4. Validation & Error Matrix
 
@@ -5544,6 +5556,9 @@ GatewaySnapshot::group_for_model(&model)
 | Group Providers share no enabled model | Not served; the editor shows the empty intersection |
 | Request names a model the intersection lacks | `404` from the gateway, not a Provider call |
 | Plain route member names no model | `route_member_model_invalid` |
+| Group member names a Provider that does not exist | `model_route_member_provider_missing` |
+| Budget already spent by user-authored routes | `model_route_limit_exceeded` |
+| Budget "spent" only by materialised direct routes | Group saves; direct rows do not count |
 
 ### 5. Good / Base / Bad Cases
 
@@ -5561,7 +5576,13 @@ GatewaySnapshot::group_for_model(&model)
 - `vibex-core` unit: intersection keeps only shared models; capabilities are
   the shared subset; a group member rejects a model; a duplicate Provider is
   rejected; `group/<id>/<model>` parses.
-- `vibex-db` unit: a group round-trips with empty member `model_id`s.
+- `vibex-db` unit: a group round-trips with empty member `model_id`s; the
+  budget count excludes a `Direct` row and includes a plain route and a group;
+  a soft-deleted route frees its place.
+- `vibex-config-switch` unit: a group saves while more than `MAX_ROUTES` direct
+  rows exist; a group is not refused for its empty member model; a group naming
+  a missing Provider is still refused; the thirty-third user-authored route is
+  still refused with `model_route_limit_exceeded`.
 - `vibex-model-gateway` integration: a shared model is routable through the
   group and reaches a serving Provider; a model outside the intersection is
   refused with `404`.
