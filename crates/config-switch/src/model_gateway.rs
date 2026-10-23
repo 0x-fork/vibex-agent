@@ -228,6 +228,29 @@ impl ProviderConfigService {
                 let profile_id = profile.id.clone();
                 drop(conn);
                 if !unchanged {
+                    // An ACP Agent's Profile must carry typed ACP configuration:
+                    // every write validates that, and a gateway Profile had none,
+                    // so `acp_config_missing` refused the update and the per-Agent
+                    // `if let Ok` swallowed it. The catalogue then never reached
+                    // the Profile and the Agent's picker stayed empty. The same
+                    // inheritance the shared-Provider create path uses fills it
+                    // in, and it keeps the internal role keys the gateway is
+                    // identified by — the agent-scoped update strips those, which
+                    // is why this stays on the generic update.
+                    let conn = self.open_connection()?;
+                    let provider_options = crate::inherit_agent_acp_runtime_options(
+                        &conn,
+                        agent_id,
+                        Some(gateway_provider_options(agent_id, profile_id.as_str())),
+                    )?;
+                    let provider_options = crate::with_acp_configured_models(
+                        provider_options,
+                        crate::configured_acp_model_ids(
+                            &models,
+                            models.first().map(|model| model.id.as_str()),
+                        ),
+                    )?;
+                    drop(conn);
                     self.update_profile(vibex_core::ProviderProfileUpdateRequest {
                         provider_profile_id: profile_id.clone(),
                         display_name: Some(gateway_display_name()),
@@ -242,16 +265,32 @@ impl ProviderConfigService {
                         sandbox_defaults: None,
                         network_defaults: None,
                         permission_defaults: None,
-                        provider_options: Some(gateway_provider_options(
-                            agent_id,
-                            profile_id.as_str(),
-                        )),
+                        provider_options: Some(provider_options),
                     })?;
                 }
                 self.set_gateway_default(agent_id, &profile_id)?;
                 Ok((profile_id, !unchanged))
             }
             None => {
+                drop(conn);
+                // The creation write validates ACP configuration too, and an ACP
+                // Agent has none until it is inherited here. Without this the
+                // Profile was never created at all, so every ACP Agent —
+                // `deepseek-harness` among them — silently stayed off the
+                // gateway and could never see a route, group or otherwise.
+                let conn = self.open_connection()?;
+                let provider_options = crate::inherit_agent_acp_runtime_options(
+                    &conn,
+                    agent_id,
+                    Some(gateway_provider_options(agent_id, "")),
+                )?;
+                let provider_options = crate::with_acp_configured_models(
+                    provider_options,
+                    crate::configured_acp_model_ids(
+                        &models,
+                        models.first().map(|model| model.id.as_str()),
+                    ),
+                )?;
                 drop(conn);
                 let created = self.create_profile(ProviderProfileCreateRequest {
                     agent_id: Some(agent_id.clone()),
@@ -267,7 +306,7 @@ impl ProviderConfigService {
                     sandbox_defaults: None,
                     network_defaults: None,
                     permission_defaults: None,
-                    provider_options: Some(gateway_provider_options(agent_id, "")),
+                    provider_options: Some(provider_options),
                     secret_references: vec![ProviderSecretReferenceCreateRequest {
                         secret_kind: ProviderSecretKind::ApiKey,
                         backend: ProviderSecretBackend::Placeholder,
@@ -278,6 +317,24 @@ impl ProviderConfigService {
                     }],
                 })?;
                 let profile_id = created.id.clone();
+                // Rewrite the options now that the Profile id exists, keeping the
+                // ACP configuration the create inherited: this write validates
+                // an ACP Profile, and replacing its options with the bare gateway
+                // keys would be refused.
+                let conn = self.open_connection()?;
+                let provider_options = crate::inherit_agent_acp_runtime_options(
+                    &conn,
+                    agent_id,
+                    Some(gateway_provider_options(agent_id, profile_id.as_str())),
+                )?;
+                let provider_options = crate::with_acp_configured_models(
+                    provider_options,
+                    crate::configured_acp_model_ids(
+                        &created.configured_models,
+                        created.default_model.as_deref(),
+                    ),
+                )?;
+                drop(conn);
                 self.update_profile(vibex_core::ProviderProfileUpdateRequest {
                     provider_profile_id: profile_id.clone(),
                     display_name: None,
@@ -292,7 +349,7 @@ impl ProviderConfigService {
                     sandbox_defaults: None,
                     network_defaults: None,
                     permission_defaults: None,
-                    provider_options: Some(gateway_provider_options(agent_id, profile_id.as_str())),
+                    provider_options: Some(provider_options),
                 })?;
                 self.set_gateway_default(agent_id, &profile_id)?;
                 Ok((profile_id, true))
@@ -974,6 +1031,164 @@ mod tests {
                 .refresh_gateway_profiles("http://127.0.0.1:3426", &["x/y".to_string()])
                 .unwrap()
                 .is_empty()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Publishing a route group is what puts it in an Agent's model picker.
+    ///
+    /// A session reads its selectable models from the Agent's gateway Profile,
+    /// which is a copy of the catalogue taken when the Profile is refreshed. A
+    /// group that is created and bound but never republished therefore exists,
+    /// is bound, and still does not appear in the picker — the failure this test
+    /// pins down.
+    #[test]
+    fn a_bound_group_appears_in_the_agents_profile_only_after_republishing() {
+        let (path, service) = service();
+        enable_gateway(&service);
+        let deepseek = service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: "DeepSeek".to_string(),
+                vendor_hint: None,
+                endpoints: Vec::new(),
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "deepseek-chat".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities: Default::default(),
+                }],
+                default_model_id: Some("deepseek-chat".to_string()),
+                headers: Vec::new(),
+                status: ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap()
+            .id;
+
+        // An Agent already routed through the gateway, with the pre-group
+        // catalogue published.
+        let agent_id = agent("claude");
+        service
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &[])
+            .unwrap();
+
+        let group = service
+            .create_model_route(vibex_core::ModelRoute {
+                display_name: "Team".to_string(),
+                kind: vibex_core::RouteKind::ProviderGroup,
+                status: vibex_core::RouteStatus::Enabled,
+                members: vec![vibex_core::ModelRouteMember::provider(deepseek, 0)],
+                ..Default::default()
+            })
+            .unwrap();
+        service
+            .bind_model_route(&agent_id, &group.id, false)
+            .unwrap();
+
+        // The group is in the catalogue the gateway would serve...
+        let catalog = service.gateway_model_catalog().unwrap();
+        let group_entry = catalog
+            .iter()
+            .find(|entry| entry.display_name == "Team")
+            .expect("the group is published by the gateway");
+        assert_eq!(
+            group_entry.model,
+            format!("group/{}/deepseek-chat", group.id.as_str())
+        );
+
+        // ...but until the catalogue is republished, the Agent's Profile does
+        // not list it, which is exactly what made the picker look empty.
+        let conn = test_connection(&path).unwrap();
+        let profile_id = default_profile_for(&conn, &agent_id).unwrap().unwrap();
+        let before = service.get_profile(&profile_id).unwrap().unwrap();
+        assert!(
+            before
+                .configured_models
+                .iter()
+                .all(|model| !model.id.starts_with("group/")),
+            "the stale Profile predates the group"
+        );
+
+        // Republishing is the step a route write now performs.
+        let catalog = service
+            .gateway_model_catalog()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.display_id())
+            .collect::<Vec<_>>();
+        let refreshed = service
+            .refresh_gateway_profiles("http://127.0.0.1:3425", &catalog)
+            .unwrap();
+        assert!(
+            refreshed.contains(&agent_id),
+            "the refresh must report the Agent it changed, not silently skip it"
+        );
+        let after = service.get_profile(&profile_id).unwrap().unwrap();
+        assert!(
+            after
+                .configured_models
+                .iter()
+                .any(|model| model.id == format!("group/{}/deepseek-chat", group.id.as_str())),
+            "the republished Profile is what a session reads its models from"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// An ACP Agent's gateway Profile accepts a new catalogue.
+    ///
+    /// `update_profile` refuses an ACP Profile whose runtime configuration was
+    /// not supplied, and a gateway Profile's options never carry one — it is
+    /// derived. Refreshing through the generic update therefore failed with
+    /// `acp_config_missing`, the per-Agent `if let Ok` swallowed it, and the
+    /// catalogue never reached the Profile. Only an ACP-kind Agent (anything
+    /// but `claude`/`codex`) exercises that path.
+    #[test]
+    fn an_acp_agents_gateway_profile_accepts_a_new_catalogue() {
+        let (path, service) = service();
+        enable_gateway(&service);
+        let agent_id = agent("deepseek-harness");
+
+        service
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &["route/first".to_string()])
+            .unwrap();
+        let conn = test_connection(&path).unwrap();
+        let profile_id = default_profile_for(&conn, &agent_id)
+            .unwrap()
+            .expect("the ACP Agent is on the gateway");
+        drop(conn);
+        let before = service.get_profile(&profile_id).unwrap().unwrap();
+        assert_eq!(
+            before
+                .configured_models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["route/first"],
+            "the gateway Profile starts with what was published"
+        );
+
+        // A group arrives, so the catalogue changes.
+        let refreshed = service
+            .refresh_gateway_profiles(
+                "http://127.0.0.1:3425",
+                &["route/first".to_string(), "group/g1/m".to_string()],
+            )
+            .unwrap();
+        assert!(
+            refreshed.contains(&agent_id),
+            "an ACP Agent must be updated, not skipped for a missing ACP config"
+        );
+        let after = service.get_profile(&profile_id).unwrap().unwrap();
+        assert_eq!(
+            after
+                .configured_models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["route/first", "group/g1/m"],
+            "the Profile now lists the group's model"
         );
         let _ = std::fs::remove_file(path);
     }

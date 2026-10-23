@@ -1226,6 +1226,31 @@ fn gateway_catalog(
         .collect())
 }
 
+/// Re-publishes the gateway catalogue into every bound Agent's hidden Profile.
+///
+/// The Profile is where a session reads its selectable models, and it is a copy
+/// of the catalogue rather than a live view. A route write therefore reaches a
+/// session only once this runs: without it a group exists in the database, is
+/// bound to its Agents, and still never appears in the model picker, because the
+/// Profile it would be selected through was last written before the group did.
+///
+/// A runtime with no bound listener has nothing to publish, so its hidden
+/// Profiles are removed instead — the same rule the gateway switch follows.
+fn refresh_gateway_catalog(
+    runtime: &vibex_desktop_runtime::DesktopRuntime,
+) -> vibex_core::VibexResult<()> {
+    let service = runtime.model_gateway();
+    let provider = runtime.providers().service();
+    service.invalidate_snapshot();
+    match service.base_url() {
+        Some(base_url) => {
+            provider.refresh_gateway_profiles(&base_url, &gateway_catalog(&provider)?)
+        }
+        None => provider.deactivate_gateway_profiles(),
+    }
+    .map(|_| ())
+}
+
 /// A URL-safe short name for an upstream, used in published model ids.
 fn provider_model_alias(display_name: &str) -> String {
     let mut alias = String::with_capacity(display_name.len());
@@ -2855,12 +2880,16 @@ impl ManagementBackend for NativeBackend {
         Box::pin(async move {
             request.validate()?;
             runtime.ensure_accepting_actions()?;
-            runtime
+            let route = runtime
                 .management()
                 .providers()
                 .service()
-                .create_model_route(request.payload)
-                .map_err(Into::into)
+                .create_model_route(request.payload)?;
+            // A new group is invisible to a session until the gateway Profile it
+            // is selected through lists it, so the catalogue is republished now
+            // rather than on the next launch or gateway toggle.
+            refresh_gateway_catalog(&runtime)?;
+            Ok(route)
         })
     }
 
@@ -2876,12 +2905,16 @@ impl ManagementBackend for NativeBackend {
                 route,
                 expected_revision,
             } = request.payload;
-            runtime
+            let route = runtime
                 .management()
                 .providers()
                 .service()
-                .update_model_route(route, expected_revision)
-                .map_err(Into::into)
+                .update_model_route(route, expected_revision)?;
+            // Editing a group's Providers changes which models it offers, and
+            // the Profile copy has to follow or a session would offer the old
+            // intersection.
+            refresh_gateway_catalog(&runtime)?;
+            Ok(route)
         })
     }
 
@@ -2893,12 +2926,15 @@ impl ManagementBackend for NativeBackend {
         Box::pin(async move {
             request.validate()?;
             runtime.ensure_accepting_actions()?;
-            runtime
+            let deleted = runtime
                 .management()
                 .providers()
                 .service()
-                .delete_model_route(&request.payload.model_route_id)
-                .map_err(Into::into)
+                .delete_model_route(&request.payload.model_route_id)?;
+            // The Profile must stop offering a route that no longer exists;
+            // otherwise the picker lists a model the gateway would refuse.
+            refresh_gateway_catalog(&runtime)?;
+            Ok(deleted)
         })
     }
 
@@ -2915,12 +2951,15 @@ impl ManagementBackend for NativeBackend {
                 model_route_id,
                 make_default,
             } = request.payload;
-            runtime
+            let binding = runtime
                 .management()
                 .providers()
                 .service()
-                .bind_model_route(&agent_id, &model_route_id, make_default)
-                .map_err(Into::into)
+                .bind_model_route(&agent_id, &model_route_id, make_default)?;
+            // Binding is what makes a route this Agent's, and the Profile is
+            // per Agent: this is the write that puts it in that Agent's picker.
+            refresh_gateway_catalog(&runtime)?;
+            Ok(binding)
         })
     }
 
@@ -2936,12 +2975,15 @@ impl ManagementBackend for NativeBackend {
                 agent_id,
                 model_route_id,
             } = request.payload;
-            runtime
+            let removed = runtime
                 .management()
                 .providers()
                 .service()
-                .unbind_model_route(&agent_id, &model_route_id)
-                .map_err(Into::into)
+                .unbind_model_route(&agent_id, &model_route_id)?;
+            // The Agent no longer references it, so its Profile must drop the
+            // entry too. Leaving it would offer a model the Agent may not use.
+            refresh_gateway_catalog(&runtime)?;
+            Ok(removed)
         })
     }
 

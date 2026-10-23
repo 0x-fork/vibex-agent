@@ -5568,6 +5568,24 @@ shared_route_group_rows(&routes, &bindings) -> Vec<SharedRouteGroupRow>
   look up; the group's models are derived later from the Providers' catalogues.
   Running the check on the empty id refused every group with
   `model_route_member_model_unknown` once the budget stopped refusing it first.
+- **A route write must republish the gateway catalogue.** An Agent's selectable
+  models are read from its hidden gateway `ProviderProfile`, which is a copy of
+  the catalogue, not a live view. Creating, editing, deleting, binding or
+  unbinding a route therefore has to call `refresh_gateway_profiles` in the same
+  operation. Without it the group exists, is bound, is served by the gateway, and
+  still never appears in the session's model picker, because the Profile it would
+  be selected through was last written before the group. A runtime whose listener
+  is not bound removes the Profiles instead, matching the gateway switch.
+- **A gateway Profile carries typed ACP configuration.** Every Profile write
+  validates it, so the hidden gateway Profile inherits the Agent's ACP runtime
+  config through `inherit_agent_acp_runtime_options` on both create and refresh
+  and keeps it through `with_acp_configured_models`. Without it an ACP Agent
+  (`deepseek-harness` and the other non-`claude`/`codex` Agents) failed Profile
+  creation with `acp_config_missing` and was silently skipped, so no ACP Agent
+  could ever be routed through the gateway at all. The internal role keys must
+  survive these writes: the agent-scoped update path strips
+  `vibex.internal.profileRole`, which stops the Profile being recognised as the
+  gateway Profile and makes the next refresh create a second one.
 
 ### 4. Validation & Error Matrix
 
@@ -5585,6 +5603,9 @@ shared_route_group_rows(&routes, &bindings) -> Vec<SharedRouteGroupRow>
 | Budget "spent" only by materialised direct routes | Group saves; direct rows do not count |
 | Drop a reference from an Agent's card | Binding removed; the group row survives |
 | Delete from the Providers page | Record removed and every binding released |
+| A route write without republishing the catalogue | Group is bound but absent from every session's picker |
+| An ACP Agent's gateway Profile written without ACP config | `acp_config_missing`; the Agent silently stays off the gateway |
+| The internal gateway role key stripped from the Profile | Next refresh creates a second Profile instead of updating |
 
 ### 5. Good / Base / Bad Cases
 
@@ -5613,7 +5634,9 @@ shared_route_group_rows(&routes, &bindings) -> Vec<SharedRouteGroupRow>
 - `vibex-config-switch` unit: a group saves while more than `MAX_ROUTES` direct
   rows exist; a group is not refused for its empty member model; a group naming
   a missing Provider is still refused; the thirty-third user-authored route is
-  still refused with `model_route_limit_exceeded`.
+  still refused with `model_route_limit_exceeded`; a bound group is absent from
+  the Agent's Profile until the catalogue is republished and present after; an
+  ACP Agent's gateway Profile accepts a new catalogue and reports the change.
 - `vibex-model-gateway` integration: a shared model is routable through the
   group and reaches a serving Provider; a model outside the intersection is
   refused with `404`.
