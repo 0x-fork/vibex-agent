@@ -388,6 +388,11 @@ impl AgentProviderProjectionEngine {
             session_env_keys: ModelProviderHeaderReference::dynamic_variable_env_keys(
                 &model_provider.headers,
             ),
+            // The gateway ignores whatever credential the Agent sends and
+            // authenticates to the upstream itself, so its Profile holds no
+            // Secret. Without this the resolver saw a missing credential and
+            // refused the launch with `agent_projection_secret_missing`.
+            local_placeholder_secret: gateway_placeholder_secret(binding),
         })
     }
 
@@ -399,11 +404,18 @@ impl AgentProviderProjectionEngine {
         validate_workspace_key(workspace_key)?;
         let mut secret_env = Vec::with_capacity(plan.secret_env.len());
         for reference in &plan.secret_env {
-            let value = secrets::resolve_provider_secret_reference(
-                reference.secret_reference.backend,
-                reference.secret_reference.setup_state,
-                &reference.secret_reference.lookup_key,
-            )?
+            // A gateway Profile carries no real credential, so its Secret has no
+            // stored value to resolve. The placeholder is what the Agent sends
+            // and the gateway ignores; asking the secret store for it treated a
+            // by-design absence as a missing credential and refused the launch.
+            let value = match plan.local_placeholder_secret.as_deref() {
+                Some(placeholder) => Some(placeholder.to_string()),
+                None => secrets::resolve_provider_secret_reference(
+                    reference.secret_reference.backend,
+                    reference.secret_reference.setup_state,
+                    &reference.secret_reference.lookup_key,
+                )?,
+            }
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
                 VibexError::validation(
@@ -1427,6 +1439,29 @@ fn selected_endpoint<'a>(
         || provider.primary_api_endpoint(),
         |model| provider.primary_api_endpoint_for_protocol(&model.wire_protocol_id),
     ))
+}
+
+/// The placeholder Secret a gateway Profile materialises instead of a real one.
+///
+/// The hidden gateway Profile is machinery: it points at the loopback listener,
+/// which ignores the inbound credential and authenticates each upstream request
+/// with the Key it selects. Storing a real Secret there would be a credential a
+/// local process never needs. The consequence is that the Profile has nothing for
+/// the resolver to look up, and treating that as a missing credential refused
+/// every session that launched a route — which is every gateway-backed Agent.
+///
+/// The role marker lives on the binding, not on the shared Provider record: the
+/// Provider is the upstream shape, while "this Agent talks to its own gateway"
+/// is a property of the Agent's binding.
+///
+/// Returns `None` for anything that is not a gateway binding, so an ordinary
+/// Provider with an unset Key still fails loudly.
+fn gateway_placeholder_secret(binding: &AgentModelProviderBinding) -> Option<String> {
+    let is_gateway = binding.provider_options.entries.iter().any(|entry| {
+        entry.key.trim() == crate::GATEWAY_PROFILE_ROLE_OPTION_KEY
+            && entry.value.trim() == crate::GATEWAY_PROFILE_ROLE
+    });
+    is_gateway.then(|| crate::GATEWAY_LOCAL_KEY_HINT.to_string())
 }
 
 fn selected_credential<'a>(
@@ -6671,6 +6706,104 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    /// A gateway binding launches with its local placeholder, not a stored Key.
+    ///
+    /// The hidden gateway Profile keeps no credential on purpose: it forwards to
+    /// upstreams with the Key it selects, so a local Secret would be one nothing
+    /// reads. Resolving it as if it were a real Provider rejected every
+    /// gateway-backed session with `agent_projection_secret_missing`, which is
+    /// what launching a route through the gateway did.
+    #[test]
+    fn a_gateway_binding_materializes_its_local_placeholder_secret() {
+        let descriptors = vibex_core::catalog_projection_descriptors().unwrap();
+        let descriptor = descriptors
+            .iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "kimi")
+            .expect("kimi has a projection descriptor");
+        let (provider, runtime, mut binding) = typed_projection_fixture(descriptor);
+        // A gateway binding carries the role marker; an ordinary Provider's does
+        // not, and that difference is the whole check.
+        binding.provider_options = crate::ProviderOptions {
+            schema_version: 1,
+            entries: vec![
+                vibex_core::ProviderBindingMetadata {
+                    key: crate::GATEWAY_PROFILE_ROLE_OPTION_KEY.to_string(),
+                    value: crate::GATEWAY_PROFILE_ROLE.to_string(),
+                },
+                vibex_core::ProviderBindingMetadata {
+                    key: "modelGateway".to_string(),
+                    value: "true".to_string(),
+                },
+            ],
+        };
+        // The stored credential stays missing, exactly as the gateway writes it.
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            descriptor,
+            "gateway-projection",
+        )
+        .unwrap();
+        assert_eq!(
+            plan.local_placeholder_secret.as_deref(),
+            Some(crate::GATEWAY_LOCAL_KEY_HINT),
+            "the plan names the placeholder instead of a stored Secret"
+        );
+        assert!(
+            plan.secret_env.iter().all(|entry| {
+                entry.secret_reference.setup_state == ProviderSecretSetupState::Missing
+            }),
+            "the fixture really has no stored Secret, so the launch would fail without the placeholder"
+        );
+
+        let temp = tempdir().unwrap();
+        let resolved = AgentProviderProjectionEngine::resolve_and_materialize(
+            &plan,
+            temp.path(),
+            "gateway-projection",
+        )
+        .expect("a gateway launch resolves its placeholder instead of a Key");
+        assert!(
+            resolved
+                .secret_env
+                .iter()
+                .any(|entry| entry.value.0 == crate::GATEWAY_LOCAL_KEY_HINT),
+            "the Agent sends the local placeholder, which the gateway ignores"
+        );
+    }
+
+    /// An ordinary Provider with no Key still fails loudly.
+    #[test]
+    fn a_provider_without_a_credential_still_reports_the_missing_secret() {
+        let descriptors = vibex_core::catalog_projection_descriptors().unwrap();
+        let descriptor = descriptors
+            .iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "kimi")
+            .expect("kimi has a projection descriptor");
+        let (provider, runtime, binding) = typed_projection_fixture(descriptor);
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            descriptor,
+            "plain-projection",
+        )
+        .unwrap();
+        assert!(
+            plan.local_placeholder_secret.is_none(),
+            "only a gateway binding gets the placeholder"
+        );
+        let temp = tempdir().unwrap();
+        let error = AgentProviderProjectionEngine::resolve_and_materialize(
+            &plan,
+            temp.path(),
+            "plain-projection",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "agent_projection_secret_missing");
     }
 
     #[test]

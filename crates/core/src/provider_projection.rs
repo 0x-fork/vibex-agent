@@ -1675,6 +1675,14 @@ pub struct AgentProviderProjectionPlan {
     /// fills them from the session that owns the Agent process and only when
     /// that process is session-scoped.
     pub session_env_keys: Vec<String>,
+    /// The local placeholder the Agent sends to the Vibex gateway.
+    ///
+    /// The hidden gateway Profile authenticates to the upstream with the Key it
+    /// selects, and ignores whatever the Agent sends. It therefore stores no
+    /// credential, which reads as "missing" to the resolver and refused the
+    /// launch with `agent_projection_secret_missing`. When set, the resolver
+    /// uses this value for every Secret target instead of looking one up.
+    pub local_placeholder_secret: Option<String>,
 }
 
 impl fmt::Debug for AgentProviderProjectionPlan {
@@ -1707,6 +1715,13 @@ impl fmt::Debug for AgentProviderProjectionPlan {
             .field("fingerprint", &self.fingerprint)
             .field("diagnostics", &self.diagnostics)
             .field("session_env_keys", &self.session_env_keys)
+            // The value is a local placeholder, never a real Secret, but it is
+            // still printed as a flag: a debug dump should not look like a
+            // resolved credential.
+            .field(
+                "local_placeholder_secret",
+                &self.local_placeholder_secret.is_some(),
+            )
             .finish()
     }
 }

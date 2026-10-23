@@ -5586,6 +5586,17 @@ shared_route_group_rows(&routes, &bindings) -> Vec<SharedRouteGroupRow>
   survive these writes: the agent-scoped update path strips
   `vibex.internal.profileRole`, which stops the Profile being recognised as the
   gateway Profile and makes the next refresh create a second one.
+- **A gateway binding resolves its Secret to the local placeholder.** The hidden
+  gateway Profile stores no credential by design: it forwards with the upstream
+  Key it selects and ignores whatever the Agent sends. Resolving that absence as
+  a real missing credential rejected every gateway-backed launch with
+  `agent_projection_secret_missing`, so a session created on a route never
+  started. `AgentProviderProjectionPlan::local_placeholder_secret` carries the
+  placeholder for a binding whose `provider_options` mark the gateway role, and
+  `resolve_and_materialize` uses it instead of the secret store. The marker lives
+  on the **binding**, not on the shared Provider record, because "this Agent
+  talks to its own gateway" is a property of the binding. An ordinary Provider
+  with an unset Key keeps failing loudly.
 
 ### 4. Validation & Error Matrix
 
@@ -5606,6 +5617,8 @@ shared_route_group_rows(&routes, &bindings) -> Vec<SharedRouteGroupRow>
 | A route write without republishing the catalogue | Group is bound but absent from every session's picker |
 | An ACP Agent's gateway Profile written without ACP config | `acp_config_missing`; the Agent silently stays off the gateway |
 | The internal gateway role key stripped from the Profile | Next refresh creates a second Profile instead of updating |
+| A gateway launch without the placeholder | `agent_projection_secret_missing` |
+| An ordinary Provider with no Key | `agent_projection_secret_missing` (unchanged) |
 
 ### 5. Good / Base / Bad Cases
 
@@ -5636,7 +5649,9 @@ shared_route_group_rows(&routes, &bindings) -> Vec<SharedRouteGroupRow>
   a missing Provider is still refused; the thirty-third user-authored route is
   still refused with `model_route_limit_exceeded`; a bound group is absent from
   the Agent's Profile until the catalogue is republished and present after; an
-  ACP Agent's gateway Profile accepts a new catalogue and reports the change.
+  ACP Agent's gateway Profile accepts a new catalogue and reports the change;
+  a gateway binding materialises the local placeholder while an ordinary Provider
+  without a Key still reports `agent_projection_secret_missing`.
 - `vibex-model-gateway` integration: a shared model is routable through the
   group and reaches a serving Provider; a model outside the intersection is
   refused with `404`.
