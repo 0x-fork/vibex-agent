@@ -22,9 +22,9 @@ use gpui::{
     Hsla, Image, ImageFormat, ImageSource, InteractiveElement as _, IntoElement, KeyDownEvent,
     ListAlignment, ListHorizontalSizingBehavior, ListOffset, ListState, MouseButton,
     MouseDownEvent, Orientation, ParentElement as _, PathBuilder, Render, RenderImage, Resource,
-    Role, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
-    canvas, deferred, div, img, list, point, prelude::*, px, relative, uniform_list,
+    Role, ScrollHandle, SharedString, StatefulInteractiveElement as _, StyleRefinement,
+    Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, deferred,
+    div, img, list, point, prelude::*, px, relative, uniform_list,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath, Rope,
@@ -49,6 +49,7 @@ use gpui_component::{
     scroll::{ScrollableElement as _, ScrollbarAxis},
     searchable_list::SearchableListItem,
     select::{Select, SelectEvent, SelectState},
+    tab::{Tab, TabBar},
     tooltip::Tooltip,
     v_flex,
 };
@@ -8367,9 +8368,13 @@ impl CodeWorkbench {
         } else {
             self.preview_revealed_tab_ids.remove(&pane_id);
         }
-        let wheel_scroll = tab_scroll.clone();
-        let mut tab_strip = h_flex();
-        tab_strip.style().restrict_scroll_to_axis = Some(true);
+        // The folder bar scrolls itself (wheel included) and paints the tabs,
+        // so the strip only owns the chrome around it: the hairline under the
+        // bar, the drop-target wash, and the two trailing buttons.
+        let active_index = active
+            .as_deref()
+            .and_then(|active| tabs.iter().position(|tab| tab.id == active));
+        let tab_strip = h_flex();
         let drop_pane_id = pane_id.clone();
         let tab_strip_pane_id = pane_id.clone();
         let drag_pane_id = pane_id.clone();
@@ -8397,6 +8402,13 @@ impl CodeWorkbench {
                 .is_some_and(|target| {
                     target.pane_id == pane_id && target.region == PreviewPaneDropRegion::TabGroup
                 });
+        // The bar paints its own plate; the strip behind it carries the panes'
+        // drop wash, so a drag over the tab group lights the whole strip.
+        let tab_strip_tone = if tab_group_drop_active {
+            cx.theme().primary.opacity(0.10)
+        } else {
+            cx.theme().muted.opacity(0.30)
+        };
         let content_drop_region = cx
             .has_active_drag()
             .then_some(self.preview_pane_drop_target.as_ref())
@@ -8486,37 +8498,14 @@ impl CodeWorkbench {
                     .h(px(36.0))
                     .flex_none()
                     .min_w_0()
-                    .overflow_x_scroll()
-                    .overflow_y_hidden()
-                    .track_scroll(&tab_scroll)
-                    .on_scroll_wheel(cx.listener(
-                        move |_, event: &ScrollWheelEvent, window, cx| {
-                            let max_x = wheel_scroll.max_offset().x;
-                            let delta = event.delta.pixel_delta(window.line_height());
-                            if max_x > px(0.0) && delta.y.abs() > delta.x.abs() {
-                                let offset = wheel_scroll.offset();
-                                // GPUI applies delta.x before custom bubble listeners run.
-                                let next_x =
-                                    (offset.x - delta.x + delta.y).clamp(-max_x, px(0.0));
-                                if next_x != offset.x {
-                                    wheel_scroll.set_offset(point(next_x, offset.y));
-                                    cx.notify();
-                                }
-                                cx.stop_propagation();
-                            }
-                        },
-                    ))
+                    .overflow_hidden()
                     .border_b_1()
                     .border_color(if tab_group_drop_active {
                         cx.theme().primary.opacity(0.60)
                     } else {
                         cx.theme().border
                     })
-                    .bg(if tab_group_drop_active {
-                        cx.theme().primary.opacity(0.10)
-                    } else {
-                        cx.theme().muted.opacity(0.30)
-                    })
+                    .bg(tab_strip_tone)
                     .on_drag_move(cx.listener(
                         move |this, event: &DragMoveEvent<PreviewTabDrag>, _, cx| {
                             if event.bounds.contains(&event.event.position) {
@@ -8534,10 +8523,23 @@ impl CodeWorkbench {
                             }
                         },
                     ))
-                    .children(
-                        tabs.into_iter().map(|tab| {
-                            self.render_preview_tab(&pane_id, tab, active.as_deref(), cx)
-                        }),
+                    .child(
+                        // The bar paints no plate of its own here: the strip's
+                        // wash shows between tabs, and the selected tab takes
+                        // the page color so it joins the content below.
+                        TabBar::new(format!("preview-tab-bar:{pane_id}"))
+                            .folder()
+                            .h_full()
+                            .flex_1()
+                            .min_w_0()
+                            .bg(cx.theme().transparent)
+                            .track_scroll(&tab_scroll)
+                            .when_some(active_index, |bar, index| bar.selected_index(index))
+                            .children(
+                                tabs.into_iter().map(|tab| {
+                                    self.render_preview_tab(&pane_id, tab, active.as_deref(), cx)
+                                }),
+                            ),
                     )
                     .child(
                         Button::new(format!("preview-pane-new:{pane_id}"))
@@ -8887,7 +8889,7 @@ impl CodeWorkbench {
         tab: PreviewTab,
         active: Option<&str>,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> Tab {
         let label = match &tab.target {
             PreviewTarget::Terminal { terminal_id } => self
                 .terminals
@@ -9055,43 +9057,18 @@ impl CodeWorkbench {
         let tab_group = format!("preview-tab:{tab_id}");
         let dot_group = tab_group.clone();
         let close_group = tab_group.clone();
-        h_flex()
-            .id(format!("preview-tab:{}", tab.id))
+        // A folder `Tab` paints its own plate, separators and hover fill, so the
+        // tab only carries what is specific to a preview: the drag payload, the
+        // middle-click close, the focus and keyboard handling, and its menu.
+        Tab::new()
             .group(tab_group)
-            .relative()
-            .h_full()
-            .flex_none()
-            .items_center()
-            .gap_1p5()
-            .px_2()
+            .selected(active_tab)
+            .aria_label(accessible_label)
             .text_xs()
-            .border_r_1()
-            .border_color(cx.theme().border)
             .cursor_default()
             .focusable()
             .tab_stop(true)
-            .role(Role::Button)
-            .aria_label(accessible_label)
             .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
-            .text_color(if active_tab {
-                cx.theme().foreground
-            } else {
-                cx.theme().muted_foreground
-            })
-            .bg(if active_tab {
-                cx.theme().background
-            } else {
-                cx.theme().transparent
-            })
-            .hover(|style| {
-                style
-                    .bg(if active_tab {
-                        cx.theme().background
-                    } else {
-                        cx.theme().muted.opacity(0.45)
-                    })
-                    .text_color(cx.theme().foreground)
-            })
             .focus_visible(|style| {
                 style.bg(cx.theme().background).shadow(vec![
                     gpui::BoxShadow::new(px(0.0), px(0.0), cx.theme().ring).spread_radius(px(2.0)),
@@ -9207,478 +9184,516 @@ impl CodeWorkbench {
                     cx.notify();
                 }
             }))
-            .child(if browser_loading {
-                Spinner::status_indicator()
-                    .with_size(Size::Small)
-                    .into_any_element()
-            } else {
-                target_icon
-            })
-            .when_some(agent_mark, |this, mark| this.child(mark))
-            .when(pinned, |this| {
-                this.child(
-                    Icon::default()
-                        .path("icons/vibex/pin-filled.svg")
-                        .size(px(11.0))
-                        .text_color(cx.theme().muted_foreground),
-                )
-            })
+            // `TabBar` collects whole `Tab` values, so everything the tab
+            // shows lives in one child of its own — which is also where the
+            // right-click menu triggers, so it still opens from anywhere on
+            // the tab.
             .child(
-                div()
+                h_flex()
+                    .id(format!("preview-tab-body:{}", tab.id))
                     .min_w_0()
-                    .whitespace_nowrap()
-                    .when(temporary, |this| {
-                        // A preview tab is marked with an oblique label. The
-                        // configured interface family may ship no italic face,
-                        // so ask for the bundled sans, whose italic is always
-                        // loaded, rather than silently rendering upright.
-                        this.font_family(BUNDLED_SANS_FAMILY).italic()
+                    .items_center()
+                    .gap_1p5()
+                    .child(if browser_loading {
+                        Spinner::status_indicator()
+                            .with_size(Size::Small)
+                            .into_any_element()
+                    } else {
+                        target_icon
                     })
-                    // A commit subject is free-form and can run long, so its
-                    // tab keeps a fixed share of the strip and ellipsizes; the
-                    // tooltip carries the whole message.
-                    .when(
-                        matches!(tab.target, PreviewTarget::GitCommit { .. }),
-                        |this| this.max_w(px(COMMIT_TAB_LABEL_MAX_WIDTH)).truncate(),
-                    )
-                    .when(
-                        matches!(tab.target, PreviewTarget::Browser { .. }),
-                        |this| this.max_w(px(BROWSER_TAB_LABEL_MAX_WIDTH)).truncate(),
-                    )
-                    .when_some(target_status_color, |this, color| this.text_color(color))
-                    .when(target_deleted, |this| this.line_through())
-                    .child(label),
-            )
-            .when_some(
-                (!parent_label.is_empty()).then_some(parent_label.clone()),
-                |this, parent_label| {
-                    this.child(
+                    .when_some(agent_mark, |this, mark| this.child(mark))
+                    .when(pinned, |this| {
+                        this.child(
+                            Icon::default()
+                                .path("icons/vibex/pin-filled.svg")
+                                .size(px(11.0))
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                    })
+                    .child(
                         div()
                             .min_w_0()
-                            .flex_none()
-                            .max_w(px(96.0))
-                            .overflow_hidden()
                             .whitespace_nowrap()
-                            .text_color(cx.theme().muted_foreground.opacity(if active_tab {
-                                0.85
-                            } else {
-                                0.6
-                            }))
-                            .child(parent_label),
+                            .when(temporary, |this| {
+                                // A preview tab is marked with an oblique label. The
+                                // configured interface family may ship no italic face,
+                                // so ask for the bundled sans, whose italic is always
+                                // loaded, rather than silently rendering upright.
+                                this.font_family(BUNDLED_SANS_FAMILY).italic()
+                            })
+                            // A commit subject is free-form and can run long, so its
+                            // tab keeps a fixed share of the strip and ellipsizes; the
+                            // tooltip carries the whole message.
+                            .when(
+                                matches!(tab.target, PreviewTarget::GitCommit { .. }),
+                                |this| this.max_w(px(COMMIT_TAB_LABEL_MAX_WIDTH)).truncate(),
+                            )
+                            .when(
+                                matches!(tab.target, PreviewTarget::Browser { .. }),
+                                |this| this.max_w(px(BROWSER_TAB_LABEL_MAX_WIDTH)).truncate(),
+                            )
+                            .when_some(target_status_color, |this, color| this.text_color(color))
+                            .when(target_deleted, |this| this.line_through())
+                            .child(label),
                     )
-                },
-            )
-            .when(!pinned, |this| {
-                this.child(
-                    // The dirty dot and the close button occupy the same end
-                    // slot: a click on the dot would close the editor out from
-                    // under unsaved work, so it turns into the close button
-                    // only while the pointer stays on the tab.
-                    div()
-                        .id(format!("close-preview-tab:{}", tab.id))
-                        .ml_1()
-                        .size(px(16.0))
-                        .flex_none()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .cursor_default()
-                        .focusable()
-                        .tab_stop(true)
-                        .role(Role::Button)
-                        .aria_label(locale::text("Close tab", "关闭标签", "關閉標籤"))
-                        .group_hover(close_group.clone(), |style| style.bg(cx.theme().muted))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_tab(close_click_id.clone(), false, cx);
-                            cx.stop_propagation();
-                        }))
-                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                            if event.keystroke.key == "enter" || event.keystroke.key == "space" {
-                                this.close_tab(close_key_id.clone(), false, cx);
-                                cx.stop_propagation();
-                            }
-                        }))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                            // Keep a close gesture from arming the tab drag handler.
-                            cx.stop_propagation();
-                        })
-                        .on_mouse_down(MouseButton::Middle, |_, _, cx| {
-                            cx.stop_propagation();
-                        })
-                        .when(dirty, |this| {
-                            this.group_hover(close_group.clone(), |style| style.invisible())
-                                .child(
-                                    div()
-                                        .group_hover(dot_group.clone(), |style| style.invisible())
-                                        .child(
-                                            div()
-                                                .size(px(6.0))
-                                                .flex_none()
-                                                .rounded_full()
-                                                .bg(cx.theme().warning),
-                                        ),
-                                )
-                        })
-                        .child(
+                    .when_some(
+                        (!parent_label.is_empty()).then_some(parent_label.clone()),
+                        |this, parent_label| {
+                            this.child(
+                                div()
+                                    .min_w_0()
+                                    .flex_none()
+                                    .max_w(px(96.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_color(
+                                        cx.theme().muted_foreground.opacity(if active_tab {
+                                            0.85
+                                        } else {
+                                            0.6
+                                        }),
+                                    )
+                                    .child(parent_label),
+                            )
+                        },
+                    )
+                    .when(!pinned, |this| {
+                        this.child(
+                            // The dirty dot and the close button occupy the same end
+                            // slot: a click on the dot would close the editor out from
+                            // under unsaved work, so it turns into the close button
+                            // only while the pointer stays on the tab.
                             div()
-                                .absolute()
-                                .flex()
-                                .size_full()
+                                .id(format!("close-preview-tab:{}", tab.id))
+                                .ml_1()
+                                .size(px(16.0))
+                                .flex_none()
                                 .items_center()
                                 .justify_center()
-                                .opacity(0.0)
-                                .group_hover(close_group.clone(), |style| style.opacity(1.0))
-                                .child(Icon::new(IconName::Close).size(px(12.0))),
-                        ),
-                )
-            })
-            .when(active_tab, |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .top_0()
-                        .h(px(2.0))
-                        .rounded_full()
-                        .bg(cx.theme().primary.opacity(0.80)),
-                )
-            })
-            .context_menu(move |menu, window, cx| {
-                let focus_entity = context_entity.clone();
-                let focus_id = tab_id.clone();
-                let _ = focus_entity
-                    .update(cx, |this, cx| this.focus_tab(focus_id.clone(), window, cx));
-                let pin_entity = context_entity.clone();
-                let pin_id = tab_id.clone();
-                let split_right_entity = context_entity.clone();
-                let split_right_id = tab_id.clone();
-                let split_right_pane = context_pane_id.clone();
-                let split_down_entity = context_entity.clone();
-                let split_down_id = tab_id.clone();
-                let split_down_pane = context_pane_id.clone();
-                let close_entity = context_entity.clone();
-                let close_id = tab_id.clone();
-                let close_other_entity = context_entity.clone();
-                let close_other_id = tab_id.clone();
-                let close_other_pane = context_pane_id.clone();
-                let close_left_entity = context_entity.clone();
-                let close_left_id = tab_id.clone();
-                let close_left_pane = context_pane_id.clone();
-                let close_right_entity = context_entity.clone();
-                let close_right_id = tab_id.clone();
-                let close_right_pane = context_pane_id.clone();
-                let close_all_entity = context_entity.clone();
-                let close_all_pane = context_pane_id.clone();
-                let mut menu = menu
-                    .min_w(px(208.0))
-                    .max_w(px(208.0))
-                    .item(
-                        PopupMenuItem::new(locale::text("Close tab", "关闭标签", "關閉標籤"))
-                            .icon(IconName::Close)
-                            .disabled(pinned)
-                            .on_click(move |_, _, cx| {
-                                let _ = close_entity.update(cx, |this, cx| {
-                                    this.close_tab(close_id.clone(), false, cx)
-                                });
-                            }),
-                    )
-                    .item(
-                        PopupMenuItem::new(locale::text(
-                            "Close other tabs",
-                            "关闭其他标签",
-                            "關閉其他標籤",
-                        ))
-                        .icon(Icon::default().path("icons/vibex/chevrons-right-left.svg"))
-                        .disabled(!can_close_other_tabs)
-                        .on_click(move |_, _, cx| {
-                            let _ = close_other_entity.update(cx, |this, cx| {
-                                this.close_other_tabs(
-                                    close_other_id.clone(),
-                                    close_other_pane.clone(),
-                                    cx,
-                                )
-                            });
-                        }),
-                    )
-                    .item(
-                        PopupMenuItem::new(locale::text(
-                            "Close tabs to the left",
-                            "关闭左侧标签",
-                            "關閉左側標籤",
-                        ))
-                        .icon(IconName::ChevronLeft)
-                        .disabled(!can_close_left_tabs)
-                        .on_click(move |_, _, cx| {
-                            let _ = close_left_entity.update(cx, |this, cx| {
-                                this.close_tabs_to_side(
-                                    close_left_id.clone(),
-                                    close_left_pane.clone(),
-                                    true,
-                                    cx,
-                                )
-                            });
-                        }),
-                    )
-                    .item(
-                        PopupMenuItem::new(locale::text(
-                            "Close tabs to the right",
-                            "关闭右侧标签",
-                            "關閉右側標籤",
-                        ))
-                        .icon(IconName::ChevronRight)
-                        .disabled(!can_close_right_tabs)
-                        .on_click(move |_, _, cx| {
-                            let _ = close_right_entity.update(cx, |this, cx| {
-                                this.close_tabs_to_side(
-                                    close_right_id.clone(),
-                                    close_right_pane.clone(),
-                                    false,
-                                    cx,
-                                )
-                            });
-                        }),
-                    )
-                    .item(
-                        PopupMenuItem::new(locale::text(
-                            "Close all tabs",
-                            "关闭所有标签",
-                            "關閉所有標籤",
-                        ))
-                        .icon(Icon::default().path("icons/vibex/chevrons-down-up.svg"))
-                        .disabled(!can_close_all_tabs)
-                        .on_click(move |_, _, cx| {
-                            let _ = close_all_entity.update(cx, |this, cx| {
-                                this.close_all_tabs(close_all_pane.clone(), cx)
-                            });
-                        }),
-                    )
-                    .separator()
-                    .item(
-                        PopupMenuItem::new(locale::text("Split right", "向右拆分", "向右分割"))
-                            .icon(Icon::default().path("icons/vibex/chevrons-right.svg"))
-                            .on_click(move |_, _, cx| {
-                                let _ = split_right_entity.update(cx, |this, cx| {
-                                    this.split_tab(
-                                        split_right_id.clone(),
-                                        split_right_pane.clone(),
-                                        PreviewSplitPosition::Right,
-                                        cx,
-                                    )
-                                });
-                            }),
-                    )
-                    .item(
-                        PopupMenuItem::new(locale::text("Split down", "向下拆分", "向下分割"))
-                            .icon(Icon::default().path("icons/vibex/chevrons-down-up.svg"))
-                            .on_click(move |_, _, cx| {
-                                let _ = split_down_entity.update(cx, |this, cx| {
-                                    this.split_tab(
-                                        split_down_id.clone(),
-                                        split_down_pane.clone(),
-                                        PreviewSplitPosition::Bottom,
-                                        cx,
-                                    )
-                                });
-                            }),
-                    )
-                    .item(
-                        PopupMenuItem::new(if pinned {
-                            locale::text("Unpin tab", "取消固定标签", "取消固定標籤")
-                        } else {
-                            locale::text("Pin tab", "固定标签", "固定標籤")
-                        })
-                        .icon(Icon::default().path("icons/vibex/pin.svg"))
-                        .on_click(move |_, _, cx| {
-                            let _ = pin_entity
-                                .update(cx, |this, cx| this.toggle_pin(pin_id.clone(), cx));
-                        }),
-                    );
-                if let Some(path) = reveal_path.clone() {
-                    let reveal_entity = context_entity.clone();
-                    menu = menu.separator().item(
-                        PopupMenuItem::new(locale::text("Reveal in Files", "定位文件", "定位檔案"))
-                            .icon(Icon::default().path("icons/vibex/files.svg"))
-                            .on_click(move |_, _, cx| {
-                                let _ = reveal_entity.update(cx, |this, cx| {
-                                    this.reveal_file_in_right_rail(path.clone(), cx)
-                                });
-                            }),
-                    );
-                }
-                if let Some((relative_path, absolute_path)) = copy_paths.clone() {
-                    menu = menu.separator();
-                    if let Some(relative_path) = relative_path {
-                        menu = menu.item(
-                            PopupMenuItem::new(locale::text(
-                                "Copy relative path",
-                                "复制相对路径",
-                                "複製相對路徑",
-                            ))
-                            .icon(IconName::Copy)
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                    relative_path.clone(),
-                                ));
-                            }),
-                        );
-                    }
-                    menu = menu.item(
-                        PopupMenuItem::new(locale::text(
-                            "Copy absolute path",
-                            "复制完整路径",
-                            "複製完整路徑",
-                        ))
-                        .icon(IconName::Copy)
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(absolute_path.clone()));
-                        }),
-                    );
-                }
-                let file_open_path = file_path.clone();
-                if file_open_path.is_some() {
-                    let submenu_entity = context_entity.clone();
-                    let submenu_pane_id = context_pane_id.clone();
-                    let can_open_in_file_system = file_open_path.is_some()
-                        && (workspace_available
-                            || file_open_path
-                                .as_deref()
-                                .is_some_and(is_local_external_path));
-                    let can_open_in_editor = open_in_editor_available && can_open_in_file_system;
-                    menu =
-                        menu.separator().submenu_with_icon(
-                            Some(Icon::new(IconName::ExternalLink)),
-                            locale::text("Open In", "Open In", "Open In"),
-                            window,
-                            cx,
-                            move |mut submenu, _, _| {
-                                submenu = submenu.min_w(px(208.0)).max_w(px(208.0));
-                                if let Some(path) = file_open_path.clone() {
-                                    if open_in_editor {
-                                        let editor_entity = submenu_entity.clone();
-                                        let editor_path = path.clone();
-                                        submenu = submenu.item(
-                                            PopupMenuItem::new(locale::text(
-                                                "Editor",
-                                                "编辑器",
-                                                "編輯器",
-                                            ))
-                                            .icon(Icon::default().path("icons/vibex/pencil.svg"))
-                                            .disabled(!can_open_in_editor)
-                                            .on_click(move |_, window, cx| {
-                                                let _ = editor_entity.update(cx, |this, cx| {
-                                                    this.open_file(
-                                                        editor_path.clone(),
-                                                        false,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                });
-                                            }),
-                                        );
-                                    }
-                                    let default_entity = submenu_entity.clone();
-                                    let default_path = path.clone();
-                                    let integrated_entity = submenu_entity.clone();
-                                    let integrated_path = path.clone();
-                                    let integrated_pane = submenu_pane_id.clone();
-                                    let native_entity = submenu_entity.clone();
-                                    let native_path = path.clone();
-                                    submenu = submenu
-                                        .item(
-                                            PopupMenuItem::new(locale::text(
-                                                "Default App",
-                                                "默认应用",
-                                                "預設應用程式",
-                                            ))
-                                            .icon(IconName::ExternalLink)
-                                            .disabled(!can_open_in_file_system)
-                                            .on_click(move |_, _, cx| {
-                                                let _ = default_entity.update(cx, |this, cx| {
-                                                    this.open_default_app(default_path.clone(), cx)
-                                                });
-                                            }),
+                                .rounded_sm()
+                                .cursor_default()
+                                .focusable()
+                                .tab_stop(true)
+                                .role(Role::Button)
+                                .aria_label(locale::text("Close tab", "关闭标签", "關閉標籤"))
+                                .group_hover(close_group.clone(), |style| {
+                                    style.bg(cx.theme().muted)
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_tab(close_click_id.clone(), false, cx);
+                                    cx.stop_propagation();
+                                }))
+                                .on_key_down(cx.listener(
+                                    move |this, event: &KeyDownEvent, _, cx| {
+                                        if event.keystroke.key == "enter"
+                                            || event.keystroke.key == "space"
+                                        {
+                                            this.close_tab(close_key_id.clone(), false, cx);
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    // Keep a close gesture from arming the tab drag handler.
+                                    cx.stop_propagation();
+                                })
+                                .on_mouse_down(MouseButton::Middle, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .when(dirty, |this| {
+                                    this.group_hover(close_group.clone(), |style| style.invisible())
+                                        .child(
+                                            div()
+                                                .group_hover(dot_group.clone(), |style| {
+                                                    style.invisible()
+                                                })
+                                                .child(
+                                                    div()
+                                                        .size(px(6.0))
+                                                        .flex_none()
+                                                        .rounded_full()
+                                                        .bg(cx.theme().warning),
+                                                ),
                                         )
-                                        .item(
-                                            PopupMenuItem::new(locale::text(
-                                                "Terminal", "终端", "終端",
-                                            ))
-                                            .icon(IconName::SquareTerminal)
-                                            .disabled(
-                                                !terminal_available || !can_open_in_file_system,
-                                            )
-                                            .on_click(move |_, window, cx| {
-                                                let _ = integrated_entity.update(cx, |this, cx| {
-                                                    this.request_new_preview_terminal(
-                                                        window.window_handle(),
-                                                        Some(integrated_pane.clone()),
-                                                        Some((
-                                                            integrated_path.clone(),
-                                                            FileEntryKind::File,
-                                                        )),
-                                                        cx,
-                                                    )
-                                                });
-                                            }),
+                                })
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .flex()
+                                        .size_full()
+                                        .items_center()
+                                        .justify_center()
+                                        .opacity(0.0)
+                                        .group_hover(close_group.clone(), |style| {
+                                            style.opacity(1.0)
+                                        })
+                                        .child(Icon::new(IconName::Close).size(px(12.0))),
+                                ),
+                        )
+                    })
+                    .context_menu(move |menu, window, cx| {
+                        let focus_entity = context_entity.clone();
+                        let focus_id = tab_id.clone();
+                        let _ = focus_entity
+                            .update(cx, |this, cx| this.focus_tab(focus_id.clone(), window, cx));
+                        let pin_entity = context_entity.clone();
+                        let pin_id = tab_id.clone();
+                        let split_right_entity = context_entity.clone();
+                        let split_right_id = tab_id.clone();
+                        let split_right_pane = context_pane_id.clone();
+                        let split_down_entity = context_entity.clone();
+                        let split_down_id = tab_id.clone();
+                        let split_down_pane = context_pane_id.clone();
+                        let close_entity = context_entity.clone();
+                        let close_id = tab_id.clone();
+                        let close_other_entity = context_entity.clone();
+                        let close_other_id = tab_id.clone();
+                        let close_other_pane = context_pane_id.clone();
+                        let close_left_entity = context_entity.clone();
+                        let close_left_id = tab_id.clone();
+                        let close_left_pane = context_pane_id.clone();
+                        let close_right_entity = context_entity.clone();
+                        let close_right_id = tab_id.clone();
+                        let close_right_pane = context_pane_id.clone();
+                        let close_all_entity = context_entity.clone();
+                        let close_all_pane = context_pane_id.clone();
+                        let mut menu = menu
+                            .min_w(px(208.0))
+                            .max_w(px(208.0))
+                            .item(
+                                PopupMenuItem::new(locale::text(
+                                    "Close tab",
+                                    "关闭标签",
+                                    "關閉標籤",
+                                ))
+                                .icon(IconName::Close)
+                                .disabled(pinned)
+                                .on_click(move |_, _, cx| {
+                                    let _ = close_entity.update(cx, |this, cx| {
+                                        this.close_tab(close_id.clone(), false, cx)
+                                    });
+                                }),
+                            )
+                            .item(
+                                PopupMenuItem::new(locale::text(
+                                    "Close other tabs",
+                                    "关闭其他标签",
+                                    "關閉其他標籤",
+                                ))
+                                .icon(Icon::default().path("icons/vibex/chevrons-right-left.svg"))
+                                .disabled(!can_close_other_tabs)
+                                .on_click(move |_, _, cx| {
+                                    let _ = close_other_entity.update(cx, |this, cx| {
+                                        this.close_other_tabs(
+                                            close_other_id.clone(),
+                                            close_other_pane.clone(),
+                                            cx,
                                         )
-                                        .item(
-                                            PopupMenuItem::new(locale::text(
-                                                "Native Terminal",
-                                                "本机终端",
-                                                "本機終端",
-                                            ))
-                                            .icon(IconName::SquareTerminal)
-                                            .disabled(!can_open_in_file_system)
-                                            .on_click(move |_, _, cx| {
-                                                let _ = native_entity.update(cx, |this, cx| {
-                                                    this.open_native_terminal(
-                                                        native_path.clone(),
-                                                        cx,
-                                                    )
-                                                });
-                                            }),
+                                    });
+                                }),
+                            )
+                            .item(
+                                PopupMenuItem::new(locale::text(
+                                    "Close tabs to the left",
+                                    "关闭左侧标签",
+                                    "關閉左側標籤",
+                                ))
+                                .icon(IconName::ChevronLeft)
+                                .disabled(!can_close_left_tabs)
+                                .on_click(move |_, _, cx| {
+                                    let _ = close_left_entity.update(cx, |this, cx| {
+                                        this.close_tabs_to_side(
+                                            close_left_id.clone(),
+                                            close_left_pane.clone(),
+                                            true,
+                                            cx,
                                         )
-                                        .separator()
-                                        .item(open_tool_menu_section_label(locale::text(
-                                            "Tools", "工具", "工具",
-                                        )));
-                                    let tools = available_external_tools();
-                                    for tool in tools {
-                                        let tool_entity = submenu_entity.clone();
-                                        let tool_path = path.clone();
-                                        let tool_id = tool.id.to_string();
-                                        submenu = submenu.item(
-                                            open_tool_menu_item(tool.id, tool.label)
-                                                .disabled(!can_open_in_file_system)
-                                                .on_click(move |_, _, cx| {
-                                                    let _ = tool_entity.update(cx, |this, cx| {
-                                                        this.open_with_tool(
-                                                            tool_path.clone(),
-                                                            tool_id.clone(),
+                                    });
+                                }),
+                            )
+                            .item(
+                                PopupMenuItem::new(locale::text(
+                                    "Close tabs to the right",
+                                    "关闭右侧标签",
+                                    "關閉右側標籤",
+                                ))
+                                .icon(IconName::ChevronRight)
+                                .disabled(!can_close_right_tabs)
+                                .on_click(move |_, _, cx| {
+                                    let _ = close_right_entity.update(cx, |this, cx| {
+                                        this.close_tabs_to_side(
+                                            close_right_id.clone(),
+                                            close_right_pane.clone(),
+                                            false,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                            )
+                            .item(
+                                PopupMenuItem::new(locale::text(
+                                    "Close all tabs",
+                                    "关闭所有标签",
+                                    "關閉所有標籤",
+                                ))
+                                .icon(Icon::default().path("icons/vibex/chevrons-down-up.svg"))
+                                .disabled(!can_close_all_tabs)
+                                .on_click(move |_, _, cx| {
+                                    let _ = close_all_entity.update(cx, |this, cx| {
+                                        this.close_all_tabs(close_all_pane.clone(), cx)
+                                    });
+                                }),
+                            )
+                            .separator()
+                            .item(
+                                PopupMenuItem::new(locale::text(
+                                    "Split right",
+                                    "向右拆分",
+                                    "向右分割",
+                                ))
+                                .icon(Icon::default().path("icons/vibex/chevrons-right.svg"))
+                                .on_click(move |_, _, cx| {
+                                    let _ = split_right_entity.update(cx, |this, cx| {
+                                        this.split_tab(
+                                            split_right_id.clone(),
+                                            split_right_pane.clone(),
+                                            PreviewSplitPosition::Right,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                            )
+                            .item(
+                                PopupMenuItem::new(locale::text(
+                                    "Split down",
+                                    "向下拆分",
+                                    "向下分割",
+                                ))
+                                .icon(Icon::default().path("icons/vibex/chevrons-down-up.svg"))
+                                .on_click(move |_, _, cx| {
+                                    let _ = split_down_entity.update(cx, |this, cx| {
+                                        this.split_tab(
+                                            split_down_id.clone(),
+                                            split_down_pane.clone(),
+                                            PreviewSplitPosition::Bottom,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                            )
+                            .item(
+                                PopupMenuItem::new(if pinned {
+                                    locale::text("Unpin tab", "取消固定标签", "取消固定標籤")
+                                } else {
+                                    locale::text("Pin tab", "固定标签", "固定標籤")
+                                })
+                                .icon(Icon::default().path("icons/vibex/pin.svg"))
+                                .on_click(move |_, _, cx| {
+                                    let _ = pin_entity
+                                        .update(cx, |this, cx| this.toggle_pin(pin_id.clone(), cx));
+                                }),
+                            );
+                        if let Some(path) = reveal_path.clone() {
+                            let reveal_entity = context_entity.clone();
+                            menu = menu.separator().item(
+                                PopupMenuItem::new(locale::text(
+                                    "Reveal in Files",
+                                    "定位文件",
+                                    "定位檔案",
+                                ))
+                                .icon(Icon::default().path("icons/vibex/files.svg"))
+                                .on_click(move |_, _, cx| {
+                                    let _ = reveal_entity.update(cx, |this, cx| {
+                                        this.reveal_file_in_right_rail(path.clone(), cx)
+                                    });
+                                }),
+                            );
+                        }
+                        if let Some((relative_path, absolute_path)) = copy_paths.clone() {
+                            menu = menu.separator();
+                            if let Some(relative_path) = relative_path {
+                                menu = menu.item(
+                                    PopupMenuItem::new(locale::text(
+                                        "Copy relative path",
+                                        "复制相对路径",
+                                        "複製相對路徑",
+                                    ))
+                                    .icon(IconName::Copy)
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                relative_path.clone(),
+                                            ));
+                                        },
+                                    ),
+                                );
+                            }
+                            menu = menu.item(
+                                PopupMenuItem::new(locale::text(
+                                    "Copy absolute path",
+                                    "复制完整路径",
+                                    "複製完整路徑",
+                                ))
+                                .icon(IconName::Copy)
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        absolute_path.clone(),
+                                    ));
+                                }),
+                            );
+                        }
+                        let file_open_path = file_path.clone();
+                        if file_open_path.is_some() {
+                            let submenu_entity = context_entity.clone();
+                            let submenu_pane_id = context_pane_id.clone();
+                            let can_open_in_file_system = file_open_path.is_some()
+                                && (workspace_available
+                                    || file_open_path
+                                        .as_deref()
+                                        .is_some_and(is_local_external_path));
+                            let can_open_in_editor =
+                                open_in_editor_available && can_open_in_file_system;
+                            menu = menu.separator().submenu_with_icon(
+                                Some(Icon::new(IconName::ExternalLink)),
+                                locale::text("Open In", "Open In", "Open In"),
+                                window,
+                                cx,
+                                move |mut submenu, _, _| {
+                                    submenu = submenu.min_w(px(208.0)).max_w(px(208.0));
+                                    if let Some(path) = file_open_path.clone() {
+                                        if open_in_editor {
+                                            let editor_entity = submenu_entity.clone();
+                                            let editor_path = path.clone();
+                                            submenu = submenu.item(
+                                                PopupMenuItem::new(locale::text(
+                                                    "Editor",
+                                                    "编辑器",
+                                                    "編輯器",
+                                                ))
+                                                .icon(
+                                                    Icon::default().path("icons/vibex/pencil.svg"),
+                                                )
+                                                .disabled(!can_open_in_editor)
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = editor_entity.update(cx, |this, cx| {
+                                                        this.open_file(
+                                                            editor_path.clone(),
+                                                            false,
+                                                            window,
                                                             cx,
                                                         )
                                                     });
                                                 }),
-                                        );
+                                            );
+                                        }
+                                        let default_entity = submenu_entity.clone();
+                                        let default_path = path.clone();
+                                        let integrated_entity = submenu_entity.clone();
+                                        let integrated_path = path.clone();
+                                        let integrated_pane = submenu_pane_id.clone();
+                                        let native_entity = submenu_entity.clone();
+                                        let native_path = path.clone();
+                                        submenu = submenu
+                                            .item(
+                                                PopupMenuItem::new(locale::text(
+                                                    "Default App",
+                                                    "默认应用",
+                                                    "預設應用程式",
+                                                ))
+                                                .icon(IconName::ExternalLink)
+                                                .disabled(!can_open_in_file_system)
+                                                .on_click(move |_, _, cx| {
+                                                    let _ =
+                                                        default_entity.update(cx, |this, cx| {
+                                                            this.open_default_app(
+                                                                default_path.clone(),
+                                                                cx,
+                                                            )
+                                                        });
+                                                }),
+                                            )
+                                            .item(
+                                                PopupMenuItem::new(locale::text(
+                                                    "Terminal", "终端", "終端",
+                                                ))
+                                                .icon(IconName::SquareTerminal)
+                                                .disabled(
+                                                    !terminal_available || !can_open_in_file_system,
+                                                )
+                                                .on_click(move |_, window, cx| {
+                                                    let _ =
+                                                        integrated_entity.update(cx, |this, cx| {
+                                                            this.request_new_preview_terminal(
+                                                                window.window_handle(),
+                                                                Some(integrated_pane.clone()),
+                                                                Some((
+                                                                    integrated_path.clone(),
+                                                                    FileEntryKind::File,
+                                                                )),
+                                                                cx,
+                                                            )
+                                                        });
+                                                }),
+                                            )
+                                            .item(
+                                                PopupMenuItem::new(locale::text(
+                                                    "Native Terminal",
+                                                    "本机终端",
+                                                    "本機終端",
+                                                ))
+                                                .icon(IconName::SquareTerminal)
+                                                .disabled(!can_open_in_file_system)
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = native_entity.update(cx, |this, cx| {
+                                                        this.open_native_terminal(
+                                                            native_path.clone(),
+                                                            cx,
+                                                        )
+                                                    });
+                                                }),
+                                            )
+                                            .separator()
+                                            .item(open_tool_menu_section_label(locale::text(
+                                                "Tools", "工具", "工具",
+                                            )));
+                                        let tools = available_external_tools();
+                                        for tool in tools {
+                                            let tool_entity = submenu_entity.clone();
+                                            let tool_path = path.clone();
+                                            let tool_id = tool.id.to_string();
+                                            submenu = submenu.item(
+                                                open_tool_menu_item(tool.id, tool.label)
+                                                    .disabled(!can_open_in_file_system)
+                                                    .on_click(move |_, _, cx| {
+                                                        let _ =
+                                                            tool_entity.update(cx, |this, cx| {
+                                                                this.open_with_tool(
+                                                                    tool_path.clone(),
+                                                                    tool_id.clone(),
+                                                                    cx,
+                                                                )
+                                                            });
+                                                    }),
+                                            );
+                                        }
+                                        if tools.is_empty() {
+                                            submenu = submenu.item(
+                                                PopupMenuItem::new(locale::text(
+                                                    "No installed IDE or project tool detected",
+                                                    "未探测到已安装的 IDE 或项目工具",
+                                                    "未探測到已安裝的 IDE 或專案工具",
+                                                ))
+                                                .disabled(true),
+                                            );
+                                        }
                                     }
-                                    if tools.is_empty() {
-                                        submenu = submenu.item(
-                                            PopupMenuItem::new(locale::text(
-                                                "No installed IDE or project tool detected",
-                                                "未探测到已安装的 IDE 或项目工具",
-                                                "未探測到已安裝的 IDE 或專案工具",
-                                            ))
-                                            .disabled(true),
-                                        );
-                                    }
-                                }
-                                submenu
-                            },
-                        );
-                }
-                menu
-            })
-            .into_any_element()
+                                    submenu
+                                },
+                            );
+                        }
+                        menu
+                    }),
+            )
     }
 
     fn render_tab_content(
@@ -20001,6 +20016,8 @@ mod file_panel_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the wheel tests below need the event type; the library's own strips
+    // hand the wheel to their `TabBar`.
 
     #[test]
     fn content_routes_and_language_names_are_stable() {
@@ -21431,7 +21448,7 @@ mod tests {
             .origin
             .y;
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollWheelEvent {
             position: point(px(20.0), px(20.0)),
             delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
             modifiers: Default::default(),
@@ -21454,7 +21471,7 @@ mod tests {
         assert!(observed_scroll.offset().y < px(0.0));
         assert_eq!(observed_scroll.offset().x, px(0.0));
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollWheelEvent {
             position: point(px(20.0), px(20.0)),
             delta: gpui::ScrollDelta::Pixels(point(px(-120.0), px(0.0))),
             modifiers: Default::default(),

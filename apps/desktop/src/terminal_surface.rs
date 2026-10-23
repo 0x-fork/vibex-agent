@@ -1647,29 +1647,45 @@ impl TerminalSurface {
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let active = self.active_tab;
-        TabBar::new("terminal-tab-bar")
-            .large()
-            .underline()
-            .when_some(active, |bar, index| bar.selected_index(index))
-            .children(self.tabs.iter().map(|tab| {
-                let status = terminal_status_label(tab.session.status);
-                let title = tab.session.title.clone();
-                // `Tab` renders `icon` *instead of* `label` when both are set, so
-                // the session title rides the children slot and `aria_label`
-                // carries the accessible name.
-                Tab::new()
-                    .aria_label(title.clone())
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(Icon::new(IconName::SquareTerminal).small())
-                            .child(title),
-                    )
-                    .suffix(div().text_xs().child(status))
-            }))
-            .on_click(
-                cx.listener(|this, index: &usize, window, cx| this.select_tab(*index, window, cx)),
+        // The folder bar draws the plates and the selected tab's shape; the wash
+        // behind it is what the shape rises out of, since the framework maps a
+        // bar and an active tab to the same color.
+        h_flex()
+            .id("terminal-tab-strip")
+            .h(px(36.0))
+            .flex_none()
+            .min_w_0()
+            .bg(cx.theme().muted.opacity(0.24))
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                TabBar::new("terminal-tab-bar")
+                    .folder()
+                    .h_full()
+                    .flex_1()
+                    .min_w_0()
+                    .bg(cx.theme().transparent)
+                    .when_some(active, |bar, index| bar.selected_index(index))
+                    .children(self.tabs.iter().map(|tab| {
+                        let status = terminal_status_label(tab.session.status);
+                        let title = tab.session.title.clone();
+                        // `Tab` renders `icon` *instead of* `label` when both are
+                        // set, so the session title rides the children slot and
+                        // `aria_label` carries the accessible name.
+                        Tab::new()
+                            .aria_label(title.clone())
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(Icon::new(IconName::SquareTerminal).small())
+                                    .child(title),
+                            )
+                            .suffix(div().pl_1().text_xs().child(status))
+                    }))
+                    .on_click(cx.listener(|this, index: &usize, window, cx| {
+                        this.select_tab(*index, window, cx)
+                    })),
             )
             .into_any_element()
     }

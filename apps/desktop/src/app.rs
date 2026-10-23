@@ -45147,7 +45147,6 @@ impl VibexWorkbench {
         } else {
             self.session_group_revealed_tab_ids.remove(&pane_id);
         }
-        let wheel_scroll = tab_scroll.clone();
         // The whole strip lights up while a tab would merge into it, exactly
         // like the preview strip: the tabs themselves are the drop zone.
         let tab_group_drop_active = cx.has_active_drag()
@@ -45161,32 +45160,14 @@ impl VibexWorkbench {
         // A pane always offers a split: a pane with more than one tab moves the
         // tab into the new pane, and a pane with one tab opens an empty pane
         // beside it. That is what lets a workspace grow past two panes.
-        let mut tab_strip = h_flex();
-        tab_strip.style().restrict_scroll_to_axis = Some(true);
         let strip_pane_id = pane_id.clone();
-        let mut tab_strip = tab_strip
+        let tab_strip = h_flex()
             .id(format!("session-group-tabs-{pane_id}"))
             .flex_none()
             .h(px(36.0))
             .min_w_0()
             .items_center()
-            .overflow_x_scroll()
-            .overflow_y_hidden()
-            .track_scroll(&tab_scroll)
-            .on_scroll_wheel(cx.listener(move |_, event: &ScrollWheelEvent, window, cx| {
-                let max_x = wheel_scroll.max_offset().x;
-                let delta = event.delta.pixel_delta(window.line_height());
-                if max_x > px(0.0) && delta.y.abs() > delta.x.abs() {
-                    let offset = wheel_scroll.offset();
-                    // GPUI applies delta.x before custom bubble listeners run.
-                    let next_x = (offset.x - delta.x + delta.y).clamp(-max_x, px(0.0));
-                    if next_x != offset.x {
-                        wheel_scroll.set_offset(point(next_x, offset.y));
-                        cx.notify();
-                    }
-                    cx.stop_propagation();
-                }
-            }))
+            .overflow_hidden()
             .border_b_1()
             .border_color(if tab_group_drop_active {
                 cx.theme().primary.opacity(0.60)
@@ -45216,6 +45197,12 @@ impl VibexWorkbench {
                     }
                 },
             ));
+        // Tabs are collected first: the bar takes whole `Tab` values, and the
+        // per-tab state below decides what each one shows.
+        let active_index = active_session_id
+            .as_ref()
+            .and_then(|active| tabs.iter().position(|tab| &tab.session_id == active));
+        let mut tab_items: Vec<Tab> = Vec::with_capacity(tabs.len());
         for tab in tabs {
             let SessionGroupTabState {
                 session_id,
@@ -45287,52 +45274,19 @@ impl VibexWorkbench {
             let drop_group_id = group_id.to_string();
             let drop_pane_id = pane_id.clone();
             let drag_entity = cx.weak_entity();
-            tab_strip = tab_strip.child(
+            // A folder `Tab` draws the plate and the separator; the tab keeps
+            // its agent mark, its title and its status column, plus the drag
+            // and drop that reorder the strip.
+            let tab_element = Tab::new().selected(selected).min_w_0().text_xs().child(
                 h_flex()
                     .id(format!("session-group-tab-{session_id}"))
-                    .relative()
-                    .h_full()
-                    .flex_none()
-                    .max_w(px(200.0))
                     .min_w_0()
                     .items_center()
                     .gap_1()
-                    .px_2()
-                    .text_xs()
-                    .border_r_1()
-                    .border_color(cx.theme().border)
                     .cursor_pointer()
-                    .when(selected, |this| {
-                        this.bg(cx.theme().background)
-                            .text_color(cx.theme().foreground)
-                    })
-                    .when(!selected, |this| {
-                        this.text_color(cx.theme().muted_foreground)
-                    })
-                    .hover(|style| {
-                        style
-                            .bg(if selected {
-                                cx.theme().background
-                            } else {
-                                cx.theme().muted.opacity(0.45)
-                            })
-                            .text_color(cx.theme().foreground)
-                    })
                     .child(sidebar_agent_logo(&agent_id, selected, cx))
                     .child(div().min_w_0().truncate().child(title_element))
                     .child(status_mark)
-                    .when(selected, |this| {
-                        this.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .right_0()
-                                .top_0()
-                                .h(px(2.0))
-                                .rounded_full()
-                                .bg(cx.theme().primary.opacity(0.80)),
-                        )
-                    })
                     .on_click(move |_, _, cx| {
                         let _ = click_entity.update(cx, |this, cx| {
                             this.focus_session_group_tab(
@@ -45495,7 +45449,21 @@ impl VibexWorkbench {
                         }
                     }),
             );
+
+            tab_items.push(tab_element);
         }
+        let tab_strip = tab_strip.child(
+            TabBar::new(format!("session-group-tab-bar-{pane_id}"))
+                .folder()
+                .h_full()
+                .flex_1()
+                .min_w_0()
+                .max_width(px(200.0))
+                .bg(cx.theme().transparent)
+                .track_scroll(&tab_scroll)
+                .when_some(active_index, |bar, index| bar.selected_index(index))
+                .children(tab_items),
+        );
 
         let content = match active_session_id.as_deref() {
             Some(session_id)
@@ -54817,7 +54785,7 @@ impl VibexWorkbench {
         terminal_ids: Vec<TerminalId>,
         selected_id: Option<&TerminalId>,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> Tab {
         let terminal_id = terminal.id.clone();
         let terminal_id_string = terminal_id.as_str().to_string();
         let title = terminal_tab_title(&terminal, &self.ui_state.terminal_tab_titles);
@@ -54847,48 +54815,19 @@ impl VibexWorkbench {
         let context_all_ids = terminal_ids.clone();
         let context_rename_id = terminal_id.clone();
 
-        h_flex()
-            .id(format!("composer-terminal-tab:{terminal_id_string}"))
-            .h_full()
+        // A folder `Tab` supplies the plate, the separator and the hover fill;
+        // the tab keeps only what is specific to a Composer terminal: its drag
+        // and drop, the middle-click close, focus, and its context menu.
+        Tab::new()
+            .selected(active)
             .min_w(px(120.0))
-            .max_w(px(220.0))
-            .flex_none()
-            .relative()
-            .items_center()
-            .gap_1p5()
-            .px_2()
-            .border_r_1()
-            .border_color(cx.theme().border.opacity(0.72))
-            .cursor_pointer()
-            .focusable()
-            .tab_stop(true)
-            .role(Role::Button)
             .aria_label(title.clone())
             .aria_selected(active)
             .group(hover_group.clone())
             .text_xs()
-            .text_color(if active {
-                cx.theme().foreground
-            } else {
-                cx.theme().muted_foreground
-            })
-            .bg(if active {
-                cx.theme().background
-            } else {
-                cx.theme().transparent
-            })
-            .when(!active, |this| {
-                // Animated hover wash: the tab brightens toward the active
-                // plate instead of snapping between two opaque fills.
-                let hover_key = motion::hover_key("composer-terminal-tab", &terminal_id_string);
-                this.on_hover(hover_listener(cx.entity_id(), hover_key.clone()))
-                    .bg(hover_blend(
-                        &hover_key,
-                        cx.theme().transparent,
-                        cx.theme().background.opacity(0.62),
-                    ))
-            })
-            .hover(|style| style.text_color(cx.theme().foreground))
+            .cursor_pointer()
+            .focusable()
+            .tab_stop(true)
             .focus_visible(|style| {
                 style.shadow(vec![
                     gpui::BoxShadow::new(px(0.0), px(0.0), cx.theme().ring).spread_radius(px(1.0)),
@@ -54944,50 +54883,120 @@ impl VibexWorkbench {
                 }),
             )
             .child(
-                Icon::new(IconName::SquareTerminal)
-                    .size(px(14.0))
-                    .flex_none(),
-            )
-            .child(div().min_w_0().flex_1().truncate().child(title.clone()))
-            .child(
-                div()
-                    .size(px(22.0))
-                    .flex_none()
-                    .opacity(if active { 0.72 } else { 0.0 })
-                    .group_hover(&hover_group, |style| style.opacity(1.0))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+                // Everything the tab shows — and the right-click target — is
+                // one child: `Tab` collects children as a list, and a menu
+                // needs an element of its own to trigger from.
+                h_flex()
+                    .id(format!("composer-terminal-tab-body:{terminal_id_string}"))
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1p5()
                     .child(
-                        Button::new(format!("close-composer-terminal:{terminal_id_string}"))
-                            .xsmall()
-                            .ghost()
-                            .compact()
+                        Icon::new(IconName::SquareTerminal)
+                            .size(px(14.0))
+                            .flex_none(),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(title.clone()))
+                    .child(
+                        div()
                             .size(px(22.0))
-                            .icon(IconName::Close)
-                            .tooltip(format!(
-                                "{}{}",
-                                locale::text("Close ", "关闭", "關閉"),
-                                title
+                            .flex_none()
+                            .opacity(if active { 0.72 } else { 0.0 })
+                            .group_hover(&hover_group, |style| style.opacity(1.0))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new(format!(
+                                    "close-composer-terminal:{terminal_id_string}"
+                                ))
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .size(px(22.0))
+                                .icon(IconName::Close)
+                                .tooltip(format!(
+                                    "{}{}",
+                                    locale::text("Close ", "关闭", "關閉"),
+                                    title
+                                ))
+                                .disabled(mutation_pending)
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.kill_composer_terminal(close_id.clone(), cx);
+                                        cx.stop_propagation();
+                                    },
+                                )),
+                            ),
+                    )
+                    .context_menu(move |menu, _, _| {
+                        let close_entity = context_entity.clone();
+                        let close_id = context_close_id.clone();
+                        let other_entity = context_entity.clone();
+                        let other_ids = context_other_ids.clone();
+                        let all_entity = context_entity.clone();
+                        let all_ids = context_all_ids.clone();
+                        let rename_entity = context_entity.clone();
+                        let rename_id = context_rename_id.clone();
+                        menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Close terminal",
+                                "关闭终端",
+                                "關閉終端機",
                             ))
+                            .icon(IconName::Close)
                             .disabled(mutation_pending)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.kill_composer_terminal(close_id.clone(), cx);
-                                cx.stop_propagation();
-                            })),
-                    ),
+                            .on_click(move |_, _, cx| {
+                                let _ = close_entity.update(cx, |this, cx| {
+                                    this.kill_composer_terminal(close_id.clone(), cx)
+                                });
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::new(locale::text(
+                                "Close other terminals",
+                                "关闭其他终端",
+                                "關閉其他終端機",
+                            ))
+                            .disabled(mutation_pending || other_ids.is_empty())
+                            .on_click(move |_, _, cx| {
+                                let ids = other_ids.clone();
+                                let _ = other_entity
+                                    .update(cx, |this, cx| this.kill_composer_terminals(ids, cx));
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::new(locale::text(
+                                "Close all terminals",
+                                "关闭所有终端",
+                                "關閉所有終端機",
+                            ))
+                            .disabled(mutation_pending || all_ids.is_empty())
+                            .on_click(move |_, _, cx| {
+                                let ids = all_ids.clone();
+                                let _ = all_entity
+                                    .update(cx, |this, cx| this.kill_composer_terminals(ids, cx));
+                            }),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new(locale::text(
+                                "Rename terminal",
+                                "重命名终端",
+                                "重新命名終端機",
+                            ))
+                            .on_click(move |_, window, cx| {
+                                let _ = rename_entity.update(cx, |this, cx| {
+                                    this.prompt_rename_composer_terminal(
+                                        rename_id.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                });
+                            }),
+                        )
+                    }),
             )
-            .when(active, |tab| {
-                tab.child(
-                    div()
-                        .absolute()
-                        .bottom_0()
-                        .left(px(8.0))
-                        .right(px(8.0))
-                        .h(px(2.0))
-                        .rounded_full()
-                        .bg(cx.theme().primary),
-                )
-            })
             .when_some(
                 (cx.has_active_drag())
                     .then_some(drop_target)
@@ -55007,66 +55016,6 @@ impl VibexWorkbench {
                     )
                 },
             )
-            .context_menu(move |menu, _, _| {
-                let close_entity = context_entity.clone();
-                let close_id = context_close_id.clone();
-                let other_entity = context_entity.clone();
-                let other_ids = context_other_ids.clone();
-                let all_entity = context_entity.clone();
-                let all_ids = context_all_ids.clone();
-                let rename_entity = context_entity.clone();
-                let rename_id = context_rename_id.clone();
-                menu.item(
-                    PopupMenuItem::new(locale::text("Close terminal", "关闭终端", "關閉終端機"))
-                        .icon(IconName::Close)
-                        .disabled(mutation_pending)
-                        .on_click(move |_, _, cx| {
-                            let _ = close_entity.update(cx, |this, cx| {
-                                this.kill_composer_terminal(close_id.clone(), cx)
-                            });
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new(locale::text(
-                        "Close other terminals",
-                        "关闭其他终端",
-                        "關閉其他終端機",
-                    ))
-                    .disabled(mutation_pending || other_ids.is_empty())
-                    .on_click(move |_, _, cx| {
-                        let ids = other_ids.clone();
-                        let _ = other_entity
-                            .update(cx, |this, cx| this.kill_composer_terminals(ids, cx));
-                    }),
-                )
-                .item(
-                    PopupMenuItem::new(locale::text(
-                        "Close all terminals",
-                        "关闭所有终端",
-                        "關閉所有終端機",
-                    ))
-                    .disabled(mutation_pending || all_ids.is_empty())
-                    .on_click(move |_, _, cx| {
-                        let ids = all_ids.clone();
-                        let _ =
-                            all_entity.update(cx, |this, cx| this.kill_composer_terminals(ids, cx));
-                    }),
-                )
-                .separator()
-                .item(
-                    PopupMenuItem::new(locale::text(
-                        "Rename terminal",
-                        "重命名终端",
-                        "重新命名終端機",
-                    ))
-                    .on_click(move |_, window, cx| {
-                        let _ = rename_entity.update(cx, |this, cx| {
-                            this.prompt_rename_composer_terminal(rename_id.clone(), window, cx)
-                        });
-                    }),
-                )
-            })
-            .into_any_element()
     }
 
     /// The Composer terminal as the Composer itself: the input is replaced by
@@ -55323,18 +55272,31 @@ impl VibexWorkbench {
             .bg(card_color)
             .child(
                 h_flex()
-                    .h(px(38.0))
+                    // The folder tabs are 32px tall over a 4px top padding, so
+                    // the header is exactly the strip they were drawn for.
+                    .h(px(36.0))
                     .flex_none()
                     .min_w_0()
                     .bg(cx.theme().muted.opacity(0.24))
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
-                        h_flex()
+                        // The folder bar scrolls itself, wheel included, and
+                        // keeps a clicked tab in view; the card only supplies
+                        // the strip's height and the button beside it.
+                        TabBar::new("composer-terminal-tabs")
+                            .folder()
                             .h_full()
                             .min_w_0()
                             .flex_1()
-                            .overflow_x_scrollbar()
+                            .max_width(px(220.0))
+                            .bg(cx.theme().transparent)
+                            .when_some(
+                                terminals.iter().position(|terminal| {
+                                    selected_id.as_ref() == Some(&terminal.id)
+                                }),
+                                |bar, index| bar.selected_index(index),
+                            )
                             .children(tabs),
                     )
                     .child(
@@ -91776,7 +91738,9 @@ mod tests {
 
         assert!(tab.contains("close-composer-terminal:"));
         assert!(tab.contains(".aria_selected(active)"));
-        assert!(tab.contains(".bottom_0()"));
+        // The selected tab is named to the bar, which paints the folder shape;
+        // the tab itself no longer draws an underline of its own.
+        assert!(tab.contains(".selected(active)"));
         assert!(!terminal.contains("Button::new(\"kill-composer-terminal\")"));
     }
 
@@ -107943,9 +107907,12 @@ mod tests {
             .map(|(body, _)| body)
             .expect("group pane renderer should remain inspectable");
 
-        assert!(strip.contains(".overflow_x_scroll()"));
+        // The folder bar owns the horizontal scroller and the wheel mapping, so
+        // the strip only hands it the tracked handle.
+        assert!(strip.contains("TabBar::new(format!(\"session-group-tab-bar-{pane_id}\"))"));
+        assert!(strip.contains(".folder()"));
         assert!(strip.contains(".track_scroll(&tab_scroll)"));
-        assert!(strip.contains("restrict_scroll_to_axis"));
+        assert!(strip.contains(".selected_index(index)"));
         // The active tab has to be reachable without the user scrolling for it.
         assert!(strip.contains("tab_scroll.scroll_to_item(index)"));
         // A tab dropped on a sibling tab names its landing slot.
