@@ -5492,8 +5492,10 @@ one Agent is local to that Agent.
 
 ### 1. Scope / Trigger
 
-- Trigger: the Config Center's per-Agent model-provider card adds, edits, or
-  deletes a route group.
+- Trigger: the Config Center's Providers page creates, edits, or deletes a route
+  group in its route-group tab.
+- Trigger: an Agent's model-provider card references or drops a reference to a
+  route group.
 - Trigger: the gateway resolves a `group/<route>/<model>` model id.
 
 ### 2. Signatures
@@ -5505,10 +5507,32 @@ ModelRoute::group_model_id(&model)   -> "group/<id>/<model>" (provider groups)
 provider_group_models(&route, &providers) -> Vec<ProviderGroupModel>
 provider_group_model_ref(&str)       -> Option<{group_id, model_id}>
 GatewaySnapshot::group_for_model(&model)
+shared_route_group_rows(&routes, &bindings) -> Vec<SharedRouteGroupRow>
 ```
 
 ### 3. Contracts
 
+- **A route group is a global record, not an Agent's property.** `ModelRoute`
+  carries no `agent_id`; an Agent references a group through
+  `AgentModelRouteBinding`, the same way it references a shared Provider. One
+  group can serve several Agents, and editing its composition reaches all of
+  them.
+- Creating a group is one write that never requires an Agent: the Providers
+  page's route-group tab creates a record nobody references yet, and an Agent's
+  chooser creates the same global record and then binds that Agent to it.
+- **Deleting and un-binding are different operations.** The Agent card's remove
+  control calls `unbind_agent_model_route` and leaves the record alone; only the
+  Providers page's group detail pane calls `delete_model_route`, because that is
+  the one surface that lists every Agent the deletion affects. Un-binding must
+  never be implemented as a delete.
+- The Providers page lists both records in one left column with two tabs:
+  Providers and route groups. Both tabs keep the gateway row above them, since a
+  group is served by that gateway. The tab, not the selected row, decides which
+  detail pane the page renders.
+- The Agent's `+` chooser owns both halves of the same question. It lists
+  Providers that can be bound, then route groups that can be referenced (minus
+  the ones this Agent already references), then a "new route group" entry. A
+  group created from the chooser is global and bound to that Agent on save.
 - A `ProviderGroup` member names a **Provider**, not a model: its `model_id` is
   empty and `validate` rejects a model on a group member. A group therefore
   cannot say which models it offers; they are derived.
@@ -5559,6 +5583,8 @@ GatewaySnapshot::group_for_model(&model)
 | Group member names a Provider that does not exist | `model_route_member_provider_missing` |
 | Budget already spent by user-authored routes | `model_route_limit_exceeded` |
 | Budget "spent" only by materialised direct routes | Group saves; direct rows do not count |
+| Drop a reference from an Agent's card | Binding removed; the group row survives |
+| Delete from the Providers page | Record removed and every binding released |
 
 ### 5. Good / Base / Bad Cases
 
@@ -5568,8 +5594,13 @@ GatewaySnapshot::group_for_model(&model)
   through the gateway, which may translate the protocol on the way out.
 - Base: one Provider lists `deepseek-chat`, `left-only`; the other lists
   `deepseek-chat`; the group offers only `deepseek-chat`.
+- Base: two Agents reference one group; the Providers page lists both as its
+  users, and the group stays in the tab after one of them drops its reference.
 - Bad: offering the union and letting `RoundRobin` send `left-only` to the
   second Provider, which answers `404`.
+- Bad: drawing every global group on each Agent's card and offering delete
+  there, which made a shared record look like one Agent's property and let an
+  Agent's page destroy another Agent's model source.
 
 ### 6. Tests Required
 
@@ -5588,9 +5619,13 @@ GatewaySnapshot::group_for_model(&model)
   refused with `404`.
 - `vibex-agent-acp` unit: a group publishes one option per shared model and each
   option's model id is `group/<id>/<model>`.
-- `vibex-desktop` unit: the provider card owns the group section and the old
-  routing section is not rendered; the group draft accepts one Provider and
-  refuses none.
+- `vibex-desktop` unit: the Providers page has a route-group tab whose Add
+  command opens the group editor and whose detail pane is the page's own
+  subject; the Agent card lists only the groups that Agent references and its
+  remove control unbinds rather than deletes; saving a group needs no Agent and
+  binds only when opened from one; the `+` chooser offers existing groups and
+  the new-group entry; the old routing section is not rendered; the group draft
+  accepts one Provider and refuses none.
 
 ### 7. Wrong vs Correct
 
