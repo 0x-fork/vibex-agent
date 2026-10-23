@@ -1162,6 +1162,9 @@ pub fn build_runtime_option_catalog(
     >,
     routes: &BTreeMap<vibex_core::ModelRouteId, RuntimeRouteFacts>,
 ) -> SessionRuntimeOptionCatalog {
+    // The names a reader sees for a route: its own label, and how many sources
+    // back it. Resolved once for the whole catalogue.
+    let (route_labels, route_member_counts, _) = route_fact_maps(routes);
     let agents_by_id = agents
         .iter()
         .filter(|agent| agent.added && agent.enabled)
@@ -1284,13 +1287,65 @@ pub fn build_runtime_option_catalog(
                         .map(|value| (feature.id.clone(), value.value.clone()))
                 })
                 .collect::<BTreeMap<_, _>>();
-            let mut selection =
-                SessionRuntimeSelection::provider(agent.id.clone(), profile.id.clone(), model_id);
+            // This builder is the one the runtime publishes, and it used to name
+            // a gateway model by its raw id. A route group's id is
+            // `group/<route>/<model>`, so the picker showed that whole string —
+            // and a plain route showed `route/<id>`. Resolve it here the same way
+            // `build_runtime_option_catalog_for_agents` does, so the reader sees
+            // the group's name and the model, not the storage shape.
+            let route_entry = route_model_ids(&model_id);
+            let route_source = route_entry.as_ref().map(|(id, _)| id.as_str().to_string());
+            let plain_provider = SessionRuntimeSelection::provider(
+                agent.id.clone(),
+                profile.id.clone(),
+                model_id.clone(),
+            );
+            let mut selection = match route_entry.as_ref() {
+                Some((route_id, Some(group_model))) => {
+                    let mut selection =
+                        SessionRuntimeSelection::model_route(agent.id.clone(), route_id.clone());
+                    selection.model = RuntimeModelSelection::explicit(format!(
+                        "{}{}/{}",
+                        vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
+                        route_id.as_str(),
+                        group_model
+                    ));
+                    selection
+                }
+                Some((route_id, None)) => {
+                    SessionRuntimeSelection::model_route(agent.id.clone(), route_id.clone())
+                }
+                None => plain_provider,
+            };
             selection.config_values = feature_config_values;
+            let auth_source_label = match route_source.as_ref() {
+                Some(route_id) => route_labels
+                    .get(route_id)
+                    .cloned()
+                    .unwrap_or_else(|| bounded_catalog_label(route_id)),
+                None => bounded_catalog_label(&profile.display_name),
+            };
+            // A group entry names one model, so the label is that model. A plain
+            // route is one selectable model too, and its label is the route's own
+            // name — the same rule `build_runtime_option_catalog_for_agents`
+            // applies when it reads the route's model list.
+            let model_label = match route_entry.as_ref() {
+                Some((_, Some(group_model))) => bounded_catalog_label(group_model),
+                Some((_, None)) => route_source
+                    .as_ref()
+                    .and_then(|route_id| route_labels.get(route_id))
+                    .cloned()
+                    .unwrap_or(model_label),
+                None => model_label,
+            };
+            let member_count = route_source
+                .as_ref()
+                .and_then(|route_id| route_member_counts.get(route_id).copied())
+                .unwrap_or(1);
             options.push(SessionRuntimeOption {
                 selection,
                 agent_label: bounded_catalog_label(&agent.label),
-                auth_source_label: bounded_catalog_label(&profile.display_name),
+                auth_source_label,
                 model_label,
                 reasoning_efforts: model_evidence
                     .filter(|model| {
@@ -1313,10 +1368,11 @@ pub fn build_runtime_option_catalog(
                 modes,
                 features,
                 availability,
-                // A gateway model entry that is not a route is a single
-                // upstream; it has nothing to fail over to.
-                member_count: 1,
-                auto_routes: false,
+                // A route knows how many sources back it, so the picker can say
+                // whether it fails over. A gateway model entry that names no
+                // route is a single upstream.
+                member_count,
+                auto_routes: member_count > 1,
             });
         }
     }
@@ -3857,6 +3913,73 @@ mod selector_route_priority_tests {
                 .iter()
                 .all(|option| option.auth_source_label == "Team"),
             "every group model is filed under the group's name"
+        );
+    }
+
+    /// The published builder names a group's models, and files them under it.
+    ///
+    /// `build_runtime_option_catalog` is the one the runtime publishes, and it
+    /// used to name every gateway entry by its raw id: a group read as
+    /// `group/<route>/<model>` in the picker, and its option stayed filed under
+    /// the gateway Profile rather than the group. That produced both the long
+    /// label and a duplicated group — the Profile group plus an empty route
+    /// group beside it.
+    #[test]
+    fn the_published_catalog_names_a_group_by_its_name_and_model() {
+        let group_id = vibex_core::ModelRouteId::new();
+        let mut profile = acp_profile("codex", &[]);
+        profile.display_name = "Vibex Gateway".to_string();
+        profile.configured_models = vec![ProviderConfiguredModel {
+            id: format!("group/{}/deepseek-chat", group_id.as_str()),
+            display_name: None,
+            enabled: true,
+            wire_api: None,
+            capabilities: Default::default(),
+        }];
+        let routes = [(
+            group_id.clone(),
+            RuntimeRouteFacts {
+                display_name: "Team".to_string(),
+                agent_ids: vec![AgentId::parse("codex").unwrap()],
+                member_count: 2,
+                models: vec!["deepseek-chat".to_string()],
+                via_gateway: true,
+                kind: vibex_core::RouteKind::ProviderGroup,
+            },
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let catalog =
+            build_runtime_option_catalog(&[agent("codex")], &[profile], &BTreeMap::new(), &routes);
+
+        let option = catalog
+            .options
+            .iter()
+            .find(|option| option.selection.auth_source.model_route_id() == Some(&group_id))
+            .expect("the group model produces an option filed under the group");
+        assert_eq!(
+            option.model_label, "deepseek-chat",
+            "the label is the model, not the storage id"
+        );
+        assert_eq!(
+            option.auth_source_label, "Team",
+            "the option belongs to the group, so a group of its own is not empty"
+        );
+        assert_eq!(option.member_count, 2, "the group reports its sources");
+        assert!(
+            option.selection.provider_profile_id().is_none(),
+            "a group model must not also select the gateway Profile, or it appears twice"
+        );
+        assert!(
+            catalog.options.iter().all(|option| {
+                option.selection.provider_profile_id().is_none()
+                    || !option
+                        .selection
+                        .model_id()
+                        .unwrap_or_default()
+                        .starts_with("group/")
+            }),
+            "no gateway-Profile option may name a group model"
         );
     }
 

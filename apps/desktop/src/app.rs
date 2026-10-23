@@ -111831,4 +111831,93 @@ mod route_picker_tests {
         assert_eq!(RUNTIME_ROUTE_GROUP_FOLD_THRESHOLD, 5);
         assert_eq!(RUNTIME_ROUTE_GROUP_FOLD, 4);
     }
+
+    /// A group's models are filed under the group, not under the gateway.
+    ///
+    /// The catalog used to leave a group's option under the gateway Profile, so
+    /// the picker drew the gateway (naming the raw `group/<route>/<model>` id)
+    /// and, beside it, an empty row for the route. Now the option belongs to the
+    /// route, the gateway Profile has no models left, and the empty gateway row
+    /// is filtered out — one group, named the way its owner named it.
+    #[test]
+    fn a_gateway_with_only_group_models_leaves_one_group_in_the_picker() {
+        let group_id = vibex_core::ModelRouteId::new();
+        let agent_id = AgentId::parse("codex").unwrap();
+        let profile_id = vibex_core::ProviderProfileId::new();
+        let group_model = format!("group/{}/deepseek-chat", group_id.as_str());
+
+        let catalog = SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: vec![vibex_core::RuntimeAgentSummary {
+                agent_id: agent_id.clone(),
+                label: "Codex".to_string(),
+            }],
+            auth_sources: vec![
+                RuntimeAuthSourceSummary {
+                    source: RuntimeAuthSource::provider_profile(profile_id.clone()),
+                    auth_source_revision: 1,
+                    agent_id: agent_id.clone(),
+                    label: "Vibex Gateway".to_string(),
+                    kind: RuntimeAuthSourceKind::ProviderProfile,
+                    availability: RuntimeAuthSourceAvailability::Available,
+                    account_hint: None,
+                    model_catalog_status: vibex_core::AgentAuthModelCatalogStatus::Unknown,
+                    supported_actions: Vec::new(),
+                },
+                RuntimeAuthSourceSummary {
+                    source: RuntimeAuthSource::model_route(group_id.clone()),
+                    auth_source_revision: 0,
+                    agent_id: agent_id.clone(),
+                    label: "Team".to_string(),
+                    kind: RuntimeAuthSourceKind::ModelRoute,
+                    availability: RuntimeAuthSourceAvailability::Available,
+                    account_hint: None,
+                    model_catalog_status: vibex_core::AgentAuthModelCatalogStatus::Unknown,
+                    supported_actions: Vec::new(),
+                },
+            ],
+            options: vec![SessionRuntimeOption {
+                selection: {
+                    let mut selection =
+                        SessionRuntimeSelection::model_route(agent_id.clone(), group_id.clone());
+                    selection.model =
+                        vibex_core::RuntimeModelSelection::explicit(group_model.clone());
+                    selection
+                },
+                agent_label: "Codex".to_string(),
+                auth_source_label: "Team".to_string(),
+                model_label: "deepseek-chat".to_string(),
+                reasoning_efforts: Vec::new(),
+                modes: Vec::new(),
+                features: Vec::new(),
+                availability: vibex_core::RuntimeOptionAvailability::Available,
+                member_count: 2,
+                auto_routes: true,
+            }],
+        };
+
+        let groups =
+            runtime_provider_groups_for_query(&catalog, &[agent_id], "", false, &[], None, &[]);
+        assert_eq!(
+            groups.len(),
+            1,
+            "the empty gateway row must be filtered out: {:?}",
+            groups
+                .iter()
+                .map(|group| group.source_label.clone())
+                .collect::<Vec<_>>()
+        );
+        let group = &groups[0];
+        assert_eq!(group.source_label, "Team");
+        assert_eq!(
+            group.status,
+            runtime_route_subtitle(2, 1),
+            "the row reports the group's sources and model count"
+        );
+        assert_eq!(group.choices.len(), 1);
+        assert_eq!(
+            group.choices[0].label, "deepseek-chat",
+            "the model is named, not its storage id"
+        );
+    }
 }
