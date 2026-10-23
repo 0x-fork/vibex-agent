@@ -60372,28 +60372,29 @@ impl VibexWorkbench {
         };
         let open = reveal.open;
         let toggle_id = row_id.clone();
+        // The reveal control answers a click of its own inside a row whose whole
+        // shape answers the reader's click, so it carries that click and stops.
+        // It rides inside the layout's vertical column: hanging it off this
+        // row's horizontal root would make its `w_full()` bid for the width the
+        // body needs.
         let layout = render_reasoning_first_line_layout(
             cx.theme().muted_foreground,
             first_line,
             body.remaining,
             body.window,
             reveal,
+            body_reveal,
         );
-        // The reveal control answers a click of its own inside a row whose whole
-        // shape answers the reader's click, so it carries that click and stops.
-        match body_reveal {
-            Some(control) => layout.child(control),
-            None => layout,
-        }
-        .id(row_id)
-        .cursor_pointer()
-        .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
-        .on_click(cx.listener(move |this, _, _, cx| {
-            // The click answers the state the reader asked for, not the spring:
-            // a body still travelling back reopens instead of ignoring it.
-            this.toggle_reasoning_expansion(toggle_id.clone(), turn_id.clone(), open, cx)
-        }))
-        .into_any_element()
+        layout
+            .id(row_id)
+            .cursor_pointer()
+            .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // The click answers the state the reader asked for, not the spring:
+                // a body still travelling back reopens instead of ignoring it.
+                this.toggle_reasoning_expansion(toggle_id.clone(), turn_id.clone(), open, cx)
+            }))
+            .into_any_element()
     }
 
     /// The height a live reasoning body is held to, or `None` while the reader's
@@ -69251,12 +69252,22 @@ impl ReasoningReveal {
 /// window draws a bar exactly as tall as the window the reader is watching
 /// instead of as tall as the whole thought. The whole second row rides inside
 /// `reveal`, so the bar grows and shrinks with the body it belongs to.
+///
+/// `control` — the fold control of a body too long to draw whole — is a row of
+/// its own under the body, so it rides in the vertical column. The root here is
+/// horizontal, and a full-width sibling beside a horizontal row takes the width
+/// from the flexible child: the control carries `w_full()`, so hanging it off
+/// the root squeezed this column to zero, laid the first line out one character
+/// per line and grew the row to the height of the whole thought (measured: a
+/// 4959-byte thought drew 46814px tall, with the header and the entire timeline
+/// below it pushed out of the viewport).
 fn render_reasoning_first_line_layout(
     icon_color: Hsla,
     first_line: AnyElement,
     remaining: Option<AnyElement>,
     window: Option<f32>,
     reveal: ReasoningReveal,
+    control: Option<AnyElement>,
 ) -> gpui::Div {
     let connector_color = icon_color.opacity(0.46);
     let first_line_row = h_flex()
@@ -69322,6 +69333,10 @@ fn render_reasoning_first_line_layout(
                 .child(body)
                 .into_any_element(),
         ));
+    }
+    if let Some(control) = control {
+        // The connector stops at the body; the control spans the row under it.
+        content = content.child(control);
     }
 
     h_flex().w_full().min_w_0().items_stretch().child(content)
@@ -110907,6 +110922,10 @@ mod tests {
     struct ReasoningFirstLineProbe {
         first_line_source: Arc<str>,
         remaining_source: Option<Arc<str>>,
+        /// Draw the fold control a body too long to show whole carries. It is
+        /// full-width, so it is the shape that used to squeeze the body column
+        /// to nothing when it hung off the row's horizontal root.
+        with_control: bool,
         measured: Rc<Cell<(f32, f32)>>,
     }
 
@@ -110936,6 +110955,14 @@ mod tests {
                 .min_w_0()
                 .into_any_element()
             });
+            let control = self.with_control.then(|| {
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .h(px(18.0))
+                    .child("Show full message")
+                    .into_any_element()
+            });
             div().w(px(680.0)).child(
                 div()
                     .w_full()
@@ -110949,6 +110976,7 @@ mod tests {
                         remaining,
                         None,
                         ReasoningReveal::new("reasoning-probe".into(), true, 1.0),
+                        control,
                     )),
             )
         }
@@ -110963,6 +110991,7 @@ mod tests {
                 "这是一段足够长的中文思考内容用来验证首行排版是否保持水平",
             ),
             remaining_source: Some(Arc::from("后续的思考内容保持正常的水平排版。")),
+            with_control: false,
             measured: measured.clone(),
         });
         cx.run_until_parked();
@@ -110977,6 +111006,44 @@ mod tests {
         assert!(
             height < 120.0,
             "first reasoning line should wrap horizontally instead of stacking one character per line, got height {height}"
+        );
+    }
+
+    /// The fold control a long thought carries must not take the body's width.
+    ///
+    /// The control is `w_full()`, which is right in the vertical column of a
+    /// message row and wrong beside one: it used to hang off the expanded
+    /// reasoning row's horizontal root, bid for the whole row, and leave the
+    /// `flex_1` body column at zero. The body then laid out one character per
+    /// line — a 4959-byte thought measured 46814px tall — and everything below
+    /// the row was pushed out of the viewport.
+    #[gpui::test]
+    fn an_expanded_reasoning_row_keeps_its_width_beside_the_fold_control(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let measured = Rc::new(Cell::new((0.0_f32, 0.0_f32)));
+        let (_, cx) = cx.add_window_view(|_, _| ReasoningFirstLineProbe {
+            first_line_source: Arc::from(
+                "Now let me plan the implementation of the providers page.",
+            ),
+            remaining_source: Some(Arc::from(
+                "The reader asked for the whole thought, so the body draws under the \
+                 connector instead of behind a fold.",
+            )),
+            with_control: true,
+            measured: measured.clone(),
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let (width, height) = measured.get();
+        assert!(
+            width > 500.0,
+            "the fold control must not take the body's width: row is {width} wide"
+        );
+        assert!(
+            height < 260.0,
+            "the body should wrap into a few lines, not one character per line: row is {height} tall"
         );
     }
 

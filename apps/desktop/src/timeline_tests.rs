@@ -628,6 +628,7 @@ impl Render for ReasoningTimelineProbe {
                                 Some(div().h(px(280.0)).flex_none().into_any_element()),
                                 windowed_reasoning.then_some(REASONING_WINDOW_HEIGHT),
                                 ReasoningReveal::new("reasoning".into(), true, 1.0),
+                                None,
                             )
                         } else {
                             div().w_full().h(px(20.0)).child("Thinking")
@@ -1228,6 +1229,7 @@ impl Render for ReasoningRevealProbe {
                         self.progress > 0.0,
                         self.progress,
                     ),
+                    None,
                 )),
         )
     }
