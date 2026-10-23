@@ -269,7 +269,7 @@ function validatePackaging() {
   // than a second build, must never carry a prerelease, and must not be able to
   // withhold the images operators already pull from GHCR.
   for (const required of [
-    "scripts/mirror-dockerhub.mjs",
+    "scripts/mirror-registry.mjs",
     "DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || 'vibexai' }}",
     "DOCKERHUB_TOKEN",
     "docker.io",
@@ -280,7 +280,7 @@ function validatePackaging() {
   // The Docker Hub repository name must match the GHCR one, so an operator
   // swaps the registry prefix and nothing else. A rename here would silently
   // ship an image no document mentions.
-  const mirrorScript = source("scripts/mirror-dockerhub.mjs");
+  const mirrorScript = source("scripts/mirror-registry.mjs");
   assert(
     mirrorScript.includes("/vibex-${service}`"),
     "Docker Hub mirror must keep the published image names"
@@ -296,7 +296,32 @@ function validatePackaging() {
   );
   assert(
     mirrorScript.includes("imagetools") && mirrorScript.includes("create"),
-    "Docker Hub mirror must copy manifest lists with buildx imagetools"
+    "registry mirrors must copy manifest lists with buildx imagetools"
+  );
+
+  // CNB is the China-reachable mirror, so it carries the same contract as
+  // Docker Hub: a copy of the GHCR index, stable only, and never able to
+  // withhold the GHCR images.
+  for (const required of [
+    "docker.cnb.cool",
+    "CNB_NAMESPACE: ${{ vars.CNB_NAMESPACE || 'vibex-ai/vibex' }}",
+    "CNB_TOKEN",
+    "username: cnb"
+  ]) {
+    assert(containerWorkflow.includes(required), `CNB mirror is missing ${required}`);
+  }
+  const cnbJob = containerWorkflow.split("\n  cnb:")[1] ?? "";
+  assert(
+    cnbJob.includes("contains(github.ref_name, '-')"),
+    "CNB mirror must not run for a prerelease tag"
+  );
+  assert(
+    cnbJob.includes("continue-on-error: true"),
+    "CNB mirror must not be able to withhold the GHCR images"
+  );
+  assert(
+    !cnbJob.includes("docker/build-push-action"),
+    "CNB mirror must copy the published manifest list, not rebuild it"
   );
 
   // The AUR package republishes the release .deb. AUR carries exactly one

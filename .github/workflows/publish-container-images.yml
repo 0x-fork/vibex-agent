@@ -339,7 +339,61 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/mirror-dockerhub.mjs \
+          node scripts/mirror-registry.mjs \
             --version "${VERSION}" \
             --namespace "${DOCKERHUB_NAMESPACE}" \
+            --services "${{ matrix.service }}"
+
+  cnb:
+    name: Mirror ${{ matrix.service }} to CNB
+    needs: [verify-meta, publish]
+    # CNB is the China-reachable mirror; GHCR is slow or blocked for a large
+    # part of the audience there, and CNB's registry is served from the same
+    # network. It is a mirror, not the release: a CNB outage must never
+    # withhold the images operators pull from GHCR.
+    continue-on-error: true
+    # Stable releases only, for the same reason as Docker Hub: an operator
+    # picking an image from a mirror is choosing something they keep deployed.
+    if: ${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [server, relay]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Log in to GHCR to read the published index
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to the CNB artifact registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: docker.cnb.cool
+          # CNB always accepts the literal `cnb` username; the access token is
+          # the password, and its `registry-package` scope decides what it may
+          # push.
+          username: cnb
+          password: ${{ secrets.CNB_TOKEN }}
+      - name: Mirror the published manifest list
+        env:
+          VIBEX_REPOSITORY: ${{ github.repository }}
+          # CNB addresses artifacts as `<repository>/<image>`, so the repository
+          # path is the namespace and the image keeps its published name.
+          CNB_NAMESPACE: ${{ vars.CNB_NAMESPACE || 'vibex-ai/vibex' }}
+          VERSION: ${{ needs.verify-meta.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/mirror-registry.mjs \
+            --version "${VERSION}" \
+            --target-registry docker.cnb.cool \
+            --namespace "${CNB_NAMESPACE}" \
             --services "${{ matrix.service }}"

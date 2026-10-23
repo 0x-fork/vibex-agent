@@ -1,17 +1,20 @@
 #!/usr/bin/env node
-// Mirror the published GHCR manifest lists to Docker Hub.
+// Mirror the published GHCR manifest lists to another registry.
 //
-// Docker Hub is a distribution channel for operators who already pull from
-// there, so this copies the exact multi-arch indexes GHCR already published
-// instead of rebuilding anything: a second build would be a second artifact
-// with its own provenance. `docker buildx imagetools create` copies the
-// manifest list and its blobs across registries without re-deriving them, so
-// the digest a user gets from Docker Hub is the digest CI verified.
+// Every mirror target is a convenience channel for operators who already pull
+// from there, so this copies the exact multi-arch indexes GHCR already
+// published instead of rebuilding anything: a second build would be a second
+// artifact with its own provenance. `docker buildx imagetools create` copies
+// the manifest list and its blobs across registries without re-deriving them,
+// so the digest a user gets from the mirror is the digest CI verified.
 //
-// Stable only. Docker Hub is where a user picks an image for a deployment they
+// Stable only. A mirror is where a user picks an image for a deployment they
 // keep, so an `rc`/`edge` tag would be consumed as if it were supported; the
-// workflow only invokes this for a `vX.Y.Z` tag, and the script refuses any
-// tag with a prerelease suffix as a second guard.
+// workflows only invoke this for a `vX.Y.Z` tag, and the script refuses any tag
+// with a prerelease suffix as a second guard.
+//
+// Docker Hub and the CNB artifact registry are both plain OCI registries, so
+// the only difference between them is `--target-registry` and `--namespace`.
 
 import { execFileSync } from "node:child_process";
 
@@ -48,11 +51,11 @@ function parseArguments(argv) {
 // `0.1.0-rc.8`, `edge`, a commit sha — is built and published to GHCR only.
 function assertStable(version) {
   if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.test(version)) {
-    fail(`refusing to mirror a non-stable version to Docker Hub: ${version}`);
+    fail(`refusing to mirror a non-stable version to a public registry: ${version}`);
   }
 }
 
-// The tags Docker Hub serves for one stable release. `latest` moves here
+// The tags a mirror serves for one stable release. `latest` moves here
 // because a stable release is the one operators are told to run; GHCR keeps
 // its own `latest` rule and the two are derived from the same release event.
 function publishedTags(version) {
@@ -82,10 +85,10 @@ function architectureSet(reference) {
 function main() {
   const args = parseArguments(process.argv.slice(2));
   if (args.help) {
-    console.log(`Usage: node scripts/mirror-dockerhub.mjs --version <x.y.z> --namespace <dockerhub-namespace> [options]
+    console.log(`Usage: node scripts/mirror-registry.mjs --version <x.y.z> --namespace <target-namespace> [options]
 
   --version <x.y.z>        stable release to mirror (required)
-  --namespace <name>       Docker Hub namespace (default: vibexai)
+  --namespace <name>       target namespace (default: vibexai)
   --source-registry <r>    registry the release was published to (default: ghcr.io)
   --target-registry <r>    registry to mirror into (default: docker.io)
   --services <a,b>         services to mirror (default: ${SERVICES.join(",")})
@@ -104,7 +107,7 @@ function main() {
 
   for (const service of args.services) {
     const source = sourceImage(args.sourceRegistry, repository, service);
-    // The Docker Hub repository keeps the same name the source uses, so an
+    // The mirror repository keeps the same name the source uses, so an
     // operator can swap `ghcr.io/...` for `docker.io/<namespace>/...` without
     // learning a second naming scheme.
     const target = `${args.targetRegistry}/${args.namespace}/vibex-${service}`;

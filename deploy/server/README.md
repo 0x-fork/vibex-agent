@@ -77,10 +77,10 @@ docker compose -f deploy/server/docker-compose.yml down
 self-hosted services on every release tag and on every push to the default
 branch:
 
-| Service | Image | Docker Hub mirror | Built from |
-| --- | --- | --- | --- |
-| Headless runtime | `ghcr.io/vibex-ai/vibex-server` | `vibexai/vibex-server` | `deploy/server/Dockerfile` |
-| Relay | `ghcr.io/vibex-ai/vibex-relay` | `vibexai/vibex-relay` | `deploy/relay/Dockerfile` |
+| Service | Image | Docker Hub mirror | CNB mirror | Built from |
+| --- | --- | --- | --- | --- |
+| Headless runtime | `ghcr.io/vibex-ai/vibex-server` | `vibexai/vibex-server` | `docker.cnb.cool/vibex-ai/vibex/vibex-server` | `deploy/server/Dockerfile` |
+| Relay | `ghcr.io/vibex-ai/vibex-relay` | `vibexai/vibex-relay` | `docker.cnb.cool/vibex-ai/vibex/vibex-relay` | `deploy/relay/Dockerfile` |
 
 Both are multi-architecture manifest lists (`linux/amd64` and `linux/arm64`),
 built natively on GitHub-hosted x64 and arm64 runners and merged by digest, so
@@ -121,6 +121,23 @@ GHCR-only, and a Docker Hub outage never withholds the GHCR images.
 > `docker login` on the host, or pull from GHCR, avoids the `toomanyrequests`
 > failure.
 
+### CNB mirror
+
+The same release is also mirrored to the CNB artifact registry, which is
+reachable from mainland China where GHCR is slow or blocked:
+
+```bash
+docker pull docker.cnb.cool/vibex-ai/vibex/vibex-server:v0.1.0
+docker pull docker.cnb.cool/vibex-ai/vibex/vibex-relay:v0.1.0
+```
+
+CNB addresses an artifact as `<repository>/<image>`, so the repository path is
+the namespace and the image keeps its published name. The mirror follows the
+same rules as Docker Hub: it copies the GHCR index, it only runs for a stable
+release, and a CNB outage never withholds the GHCR images.
+
+CNB repositories inherit their visibility from the project, so the CNB project
+must be public before an anonymous `docker pull` works.
 
 > **Anonymous pulls need a public package.** Container packages on GitHub
 > Container Registry start out private even when they come from a public

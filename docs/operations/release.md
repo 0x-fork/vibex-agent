@@ -201,36 +201,61 @@ list, and boots each published image once before the run succeeds.
 - A release is not complete until both images answer their health endpoint from
   the published registry tag, not only from a local build.
 
-### Docker Hub mirror
+### Registry mirrors
 
-A stable release additionally mirrors both manifest lists to Docker Hub, in the
-same workflow, after the GHCR publish job has succeeded. The mirror copies the
-index GHCR already published with `docker buildx imagetools create`, so Docker
-Hub serves the same digest CI verified instead of a second build with its own
-provenance.
+A stable release mirrors both manifest lists to Docker Hub and to the CNB
+artifact registry, in the same workflow, after the GHCR publish job has
+succeeded. Each mirror copies the index GHCR already published with
+`docker buildx imagetools create`, so every registry serves the same digest CI
+verified instead of a second build with its own provenance.
 
-- Stable only. `dockerhub` job is skipped for any tag containing `-`, because an
-  operator pulling from Docker Hub is choosing an image for a deployment they
-  keep, and an `rc` tag there reads as supported. GHCR still carries every
-  channel.
-- The job is `continue-on-error`: Docker Hub is a convenience mirror, so a Hub
-  outage or a rejected token must never withhold the images operators already
-  pull from GHCR.
+| Registry | Image | Why |
+| --- | --- | --- |
+| GHCR | `ghcr.io/vibex-ai/vibex-{server,relay}` | Canonical release |
+| Docker Hub | `vibexai/vibex-{server,relay}` | Operators who already pull from there |
+| CNB | `docker.cnb.cool/vibex-ai/vibex/vibex-{server,relay}` | Reachable where GHCR is slow or blocked |
+
+Shared rules for both mirrors:
+
+- Stable only. The `dockerhub` and `cnb` jobs are skipped for any tag containing
+  `-`, because an operator pulling from a mirror is choosing an image for a
+  deployment they keep, and an `rc` tag there reads as supported. GHCR still
+  carries every channel.
+- Both jobs are `continue-on-error`: a mirror is a convenience channel, so a
+  registry outage or a rejected token must never withhold the images operators
+  already pull from GHCR.
 - Tags are `0.1.0`, `v0.1.0`, and `latest` for a stable release.
-- `scripts/mirror-dockerhub.mjs` verifies the source really is a two-architecture
-  index before writing and rechecks both architectures on every mirrored tag.
+- `scripts/mirror-registry.mjs` verifies the source really is a
+  two-architecture index before writing and rechecks both architectures on
+  every mirrored tag.
 
-Configure two repository secrets: `DOCKERHUB_USERNAME` (the account that owns
-the token) and `DOCKERHUB_TOKEN` (a personal access token with **Read & Write**
-repository permission), plus `DOCKERHUB_NAMESPACE` for the repository namespace.
-The namespace is separate from the token identity so an organization keeps a
-stable namespace across maintainer changes; a free personal account can only
-push under its own Docker ID, which cannot contain a hyphen.
+Docker Hub needs two repository secrets: `DOCKERHUB_USERNAME` (the account that
+owns the token) and `DOCKERHUB_TOKEN` (a personal access token with **Read &
+Write** repository permission). The optional repository variable
+`DOCKERHUB_NAMESPACE` defaults to `vibexai`. The namespace is separate from the
+token identity so an organization keeps a stable namespace across maintainer
+changes; a free personal account can only push under its own Docker ID, which
+cannot contain a hyphen.
 
-A local dry run prints the plan without touching either registry:
+CNB needs one repository secret, `CNB_TOKEN`, an access token whose
+`registry-package` scope allows writes. CNB always accepts the literal `cnb`
+username, so the token is the password. The optional repository variable
+`CNB_NAMESPACE` defaults to `vibex-ai/vibex`: CNB addresses an artifact as
+`<repository>/<image>`, so the repository path is the namespace and the image
+keeps its published name. CNB repositories start private and inherit their
+visibility from the repository, so the CNB project must be **Public** before an
+anonymous `docker pull` works.
+
+A local dry run prints the plan without touching any registry:
 
 ```bash
-node scripts/mirror-dockerhub.mjs --version 0.1.0 --namespace <namespace> --dry-run
+# Docker Hub
+node scripts/mirror-registry.mjs --version 0.1.0 --namespace vibexai --dry-run
+
+# CNB
+node scripts/mirror-registry.mjs \
+  --version 0.1.0 --target-registry docker.cnb.cool \
+  --namespace vibex-ai/vibex --dry-run
 ```
 
 
