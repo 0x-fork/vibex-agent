@@ -20053,11 +20053,12 @@ impl ManagementCenter {
     fn create_route_group_from_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.provider_preset_picker = false;
         self.close_profile_editor(window, cx);
-        let center = cx.entity().downgrade();
-        cx.defer_in(window, move |_, window, cx| {
-            let _ = center.update(cx, |center, cx| {
-                center.open_route_group_editor(true, window, cx);
-            });
+        // `defer_in` hands the callback `&mut Self`; it has already leased the
+        // entity for the call. A second `update` on the same entity nests a
+        // lease and panics with "cannot update ManagementCenter while it is
+        // already being updated", which is what this path used to do.
+        cx.defer_in(window, move |center, window, cx| {
+            center.open_route_group_editor(true, window, cx);
         });
         cx.notify();
     }
@@ -37768,6 +37769,57 @@ mod tests {
 #[cfg(test)]
 mod gateway_surface_tests {
     use super::*;
+
+    /// Creating a group from an Agent's chooser must survive the dialog swap.
+    ///
+    /// The chooser lives in the Provider dialog, so the path closes that dialog
+    /// and opens the group dialog on the next frame. `defer_in` already leases
+    /// the entity for its callback; an `update` on the same entity inside it
+    /// nests a second lease and panics with "cannot update ManagementCenter while
+    /// it is already being updated". This drives the deferred callback so that
+    /// regression fails here instead of crashing the app on a click.
+    #[gpui::test]
+    fn creating_a_group_from_an_agent_swaps_the_dialog_without_nesting_a_lease(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        // The window root has to be a `Root`: the group editor lives in a dialog,
+        // and only that layer can host one.
+        let mut built = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let center = cx.new(|cx| ManagementCenter::new(window, cx));
+            let root = gpui_base::Root::new(center.clone(), window, cx);
+            built = Some(center);
+            root
+        });
+        let center = built.expect("the management window builds its center");
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.provider_preset_picker = true;
+                center.profile_editor_open = true;
+                center.create_route_group_from_agent(window, cx);
+            });
+        });
+        // Running the frame flushes the deferred callback, which is the step
+        // that used to panic.
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        center.read_with(cx, |center, _| {
+            assert!(
+                center.route_group_editor_open,
+                "the group dialog opens after the Provider dialog is closed"
+            );
+            assert!(
+                center.route_group_editor_from_agent,
+                "the draft remembers that a save must also bind this Agent"
+            );
+            assert!(
+                !center.profile_editor_open,
+                "the Provider dialog is gone, not left underneath"
+            );
+        });
+    }
 
     /// The route-group tab is a second view of one page, and it has to render
     /// without an Agent and without a selected group.
