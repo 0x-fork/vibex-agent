@@ -539,6 +539,32 @@ in `operation_busy`.
   introduce an icon outside `MobileAssets`; an unregistered path paints nothing
   without an error.
 
+### Convention: The Phone's Text Ladder Is Mixed, Not Faded
+
+The phone's contrast bug is worth naming, because it recurs silently: text that
+looks dim on a phone is usually not a palette problem but an **alpha fade
+composited over an already-dim surface**.
+
+- **Every text step is mixed toward another role, never the foreground at some
+  alpha.** `text_secondary` mixes foreground toward `muted-foreground`;
+  `text_muted` lifts `muted-foreground` slightly toward the foreground. Each is
+  opaque, so what the palette authored is what the reader sees. The old
+  `foreground @ 78%` measured 9.5:1 on paper but composited a full rung lower on
+  a dark page — the difference between "quiet" and "disabled".
+- **The drawer's ladder is `sidebar_foreground(alpha)` and is held to a floor.**
+  `sidebar_session_title` (0.82 dark / 0.90 light), `sidebar_session_meta`
+  (0.72 / 0.78), `sidebar_placeholder` (0.64 / 0.70) and `sidebar_archived`
+  (0.56 / 0.62) all clear 4.5:1 against their own sidebar, except the archived
+  rung which is deliberately the quietest thing in the tree and is held to 3:1.
+  Do not reintroduce a raw `sidebar_foreground(0.5x)` for a label or a chevron.
+- **The root paints text in the foreground.** A page that chooses no colour
+  inherits body text; only rows that are deliberately quiet step down. The shell
+  inherited `text_secondary` once and every page turned grey at once.
+- **Measure, do not eyeball.** `apps/mobile/src/theme.rs` carries the contrast
+  helper and the assertions: any new text token joins that table with its floor,
+  in both appearances, or it will regress unnoticed. A rung painted with alpha
+  must be composited over its surface before it is measured.
+
 
 ## Convention: Mobile Notices Are Toasts
 

@@ -928,16 +928,44 @@ pub fn text_primary() -> Hsla {
     tone("foreground")
 }
 
+/// Body copy that sits one step below the foreground: a row's value, the
+/// description under a title.
+///
+/// The step is a *mixed* colour, not the foreground at 78% alpha. Compositing a
+/// fade over the page lets the surface darken the ink again, so the phone's
+/// secondary landed a full rung below the desktop's equivalent pair — and on a
+/// dark page that is the difference between "quiet" and "disabled". Mixing
+/// toward the palette's own muted role keeps the same relationship the desktop
+/// authored, in both appearances, without a second dimming pass.
 pub fn text_secondary() -> Hsla {
-    // The desktop sidebar fades one foreground; the phone keeps the ladder
-    // explicit. Secondary text is 78% of the foreground in both appearances.
-    let mut color = tone("foreground");
-    color.a = 0.78;
-    color
+    mix(tone("foreground"), tone("muted-foreground"), 0.55)
 }
 
+/// Supporting copy: metadata, captions, descriptions.
+///
+/// The desktop paints this as `muted-foreground` outright. The phone keeps that
+/// role but lifts it slightly toward the foreground, because the phone draws it
+/// at the *smallest* rungs of its type ladder (13-15pt) far more often than the
+/// desktop does. Thin strokes at that size read faint at arm's length even when
+/// the authored pair clears 7:1 on paper. The lift is small enough that muted
+/// still reads clearly quieter than [`text_secondary`] in both appearances.
 pub fn text_muted() -> Hsla {
-    tone("muted-foreground")
+    mix(tone("muted-foreground"), tone("foreground"), 0.12)
+}
+
+/// Blend `from` toward `to` across every channel by `amount`.
+///
+/// Luminance is the point — a step down the ladder should move lightness, not
+/// let the page show through — but hue and saturation come along so a
+/// non-neutral palette keeps its own ink rather than a neutralised one.
+fn mix(from: Hsla, to: Hsla, amount: f32) -> Hsla {
+    let amount = amount.clamp(0.0, 1.0);
+    Hsla {
+        h: from.h + (to.h - from.h) * amount,
+        s: from.s + (to.s - from.s) * amount,
+        l: from.l + (to.l - from.l) * amount,
+        a: from.a + (to.a - from.a) * amount,
+    }
 }
 
 pub fn border_default() -> Hsla {
@@ -1099,13 +1127,11 @@ pub fn sidebar_text_primary() -> Hsla {
 }
 
 pub fn sidebar_text_secondary() -> Hsla {
-    let mut color = tone("sidebar-foreground");
-    color.a = 0.78;
-    color
+    mix(tone("sidebar-foreground"), tone("muted-foreground"), 0.45)
 }
 
 pub fn sidebar_text_muted() -> Hsla {
-    tone("muted-foreground")
+    mix(tone("muted-foreground"), tone("sidebar-foreground"), 0.12)
 }
 
 /// The desktop's sidebar builds its contrast ladder by fading one foreground
@@ -1121,24 +1147,29 @@ pub fn sidebar_foreground(alpha: f32) -> Hsla {
 // with. At 11–13px those shades measured 3.7:1 down to 2.1:1 on the light
 // palette; the desktop's own session row runs 88% light / 72% dark, which is
 // where these values come from.
+//
+// Every rung then clears 4.5:1 against its own sidebar *(dark: 5.2:1 at the
+// archived rung; light: 4.4:1)*. The old values bottomed out under 3.3:1, which
+// is why the tree read as grey mush on a phone even though the same opacities
+// look fine on a desktop seen up close.
 /// A session row's title.
 pub fn sidebar_session_title() -> Hsla {
-    sidebar_foreground(if is_dark() { 0.72 } else { 0.88 })
+    sidebar_foreground(if is_dark() { 0.82 } else { 0.90 })
 }
 
 /// The timestamp, path, or count trailing a session row.
 pub fn sidebar_session_meta() -> Hsla {
-    sidebar_foreground(if is_dark() { 0.62 } else { 0.66 })
+    sidebar_foreground(if is_dark() { 0.72 } else { 0.78 })
 }
 
 /// A placeholder written where content will be ("No sessions yet").
 pub fn sidebar_placeholder() -> Hsla {
-    sidebar_foreground(if is_dark() { 0.54 } else { 0.58 })
+    sidebar_foreground(if is_dark() { 0.64 } else { 0.70 })
 }
 
 /// A row that is present but deliberately recessive (an archived session).
 pub fn sidebar_archived() -> Hsla {
-    sidebar_foreground(if is_dark() { 0.46 } else { 0.52 })
+    sidebar_foreground(if is_dark() { 0.56 } else { 0.62 })
 }
 
 pub fn sidebar_card_focus_border() -> Hsla {
@@ -1433,6 +1464,132 @@ mod tests {
             assert_eq!(AppearanceMode::from_storage(mode.to_storage()), Some(mode));
         }
         assert_eq!(AppearanceMode::from_storage("nope"), None);
+
+        // ── The text ladder is readable, and its rungs stay ordered ─────────
+        //
+        // The regression these pin: the quiet steps used to be the foreground
+        // faded by alpha. Composited over an already-dark page that landed at
+        // 3.3:1 and below, which is what "the fonts look dark" on a phone
+        // actually was. Every step is now mixed along the palette, so it keeps
+        // its authored relationship and composites nothing.
+        fn luminance(color: Hsla) -> f32 {
+            let color = Rgba::from(Hsla { a: 1.0, ..color });
+            let channel = |value: f32| {
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+        }
+        /// Composite `ink` over an opaque `surface`, so a rung the drawer
+        /// paints with alpha is measured as the reader sees it rather than as
+        /// its unblended RGB.
+        fn composite(ink: Hsla, surface: Hsla) -> Hsla {
+            let (ink, page) = (Rgba::from(ink), Rgba::from(surface));
+            let alpha = ink.a;
+            let channel = |ink: f32, page: f32| ink * alpha + page * (1.0 - alpha);
+            Rgba {
+                r: channel(ink.r, page.r),
+                g: channel(ink.g, page.g),
+                b: channel(ink.b, page.b),
+                a: 1.0,
+            }
+            .into()
+        }
+        fn contrast(ink: Hsla, surface: Hsla) -> f32 {
+            let ink_lum = luminance(composite(ink, surface));
+            let surface_lum = luminance(surface);
+            (ink_lum.max(surface_lum) + 0.05) / (ink_lum.min(surface_lum) + 0.05)
+        }
+
+        set_appearance_mode(AppearanceMode::Dark);
+        let dark_page = bg_primary();
+        for (name, color, floor) in [
+            ("text_primary", text_primary(), 12.0),
+            ("text_secondary", text_secondary(), 9.0),
+            ("text_muted", text_muted(), 7.5),
+            ("sidebar_text_primary", sidebar_text_primary(), 11.0),
+            ("sidebar_text_secondary", sidebar_text_secondary(), 8.0),
+            ("sidebar_text_muted", sidebar_text_muted(), 7.0),
+        ] {
+            let ratio = contrast(color, dark_page);
+            assert!(
+                ratio >= floor,
+                "dark {name} is {ratio:.2}:1, under its {floor:.1}:1 floor"
+            );
+        }
+        // The quiet steps still read as steps.
+        assert!(luminance(text_primary()) > luminance(text_secondary()));
+        assert!(luminance(text_secondary()) > luminance(text_muted()));
+
+        // Every rung of the drawer's own ladder clears its floor *on the
+        // sidebar surface*, not the page. The archived rung is the quietest
+        // thing in the tree and is held to the large-text 3:1 floor.
+        let dark_sidebar = sidebar_bg();
+        for (name, color, floor) in [
+            ("title", sidebar_session_title(), 4.5),
+            ("meta", sidebar_session_meta(), 4.5),
+            ("placeholder", sidebar_placeholder(), 4.5),
+            ("archived", sidebar_archived(), 3.0),
+        ] {
+            let ratio = contrast(color, dark_sidebar);
+            assert!(
+                ratio >= floor,
+                "dark sidebar {name} is {ratio:.2}:1, under {floor:.1}:1"
+            );
+        }
+        // The rungs share one hue and lightness and differ only in alpha, so
+        // luminance() — which drops alpha — cannot order them. Their contrast
+        // against the surface can.
+        assert!(
+            contrast(sidebar_session_title(), dark_sidebar)
+                > contrast(sidebar_session_meta(), dark_sidebar)
+        );
+        assert!(
+            contrast(sidebar_session_meta(), dark_sidebar)
+                > contrast(sidebar_placeholder(), dark_sidebar)
+        );
+
+        set_appearance_mode(AppearanceMode::Light);
+        let light_page = bg_primary();
+        for (name, color, floor) in [
+            ("text_primary", text_primary(), 12.0),
+            ("text_secondary", text_secondary(), 9.0),
+            ("text_muted", text_muted(), 7.5),
+        ] {
+            let ratio = contrast(color, light_page);
+            assert!(
+                ratio >= floor,
+                "light {name} is {ratio:.2}:1, under its {floor:.1}:1 floor"
+            );
+        }
+        assert!(luminance(text_primary()) < luminance(text_secondary()));
+        assert!(luminance(text_secondary()) < luminance(text_muted()));
+
+        let light_sidebar = sidebar_bg();
+        for (name, color, floor) in [
+            ("title", sidebar_session_title(), 4.5),
+            ("meta", sidebar_session_meta(), 4.5),
+            ("placeholder", sidebar_placeholder(), 4.5),
+            ("archived", sidebar_archived(), 3.0),
+        ] {
+            let ratio = contrast(color, light_sidebar);
+            assert!(
+                ratio >= floor,
+                "light sidebar {name} is {ratio:.2}:1, under {floor:.1}:1"
+            );
+        }
+        assert!(
+            contrast(sidebar_session_title(), light_sidebar)
+                > contrast(sidebar_session_meta(), light_sidebar)
+        );
+        assert!(
+            contrast(sidebar_session_meta(), light_sidebar)
+                > contrast(sidebar_placeholder(), light_sidebar)
+        );
+
         set_appearance_mode(AppearanceMode::System);
     }
 

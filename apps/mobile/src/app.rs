@@ -157,13 +157,14 @@ const CONNECTING_WORDMARK_SCAN_SPREAD: f32 = 0.42;
 /// `REPEATING_ANIMATION_MAX_FPS`; a slow sweep looks identical at half the
 /// repaints, and the connecting page is otherwise static.
 const CONNECTING_WORDMARK_SHIMMER_MAX_FPS: f32 = 30.0;
-/// The label size of the connecting page's wordmark, in points.
+/// The label size of the connecting page's wordmark.
 ///
-/// A step over the pairing page's [`theme::FONT_WORDMARK`]: the connecting
-/// screen has no other content while it works, so the lockup is what says the
-/// product is alive. The mark is scaled from this size by
-/// [`theme::wordmark_mark`], the same authored geometry the other lockups use.
-const CONNECTING_WORDMARK_FONT: f32 = 48.0;
+/// Exactly the pairing page's [`theme::FONT_WORDMARK`], not a step over it: the
+/// lockup is the same product signature on both screens, and an oversized
+/// version read as a splash poster on a phone rather than as this app's name.
+/// The mark is scaled from this size by [`theme::wordmark_mark`], the same
+/// authored geometry the other lockups use.
+const CONNECTING_WORDMARK_FONT: f32 = theme::FONT_WORDMARK;
 
 #[derive(Clone)]
 struct ReasoningRowSummary {
@@ -15675,9 +15676,10 @@ impl MobileApp {
     /// backgrounded app park it on the idle tone, the same rule the sidebar's
     /// activity marks follow.
     fn render_connecting_brand(&self, scanning: bool) -> impl IntoElement {
-        // Desktop parity: the launch wordmark idles in the muted foreground at
-        // 75% and sweeps toward the foreground, so the mark is present but
-        // quiet when the effect is parked.
+        // Desktop parity (`startup_loading_wordmark`): the moving sweep runs
+        // from the muted foreground at 75% toward the foreground, but the
+        // parked state is the foreground itself. Painting the sweep's dim end
+        // while nothing moves made the lockup look disabled rather than idle.
         let base = theme::text_muted().opacity(0.75);
         let glow = theme::text_primary();
         let font = theme::scaled_px(CONNECTING_WORDMARK_FONT);
@@ -15690,7 +15692,7 @@ impl MobileApp {
 
         let lockup = move |scan_position: Option<f32>| {
             let color_at = |position| {
-                scan_position.map_or(base, |scan_position| {
+                scan_position.map_or(glow, |scan_position| {
                     connecting_wordmark_color(base, glow, position, scan_position)
                 })
             };
@@ -25099,7 +25101,7 @@ impl MobileApp {
                         .text_color(if auto_archives {
                             theme::accent_green()
                         } else {
-                            theme::sidebar_foreground(0.72)
+                            theme::sidebar_session_title()
                         }),
                 )
                 .into_any_element()
@@ -25115,7 +25117,7 @@ impl MobileApp {
                     .text_color(if auto_archives {
                         theme::accent_green()
                     } else {
-                        theme::sidebar_foreground(0.72)
+                        theme::sidebar_session_title()
                     })
                     .into_any_element(),
             )
@@ -25199,7 +25201,7 @@ impl MobileApp {
                             .whitespace_nowrap()
                             .text_size(theme::font_sidebar_row())
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::sidebar_foreground(0.78))
+                            .text_color(theme::sidebar_session_title())
                             .child(row.label.clone()),
                     )
                     // The expander trails the name here, exactly as on the
@@ -25213,7 +25215,7 @@ impl MobileApp {
                             })
                             .size(px(12.0))
                             .flex_shrink_0()
-                            .text_color(theme::sidebar_foreground(0.78)),
+                            .text_color(theme::sidebar_session_title()),
                     ),
             )
             .into_any_element()
@@ -25273,7 +25275,7 @@ impl MobileApp {
                             })
                             .size(px(12.0))
                             .flex_shrink_0()
-                            .text_color(theme::sidebar_foreground(0.60)),
+                            .text_color(theme::sidebar_session_meta()),
                     )
                     .when_some(
                         self.group_member_identities(&group_id),
@@ -25313,7 +25315,7 @@ impl MobileApp {
                             .whitespace_nowrap()
                             .text_size(theme::font_sidebar_row())
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::sidebar_foreground(0.78))
+                            .text_color(theme::sidebar_session_title())
                             .child(row.label.clone()),
                     )
                     .child(
@@ -25488,7 +25490,7 @@ impl MobileApp {
                             .text_color(if row.selected {
                                 theme::sidebar_foreground(1.0)
                             } else {
-                                theme::sidebar_foreground(0.78)
+                                theme::sidebar_session_title()
                             })
                             .child(row.label.clone()),
                     )
@@ -25650,7 +25652,7 @@ impl MobileApp {
                             .text_color(if workspace_selected {
                                 theme::sidebar_foreground(1.0)
                             } else {
-                                theme::sidebar_foreground(0.72)
+                                theme::sidebar_session_title()
                             })
                             .child(row.label.clone()),
                     )
@@ -25911,7 +25913,7 @@ impl MobileApp {
                             "icons/chevrons-right.svg"
                         })
                         .size(px(14.0))
-                        .text_color(theme::sidebar_foreground(0.58)),
+                        .text_color(theme::sidebar_session_meta()),
                 )
                 .into_any_element()
         });
@@ -28016,7 +28018,12 @@ impl Render for MobileApp {
                 .size_full()
                 .bg(theme::bg_primary())
                 .font_family(theme::UI_FONT_FAMILY)
-                .text_color(theme::text_secondary())
+                // The desktop paints its shell in the foreground and lets each
+                // row choose its own step down the ladder. Inheriting the
+                // secondary shade instead dimmed every page that did not set a
+                // colour of its own, which on a phone read as whole screens
+                // being disabled.
+                .text_color(theme::text_primary())
                 .pt(insets.top)
                 .pr(insets.right)
                 .pb(insets.bottom)
@@ -34537,7 +34544,7 @@ fn sidebar_worktree_lifecycle_color(state: WorktreeLifecycleDisplayState) -> gpu
         State::NeedsResolution | State::Aborting | State::Failed | State::NeedsAttention => {
             theme::accent_red()
         }
-        State::Working | State::Archived | State::Discarded => theme::sidebar_foreground(0.48),
+        State::Working | State::Archived | State::Discarded => theme::sidebar_foreground(0.58),
     }
 }
 
@@ -34564,7 +34571,7 @@ fn sidebar_agent_logo(identity: &str, active: bool) -> gpui::AnyElement {
     agent_brand_icon(
         identity,
         px(theme::SIDEBAR_AGENT_LOGO_SIZE),
-        theme::sidebar_foreground(if active { 0.80 } else { 0.58 }),
+        theme::sidebar_foreground(if active { 0.88 } else { 0.62 }),
     )
 }
 
@@ -37571,7 +37578,7 @@ mod tests {
             .split_once("fn sidebar_agent_logo")
             .map(|(_, tail)| tail.split_once("\nfn ").map_or(tail, |(body, _)| body))
             .expect("the sidebar Agent mark should stay inspectable");
-        assert!(logo.contains("theme::sidebar_foreground(if active { 0.80 } else { 0.58 })"));
+        assert!(logo.contains("theme::sidebar_foreground(if active { 0.88 } else { 0.62 })"));
         assert!(logo.contains("theme::SIDEBAR_AGENT_LOGO_SIZE"));
     }
 
@@ -40407,6 +40414,49 @@ mod tests {
         );
         assert_eq!(CONNECTING_WORDMARK_SCAN_PASSES, 10.0);
         assert_eq!(CONNECTING_WORDMARK_SCAN_SPREAD, 0.42);
+
+        // The lockup is the pairing page's size, not a splash-poster step over
+        // it: on a phone an oversized wordmark read as a wasted screen rather
+        // than as the product's name.
+        assert_eq!(CONNECTING_WORDMARK_FONT, theme::FONT_WORDMARK);
+        // The brand sits on the ladder's own wordmark step; it may not outgrow
+        // it into a splash-poster size.
+        const {
+            assert!(CONNECTING_WORDMARK_FONT <= theme::FONT_WORDMARK);
+        }
+        // Parked is the foreground, exactly as the desktop draws its startup
+        // wordmark with no sweep. The muted base is the *start* of the moving
+        // gradient only; using it while still painted the lockup as disabled.
+        assert!(brand.contains("scan_position.map_or(glow,"));
+        assert!(!brand.contains("scan_position.map_or(base,"));
+    }
+
+    /// The root paints its own text in the foreground, so a page that does not
+    /// choose a colour inherits body text rather than a dimmed step.
+    ///
+    /// The desktop shell does exactly this (`cx.theme().foreground`) and lets
+    /// each row descend the ladder on purpose. The phone inherited its secondary
+    /// shade instead, which turned every page that set no colour for itself into
+    /// a screen of disabled-looking copy.
+    #[test]
+    fn the_root_inherits_the_foreground_not_a_dimmed_step() {
+        let source = include_str!("app.rs");
+        let root = source
+            .split_once("\"mobile-app-swipe-back\"")
+            .map(|(_, tail)| tail)
+            .expect("the app shell wrapper should stay inspectable");
+        let root = root
+            .split(".child(match visible_mode")
+            .next()
+            .unwrap_or(root);
+        assert!(
+            root.contains(".text_color(theme::text_primary())"),
+            "the shell should hand pages the foreground"
+        );
+        assert!(
+            !root.contains(".text_color(theme::text_secondary())"),
+            "inheriting a faded shade dims every page that does not set its own"
+        );
     }
 
     /// Every action on the unavailable-connection page leads with a glyph, so
