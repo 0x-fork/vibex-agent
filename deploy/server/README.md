@@ -77,10 +77,10 @@ docker compose -f deploy/server/docker-compose.yml down
 self-hosted services on every release tag and on every push to the default
 branch:
 
-| Service | Image | Built from |
-| --- | --- | --- |
-| Headless runtime | `ghcr.io/vibex-ai/vibex-server` | `deploy/server/Dockerfile` |
-| Relay | `ghcr.io/vibex-ai/vibex-relay-server` | `deploy/relay/Dockerfile` |
+| Service | Image | Docker Hub mirror | Built from |
+| --- | --- | --- | --- |
+| Headless runtime | `ghcr.io/vibex-ai/vibex-server` | `vibexai/vibex-server` | `deploy/server/Dockerfile` |
+| Relay | `ghcr.io/vibex-ai/vibex-relay` | `vibexai/vibex-relay` | `deploy/relay/Dockerfile` |
 
 Both are multi-architecture manifest lists (`linux/amd64` and `linux/arm64`),
 built natively on GitHub-hosted x64 and arm64 runners and merged by digest, so
@@ -97,10 +97,30 @@ built natively on GitHub-hosted x64 and arm64 runners and merged by digest, so
 candidate and `edge` the default branch. Version tags are immutable — a
 rollback pulls an older version tag instead of moving one.
 
-The workflow verifies the tag against `vibex-server` and `vibex-relay-server`
+The workflow verifies the tag against `vibex-server` and `vibex-relay`
 before building, starts each published image once (`/api/v2/info` and
 `/health`) before the run succeeds, and warns when the registry package is
 still private.
+
+### Docker Hub mirror
+
+A stable release also mirrors both manifest lists to Docker Hub, so an operator
+who already pulls from there does not need a GHCR account:
+
+```bash
+docker pull vibexai/vibex-server:v0.1.0
+docker pull vibexai/vibex-relay:v0.1.0
+```
+
+The mirror copies the GHCR index rather than rebuilding it, so both registries
+serve the same digest. Only stable releases are mirrored: `rc` and `edge` stay
+GHCR-only, and a Docker Hub outage never withholds the GHCR images.
+
+> **Docker Hub rate limits.** Anonymous pulls are limited to 100 per 6 hours per
+> IPv4 address (200 when signed in), and shared NAT egress reaches that quickly.
+> `docker login` on the host, or pull from GHCR, avoids the `toomanyrequests`
+> failure.
+
 
 > **Anonymous pulls need a public package.** Container packages on GitHub
 > Container Registry start out private even when they come from a public

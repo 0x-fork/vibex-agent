@@ -4,7 +4,7 @@
 
 Vibex release work covers the native desktop package, optional native Android/iOS
 clients, the transport-only Relay service, and the two published container
-images (`vibex-server`, `vibex-relay-server`). Desktop remains the authority for
+images (`vibex-server`, `vibex-relay`). Desktop remains the authority for
 all Agent and workspace state.
 
 ## Preflight
@@ -183,7 +183,7 @@ endpoints against the same source and Cargo lockfile.
 ## Container images
 
 A tag push publishes `ghcr.io/vibex-ai/vibex-server` and
-`ghcr.io/vibex-ai/vibex-relay-server` from
+`ghcr.io/vibex-ai/vibex-relay` from
 `.github/workflows/publish-container-images.yml`, independently of the desktop
 and mobile jobs: a packaging failure in one product must not withhold the other.
 The workflow verifies the tag against both container binaries, builds
@@ -200,6 +200,39 @@ list, and boots each published image once before the run succeeds.
   still private.
 - A release is not complete until both images answer their health endpoint from
   the published registry tag, not only from a local build.
+
+### Docker Hub mirror
+
+A stable release additionally mirrors both manifest lists to Docker Hub, in the
+same workflow, after the GHCR publish job has succeeded. The mirror copies the
+index GHCR already published with `docker buildx imagetools create`, so Docker
+Hub serves the same digest CI verified instead of a second build with its own
+provenance.
+
+- Stable only. `dockerhub` job is skipped for any tag containing `-`, because an
+  operator pulling from Docker Hub is choosing an image for a deployment they
+  keep, and an `rc` tag there reads as supported. GHCR still carries every
+  channel.
+- The job is `continue-on-error`: Docker Hub is a convenience mirror, so a Hub
+  outage or a rejected token must never withhold the images operators already
+  pull from GHCR.
+- Tags are `0.1.0`, `v0.1.0`, and `latest` for a stable release.
+- `scripts/mirror-dockerhub.mjs` verifies the source really is a two-architecture
+  index before writing and rechecks both architectures on every mirrored tag.
+
+Configure two repository secrets: `DOCKERHUB_USERNAME` (the account that owns
+the token) and `DOCKERHUB_TOKEN` (a personal access token with **Read & Write**
+repository permission), plus `DOCKERHUB_NAMESPACE` for the repository namespace.
+The namespace is separate from the token identity so an organization keeps a
+stable namespace across maintainer changes; a free personal account can only
+push under its own Docker ID, which cannot contain a hyphen.
+
+A local dry run prints the plan without touching either registry:
+
+```bash
+node scripts/mirror-dockerhub.mjs --version 0.1.0 --namespace <namespace> --dry-run
+```
+
 
 ## AUR
 

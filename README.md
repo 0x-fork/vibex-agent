@@ -329,7 +329,7 @@ developer or release pipeline.
 The Relay is optional. Pull the published image, or build it from source:
 
 ```bash
-export VIBEX_RELAY_IMAGE=ghcr.io/vibex-ai/vibex-relay-server:v0.1.0-rc.8
+export VIBEX_RELAY_IMAGE=ghcr.io/vibex-ai/vibex-relay:v0.1.0-rc.8
 docker compose -f deploy/relay/docker-compose.yml pull relay-server
 docker compose -f deploy/relay/docker-compose.yml up -d --no-build relay-server
 curl -fsS http://127.0.0.1:9700/health

@@ -265,6 +265,40 @@ function validatePackaging() {
     latestTagRule.includes("refs/tags/") && latestTagRule.includes("contains(github.ref_name, '-')"),
     "container image workflow must not publish latest for a prerelease tag"
   );
+  // Docker Hub is a mirror of the GHCR release, so it must stay a copy rather
+  // than a second build, must never carry a prerelease, and must not be able to
+  // withhold the images operators already pull from GHCR.
+  for (const required of [
+    "scripts/mirror-dockerhub.mjs",
+    "DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || 'vibexai' }}",
+    "DOCKERHUB_TOKEN",
+    "docker.io",
+    "continue-on-error: true"
+  ]) {
+    assert(containerWorkflow.includes(required), `Docker Hub mirror is missing ${required}`);
+  }
+  // The Docker Hub repository name must match the GHCR one, so an operator
+  // swaps the registry prefix and nothing else. A rename here would silently
+  // ship an image no document mentions.
+  const mirrorScript = source("scripts/mirror-dockerhub.mjs");
+  assert(
+    mirrorScript.includes("/vibex-${service}`"),
+    "Docker Hub mirror must keep the published image names"
+  );
+  const dockerHubJob = containerWorkflow.split("\n  dockerhub:")[1] ?? "";
+  assert(
+    dockerHubJob.includes("contains(github.ref_name, '-')"),
+    "Docker Hub mirror must not run for a prerelease tag"
+  );
+  assert(
+    !dockerHubJob.includes("docker/build-push-action"),
+    "Docker Hub mirror must copy the published manifest list, not rebuild it"
+  );
+  assert(
+    mirrorScript.includes("imagetools") && mirrorScript.includes("create"),
+    "Docker Hub mirror must copy manifest lists with buildx imagetools"
+  );
+
   // The AUR package republishes the release .deb. AUR carries exactly one
   // version per package, so a prerelease pushed there downgrades every Arch
   // user; keep the stable-only gate, the checksum recording, and the pinned

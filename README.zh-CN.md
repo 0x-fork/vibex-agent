@@ -282,7 +282,7 @@ pnpm build:mobile:ios
 Relay 是可选组件。可以直接拉取已发布的镜像，也可以从源码构建:
 
 ```bash
-export VIBEX_RELAY_IMAGE=ghcr.io/vibex-ai/vibex-relay-server:v0.1.0-rc.8
+export VIBEX_RELAY_IMAGE=ghcr.io/vibex-ai/vibex-relay:v0.1.0-rc.8
 docker compose -f deploy/relay/docker-compose.yml pull relay-server
 docker compose -f deploy/relay/docker-compose.yml up -d --no-build relay-server
 curl -fsS http://127.0.0.1:9700/health
