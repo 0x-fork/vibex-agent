@@ -4798,13 +4798,22 @@ impl AgentManager {
     pub async fn delete_session(&self, session_id: &VibexSessionId) -> VibexResult<()> {
         let runtimes = {
             let mut conn = self.open_migrated()?;
-            let transaction = conn.transaction().map_err(|error| {
-                VibexError::storage(
-                    "session_delete_transaction_failed",
-                    "failed to begin Agent session deletion transaction",
-                )
-                .with_diagnostic("error", error.to_string())
-            })?;
+            // Deletions arrive in bursts: "delete all" on the archived page asks
+            // for every row on the page at once. A deferred transaction reads
+            // before it writes, so two deletions that both read and then try to
+            // upgrade their read locks deadlock, and SQLite fails all but one
+            // with "database is locked" instead of waiting the burst out. The
+            // immediate behaviour takes the write lock up front, which queues
+            // the burst behind `busy_timeout` and lets every deletion commit.
+            let transaction = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| {
+                    VibexError::storage(
+                        "session_delete_transaction_failed",
+                        "failed to begin Agent session deletion transaction",
+                    )
+                    .with_diagnostic("error", error.to_string())
+                })?;
             let mut session_ids =
                 AgentDelegationRepository::descendant_session_ids(&transaction, session_id)?;
             session_ids.push(session_id.clone());
@@ -9641,6 +9650,64 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a committed deletion leaves no row behind"
+        );
+
+        drop(conn);
+        drop(manager);
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_deletions_each_commit_their_own_session() {
+        // "Delete all" on the archived page asks for every row on the page, and
+        // the requests overlap: the page holds sessions no two of which share a
+        // lock. A deletion transaction opened as a deferred one reads before it
+        // writes, so a batch of them that all read first and then try to upgrade
+        // their read locks deadlock — SQLite breaks the tie by failing all but
+        // one with "database is locked", and the page loses every row but the
+        // survivor. An immediate transaction takes the write lock up front, so
+        // the batch queues and every deletion commits.
+        let db_path = temp_db_path("concurrent-session-deletion");
+        let manager = Arc::new(AgentManager::new(&db_path).unwrap());
+        let conn = manager.open_migrated().unwrap();
+        let workspace_root = temp_workspace_path("concurrent-session-deletion");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let sessions = (0..8)
+            .map(|index| {
+                insert_session(
+                    &conn,
+                    &format!("concurrent delete {index}"),
+                    &project.id,
+                    &workspace.id,
+                    &workspace.root_path,
+                    AgentId::parse("concurrent-delete-agent").unwrap(),
+                    AgentSessionState::Archived,
+                )
+            })
+            .collect::<Vec<_>>();
+        drop(conn);
+
+        let mut deletions = Vec::new();
+        for session in &sessions {
+            let manager = Arc::clone(&manager);
+            let session_id = session.id.clone();
+            deletions.push(tokio::spawn(async move {
+                manager.delete_session(&session_id).await
+            }));
+        }
+        for deletion in deletions {
+            deletion.await.unwrap().unwrap();
+        }
+
+        let conn = manager.open_migrated().unwrap();
+        let remaining = SessionRepository::list_archived(&conn, 50).unwrap();
+        assert!(
+            remaining.is_empty(),
+            "every deletion in the batch must commit: {remaining:?}"
         );
 
         drop(conn);

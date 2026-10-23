@@ -137,6 +137,26 @@ Use transactions for multi-record state transitions:
 If a native side effect cannot be rolled back transactionally, record enough
 state before the side effect to support recovery on restart.
 
+### A write transaction that can run in a burst must be `Immediate`
+
+`conn.transaction()` is `DEFERRED`: it takes the write lock only when the first
+write statement runs. A transaction that reads first and writes later therefore
+holds a read lock through its reads and then tries to upgrade it. Two such
+transactions running concurrently — which is exactly what a client-side "delete
+all" produces — deadlock on that upgrade, and SQLite resolves it by failing all
+but one with `database is locked` inside the `busy_timeout` window. The client
+sees a batch where every request but one failed.
+
+Open the transaction with `transaction_with_behavior(TransactionBehavior::Immediate)`
+whenever more than one caller can issue the same write at once, or when the
+transaction reads before it writes. The write lock is then taken up front and the
+burst queues behind `busy_timeout` instead of fighting over the upgrade.
+
+A batch is also one request, not N. `AgentManager::delete_session` is immediate so
+overlapping deletions each commit; the desktop still sends "delete all" as one
+batch through `delete_sessions`, so the page has one pending set and one
+reconciliation rather than one racing request per row.
+
 ## Naming
 
 - Table names should be plural snake_case.

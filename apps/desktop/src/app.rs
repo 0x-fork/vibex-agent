@@ -37136,6 +37136,11 @@ impl VibexWorkbench {
             .retain(|session_id, _| !session_ids.contains(session_id));
         self.session_search_index
             .retain(|session_id, _| !session_ids.contains(session_id));
+        // The archived page is a list of its own: a row the reader deletes from
+        // it is gone from every list at once, not only from the sidebar.
+        if let Some(archived) = self.archived_sessions.as_mut() {
+            archived.retain(|session| !session_ids.contains(session.id.as_str()));
+        }
         if self
             .pending_session_search_jump
             .as_ref()
@@ -37826,26 +37831,25 @@ impl VibexWorkbench {
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let outcome = runner.await;
                 let _ = entity.update(cx, |this, cx| {
-                    this.settle_optimistic_session_deletion(
-                        &session_ids,
-                        matches!(outcome, Ok(Ok(()))),
-                    );
+                    let committed = matches!(outcome, Ok(Ok(())));
+                    this.settle_optimistic_session_deletion(&session_ids, committed);
                     let active = this.session_generation == generation;
                     let should_reconcile = this.pending_session_deletion_ids.is_empty();
                     if should_reconcile {
                         this.optimistic_session_deletion_reconciliation_pending = true;
                         this.load_agent_overview(cx);
                     }
+                    // The archived page is the surface that can still show the
+                    // rows: the teardown took them off that list optimistically,
+                    // so the runtime's answer decides whether they stay off (a
+                    // committed deletion) or come back (a failed one). A batch of
+                    // rows settles once, and the page is refreshed once with it.
+                    if this.archived_sessions.is_some() {
+                        this.archived_sessions = None;
+                        this.load_archived_sessions(cx);
+                    }
                     match outcome {
-                        Ok(Ok(())) => {
-                            // The archived page is the surface that can still
-                            // show the row, so it is refreshed with the
-                            // deletion that just committed.
-                            if this.archived_sessions.is_some() {
-                                this.archived_sessions = None;
-                                this.load_archived_sessions(cx);
-                            }
-                        }
+                        Ok(Ok(())) => {}
                         Ok(Err(error)) if active => {
                             this.agent_error = Some(format!("{}: {}", error.code, error.message));
                         }
@@ -38223,16 +38227,20 @@ impl VibexWorkbench {
     /// Deletes every session the archived page is holding.
     ///
     /// The page is bounded, so "all" means all of the page the reader is
-    /// looking at; the confirmation names the same count. Each deletion goes
-    /// through the sidebar's own path, which owns the pending set, the
-    /// optimistic removal and the failure reconciliation.
+    /// looking at; the confirmation names the same count. The rows leave in one
+    /// batch rather than as one deletion per row: the batch owns a single
+    /// pending set, one optimistic removal and one reconciliation, so the rows
+    /// go together and the page is refreshed once. Firing them individually
+    /// used to leave the page depending on every request winning its own race.
     fn delete_all_archived_sessions(&mut self, cx: &mut Context<Self>) {
         let Some(sessions) = self.archived_sessions.clone() else {
             return;
         };
-        for session in sessions {
-            self.delete_session(session.id.clone(), cx);
-        }
+        let session_ids = sessions
+            .into_iter()
+            .map(|session| session.id.to_string())
+            .collect::<Vec<_>>();
+        self.delete_sessions(session_ids, cx);
     }
 
     fn set_auto_archive_after_days(&mut self, days: Option<u8>, cx: &mut Context<Self>) {
@@ -92221,10 +92229,18 @@ mod tests {
             completion.contains("this.optimistic_session_deletion_reconciliation_pending = true;")
         );
         assert!(completion.contains("this.settle_optimistic_session_deletion("));
-        assert!(completion.contains("matches!(outcome, Ok(Ok(())))"));
+        assert!(completion.contains("let committed = matches!(outcome, Ok(Ok(())));"));
         assert!(completion.contains("if should_reconcile {"));
         assert!(!completion.contains("this.agent_action_pending = false;"));
         assert!(completion.contains("this.load_agent_overview(cx);"));
+        // The archived page is a second list holding the same rows, so a
+        // settled deletion re-reads it whether the batch committed or failed.
+        assert!(completion.contains("this.archived_sessions = None;"));
+        assert!(completion.contains("this.load_archived_sessions(cx);"));
+        assert!(
+            !completion.contains("Ok(Ok(())) => {\n"),
+            "a committed batch must not be the only case that refreshes the page"
+        );
 
         // The answer decides the tombstone: a committed deletion is permanent,
         // a failed one only ever hid its rows optimistically.
@@ -92238,6 +92254,26 @@ mod tests {
         assert!(settle.contains("self.deleted_session_ids"));
         assert!(settle.contains("self.optimistically_removed_session_ids"));
         assert!(settle.contains("if committed {"));
+
+        // "Delete all" is a batch, not a loop of single deletions. A batch owns
+        // one pending set, one optimistic removal and one reconciliation, so no
+        // row of the page depends on its own request winning a race with the
+        // rest; the page the reader confirmed is read back once when it settles.
+        let delete_all = source
+            .split_once("    fn delete_all_archived_sessions(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_auto_archive_after_days("))
+            .map(|(body, _)| body)
+            .expect("the archived page's delete-all should remain inspectable");
+        assert!(delete_all.contains("self.delete_sessions(session_ids, cx);"));
+        assert!(
+            !delete_all.contains("self.delete_session("),
+            "delete-all must not fan out into one deletion request per row"
+        );
+
+        // The teardown takes the row off the archived page too: it is a list of
+        // its own, and a row deleted from it is gone from every list at once.
+        assert!(teardown.contains("self.archived_sessions.as_mut()"));
+        assert!(teardown.contains("archived.retain("));
     }
 
     fn child_agent_session(session_id: &VibexSessionId, state: AgentSessionState) -> AgentSession {
