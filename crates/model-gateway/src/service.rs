@@ -1346,9 +1346,6 @@ impl ModelGatewayService {
                     closest: Vec::new(),
                 })?;
 
-        if request.has_vendor_file_image() && !upstream.supports(WireProtocol::Responses) {
-            return Err(GatewayError::UnsupportedImageReference);
-        }
         // What this endpoint was seen to answer outranks a guess. Only an
         // endpoint that declares nothing can have a lesson: a typed one has
         // already stated its protocol.
@@ -1360,6 +1357,15 @@ impl ModelGatewayService {
                 .ok()
                 .flatten()
         });
+        // A vendor file reference only means anything to the Responses API, and
+        // the check has to know what this endpoint really speaks: an untyped one
+        // that was observed to answer Responses does support it, and refusing
+        // would take away a call it has already served.
+        let speaks_responses =
+            upstream.supports(WireProtocol::Responses) || learned == Some(WireProtocol::Responses);
+        if request.has_vendor_file_image() && !speaks_responses {
+            return Err(GatewayError::UnsupportedImageReference);
+        }
         let plan = choose_target(inbound, &upstream, learned, &snapshot.settings.policy)?;
         let target = plan.target;
         let passthrough = plan.passthrough;
