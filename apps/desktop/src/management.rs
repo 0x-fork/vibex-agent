@@ -11613,8 +11613,13 @@ impl ManagementCenter {
                 management_locale_text("Starting…", "启动中…", "啟動中…"),
                 cx.theme().info,
             ),
-            vibex_core::ModelGatewayStatus::Unavailable
-            | vibex_core::ModelGatewayStatus::Degraded => (
+            // A degraded gateway is still listening: some groups stepped aside
+            // and the rest keep serving, so this is a warning, never "down".
+            vibex_core::ModelGatewayStatus::Degraded => (
+                management_locale_text("Gateway · degraded", "网关 · 已降级", "閘道 · 已降級"),
+                cx.theme().warning,
+            ),
+            vibex_core::ModelGatewayStatus::Unavailable => (
                 management_locale_text(
                     "Gateway unavailable · route groups unusable",
                     "网关不可用，路由组无法使用",
@@ -11633,6 +11638,17 @@ impl ManagementCenter {
             .len();
         let gateway_summary = if gateway.models.is_empty() {
             management_locale_text("No route groups", "还没有路由组", "還沒有路由組").to_string()
+        } else if gateway.runtime.status == vibex_core::ModelGatewayStatus::Degraded
+            && gateway.runtime.degraded_routes > 0
+        {
+            // Which groups stepped aside is the useful part of "degraded": the
+            // rest are still serving, so the count belongs beside the groups it
+            // is counting.
+            format!(
+                "{} {}",
+                gateway.runtime.degraded_routes,
+                management_locale_text("groups stepped aside", "个路由组已让路", "個路由組已讓路")
+            )
         } else {
             format!(
                 "{} · {gateway_route_count} {}",
@@ -13216,9 +13232,9 @@ impl ManagementCenter {
                     "關閉閘道？",
                 ))
                 .child(management_locale_text(
-                    "Every Agent bound to a route group will lose it and fall back to its own direct Provider. Direct Providers are not affected. The bindings are kept, so turning the gateway back on restores them.",
-                    "所有绑定了路由组的 Agent 都会失去该路由组，回退到自己的直连供应商。直连供应商不受影响。绑定关系会保留，重新打开网关即可恢复。",
-                    "所有綁定了路由組的 Agent 都會失去該路由組，回到自己的直連供應商。直連供應商不受影響。綁定關係會保留，重新打開閘道即可恢復。",
+                    "Every Agent bound to a route group will lose it. Agents that are not bound to one are not affected. The bindings are kept, so turning the gateway back on restores them.",
+                    "所有绑定了路由组的 Agent 都会失去该路由组。未绑定路由组的 Agent 不受影响。绑定关系会保留，重新打开网关即可恢复。",
+                    "所有綁定了路由組的 Agent 都會失去該路由組。未綁定路由組的 Agent 不受影響。綁定關係會保留，重新打開閘道即可恢復。",
                 ))
                 .footer(
                     gpui_component::dialog::DialogFooter::new()
@@ -13247,8 +13263,8 @@ impl ManagementCenter {
     /// Turns the gateway on or off.
     ///
     /// This is the user's control over a live service: turning it off stops the
-    /// listener, so no route group can be served, and every Agent bound to one
-    /// falls back to its direct Provider.
+    /// listener, so no route group can be served and every Agent bound to one
+    /// loses it.
     fn set_gateway_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
@@ -21909,9 +21925,9 @@ impl ManagementCenter {
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(management_locale_text(
-                            "This Agent uses the gateway through the route groups it is bound to. Unbinding its last group returns it to a direct Provider.",
-                            "该 Agent 通过绑定的路由组使用网关。解绑最后一个路由组后，它会回到直连供应商。",
-                            "該 Agent 透過綁定的路由組使用閘道。解綁最後一個路由組後，它會回到直連供應商。",
+                            "This Agent uses the gateway through the route groups it is bound to. Unbinding its last group leaves it with no route group to use.",
+                            "该 Agent 通过绑定的路由组使用网关。解绑最后一个路由组后，它将没有可用的路由组。",
+                            "該 Agent 透過綁定的路由組使用閘道。解綁最後一個路由組後，它將沒有可用的路由組。",
                         )),
                 )
             })
@@ -23530,9 +23546,9 @@ impl ManagementCenter {
                 .child(profile_rows)
                 .into_any_element()
         };
-        // Route groups sit beside the direct Providers inside the same card:
-        // both answer "which model will this Agent use", and the gateway is
-        // what a group is served by. Keeping them together is what makes the
+        // Route groups sit beside the Providers inside the same card: both
+        // answer "which model will this Agent use", and the gateway is what a
+        // group is served by. Keeping them together is what makes the
         // relationship legible instead of a separate section that named routes
         // while this one named Providers.
         let route_groups = self.render_agent_route_groups(window, cx);
@@ -23548,11 +23564,7 @@ impl ManagementCenter {
                     .text_xs()
                     .font_semibold()
                     .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Direct Providers",
-                        "直连供应商",
-                        "直連供應商",
-                    )),
+                    .child(management_locale_text("Providers", "供应商", "供應商")),
             )
             .child(provider_configuration)
             .into_any_element();
@@ -23570,9 +23582,9 @@ impl ManagementCenter {
         let authentication = self.render_agent_authentication(window, cx);
 
         // The Provider card owns every way this Agent reaches a model now:
-        // direct Providers, route groups, and the local gateway that serves
-        // them. Routing is no longer a section of its own, so there is no
-        // second surface that could describe the same choice differently.
+        // Providers, route groups, and the local gateway that serves them.
+        // Routing is no longer a section of its own, so there is no second
+        // surface that could describe the same choice differently.
         v_flex()
             .w_full()
             .min_w_0()
@@ -28958,11 +28970,12 @@ fn gateway_status_badge(state: &vibex_core::ModelGatewayRuntimeState, _cx: &App)
             management_locale_text("Not running", "未运行", "未執行"),
             Tag::warning(),
         ),
-        // Stepped aside is not the same as not running: the port is bound, but
-        // requests are being refused so Agents can use their direct Provider.
+        // A degraded gateway is not a stopped one: the port is still bound and
+        // the groups that did not step aside keep serving. The counts that make
+        // that legible live beside the badge, so the label only says so much.
         vibex_core::ModelGatewayStatus::Degraded => (
-            management_locale_text("Stepped aside", "已降级", "已降級"),
-            Tag::danger(),
+            management_locale_text("Degraded", "已降级", "已降級"),
+            Tag::warning(),
         ),
         vibex_core::ModelGatewayStatus::Disabled => (
             management_locale_text("Off", "已关闭", "已關閉"),
@@ -37943,9 +37956,14 @@ mod gateway_surface_tests {
             ..vibex_core::ModelGatewayRuntimeState::default()
         };
         assert!(degraded.status.is_listening());
-        assert!(!degraded.status.is_routable());
-        // The address is still published, because the port is still bound.
-        assert_eq!(degraded.base_url().as_deref(), None);
+        // Degraded is a scope, not a shutdown: the listener is up, so the
+        // groups that did not step aside must keep being routable and the
+        // address must stay published.
+        assert!(degraded.status.is_routable());
+        assert_eq!(
+            degraded.base_url().as_deref(),
+            Some("http://127.0.0.1:3425")
+        );
         assert!(
             gateway_runtime_text(&degraded).contains("only one request at a time"),
             "a degraded gateway says what it is doing, not that it fell back"

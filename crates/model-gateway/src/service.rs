@@ -27,15 +27,16 @@ use vibex_core::{
     ModelProviderProfileId, ModelProviderProfileStatus, RequestId,
 };
 use vibex_db::{
-    DbConnection, GatewayConversationPinRepository, GatewayTokenWindowRepository,
-    ModelGatewayRequestLogRepository, ModelGatewaySettingsRepository,
+    DbConnection, GatewayConversationPinRepository, GatewayEndpointProtocolRepository,
+    GatewayTokenWindowRepository, ModelGatewayRequestLogRepository, ModelGatewaySettingsRepository,
     ModelProviderAccountStateRepository, apply_migrations, open_database,
 };
 
 use crate::error::{GatewayError, GatewayResult};
 use crate::ir::{CanonicalEvent, CanonicalRequest, CanonicalUsage, ReasoningRequest};
 use crate::route::{
-    CandidateKey, KeyHealth, RouteRequest, classify_failure, conversation_key, plan_route,
+    CandidateKey, KeyHealth, RouteRequest, classify_failure, conversation_key,
+    is_protocol_mismatch, plan_route,
 };
 use crate::stream::{ReplyAccumulator, SseBuffer, UsageSniffer};
 use crate::wire::parse_reply;
@@ -65,21 +66,41 @@ pub struct GatewayKeySummary {
 
 impl GatewayUpstream {
     /// The endpoint this protocol should call, if the upstream publishes one.
+    ///
+    /// Only an endpoint that names this protocol counts. An endpoint that
+    /// declares none is a single address whose API is unknown, and returning it
+    /// for every protocol turned "I do not know" into "I speak all four" — the
+    /// bug that sent an OpenAI Responses body to a Chat Completions endpoint and
+    /// then cooled the Key when the vendor said so.
     pub fn endpoint_for(&self, wire_protocol_id: &str) -> Option<&ModelProviderEndpoint> {
-        self.endpoints
-            .iter()
-            .find(|endpoint| {
-                endpoint.kind == ModelProviderEndpointKind::Api
-                    && endpoint.wire_protocol_id.as_deref() == Some(wire_protocol_id)
-            })
-            .or_else(|| {
-                self.endpoints.iter().find(|endpoint| {
-                    endpoint.kind == ModelProviderEndpointKind::Api
-                        && endpoint.wire_protocol_id.is_none()
-                })
-            })
+        self.endpoints.iter().find(|endpoint| {
+            endpoint.kind == ModelProviderEndpointKind::Api
+                && endpoint.wire_protocol_id.as_deref() == Some(wire_protocol_id)
+        })
     }
 
+    /// The untyped address a protocol should be *attempted* on.
+    ///
+    /// It is a guess the caller has to verify, never a statement of support.
+    pub fn untyped_endpoint(&self) -> Option<&ModelProviderEndpoint> {
+        self.endpoints.iter().find(|endpoint| {
+            endpoint.kind == ModelProviderEndpointKind::Api && endpoint.wire_protocol_id.is_none()
+        })
+    }
+
+    /// The endpoint to call for one protocol.
+    ///
+    /// A typed endpoint decides; an untyped one is the last resort, and the only
+    /// caller that may use it is the one that verifies the guess by trying.
+    pub fn endpoint_for_call(&self, protocol: WireProtocol) -> Option<&ModelProviderEndpoint> {
+        self.endpoint_for(protocol.wire_protocol_id())
+            .or_else(|| self.untyped_endpoint())
+    }
+
+    /// Whether this upstream states that it speaks `protocol`.
+    ///
+    /// An untyped endpoint is not a statement: it is an address whose protocol
+    /// the gateway has yet to observe, so it never counts here.
     pub fn supports(&self, protocol: WireProtocol) -> bool {
         self.endpoint_for(protocol.wire_protocol_id()).is_some()
     }
@@ -313,16 +334,13 @@ pub struct ModelGatewayService {
     /// Set while the service is shutting down, so an in-flight request stops
     /// instead of starting a new upstream call.
     shutting_down: RwLock<bool>,
-    /// Consecutive attempts that produced no usable upstream response.
+    /// Consecutive failures per route group, the breaker's whole state.
     ///
-    /// Reaching [`Self::DEGRADE_AFTER_FAILURES`] puts the service into
-    /// `Degraded`, which refuses every request but one probe instead of letting
-    /// each caller wait out the same failure. One success clears the count and
-    /// the state.
-    consecutive_failures: AtomicU64,
-    /// When the last failure happened, so a stale count does not degrade a
-    /// gateway that has simply been idle.
-    last_failure_at_ms: AtomicU64,
+    /// The scope is the group, not the gateway. Groups share nothing but the
+    /// listener: one group whose Providers are all broken must not turn away
+    /// requests for a group whose Providers are fine, which is exactly what a
+    /// single counter did.
+    breakers: Mutex<BTreeMap<String, RouteBreaker>>,
     /// Requests currently being served, newest last.
     ///
     /// Bounded, because the graph draws a handful: a long-running gateway under
@@ -333,13 +351,35 @@ pub struct ModelGatewayService {
     /// Where request events go. A sink rather than a direct broadcast so the
     /// gateway crate stays unaware of the runtime's event bus.
     events: RwLock<Option<GatewayEventSink>>,
-    /// Set while one request is being let through a degraded gateway.
+    /// Protocol verdicts per untyped endpoint, keyed by Provider and endpoint.
     ///
-    /// A degraded gateway is not closed: it still forwards one request at a
-    /// time so a recovered upstream can prove itself. Without that, the refusal
-    /// path could never reach an upstream, no success could be recorded, and
-    /// the state would only clear on a restart.
-    probe_in_flight: std::sync::atomic::AtomicBool,
+    /// It is a cache of what the endpoint answered, not configuration: the
+    /// durable copy lives in `model_gateway_endpoint_protocol`, and this map
+    /// only saves a database read per request.
+    lessons: RwLock<BTreeMap<(ModelProviderProfileId, String), WireProtocol>>,
+}
+
+/// One route group's breaker.
+///
+/// It carries the same three facts the service used to hold once for the whole
+/// gateway, plus the group they belong to.
+#[derive(Debug, Clone, Default)]
+struct RouteBreaker {
+    consecutive_failures: u64,
+    last_failure_at_ms: i64,
+    /// Set while one request is being let through this degraded group.
+    ///
+    /// A degraded group is not closed: it forwards one request at a time so a
+    /// recovered upstream can prove itself. Without that, the refusal path
+    /// could never reach an upstream, no success could be recorded, and the
+    /// group would only recover on a restart.
+    probe_in_flight: bool,
+}
+
+impl RouteBreaker {
+    fn is_degraded(&self) -> bool {
+        self.consecutive_failures >= ModelGatewayService::DEGRADE_AFTER_FAILURES
+    }
 }
 
 struct ListenerHandle {
@@ -403,9 +443,8 @@ impl ModelGatewayService {
             listener: Mutex::new(None),
             snapshot: RwLock::new(None),
             shutting_down: RwLock::new(false),
-            consecutive_failures: AtomicU64::new(0),
-            last_failure_at_ms: AtomicU64::new(0),
-            probe_in_flight: std::sync::atomic::AtomicBool::new(false),
+            breakers: Mutex::new(BTreeMap::new()),
+            lessons: RwLock::new(BTreeMap::new()),
             inflight: RwLock::new(Vec::new()),
             events: RwLock::new(None),
         })
@@ -643,7 +682,10 @@ impl ModelGatewayService {
     /// port.
     pub async fn apply_policy(self: &Arc<Self>) -> GatewayResult<ModelGatewayRuntimeState> {
         let settings = self.settings()?;
-        let running = self.runtime_state().status == ModelGatewayStatus::Running;
+        // A degraded listener is already bound: restarting it would move the
+        // port, rewrite every Agent's base URL, and throw away the breakers
+        // that were about to prove the upstream had recovered.
+        let running = self.runtime_state().status.is_listening();
         match (settings.policy.enabled, running) {
             (false, true) => {
                 self.stop_listener().await;
@@ -780,59 +822,6 @@ impl ModelGatewayService {
         ))
     }
 
-    /// Records one upstream success, clearing the failure count and any
-    /// degraded state.
-    pub(crate) fn note_success(&self) {
-        self.consecutive_failures.store(0, Ordering::Relaxed);
-        self.last_failure_at_ms.store(0, Ordering::Relaxed);
-        let mut state = self.runtime_state();
-        if state.status == ModelGatewayStatus::Degraded {
-            state.status = ModelGatewayStatus::Running;
-            state.notice = None;
-            state.updated_at_ms = vibex_core::unix_timestamp_ms();
-            self.publish(state);
-        }
-    }
-
-    /// Records one failed request and degrades the gateway once the count is
-    /// reached.
-    ///
-    /// This counts *requests the caller saw fail*, not upstream attempts: one
-    /// dead upstream cools its only Key, and every later request is refused
-    /// before it can attempt anything. Counting attempts would never reach the
-    /// threshold in exactly the case that matters.
-    ///
-    /// A failure observed while the gateway is already degraded only advances
-    /// the record; it never re-degrades or rewrites the notice, because
-    /// [`Self::begin_attempt`] is what decides whether an upstream is even
-    /// consulted.
-    pub(crate) fn note_failure(&self) {
-        let now = vibex_core::unix_timestamp_ms();
-        let previous = self.last_failure_at_ms.swap(now as u64, Ordering::Relaxed) as i64;
-        // A failure older than the memory window starts a fresh count rather
-        // than adding to a tally from an unrelated outage.
-        let count = if previous != 0 && now.saturating_sub(previous) > Self::FAILURE_MEMORY_MS {
-            self.consecutive_failures.store(1, Ordering::Relaxed);
-            1
-        } else {
-            self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1
-        };
-        if count < Self::DEGRADE_AFTER_FAILURES {
-            return;
-        }
-        let mut state = self.runtime_state();
-        if state.status != ModelGatewayStatus::Running {
-            return;
-        }
-        state.status = ModelGatewayStatus::Degraded;
-        state.notice = Some(
-            "Repeated upstream failures: only one request at a time is let through until an upstream answers again."
-                .to_string(),
-        );
-        state.updated_at_ms = now;
-        self.publish(state);
-    }
-
     /// Installs the sink request events are delivered to.
     ///
     /// The runtime owns the event bus, so the gateway is handed a way to send
@@ -917,47 +906,151 @@ impl ModelGatewayService {
         }
     }
 
-    /// Whether the gateway is currently stepping aside.
+    /// Whether any route group is currently stepping aside.
     pub fn is_degraded(&self) -> bool {
-        self.runtime_state().status == ModelGatewayStatus::Degraded
+        self.runtime_state().degraded_routes > 0
+    }
+
+    /// Whether one group is stepping aside.
+    pub fn group_is_degraded(&self, group_id: &str) -> bool {
+        self.breakers
+            .lock()
+            .map(|breakers| {
+                breakers
+                    .get(group_id)
+                    .is_some_and(RouteBreaker::is_degraded)
+            })
+            .unwrap_or(false)
     }
 
     /// Decides whether this request may consult an upstream, and claims the
-    /// probe slot when it is the one a degraded gateway lets through.
+    /// group's probe slot when it is the one its degraded group lets through.
     ///
-    /// A degraded gateway is not closed. It admits exactly one request at a
+    /// A degraded group is not closed. It admits exactly one request at a
     /// time: if that request reaches an upstream and succeeds,
-    /// [`Self::note_success`] clears the state; if it fails, the refusal keeps
+    /// [`Self::note_success`] clears the group; if it fails, the refusal keeps
     /// every other caller on their direct Provider instead of queueing them
-    /// behind a broken upstream.
+    /// behind a broken member.
     ///
-    /// Returns `true` when this request claimed the probe slot and must release
+    /// Returns `true` when this request claimed a probe slot and must release
     /// it with [`Self::finish_attempt`], including on every error path.
-    pub(crate) fn begin_attempt(&self) -> GatewayResult<bool> {
-        if !self.is_degraded() {
+    pub(crate) fn begin_attempt(&self, group_id: &str) -> GatewayResult<bool> {
+        let Ok(mut breakers) = self.breakers.lock() else {
+            return Err(GatewayError::Internal(
+                "the gateway breaker state is poisoned".to_string(),
+            ));
+        };
+        let breaker = breakers.entry(group_id.to_string()).or_default();
+        if !breaker.is_degraded() {
             return Ok(false);
         }
-        if self
-            .probe_in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
+        if breaker.probe_in_flight {
             return Err(GatewayError::NotConfigured(Self::STEPPED_ASIDE.to_string()));
         }
+        breaker.probe_in_flight = true;
         Ok(true)
     }
 
     /// Releases the slot [`Self::begin_attempt`] may have claimed.
-    pub(crate) fn finish_attempt(&self, probe: bool) {
-        if probe {
-            self.probe_in_flight.store(false, Ordering::Release);
+    pub(crate) fn finish_attempt(&self, group_id: &str, probe: bool) {
+        if !probe {
+            return;
+        }
+        if let Ok(mut breakers) = self.breakers.lock()
+            && let Some(breaker) = breakers.get_mut(group_id)
+        {
+            breaker.probe_in_flight = false;
         }
     }
 
-    /// The notice and error text a degraded gateway returns to callers it is
+    /// The notice and error text a degraded group returns to callers it is
     /// not currently letting through. Kept in one place so the server can
     /// recognise its own refusal and never count it as an upstream failure.
-    pub(crate) const STEPPED_ASIDE: &'static str = "the gateway stepped aside after repeated upstream failures; let one request through at a time until an upstream answers, or use the direct Provider";
+    pub(crate) const STEPPED_ASIDE: &'static str = "this route group stepped aside after repeated upstream failures; let one request through at a time until an upstream answers, or use a direct Provider";
+
+    /// Records one upstream success for a group, clearing its failure count
+    /// and its degraded state.
+    pub fn note_success(&self, group_id: &str) {
+        let Ok(mut breakers) = self.breakers.lock() else {
+            return;
+        };
+        let breaker = breakers.entry(group_id.to_string()).or_default();
+        breaker.consecutive_failures = 0;
+        breaker.last_failure_at_ms = 0;
+        breaker.probe_in_flight = false;
+        let degraded = breakers
+            .values()
+            .filter(|breaker| breaker.is_degraded())
+            .count();
+        drop(breakers);
+        self.publish_degraded_routes(degraded);
+    }
+
+    /// Records one failed request for a group and degrades that group once its
+    /// count is reached.
+    ///
+    /// This counts *requests the caller saw fail*, not upstream attempts: one
+    /// dead upstream cools its only Key, and every later request is refused
+    /// before it can attempt anything. Counting attempts would never reach the
+    /// threshold in exactly the case that matters.
+    ///
+    /// A failure observed while the group is already degraded only advances
+    /// the record; it never re-degrades or rewrites the notice, because
+    /// [`Self::begin_attempt`] is what decides whether an upstream is even
+    /// consulted.
+    pub fn note_failure(&self, group_id: &str) {
+        let now = vibex_core::unix_timestamp_ms();
+        let Ok(mut breakers) = self.breakers.lock() else {
+            return;
+        };
+        let breaker = breakers.entry(group_id.to_string()).or_default();
+        // A failure older than the memory window starts a fresh count rather
+        // than adding to a tally from an unrelated outage.
+        if breaker.last_failure_at_ms != 0
+            && now.saturating_sub(breaker.last_failure_at_ms) > Self::FAILURE_MEMORY_MS
+        {
+            breaker.consecutive_failures = 1;
+        } else {
+            breaker.consecutive_failures = breaker.consecutive_failures.saturating_add(1);
+        }
+        breaker.last_failure_at_ms = now;
+        let count = breaker.consecutive_failures;
+        let degraded = breakers
+            .values()
+            .filter(|breaker| breaker.is_degraded())
+            .count();
+        drop(breakers);
+        if count < Self::DEGRADE_AFTER_FAILURES {
+            return;
+        }
+        self.publish_degraded_routes(degraded);
+    }
+
+    /// Rewrites the runtime state to match the per-group breaker set.
+    ///
+    /// The status is derived, never stored separately: `Degraded` means "the
+    /// listener is up and at least one group is stepping aside", so it cannot
+    /// disagree with the map that decides whether a group refuses.
+    fn publish_degraded_routes(&self, degraded: usize) {
+        let mut state = self.runtime_state();
+        if !state.status.is_listening() {
+            return;
+        }
+        state.degraded_routes = degraded;
+        state.status = if degraded == 0 {
+            ModelGatewayStatus::Running
+        } else {
+            ModelGatewayStatus::Degraded
+        };
+        state.notice = (degraded > 0).then(|| {
+            format!(
+                "{degraded} of {} route groups stepped aside after repeated upstream failures: each lets one request through at a time until an upstream answers.",
+                state.route_count.unwrap_or(0)
+            )
+        });
+        state.updated_at_ms = vibex_core::unix_timestamp_ms();
+        self.publish(state);
+    }
 
     pub fn publish(&self, state: ModelGatewayRuntimeState) {
         if let Ok(mut guard) = self.runtime.write() {
@@ -999,16 +1092,6 @@ impl ModelGatewayService {
             GatewayError::MalformedRequest("the body is not valid JSON".to_string())
         })?;
         let snapshot = self.cached_snapshot()?;
-        // A degraded gateway still prepares and forwards one request at a time:
-        // that probe is the only way an upstream can prove it recovered, since
-        // the success that clears the breaker can only be observed upstream.
-        // The claim is held by a guard, so every early return below releases
-        // it. It is handed to `PreparedCall` only once the request is ready to
-        // be sent.
-        let mut probe = ProbeGuard {
-            service: self,
-            armed: self.begin_attempt()?,
-        };
         // A group may set its own ceiling. It is checked instead of the
         // gateway's rather than in addition: a group that composes three
         // Providers needs one ceiling over the composition, and the per-Key
@@ -1044,6 +1127,19 @@ impl ModelGatewayService {
                     .collect(),
             });
         }
+
+        // The breaker is per route group, so the group has to be known before
+        // it can be consulted: a degraded group refuses an extra request, and
+        // a healthy one must not pay for a neighbour's failures.
+        let group_id = resolved_group_id(&request.model).map(str::to_string);
+        let mut probe = ProbeGuard {
+            service: self,
+            group: group_id.clone().unwrap_or_default(),
+            armed: match group_id.as_deref() {
+                Some(group_id) => self.begin_attempt(group_id)?,
+                None => false,
+            },
+        };
 
         let now = vibex_core::unix_timestamp_ms();
         let connection = self.connection()?;
@@ -1110,7 +1206,7 @@ impl ModelGatewayService {
             agent_id,
             conversation,
             stream: request.stream,
-            group_id: resolved_group_id(&request.model).map(str::to_string),
+            group_id,
             probe: probe.armed,
             request_id: RequestId::new(),
         };
@@ -1253,13 +1349,25 @@ impl ModelGatewayService {
         if request.has_vendor_file_image() && !upstream.supports(WireProtocol::Responses) {
             return Err(GatewayError::UnsupportedImageReference);
         }
-        let (target, passthrough) = choose_target(inbound, &upstream, &snapshot.settings.policy)?;
-        let endpoint = upstream
-            .endpoint_for(target.wire_protocol_id())
-            .cloned()
-            .ok_or_else(|| GatewayError::TranslationDisabled {
+        // What this endpoint was seen to answer outranks a guess. Only an
+        // endpoint that declares nothing can have a lesson: a typed one has
+        // already stated its protocol.
+        let untyped = upstream
+            .untyped_endpoint()
+            .map(|endpoint| endpoint.id.clone());
+        let learned = untyped.as_deref().and_then(|endpoint_id| {
+            self.learned_protocol(connection, &profile_id, endpoint_id)
+                .ok()
+                .flatten()
+        });
+        let plan = choose_target(inbound, &upstream, learned, &snapshot.settings.policy)?;
+        let target = plan.target;
+        let passthrough = plan.passthrough;
+        let endpoint = upstream.endpoint_for_call(target).cloned().ok_or_else(|| {
+            GatewayError::TranslationDisabled {
                 wire_protocol_id: target.wire_protocol_id().to_string(),
-            })?;
+            }
+        })?;
 
         let policy = &snapshot.settings.policy;
         let states = ModelProviderAccountStateRepository::list(connection, &profile_id)?;
@@ -1310,7 +1418,7 @@ impl ModelGatewayService {
         let member_pin = pinned
             .filter(|(profile, _)| profile == &profile_id)
             .cloned();
-        let plan = plan_route(RouteRequest {
+        let key_plan = plan_route(RouteRequest {
             candidates: candidates
                 .iter()
                 .map(|(candidate, _)| candidate.clone())
@@ -1322,13 +1430,13 @@ impl ModelGatewayService {
             rotation: self.rotation.fetch_add(1, Ordering::Relaxed),
             pinned: member_pin,
         });
-        if plan.attemptable().count() == 0 {
+        if key_plan.attemptable().count() == 0 {
             return Err(GatewayError::AllKeysCooling {
                 model: request.model.clone(),
                 retry_after_ms: None,
             });
         }
-        let keys = plan
+        let keys = key_plan
             .attemptable()
             .filter_map(|candidate| {
                 candidates
@@ -1338,7 +1446,6 @@ impl ModelGatewayService {
             })
             .collect::<Vec<_>>();
 
-        let upstream_stream = request.stream || !passthrough;
         // A member may pin the reasoning effort, in which case it replaces what
         // the Agent asked for rather than adding to it.
         let member_request = match resolved.reasoning_effort.as_deref() {
@@ -1352,8 +1459,30 @@ impl ModelGatewayService {
             }
             None => request.clone(),
         };
+        let upstream_stream = request.stream || !passthrough;
         let body =
             build_upstream_request(target, &member_request, &resolved.model, upstream_stream)?;
+        // The other calls this member may make. They exist only when the first
+        // one was a guess at an endpoint that declares nothing, so a wrong
+        // guess costs one extra request instead of every request.
+        let mut alternates = Vec::new();
+        for (alternate_target, alternate_passthrough) in &plan.alternates {
+            let Some(endpoint) = upstream.endpoint_for_call(*alternate_target).cloned() else {
+                continue;
+            };
+            let body = build_upstream_request(
+                *alternate_target,
+                &member_request,
+                &resolved.model,
+                request.stream || !alternate_passthrough,
+            )?;
+            alternates.push(MemberCall {
+                target: *alternate_target,
+                passthrough: *alternate_passthrough,
+                endpoint,
+                body,
+            });
+        }
         Ok(PreparedMember {
             profile_id,
             provider_name: upstream.display_name.clone(),
@@ -1362,16 +1491,70 @@ impl ModelGatewayService {
             passthrough,
             endpoint,
             body,
+            alternates,
             keys,
             limits: policy.account_limits.clone(),
             // The ledger keeps this much of the routing decision even when the
             // first attempt answers: "the gateway had to step over a cooling
             // Key" is exactly what a later failover investigation asks for.
-            skipped_cooling: plan.skipped_cooling,
-            skipped_over_limit: plan.skipped_over_limit,
+            skipped_cooling: key_plan.skipped_cooling,
+            skipped_over_limit: key_plan.skipped_over_limit,
             reasoning_effort: resolved.reasoning_effort.clone(),
             first_token_timeout_ms: resolved.first_token_timeout_ms,
         })
+    }
+
+    /// What this untyped endpoint was seen to answer, if it was ever tried.
+    fn learned_protocol(
+        &self,
+        connection: &DbConnection,
+        profile: &ModelProviderProfileId,
+        endpoint_id: &str,
+    ) -> GatewayResult<Option<WireProtocol>> {
+        let key = (profile.clone(), endpoint_id.to_string());
+        if let Ok(cache) = self.lessons.read()
+            && let Some(protocol) = cache.get(&key)
+        {
+            return Ok(Some(*protocol));
+        }
+        let stored = GatewayEndpointProtocolRepository::get(connection, profile, endpoint_id)
+            .map_err(GatewayError::from)?;
+        let Some(protocol) = stored
+            .as_deref()
+            .and_then(WireProtocol::from_wire_protocol_id)
+        else {
+            return Ok(None);
+        };
+        if let Ok(mut cache) = self.lessons.write() {
+            cache.insert(key, protocol);
+        }
+        Ok(Some(protocol))
+    }
+
+    /// Records which protocol an untyped endpoint actually answered.
+    ///
+    /// This is the "remember" half of trying once: the next request goes
+    /// straight to the protocol that worked, so a guess is paid for at most
+    /// once per endpoint rather than on every call.
+    fn remember_protocol(
+        &self,
+        profile: &ModelProviderProfileId,
+        endpoint_id: &str,
+        protocol: WireProtocol,
+    ) {
+        if let Ok(mut cache) = self.lessons.write() {
+            cache.insert((profile.clone(), endpoint_id.to_string()), protocol);
+        }
+        let Ok(connection) = self.connection() else {
+            return;
+        };
+        let _ = GatewayEndpointProtocolRepository::remember(
+            &connection,
+            profile,
+            endpoint_id,
+            protocol.wire_protocol_id(),
+            vibex_core::unix_timestamp_ms(),
+        );
     }
 
     /// Sends one attempt, trying the prepared candidates in order until one
@@ -1382,7 +1565,10 @@ impl ModelGatewayService {
         prepared: &PreparedCall,
     ) -> GatewayResult<(UpstreamAttempt, KeyReference)> {
         if self.shutting_down.read().map(|flag| *flag).unwrap_or(false) {
-            self.finish_attempt(prepared.probe);
+            self.finish_attempt(
+                prepared.group_id.as_deref().unwrap_or_default(),
+                prepared.probe,
+            );
             return Err(GatewayError::NotConfigured(
                 "the gateway is shutting down".to_string(),
             ));
@@ -1422,7 +1608,9 @@ impl ModelGatewayService {
                 .await
             {
                 Ok((response, target, passthrough, credential)) => {
-                    self.note_success();
+                    if let Some(group_id) = prepared.group_id.as_deref() {
+                        self.note_success(group_id);
+                    }
                     self.clear_failure(&member.profile_id, &credential);
                     return Ok((
                         UpstreamAttempt {
@@ -1455,7 +1643,9 @@ impl ModelGatewayService {
                 }
             }
         }
-        self.finish_attempt(prepared.probe);
+        if let Some(group_id) = prepared.group_id.as_deref() {
+            self.finish_attempt(group_id, prepared.probe);
+        }
         self.note_finished(
             &prepared.request_id,
             vibex_core::GatewayRequestOutcome::Failed,
@@ -1479,6 +1669,20 @@ impl ModelGatewayService {
         _members: &mut Vec<vibex_core::GatewaySkippedMember>,
     ) -> GatewayResult<(reqwest::Response, WireProtocol, bool, RequestId)> {
         let mut last_error: Option<GatewayError> = None;
+        // The calls this member may make, in order. Usually one; a member on an
+        // endpoint that declares nothing gets the rest of the protocols as
+        // well, and those exist only to correct a wrong guess.
+        let calls = std::iter::once(MemberCall {
+            target: member.target,
+            passthrough: member.passthrough,
+            endpoint: member.endpoint.clone(),
+            body: member.body.clone(),
+        })
+        .chain(member.alternates.iter().cloned())
+        .collect::<Vec<_>>();
+        // More than one call means the first is a guess, and a guess that pays
+        // off is worth writing down.
+        let guessing = calls.len() > 1;
         for (candidate, credential) in member.keys.iter() {
             let secret = match resolve_key_secret(credential) {
                 Ok(Some(secret)) => secret,
@@ -1550,90 +1754,139 @@ impl ModelGatewayService {
                 last_error = Some(error);
                 continue;
             }
-            let url = endpoint_url(
-                &member.endpoint.url,
-                member.target,
-                &member.model,
-                prepared.stream,
-            )?;
-            let mut wire = apply_auth(
-                self.client.post(&url).json(&member.body),
-                member.target,
-                &secret,
-            );
-            if let Some(beta) = beta_header(&member.target, &member.body) {
-                wire = wire.header("anthropic-beta", beta);
-            }
-            // A stalled vendor may not answer the response headers at all. The
-            // route's deadline has to bound that wait too, or the deadline only
-            // covers the stream and the request hangs before it starts.
-            let sent = match member.first_token_timeout_ms {
-                Some(timeout) => match tokio::time::timeout(
-                    std::time::Duration::from_millis(timeout),
-                    wire.send(),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
+            let mut call_error: Option<GatewayError> = None;
+            for (call_index, call) in calls.iter().enumerate() {
+                let url = endpoint_url(
+                    &call.endpoint.url,
+                    call.target,
+                    &member.model,
+                    prepared.stream,
+                )?;
+                let mut wire = apply_auth(
+                    self.client.post(&url).json(&call.body),
+                    call.target,
+                    &secret,
+                );
+                if let Some(beta) = beta_header(&call.target, &call.body) {
+                    wire = wire.header("anthropic-beta", beta);
+                }
+                // A stalled vendor may not answer the response headers at
+                // all. The route's deadline has to bound that wait too, or the
+                // deadline only covers the stream and the request hangs before
+                // it starts.
+                let sent = match member.first_token_timeout_ms {
+                    Some(timeout) => match tokio::time::timeout(
+                        std::time::Duration::from_millis(timeout),
+                        wire.send(),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            attempts.push(GatewayRouteAttempt {
+                                credential_id: candidate.credential.clone(),
+                                failure: GatewayFailureKind::Upstream,
+                            });
+                            call_error = Some(GatewayError::Upstream {
+                                status: 504,
+                                message: format!(
+                                    "{} did not answer within {} ms",
+                                    member.provider_name, timeout
+                                ),
+                            });
+                            // The endpoint was reached; it is just slow. That
+                            // says nothing about the protocol, so the alternate
+                            // would only wait again.
+                            break;
+                        }
+                    },
+                    None => wire.send().await,
+                };
+                let response = match sent {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let kind = if error.is_timeout() {
+                            GatewayFailureKind::Upstream
+                        } else {
+                            GatewayFailureKind::Proxy
+                        };
+                        self.mark_failure(&member.profile_id, &candidate.credential, kind);
                         attempts.push(GatewayRouteAttempt {
                             credential_id: candidate.credential.clone(),
-                            failure: GatewayFailureKind::Upstream,
+                            failure: kind,
                         });
-                        last_error = Some(GatewayError::Upstream {
-                            status: 504,
+                        call_error = Some(GatewayError::Upstream {
+                            status: 502,
                             message: format!(
-                                "{} did not answer within {} ms",
-                                member.provider_name, timeout
+                                "{}: {}",
+                                member.provider_name,
+                                redact_transport(&error)
                             ),
                         });
-                        continue;
+                        break;
                     }
-                },
-                None => wire.send().await,
-            };
-            let response = match sent {
-                Ok(response) => response,
-                Err(error) => {
-                    let kind = if error.is_timeout() {
-                        GatewayFailureKind::Upstream
-                    } else {
-                        GatewayFailureKind::Proxy
-                    };
-                    self.mark_failure(&member.profile_id, &candidate.credential, kind);
+                };
+                if response.status().is_success() {
+                    // A guess that answered is a fact worth keeping: the next
+                    // request starts on the protocol that worked instead of
+                    // paying for the same correction again.
+                    if guessing {
+                        self.remember_protocol(&member.profile_id, &call.endpoint.id, call.target);
+                    }
+                    return Ok((
+                        response,
+                        call.target,
+                        call.passthrough,
+                        candidate.credential.clone(),
+                    ));
+                }
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                // A 404 only means "wrong protocol" when another protocol is
+                // left to try: on its own it is the address being wrong, and
+                // blaming the protocol would send the next request on the same
+                // hopeless walk.
+                let wrong_shape = is_protocol_mismatch(status, &body)
+                    || (status == 404 && call_index + 1 < calls.len());
+                if wrong_shape {
+                    // The Key worked; the body was addressed to the wrong API.
+                    // Cooling the Key here is what turned one wrong guess into
+                    // a gateway-wide outage.
                     attempts.push(GatewayRouteAttempt {
                         credential_id: candidate.credential.clone(),
-                        failure: kind,
+                        failure: GatewayFailureKind::Other,
                     });
-                    last_error = Some(GatewayError::Upstream {
-                        status: 502,
-                        message: format!("{}: {}", member.provider_name, redact_transport(&error)),
+                    call_error = Some(GatewayError::ProtocolMismatch {
+                        wire_protocol_id: call.target.wire_protocol_id().to_string(),
+                        status,
+                        message: upstream_message(&body),
                     });
-                    continue;
+                    // Another protocol may still answer, so try the alternate;
+                    // the same protocol on another Key cannot.
+                    if call_index + 1 < calls.len() {
+                        continue;
+                    }
+                    break;
                 }
-            };
-            if response.status().is_success() {
-                return Ok((
-                    response,
-                    member.target,
-                    member.passthrough,
-                    candidate.credential.clone(),
-                ));
-            }
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            let kind = classify_failure(status, &body);
-            self.mark_failure(&member.profile_id, &candidate.credential, kind);
-            attempts.push(GatewayRouteAttempt {
-                credential_id: candidate.credential.clone(),
-                failure: kind,
-            });
-            last_error = Some(GatewayError::Upstream {
-                status,
-                message: upstream_message(&body),
-            });
-            if !kind.should_fail_over() {
+                let kind = classify_failure(status, &body);
+                self.mark_failure(&member.profile_id, &candidate.credential, kind);
+                attempts.push(GatewayRouteAttempt {
+                    credential_id: candidate.credential.clone(),
+                    failure: kind,
+                });
+                call_error = Some(GatewayError::Upstream {
+                    status,
+                    message: upstream_message(&body),
+                });
+                // A Key-level failure is not a protocol problem: the alternate
+                // would repeat the same rejection on a different body shape.
+                if !kind.should_fail_over() {
+                    break;
+                }
                 break;
+            }
+            if let Some(error) = call_error {
+                last_error = Some(error);
             }
         }
         Err(last_error.unwrap_or_else(|| GatewayError::AllKeysCooling {
@@ -1692,8 +1945,10 @@ impl ModelGatewayService {
     pub(crate) fn record(&self, prepared: &PreparedCall, outcome: &RequestOutcome) {
         // Every finished request lands here, including the ones whose reply was
         // cut. Releasing the probe first keeps a ledger write failure from
-        // wedging the one slot a degraded gateway has.
-        self.finish_attempt(prepared.probe);
+        // wedging the one slot a degraded group has.
+        if let Some(group_id) = prepared.group_id.as_deref() {
+            self.finish_attempt(group_id, prepared.probe);
+        }
         // The in-flight table and the event stream are cleared here rather than
         // at each return site: this is the single funnel every finished request
         // passes through, so nothing can be left drawn as still running.
@@ -1852,13 +2107,14 @@ impl ModelGatewayService {
 /// value that releases on drop means none of them has to remember to do it.
 struct ProbeGuard<'a> {
     service: &'a ModelGatewayService,
+    group: String,
     armed: bool,
 }
 
 impl Drop for ProbeGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.service.finish_attempt(true);
+            self.service.finish_attempt(&self.group, true);
         }
     }
 }
@@ -1936,6 +2192,24 @@ pub struct PreparedMember {
     pub reasoning_effort: Option<String>,
     /// How long this attempt may take to produce its first token.
     pub first_token_timeout_ms: Option<u64>,
+    /// The other protocols to try when the first was the wrong shape.
+    ///
+    /// Only an endpoint that declares no protocol produces these: the gateway
+    /// guessed, and each guess is allowed one correction.
+    pub alternates: Vec<MemberCall>,
+}
+
+/// One wire call a member may make: the protocol, the address, and the body.
+///
+/// A member normally has one. A member whose endpoint declares no protocol has
+/// two, because the first is a guess and the vendor's refusal is what names the
+/// right answer.
+#[derive(Debug, Clone)]
+pub struct MemberCall {
+    pub target: WireProtocol,
+    pub passthrough: bool,
+    pub endpoint: ModelProviderEndpoint,
+    pub body: Value,
 }
 
 impl PreparedCall {
@@ -2013,30 +2287,88 @@ pub(crate) struct UpstreamAttempt {
     pub skipped_members: Vec<vibex_core::GatewaySkippedMember>,
 }
 
+/// The protocols one member may be called with, best first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetPlan {
+    target: WireProtocol,
+    passthrough: bool,
+    /// The protocols to try when the first one is refused as the wrong shape
+    /// for the endpoint, best first.
+    ///
+    /// It exists only for an address that declares no protocol: the gateway
+    /// does not know what the endpoint speaks, so it tries one and, when the
+    /// vendor answers that the body belongs to another API, walks the remaining
+    /// ones once each. A proven answer is remembered, so the whole walk happens
+    /// at most once per endpoint.
+    alternates: Vec<(WireProtocol, bool)>,
+}
+
+/// The translation order, best fidelity first.
+const TRANSLATION_PREFERENCE: [WireProtocol; 4] = [
+    // Anthropic first: the translation into Messages keeps cache breakpoints
+    // and thinking signatures, which the others cannot carry.
+    WireProtocol::AnthropicMessages,
+    WireProtocol::ChatCompletions,
+    WireProtocol::Responses,
+    WireProtocol::GeminiGenerateContent,
+];
+
 /// Chooses the protocol the upstream is called with.
 ///
-/// Passthrough wins whenever the upstream speaks what the client spoke: a
+/// Two statements decide it, strongest first: an endpoint that names its
+/// protocol, and what an untyped endpoint was observed to accept. Passthrough
+/// wins whenever the upstream states that it speaks what the client spoke: a
 /// same-protocol call is forwarded byte for byte, which is what keeps a
-/// vendor's prompt cache valid.
+/// vendor's prompt cache valid. An untyped endpoint states nothing, so a
+/// passthrough there is only a guess and comes back with an `alternate` to fall
+/// back on.
 fn choose_target(
     inbound: WireProtocol,
     upstream: &GatewayUpstream,
+    learned: Option<WireProtocol>,
     policy: &GatewayPolicy,
-) -> GatewayResult<(WireProtocol, bool)> {
-    if upstream.supports(inbound) {
-        return Ok((inbound, true));
+) -> GatewayResult<TargetPlan> {
+    let allowed = |protocol: WireProtocol| policy.translate.allows(protocol.wire_protocol_id());
+    // What this endpoint was seen to answer is the strongest statement there
+    // is, because it was observed rather than declared.
+    if let Some(learned) = learned {
+        return Ok(TargetPlan {
+            target: learned,
+            passthrough: learned == inbound,
+            alternates: Vec::new(),
+        });
     }
-    let preference = [
-        // Anthropic first: the translation into Messages keeps cache
-        // breakpoints and thinking signatures, which the others cannot carry.
-        WireProtocol::AnthropicMessages,
-        WireProtocol::ChatCompletions,
-        WireProtocol::Responses,
-        WireProtocol::GeminiGenerateContent,
-    ];
-    for protocol in preference {
-        if upstream.supports(protocol) && policy.translate.allows(protocol.wire_protocol_id()) {
-            return Ok((protocol, false));
+    if upstream.supports(inbound) {
+        return Ok(TargetPlan {
+            target: inbound,
+            passthrough: true,
+            alternates: Vec::new(),
+        });
+    }
+    if upstream.untyped_endpoint().is_some() {
+        // Nothing declares anything. A passthrough is the cheapest first try
+        // and the one that preserves the vendor's prompt cache, so it goes
+        // first even though the endpoint might speak another protocol. Every
+        // other protocol the policy allows follows, so a wrong guess is
+        // corrected instead of becoming a refusal.
+        let alternates = TRANSLATION_PREFERENCE
+            .into_iter()
+            .filter(|protocol| *protocol != inbound && allowed(*protocol))
+            .map(|protocol| (protocol, false))
+            .collect();
+        return Ok(TargetPlan {
+            target: inbound,
+            passthrough: true,
+            alternates,
+        });
+    }
+    for protocol in TRANSLATION_PREFERENCE {
+        if upstream.supports(protocol) && allowed(protocol) {
+            return Ok(TargetPlan {
+                target: protocol,
+                passthrough: false,
+                alternates: Vec::new(),
+            });
         }
     }
     Err(GatewayError::TranslationDisabled {
@@ -2054,6 +2386,9 @@ fn member_failure_kind(error: &GatewayError) -> GatewayFailureKind {
         GatewayError::Upstream { status, message } => classify_failure(*status, message),
         GatewayError::AllKeysCooling { .. } => GatewayFailureKind::Rate,
         GatewayError::TokenCeilingReached { .. } => GatewayFailureKind::Quota,
+        // A wrong protocol is not a Key problem, so it must not be described
+        // as one: `Auth` would retire the Key for the mistake of the address.
+        GatewayError::ProtocolMismatch { .. } => GatewayFailureKind::Other,
         GatewayError::NotConfigured(_) => GatewayFailureKind::Auth,
         GatewayError::TranslationDisabled { .. }
         | GatewayError::UnsupportedImageReference
@@ -2563,43 +2898,72 @@ mod tests {
         }
     }
 
-    /// Three failures degrade, one success recovers.
+    /// An upstream that publishes only an untyped address.
+    fn untyped_upstream() -> GatewayUpstream {
+        GatewayUpstream {
+            profile_id: ModelProviderProfileId::new(),
+            display_name: "Untyped".to_string(),
+            endpoints: vec![ModelProviderEndpoint {
+                id: "api".to_string(),
+                kind: ModelProviderEndpointKind::Api,
+                url: "https://example.invalid".to_string(),
+                wire_protocol_id: None,
+            }],
+            models: vec!["m".to_string()],
+            credentials: Vec::new(),
+            keys: Vec::new(),
+        }
+    }
+
+    /// Three failures degrade one group, one success recovers it.
     ///
-    /// The transition is the whole contract: a degraded gateway must come back
+    /// The transition is the whole contract: a degraded group must come back
     /// without a restart, and a single good answer is the signal.
     #[test]
-    fn the_breaker_degrades_after_three_failures_and_recovers_on_success() {
-        use std::sync::atomic::Ordering;
+    fn one_group_degrades_after_three_failures_and_recovers_on_success() {
         let service = ModelGatewayService::new(
             std::env::temp_dir().join("vibex-breaker-test.db"),
             ProviderConfigService::new(std::env::temp_dir().join("vibex-breaker-test-db.db")),
             GatewayLimits::default(),
         );
-        service.publish(ModelGatewayRuntimeState::running(3425, 1));
+        service.publish(ModelGatewayRuntimeState::running(3425, 2));
         for _ in 0..ModelGatewayService::DEGRADE_AFTER_FAILURES {
-            service.note_failure();
+            service.note_failure("group-a");
         }
         assert!(service.is_degraded());
-        assert!(service.runtime_state().notice.is_some());
+        assert!(service.group_is_degraded("group-a"));
+        assert_eq!(service.runtime_state().degraded_routes, 1);
+        assert!(
+            service
+                .runtime_state()
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("1 of 2 route groups")),
+            "the notice must name the scope, got {:?}",
+            service.runtime_state().notice
+        );
         // The listener is still bound, so the UI can distinguish "stepped
-        // aside" from "not running".
+        // aside" from "not running", and the other group keeps working.
         assert!(service.runtime_state().status.is_listening());
+        assert!(service.runtime_state().base_url().is_some());
+        assert!(!service.group_is_degraded("group-b"));
+        assert!(!service.begin_attempt("group-b").unwrap());
 
-        service.note_success();
+        service.note_success("group-a");
         assert!(!service.is_degraded());
         assert_eq!(service.runtime_state().status, ModelGatewayStatus::Running);
         assert!(service.runtime_state().notice.is_none());
-        assert_eq!(service.consecutive_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(service.runtime_state().degraded_routes, 0);
     }
 
-    /// A degraded gateway admits exactly one request at a time.
+    /// A degraded group admits exactly one request at a time.
     ///
     /// This is what makes recovery possible at all: the single probe is the
     /// only request that can reach an upstream and produce the success
     /// `note_success` needs. A second caller is refused rather than queued, so
     /// it stays on its direct Provider instead of waiting behind a broken one.
     #[test]
-    fn a_degraded_gateway_admits_one_probe_at_a_time() {
+    fn a_degraded_group_admits_one_probe_at_a_time() {
         let service = ModelGatewayService::new(
             std::env::temp_dir().join("vibex-breaker-probe.db"),
             ProviderConfigService::new(std::env::temp_dir().join("vibex-breaker-probe-db.db")),
@@ -2607,7 +2971,7 @@ mod tests {
         );
         service.publish(ModelGatewayRuntimeState::running(3425, 1));
         for _ in 0..ModelGatewayService::DEGRADE_AFTER_FAILURES {
-            service.note_failure();
+            service.note_failure("group-a");
         }
         assert!(service.is_degraded());
 
@@ -2618,12 +2982,12 @@ mod tests {
             GatewayLimits::default(),
         );
         running.publish(ModelGatewayRuntimeState::running(3425, 1));
-        assert!(!running.begin_attempt().unwrap());
+        assert!(!running.begin_attempt("group-a").unwrap());
 
-        // The first caller through a degraded gateway holds the slot.
-        assert!(service.begin_attempt().unwrap());
+        // The first caller through a degraded group holds the slot.
+        assert!(service.begin_attempt("group-a").unwrap());
         // A second one is refused with the message the server must not count.
-        let refused = service.begin_attempt().unwrap_err();
+        let refused = service.begin_attempt("group-a").unwrap_err();
         assert!(
             matches!(&refused, GatewayError::NotConfigured(message)
                 if message == ModelGatewayService::STEPPED_ASIDE),
@@ -2631,9 +2995,9 @@ mod tests {
         );
 
         // Releasing lets the next request probe.
-        service.finish_attempt(true);
-        assert!(service.begin_attempt().unwrap());
-        service.finish_attempt(true);
+        service.finish_attempt("group-a", true);
+        assert!(service.begin_attempt("group-a").unwrap());
+        service.finish_attempt("group-a", true);
     }
 
     /// A probe that reaches an upstream and answers clears the state.
@@ -2646,17 +3010,17 @@ mod tests {
         );
         service.publish(ModelGatewayRuntimeState::running(3425, 1));
         for _ in 0..ModelGatewayService::DEGRADE_AFTER_FAILURES {
-            service.note_failure();
+            service.note_failure("group-a");
         }
         assert!(service.is_degraded());
 
-        assert!(service.begin_attempt().unwrap());
-        service.note_success();
+        assert!(service.begin_attempt("group-a").unwrap());
+        service.note_success("group-a");
 
         assert!(!service.is_degraded());
         assert_eq!(service.runtime_state().status, ModelGatewayStatus::Running);
         // The next request is ordinary again, not a probe.
-        assert!(!service.begin_attempt().unwrap());
+        assert!(!service.begin_attempt("group-a").unwrap());
     }
 
     /// A failure from an unrelated outage starts the count over.
@@ -2668,13 +3032,15 @@ mod tests {
             GatewayLimits::default(),
         );
         service.publish(ModelGatewayRuntimeState::running(3425, 1));
-        service.note_failure();
-        service.note_failure();
-        service.last_failure_at_ms.store(
-            (vibex_core::unix_timestamp_ms() - ModelGatewayService::FAILURE_MEMORY_MS - 1) as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        service.note_failure();
+        service.note_failure("group-a");
+        service.note_failure("group-a");
+        if let Ok(mut breakers) = service.breakers.lock()
+            && let Some(breaker) = breakers.get_mut("group-a")
+        {
+            breaker.last_failure_at_ms =
+                vibex_core::unix_timestamp_ms() - ModelGatewayService::FAILURE_MEMORY_MS - 1;
+        }
+        service.note_failure("group-a");
         assert!(
             !service.is_degraded(),
             "a failure from an unrelated outage must not complete the count"
@@ -2715,6 +3081,8 @@ mod tests {
         );
     }
 
+    /// A declared protocol wins over passthrough: a client speaking another
+    /// protocol is translated onto the one the endpoint states.
     #[test]
     fn passthrough_wins_over_translation() {
         let upstream = upstream(&[
@@ -2723,13 +3091,84 @@ mod tests {
         ]);
         let policy = GatewayPolicy::default();
         assert_eq!(
-            choose_target(WireProtocol::ChatCompletions, &upstream, &policy).unwrap(),
-            (WireProtocol::ChatCompletions, true)
+            choose_target(WireProtocol::ChatCompletions, &upstream, None, &policy).unwrap(),
+            TargetPlan {
+                target: WireProtocol::ChatCompletions,
+                passthrough: true,
+                alternates: Vec::new(),
+            }
         );
         // A protocol the upstream does not speak is translated.
         assert_eq!(
-            choose_target(WireProtocol::Responses, &upstream, &policy).unwrap(),
-            (WireProtocol::AnthropicMessages, false)
+            choose_target(WireProtocol::Responses, &upstream, None, &policy).unwrap(),
+            TargetPlan {
+                target: WireProtocol::AnthropicMessages,
+                passthrough: false,
+                alternates: Vec::new(),
+            }
+        );
+    }
+
+    /// An endpoint that declares nothing is guessed once, with a fallback, and
+    /// never claimed to support anything.
+    ///
+    /// This is the fix for the outage: the untyped address used to answer
+    /// `endpoint_for` for every protocol, so a Responses body went to a Chat
+    /// Completions endpoint unmodified and the vendor's 422 cooled the Key.
+    #[test]
+    fn an_untyped_endpoint_is_guessed_once_with_a_fallback() {
+        let upstream = untyped_upstream();
+        assert!(!upstream.supports(WireProtocol::Responses));
+        assert!(upstream.endpoint_for("openai_responses").is_none());
+        assert!(upstream.untyped_endpoint().is_some());
+
+        let policy = GatewayPolicy::default();
+        let plan = choose_target(WireProtocol::Responses, &upstream, None, &policy).unwrap();
+        assert_eq!(plan.target, WireProtocol::Responses);
+        assert!(plan.passthrough, "the first try is the cheap one");
+        assert_eq!(
+            plan.alternates,
+            vec![
+                (WireProtocol::AnthropicMessages, false),
+                (WireProtocol::ChatCompletions, false),
+                (WireProtocol::GeminiGenerateContent, false),
+            ],
+            "a refusal has to have somewhere to go, and every allowed protocol \
+             is a candidate because the endpoint declared nothing"
+        );
+    }
+
+    /// A remembered verdict replaces the guess: the second request does not pay
+    /// for the same correction again.
+    #[test]
+    fn a_remembered_protocol_replaces_the_guess() {
+        let upstream = untyped_upstream();
+        let policy = GatewayPolicy::default();
+        let plan = choose_target(
+            WireProtocol::Responses,
+            &upstream,
+            Some(WireProtocol::ChatCompletions),
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(
+            plan,
+            TargetPlan {
+                target: WireProtocol::ChatCompletions,
+                passthrough: false,
+                alternates: Vec::new(),
+            }
+        );
+        // The same verdict on an inbound that matches it is a passthrough.
+        assert!(
+            choose_target(
+                WireProtocol::ChatCompletions,
+                &upstream,
+                Some(WireProtocol::ChatCompletions),
+                &policy,
+            )
+            .unwrap()
+            .passthrough
         );
     }
 
@@ -2738,8 +3177,25 @@ mod tests {
         let upstream = upstream(&[WireProtocol::ChatCompletions]);
         let mut policy = GatewayPolicy::default();
         policy.translate.openai_chat_completions = false;
-        let error = choose_target(WireProtocol::Responses, &upstream, &policy).unwrap_err();
+        let error = choose_target(WireProtocol::Responses, &upstream, None, &policy).unwrap_err();
         assert_eq!(error.code(), "model_gateway_translation_disabled");
+    }
+
+    /// A vendor answering "wrong shape" is not a Key failure.
+    ///
+    /// The old path classified it as `Other`, cooled the Key for ten seconds,
+    /// and counted the request against the gateway — three guesses were enough
+    /// to close the whole service.
+    #[test]
+    fn a_protocol_mismatch_blames_no_key() {
+        let error = GatewayError::ProtocolMismatch {
+            wire_protocol_id: "openai_responses".to_string(),
+            status: 422,
+            message: "unknown variant `function_call_output`".to_string(),
+        };
+        assert!(!error.blames_upstream());
+        assert_eq!(error.code(), "model_gateway_protocol_mismatch");
+        assert_eq!(member_failure_kind(&error), GatewayFailureKind::Other);
     }
 
     #[test]

@@ -361,9 +361,13 @@ pub enum ModelGatewayStatus {
     /// served while it is down; direct Providers are unaffected, because they
     /// never reach the gateway.
     Unavailable,
-    /// The listener is up but upstream calls have failed repeatedly. The
-    /// gateway has stepped out of the way: every request but one is refused
-    /// while a single probe is allowed through.
+    /// The listener is up, but at least one route group has stepped out of the
+    /// way after repeated upstream failures: that group refuses every request
+    /// but one probe while a single attempt is allowed through.
+    ///
+    /// The scope is the route group, not the gateway. Other groups keep
+    /// serving, and `base_url()` stays available, because a group whose
+    /// members are all broken says nothing about an unrelated one.
     ///
     /// This is distinct from `Unavailable`: the port is still bound, and the
     /// state clears itself once an upstream answers again. Reporting it is the
@@ -376,8 +380,13 @@ pub enum ModelGatewayStatus {
 }
 
 impl ModelGatewayStatus {
+    /// Whether requests can be routed at all.
+    ///
+    /// A degraded gateway is still routing: the degraded set is a subset of
+    /// the route groups, so a request naming a healthy group must not be
+    /// turned away because a different one is stepping aside.
     pub const fn is_routable(self) -> bool {
-        matches!(self, Self::Running)
+        matches!(self, Self::Running | Self::Degraded)
     }
 
     /// The listener is bound even though routing may be bypassed.
@@ -396,6 +405,14 @@ pub struct ModelGatewayRuntimeState {
     /// How many enabled route groups the listener can serve right now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_count: Option<usize>,
+    /// How many of those groups are currently stepping aside.
+    ///
+    /// It is a count rather than a list because every surface only needs to
+    /// say whether the gateway is fully serving or partly; which group is
+    /// degraded is answered by the per-group routing state, not by this
+    /// summary.
+    #[serde(default, skip_serializing_if = "degraded_routes_is_zero")]
+    pub degraded_routes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,
     pub updated_at_ms: i64,
@@ -407,6 +424,7 @@ impl Default for ModelGatewayRuntimeState {
             status: ModelGatewayStatus::Starting,
             port: None,
             route_count: None,
+            degraded_routes: 0,
             notice: None,
             updated_at_ms: unix_timestamp_ms(),
         }
@@ -419,6 +437,7 @@ impl ModelGatewayRuntimeState {
             status: ModelGatewayStatus::Running,
             port: Some(port),
             route_count: Some(route_count),
+            degraded_routes: 0,
             notice: None,
             updated_at_ms: unix_timestamp_ms(),
         }
@@ -429,17 +448,28 @@ impl ModelGatewayRuntimeState {
             status: ModelGatewayStatus::Unavailable,
             port: None,
             route_count: None,
+            degraded_routes: 0,
             notice: Some(notice.into()),
             updated_at_ms: unix_timestamp_ms(),
         }
     }
 
-    /// The address an Agent's base URL should point at, when the service runs.
+    /// The address an Agent's base URL should point at, when the port is bound.
+    ///
+    /// A degraded gateway still answers on this address for every group that
+    /// has not stepped aside, so withdrawing the URL here would take working
+    /// groups away from the Agents using them.
     pub fn base_url(&self) -> Option<String> {
         self.port
-            .filter(|_| self.status == ModelGatewayStatus::Running)
+            .filter(|_| self.status.is_listening())
             .map(|port| format!("http://127.0.0.1:{port}"))
     }
+}
+
+/// Keeps a fully-serving runtime state's JSON identical to what it was before
+/// the per-group breaker existed.
+pub const fn degraded_routes_is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 /// Why a Key is not currently selectable.

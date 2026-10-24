@@ -325,6 +325,45 @@ pub fn classify_failure(status: u16, body: &str) -> GatewayFailureKind {
     }
 }
 
+/// Whether a failed upstream call failed because the *shape* of the request did
+/// not match the protocol the endpoint speaks.
+///
+/// This is the one failure the Key has nothing to do with. A vendor that
+/// answers `422 unknown variant` is telling the gateway that this body belongs
+/// to a different API, so cooling the Key would blame the credential for a
+/// routing mistake — and, with a single Key, would leave every later request
+/// refused before it could be retried on the right protocol.
+pub fn is_protocol_mismatch(status: u16, body: &str) -> bool {
+    let words = body.to_lowercase();
+    let shape_words = [
+        "unknown variant",
+        "unknown field",
+        "missing field",
+        "unexpected field",
+        "failed to deserialize",
+        "invalid type",
+        "expected one of",
+        "unsupported",
+        "not supported",
+        "no such",
+    ]
+    .iter()
+    .any(|needle| words.contains(needle));
+    match status {
+        // Wrong media type or wrong request schema. A 404 is deliberately not
+        // here: it also means "this address is wrong", which no other protocol
+        // would fix. The caller treats it as a shape problem only when it has
+        // another protocol left to try, because then a path that does not exist
+        // under this API is a real possibility.
+        415 | 422 => true,
+        // A 400 is only the body's shape when the vendor says so; a plain 400
+        // can also be a content refusal, which is the request's fault and must
+        // keep its ordinary treatment.
+        400 => shape_words,
+        _ => false,
+    }
+}
+
 /// The health a Key should be recorded with after one failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyHealth {
@@ -1134,5 +1173,39 @@ mod route_members {
     fn an_empty_route_plans_to_nothing() {
         let planned = plan_members_with_usage(&[], vibex_core::RouteStrategy::RoundRobin, 5, &[]);
         assert!(planned.is_empty());
+    }
+
+    /// A refusal that names a shape problem is the protocol's fault, not the
+    /// Key's.
+    ///
+    /// The distinction is load-bearing: treating these as Key failures is what
+    /// cooled every Key three times and closed the gateway.
+    #[test]
+    fn a_shape_refusal_is_recognised_as_a_protocol_mismatch() {
+        // The exact reply that started this: a Chat Completions endpoint handed
+        // a Responses body.
+        assert!(is_protocol_mismatch(
+            422,
+            r#"{"error":{"message":"messages[8]: unknown variant `function_call_output`, expected one of `text`, `image_url`, `file`"}}"#
+        ));
+        assert!(is_protocol_mismatch(415, "unsupported media type"));
+        // A 400 only counts when the body says the shape is wrong.
+        assert!(is_protocol_mismatch(
+            400,
+            r#"{"error":"failed to deserialize the JSON body into the target type"}"#
+        ));
+        assert!(
+            !is_protocol_mismatch(400, r#"{"error":{"message":"content was rejected"}}"#),
+            "a content refusal is the request's fault and keeps its treatment"
+        );
+        assert!(!is_protocol_mismatch(401, "invalid api key"));
+        assert!(!is_protocol_mismatch(429, "rate limit exceeded"));
+        assert!(
+            !is_protocol_mismatch(500, "unknown variant"),
+            "a server error is the vendor's problem whatever its wording"
+        );
+        // A 404 is decided by the caller, which knows whether another protocol
+        // is left to try.
+        assert!(!is_protocol_mismatch(404, "not found"));
     }
 }

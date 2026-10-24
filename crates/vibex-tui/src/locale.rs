@@ -1170,6 +1170,7 @@ strings! {
     config_state_ready => { "Ready", "就绪", "就緒" },
     config_state_invalid => { "Invalid", "已失效", "已失效" },
     config_state_unavailable => { "Unavailable", "不可用", "不可用" },
+    config_state_degraded => { "Degraded", "已降级", "已降級" },
     config_state_probe_failed => { "Probe failed", "探测失败", "探測失敗" },
     config_state_unknown => { "Unknown", "未知", "未知" },
     config_state_importable => { "Importable", "可导入", "可匯入" },

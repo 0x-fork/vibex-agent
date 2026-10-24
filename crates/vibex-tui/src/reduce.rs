@@ -1887,10 +1887,10 @@ impl App {
                 let Some(snapshot) = self.management_data.gateway.as_ref() else {
                     return Outcome::quiet();
                 };
-                // "On" means it is serving; anything else — disabled, still
-                // starting, or stepped aside — is a row that asks to be turned
-                // on, so the press is the opposite of what the row shows.
-                let enabled = snapshot.runtime.status != vibex_core::ModelGatewayStatus::Running;
+                // "On" means it is listening; a degraded gateway is still
+                // listening, so the press turns it off. Only a state that is
+                // not serving at all is asked to be turned on.
+                let enabled = !snapshot.runtime.status.is_listening();
                 self.begin_toggle(key, enabled, Effect::SetGatewayEnabled { enabled })
             }
             (ConfigSection::Providers, ConfigAction::Activate) => {

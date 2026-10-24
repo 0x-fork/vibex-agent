@@ -5147,14 +5147,41 @@ ProviderConfigService::{
     Agent's own effort vocabulary, and inventing one produces a declaration the
     Agent refuses.
   - No money field exists anywhere in the catalogue, its cache, or its DTOs.
-- **The gateway steps aside when it is the problem.** Three consecutive requests
-  that produce no upstream answer put the service into `Degraded`: the listener
-  stays bound, all but one request are refused with a `503` that says it stepped
-  aside, and one success clears both the count and the state. `Degraded` is
-  deliberately distinct from `Unavailable` — the port is alive either way, and
-  only one of them means "restart or wait". A failure older than the memory
-  window starts the count over, and the degraded refusal itself never counts, or
-  the state could never clear.
+- **A route group steps aside, not the gateway.** Three consecutive requests
+  that produce no upstream answer put *that group* into a stepped-aside state:
+  the listener stays bound, everything the group would have served but one
+  request at a time is refused with a `503` that says the group stepped aside,
+  and one success clears both the count and the group. The service-wide
+  `Degraded` status is derived from those per-group breakers (`degraded_routes`)
+  and never latched independently; `Running` means none is set. The scope is the
+  group because that is what a failure belongs to — three Agents bound to the
+  same group share its breakers, and a group whose upstream is healthy keeps
+  serving while its neighbour steps aside.
+  `Degraded` is deliberately distinct from `Unavailable`: the port is alive
+  either way, `base_url()` and `is_routable()` stay true while degraded (the
+  remaining groups still serve), and only `Unavailable` means "restart or wait".
+  A failure older than the memory window starts the count over, and the
+  stepped-aside refusal itself never counts, or the state could never clear.
+- **An undeclared protocol is a guess, and a guess is corrected once.** An
+  endpoint that carries no `wireProtocolId` is an address whose API is unknown,
+  not an endpoint that speaks all four. `GatewayUpstream::endpoint_for` matches
+  only an endpoint that *names* the protocol; `untyped_endpoint` is the single
+  fallback, and `choose_target` uses it by sending a passthrough first — the
+  cheapest try, and the one that keeps the vendor's prompt cache — with every
+  other protocol the translation policy allows queued behind it.
+  `model_gateway_endpoint_protocol` remembers the protocol that answered, keyed
+  by `(profile, endpoint_id)`, so the walk happens at most once per endpoint.
+  Treating "no declaration" as "speaks every protocol" is what sent a Responses
+  body to a Chat Completions endpoint unmodified.
+- **A wrong protocol blames nothing.** A `404`/`415`/`422`, or a `400` whose body
+  names a shape problem, is classified as `GatewayError::ProtocolMismatch` and
+  answered as `502 model_gateway_protocol_mismatch`. It does *not* cool the Key
+  (`mark_failure` is skipped), does not count toward a group's breaker
+  (`GatewayError::blames_upstream()` is false for it), and does not latch a
+  degraded state. The Key worked; only the body was addressed to the wrong API.
+  Cooling the Key on that reply is how three wrong guesses closed the whole
+  gateway: every retry then hit `429 model_gateway_keys_cooling`, which counted
+  as another failure.
 - **The gateway's own switch reaches the listener and the bindings.** Turning it
   off stops the listener and removes every hidden gateway Profile, so each bound
   Agent really falls back to its direct Provider instead of pointing at a dead
@@ -5331,11 +5358,19 @@ ProviderConfigService::{
   Provider and each Key in its route, drops a trace that says nothing, and keeps
   the id of a Key that has since been removed.
 - `cargo test -p vibex-model-gateway --test gateway` asserts that three
-  unreachable requests degrade the gateway, that a degraded gateway refuses with
-  `503` instead of retrying, and that the state is reported with a reason.
+  unreachable requests step a group aside, that a stepped-aside group refuses
+  with `503` instead of retrying, and that the state is reported with a reason.
+- `cargo test -p vibex-model-gateway --test gateway` also asserts the protocol
+  contracts end to end: an undeclared endpoint is tried once and the winning
+  protocol is remembered (the second request skips the guess), and a mismatch
+  with no allowed fallback answers `502 model_gateway_protocol_mismatch` while
+  leaving the Key un-cooled and `degraded_routes` at zero.
 - `cargo test -p vibex-model-gateway --lib` asserts the breaker's transitions
-  directly: three failures degrade, one success recovers, and an old failure does
-  not accumulate.
+  directly: three failures degrade one group while its neighbour keeps serving,
+  one success recovers, and an old failure does not accumulate. It also asserts
+  `choose_target`'s precedence — a declared endpoint outranks passthrough, an
+  untyped one is guessed once with an ordered fallback list, and a remembered
+  verdict replaces the guess.
 - `cargo test -p vibex-config-switch credential_tests` asserts that a Key can be
   added and removed, that the profile row never carries the value, that an empty
   Key is refused, and that each add advances the revision.
@@ -5450,9 +5485,10 @@ ModelGatewayService::start()                       -> ModelGatewayRuntimeState
   later start re-creates the Profiles for the same Agents and groups without
   asking again.
 - **A failure is reported, never silent.** A failed bind publishes
-  `Unavailable` and removes the Profiles; repeated upstream failures publish
-  `Degraded` (the listener stays bound, one request at a time is let through).
-  Neither state is `Disabled`, because neither means the user turned it off.
+  `Unavailable` and removes the Profiles; repeated upstream failures raise
+  `degraded_routes` and publish `Degraded` (the listener stays bound, and each
+  stepped-aside group lets one request at a time through). Neither state is
+  `Disabled`, because neither means the user turned it off.
 - **There is no plain gateway route.** `RouteKind` has two shapes:
   `ProviderGroup` (served by the gateway) and `Direct` (never is). The retired
   `Gateway` kind and its `route/<id>` ids are gone from the model namespace;

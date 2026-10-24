@@ -36,6 +36,18 @@ pub enum GatewayError {
         status: u16,
         message: String,
     },
+    /// The endpoint answered as if this request belonged to another protocol.
+    ///
+    /// It is its own variant because it is not a Key or provider failure: the
+    /// credential worked, the provider is reachable, and the same request may
+    /// still succeed on a different protocol. Counting it against the Key or
+    /// the route group would report the wrong thing and, with one Key, would
+    /// make the mistake unrecoverable.
+    ProtocolMismatch {
+        wire_protocol_id: String,
+        status: u16,
+        message: String,
+    },
     /// The gateway's own configuration is unusable.
     NotConfigured(String),
     /// An internal invariant broke. Never includes request content.
@@ -52,6 +64,7 @@ impl GatewayError {
             Self::UnsupportedImageReference => 400,
             Self::MalformedRequest(_) => 400,
             Self::Upstream { status, .. } => *status,
+            Self::ProtocolMismatch { .. } => 502,
             Self::NotConfigured(_) => 503,
             Self::Internal(_) => 500,
         }
@@ -66,6 +79,7 @@ impl GatewayError {
             Self::UnsupportedImageReference => "unsupported_image_reference",
             Self::MalformedRequest(_) => "model_gateway_request_invalid",
             Self::Upstream { .. } => "model_gateway_upstream_failed",
+            Self::ProtocolMismatch { .. } => "model_gateway_protocol_mismatch",
             Self::NotConfigured(_) => "model_gateway_not_configured",
             Self::Internal(_) => "model_gateway_internal",
         }
@@ -97,6 +111,13 @@ impl GatewayError {
             }
             Self::MalformedRequest(detail) => format!("The gateway could not read this request: {detail}"),
             Self::Upstream { message, .. } => message.clone(),
+            Self::ProtocolMismatch {
+                wire_protocol_id,
+                message,
+                ..
+            } => format!(
+                "`{wire_protocol_id}` is the wrong protocol for this endpoint: {message}"
+            ),
             Self::NotConfigured(detail) => format!("The gateway is not configured: {detail}"),
             Self::Internal(detail) => format!("The gateway could not complete this request: {detail}"),
         }
@@ -109,6 +130,18 @@ impl GatewayError {
             Self::Upstream { status, .. } => Some(classify_status(*status)),
             _ => None,
         }
+    }
+
+    /// Whether this failure says anything about the upstream or the Key.
+    ///
+    /// A protocol mismatch and the gateway's own refusals do not: counting
+    /// them is what let one wrong-protocol guess cool a Key and then degrade
+    /// the whole gateway.
+    pub const fn blames_upstream(&self) -> bool {
+        matches!(
+            self,
+            Self::Upstream { .. } | Self::AllKeysCooling { .. } | Self::TokenCeilingReached { .. }
+        )
     }
 
     pub fn retry_after_ms(&self) -> Option<i64> {
@@ -184,6 +217,15 @@ mod tests {
         assert_eq!(
             GatewayError::MalformedRequest("x".into()).key_failure(),
             None
+        );
+        assert!(
+            !GatewayError::ProtocolMismatch {
+                wire_protocol_id: "openai_responses".into(),
+                status: 422,
+                message: "unknown variant".into(),
+            }
+            .blames_upstream(),
+            "a wrong protocol must not be charged to the upstream"
         );
     }
 

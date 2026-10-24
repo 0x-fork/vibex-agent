@@ -323,6 +323,64 @@ fn point_gateway_at(
     route.id
 }
 
+/// Seeds a Provider that publishes one address and declares no protocol.
+///
+/// This is the shape a hand-entered "default API base URL" produces, and the
+/// shape that broke: the gateway treated "no declaration" as "speaks all four".
+fn seed_untyped_upstream(
+    service: &ProviderConfigService,
+    endpoint: &str,
+    models: &[&str],
+    api_key: &str,
+) -> ModelProviderProfileId {
+    let lookup_key = format!("vibex-test-secret-{}", RequestId::new().as_str());
+    secrets::store_provider_secret(&lookup_key, api_key).unwrap();
+    let credential = ModelProviderCredentialReference {
+        id: RequestId::new(),
+        display_name: "Primary".to_string(),
+        status: AgentCredentialStatus::Ready,
+        credential: AgentCredential::ApiKey {
+            secret: ProjectionSecretReference {
+                id: RequestId::new(),
+                backend: secrets::provider_secret_write_backend(),
+                setup_state: ProviderSecretSetupState::Available,
+                lookup_key,
+                redacted_hint: "stored".to_string(),
+                revision: 1,
+                legacy_secret_reference_id: None,
+            },
+            target_hint: None,
+        },
+        revision: 1,
+    };
+    let profile = vibex_core::ModelProviderProfileCreateRequest {
+        display_name: "Untyped".to_string(),
+        vendor_hint: None,
+        endpoints: vec![ModelProviderEndpoint {
+            id: "api".to_string(),
+            kind: ModelProviderEndpointKind::Api,
+            url: endpoint.to_string(),
+            wire_protocol_id: None,
+        }],
+        proxy_policy: ModelProviderProxyPolicy::InheritSystem,
+        credentials: vec![credential],
+        configured_models: models
+            .iter()
+            .map(|model| ModelProviderCatalogEntry {
+                id: (*model).to_string(),
+                display_name: None,
+                enabled: true,
+                metadata: Vec::new(),
+                capabilities: Default::default(),
+            })
+            .collect(),
+        default_model_id: models.first().map(|model| (*model).to_string()),
+        headers: Vec::new(),
+        status: ModelProviderProfileStatus::Enabled,
+    };
+    service.create_model_provider_profile(profile).unwrap().id
+}
+
 /// The model id a session selects from a group.
 fn group_model(group: &vibex_core::ModelRouteId, model: &str) -> String {
     format!("group/{}/{}", group.as_str(), model)
@@ -1831,7 +1889,201 @@ async fn repeated_failures_degrade_the_gateway_and_one_probe_recovers_it() {
     cleanup(path);
 }
 
-/// A degraded gateway recovers as soon as an upstream answers again, without a
+/// Which path each request reached, for a mock that answers by protocol.
+type Paths = Arc<Mutex<Vec<String>>>;
+
+/// A vendor that speaks Chat Completions and answers anything else with the
+/// shape error the real one produced.
+///
+/// The 422 body is copied from what an OpenAI-compatible Chat Completions
+/// endpoint says when it is handed a Responses body, because that message is
+/// what the mismatch detector keys on.
+async fn mock_chat_only_upstream() -> (String, Paths, tokio::task::JoinHandle<()>) {
+    let paths: Paths = Arc::new(Mutex::new(Vec::new()));
+    let state = paths.clone();
+    let router = Router::new()
+        .route(
+            "/{*path}",
+            post(
+                move |uri: axum::http::Uri, body: axum::body::Bytes| async move {
+                    state.lock().await.push(uri.path().to_string());
+                    if uri.path().contains("/chat/completions") {
+                        let _ = body;
+                        let mut response = Response::new(Body::from(chat_stream()));
+                        response.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            header::HeaderValue::from_static("text/event-stream"),
+                        );
+                        return response;
+                    }
+                    let mut response = Response::new(Body::from(
+                        json!({"error": {"message":
+                            "messages[0].content: unknown variant `input_text`, expected one of `text`, `image_url`, `file`"
+                        }})
+                        .to_string(),
+                    ));
+                    *response.status_mut() = axum::http::StatusCode::UNPROCESSABLE_ENTITY;
+                    response
+                },
+            ),
+        );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (format!("http://{address}"), paths, task)
+}
+
+/// An undeclared endpoint is tried once and then remembered.
+///
+/// This is the whole fix in one test: the first request guesses wrong, the
+/// vendor says so in a way that must *not* cool the Key or degrade the group,
+/// the gateway retries the plausible alternative, and the answer is kept so the
+/// next request starts on the protocol that worked.
+#[tokio::test]
+async fn an_undeclared_endpoint_is_tried_once_and_the_answer_is_remembered() {
+    let path = database_path();
+    let (upstream_url, paths, upstream_task) = mock_chat_only_upstream().await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_untyped_upstream(&config, &upstream_url, &["deepseek-chat"], "sk-test");
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let body = json!({
+        "model": group_model(&group, "deepseek-chat"),
+        "input": [{"type": "message", "role": "user", "content": "hi"}],
+        "stream": true
+    });
+    let client = reqwest::Client::new();
+    let first = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = first.status();
+    let text = first.text().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "the alternate protocol should have answered: {text}"
+    );
+
+    let tried = paths.lock().await.clone();
+    assert_eq!(
+        tried,
+        vec![
+            "/v1/responses".to_string(),
+            "/v1/messages".to_string(),
+            "/v1/chat/completions".to_string()
+        ],
+        "the guess is walked once, in preference order, until one answers"
+    );
+
+    // The wrong guess cost nothing: no Key cooldown, no degraded group.
+    let connection = open_database(&path).unwrap();
+    let states = ModelProviderAccountStateRepository::list(&connection, &upstream).unwrap();
+    assert!(
+        states.iter().all(|state| state.cooldown_until_ms.is_none()),
+        "a wrong protocol must not cool the Key, got {states:?}"
+    );
+    assert!(!service.is_degraded());
+    assert_eq!(
+        service.runtime_state().status,
+        vibex_core::ModelGatewayStatus::Running
+    );
+
+    // The answer was kept, so the second request does not pay for it again.
+    assert_eq!(
+        vibex_db::GatewayEndpointProtocolRepository::get(&connection, &upstream, "api").unwrap(),
+        Some("openai_chat_completions".to_string())
+    );
+
+    let second = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 200);
+    let _ = second.text().await.unwrap();
+    assert_eq!(
+        paths.lock().await.clone(),
+        vec![
+            "/v1/responses".to_string(),
+            "/v1/messages".to_string(),
+            "/v1/chat/completions".to_string(),
+            "/v1/chat/completions".to_string()
+        ],
+        "a remembered verdict replaces the guess"
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A mismatch with nowhere to fall back to is a 502, not a cooled Key.
+///
+/// When translation to the only alternative is switched off, the request has to
+/// fail as a protocol problem the user can see. Classifying it as a Key failure
+/// is what let three wrong guesses close the gateway.
+#[tokio::test]
+async fn a_protocol_mismatch_without_a_fallback_blames_neither_the_key_nor_the_group() {
+    let path = database_path();
+    let (upstream_url, _paths, upstream_task) = mock_chat_only_upstream().await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_untyped_upstream(&config, &upstream_url, &["deepseek-chat"], "sk-test");
+    let mut policy = GatewayPolicy::default();
+    policy.translate.openai_chat_completions = false;
+    let group = point_gateway_at(&path, upstream.clone(), policy);
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/responses"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": group_model(&group, "deepseek-chat"),
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(
+        body.get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str),
+        Some("model_gateway_protocol_mismatch"),
+        "the caller must read what actually went wrong, got {body}"
+    );
+
+    let connection = open_database(&path).unwrap();
+    let states = ModelProviderAccountStateRepository::list(&connection, &upstream).unwrap();
+    assert!(
+        states.iter().all(|state| state.cooldown_until_ms.is_none()),
+        "the Key worked; only the body was addressed wrong, got {states:?}"
+    );
+    assert!(
+        !service.is_degraded(),
+        "one wrong guess must not latch a breaker"
+    );
+    assert_eq!(service.runtime_state().degraded_routes, 0);
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A degraded group recovers as soon as an upstream answers again, without a
 /// restart.
 ///
 /// This is the regression the probe exists for: refusing every request while
@@ -1851,14 +2103,13 @@ async fn a_degraded_gateway_recovers_when_an_upstream_answers() {
     let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
-    // Put the gateway into `Degraded` directly: the failure counting itself is
+    // Trip this group's breaker directly: the failure counting itself is
     // covered above, and driving three dead upstreams here would only repeat it.
-    service.publish(vibex_core::ModelGatewayRuntimeState {
-        status: vibex_core::ModelGatewayStatus::Degraded,
-        notice: Some("degraded for the test".to_string()),
-        ..vibex_core::ModelGatewayRuntimeState::running(1, 1)
-    });
+    for _ in 0..vibex_model_gateway::ModelGatewayService::DEGRADE_AFTER_FAILURES {
+        service.note_failure(group.as_str());
+    }
     assert!(service.is_degraded());
+    assert_eq!(service.runtime_state().degraded_routes, 1);
 
     let client = reqwest::Client::new();
     let status = client

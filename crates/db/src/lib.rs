@@ -95,7 +95,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 78;
+pub const CURRENT_SCHEMA_VERSION: i64 = 79;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12453,6 +12453,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_runtime_auth_source_route_shape(conn, &mut applied)?;
     model_gateway::migrate_retire_gateway_inputs(conn, &mut applied)?;
     apply_gateway_profile_kind_repair(conn, &mut applied)?;
+    model_gateway::migrate_endpoint_protocol(conn, &mut applied)?;
 
     // Seeding the per-kind placeholders used to happen here, before the backfill,
     // so a caller always had a Provider id to fall back on. They are gone: a missing
@@ -18684,6 +18685,7 @@ mod tests {
                 "76:runtime_auth_source_route_shape",
                 "77:retire_gateway_inputs",
                 "78:gateway_profile_kind_repair",
+                "79:model_gateway_endpoint_protocol",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -18846,6 +18848,7 @@ mod tests {
                 "76:runtime_auth_source_route_shape",
                 "77:retire_gateway_inputs",
                 "78:gateway_profile_kind_repair",
+                "79:model_gateway_endpoint_protocol",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -18989,6 +18992,7 @@ mod tests {
                 "76:runtime_auth_source_route_shape",
                 "77:retire_gateway_inputs",
                 "78:gateway_profile_kind_repair",
+                "79:model_gateway_endpoint_protocol",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -19170,6 +19174,7 @@ mod tests {
                 "76:runtime_auth_source_route_shape",
                 "77:retire_gateway_inputs",
                 "78:gateway_profile_kind_repair",
+                "79:model_gateway_endpoint_protocol",
             ]
         );
         assert_eq!(
@@ -20611,6 +20616,7 @@ mod tests {
                 "76:runtime_auth_source_route_shape",
                 "77:retire_gateway_inputs",
                 "78:gateway_profile_kind_repair",
+                "79:model_gateway_endpoint_protocol",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

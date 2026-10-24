@@ -1758,6 +1758,15 @@ fn gateway_row(data: &ManagementData, strings: Strings) -> Option<ConfigRow> {
     let snapshot = data.gateway.as_ref()?;
     let state = match snapshot.runtime.status {
         vibex_core::ModelGatewayStatus::Running => strings.config_state_ready(),
+        // A degraded gateway is still serving every group that did not step
+        // aside, so it is not "off" and not "unavailable".
+        vibex_core::ModelGatewayStatus::Degraded => {
+            if snapshot.runtime.degraded_routes > 0 {
+                strings.config_state_degraded()
+            } else {
+                strings.config_state_ready()
+            }
+        }
         vibex_core::ModelGatewayStatus::Disabled => strings.config_state_off(),
         _ => strings.config_state_unavailable(),
     };
@@ -1791,7 +1800,7 @@ fn gateway_row(data: &ManagementData, strings: Strings) -> Option<ConfigRow> {
         .cell(snapshot.models.len().to_string())
         .chip(
             state,
-            if snapshot.runtime.status == vibex_core::ModelGatewayStatus::Running {
+            if snapshot.runtime.status.is_routable() {
                 ConfigTone::Ok
             } else {
                 ConfigTone::Warn

@@ -1008,6 +1008,122 @@ pub(crate) fn migrate_retire_gateway_inputs(
     Ok(())
 }
 
+/// Which wire protocol each untyped endpoint was observed to answer.
+///
+/// An endpoint that declares no protocol is an address whose API is unknown, so
+/// the gateway tries one and keeps the answer here. It is a cache of observed
+/// behaviour, never of configuration: deleting a row only costs one probe.
+pub struct GatewayEndpointProtocolRepository;
+
+impl GatewayEndpointProtocolRepository {
+    pub fn get(
+        conn: &Connection,
+        profile: &ModelProviderProfileId,
+        endpoint_id: &str,
+    ) -> VibexResult<Option<String>> {
+        conn.query_row(
+            "SELECT wire_protocol_id FROM model_gateway_endpoint_protocol \
+             WHERE model_provider_profile_id = ?1 AND endpoint_id = ?2",
+            params![profile.as_str(), endpoint_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(storage_err(
+            "model_gateway_endpoint_protocol_read_failed",
+            "failed to read an endpoint's learned protocol",
+        ))
+    }
+
+    pub fn remember(
+        conn: &Connection,
+        profile: &ModelProviderProfileId,
+        endpoint_id: &str,
+        wire_protocol_id: &str,
+        now_ms: i64,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "INSERT INTO model_gateway_endpoint_protocol (
+                model_provider_profile_id, endpoint_id, wire_protocol_id, learned_at_ms
+             )
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(model_provider_profile_id, endpoint_id)
+             DO UPDATE SET wire_protocol_id = excluded.wire_protocol_id,
+                           learned_at_ms = excluded.learned_at_ms",
+            params![profile.as_str(), endpoint_id, wire_protocol_id, now_ms],
+        )
+        .map_err(storage_err(
+            "model_gateway_endpoint_protocol_write_failed",
+            "failed to remember an endpoint's protocol",
+        ))?;
+        Ok(())
+    }
+
+    /// Forgets a verdict, so a corrected address is probed again.
+    pub fn forget(
+        conn: &Connection,
+        profile: &ModelProviderProfileId,
+        endpoint_id: &str,
+    ) -> VibexResult<()> {
+        conn.execute(
+            "DELETE FROM model_gateway_endpoint_protocol \
+             WHERE model_provider_profile_id = ?1 AND endpoint_id = ?2",
+            params![profile.as_str(), endpoint_id],
+        )
+        .map_err(storage_err(
+            "model_gateway_endpoint_protocol_delete_failed",
+            "failed to forget an endpoint's protocol",
+        ))?;
+        Ok(())
+    }
+}
+
+/// Creates the table that remembers what an undeclared endpoint speaks.
+pub(crate) fn migrate_endpoint_protocol(
+    conn: &mut DbConnection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 79;
+    const NAME: &str = "model_gateway_endpoint_protocol";
+    if crate::migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start the endpoint protocol migration transaction",
+    ))?;
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS model_gateway_endpoint_protocol (
+            model_provider_profile_id TEXT NOT NULL
+                REFERENCES model_provider_profiles(model_provider_profile_id)
+                ON DELETE CASCADE,
+            endpoint_id TEXT NOT NULL,
+            wire_protocol_id TEXT NOT NULL,
+            learned_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (model_provider_profile_id, endpoint_id)
+        );
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to create the endpoint protocol table",
+    ))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms().max(1)],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the endpoint protocol migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit the endpoint protocol migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
 fn encode_json<T: serde::Serialize>(code: &'static str, value: &T) -> VibexResult<String> {
     serde_json::to_string(value)
         .map_err(|_| VibexError::storage(code, "failed to encode gateway settings"))

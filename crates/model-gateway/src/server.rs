@@ -117,6 +117,18 @@ fn perimeter(headers: &HeaderMap) -> Result<(), GatewayError> {
     Ok(())
 }
 
+/// The route group a raw request body names.
+///
+/// Only reached on a failure path where `prepare` did not produce a call. The
+/// group is the breaker's scope, so the count has to land on the right one even
+/// when nothing was prepared; a body that does not name a group counts nothing,
+/// because there is no group it could belong to.
+fn model_group_id(body: &axum::body::Bytes) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let model = value.get("model")?.as_str()?;
+    vibex_core::provider_group_model_ref(model).map(|parsed| parsed.group_id.to_string())
+}
+
 async fn serve(
     state: GatewayRouterState,
     protocol: WireProtocol,
@@ -135,18 +147,16 @@ async fn serve(
             // what lets a dead upstream reach the threshold even after its only
             // Key has cooled.
             //
-            // The gateway's own refusals are excluded. A degraded gateway
-            // refusing a request because another one holds the probe slot never
-            // consulted an upstream, so counting it would keep the count topped
-            // up and the state would never clear.
-            let refuse_means_failure = matches!(
-                error,
-                GatewayError::AllKeysCooling { .. }
-                    | GatewayError::TokenCeilingReached { .. }
-                    | GatewayError::Upstream { .. }
-            );
-            if refuse_means_failure {
-                service.note_failure();
+            // What is *not* counted is anything that says nothing about the
+            // upstream: the gateway's own refusals (a degraded group whose
+            // probe slot is taken never consulted anyone), a body the vendor
+            // read as the wrong protocol, and a request the gateway could not
+            // shape. Counting those is how one wrong protocol guess closed a
+            // whole gateway.
+            if error.blames_upstream()
+                && let Some(group_id) = model_group_id(&body)
+            {
+                service.note_failure(&group_id);
             }
             return service.error_response(protocol, &error);
         }
@@ -154,13 +164,12 @@ async fn serve(
     let (attempt, key) = match service.open_attempt(&prepared).await {
         Ok(attempt) => attempt,
         Err(error) => {
-            // A request that could not reach any upstream is what degrades the
-            // gateway; a request that never got past its own body is not.
-            if matches!(
-                error,
-                GatewayError::AllKeysCooling { .. } | GatewayError::Upstream { .. }
-            ) {
-                service.note_failure();
+            // A request that could not reach any upstream is what degrades a
+            // group; a request that never got past its own body is not.
+            if error.blames_upstream()
+                && let Some(group_id) = prepared.group_id.as_deref()
+            {
+                service.note_failure(group_id);
             }
             return service.error_response(protocol, &error);
         }
