@@ -1114,6 +1114,9 @@ impl AgentBackend for NativeBackend {
 /// The stable code matches the one the Desktop's remote service answers with,
 /// so a client recognises both without a second vocabulary.
 /// Builds the gateway surface the Config Center renders.
+///
+/// The gateway owns no Provider list, so both the upstream summary and the
+/// model list are read from the enabled route groups rather than from settings.
 fn read_gateway_snapshot(
     runtime: &vibex_desktop_runtime::DesktopRuntime,
 ) -> vibex_core::VibexResult<GatewaySnapshot> {
@@ -1122,10 +1125,10 @@ fn read_gateway_snapshot(
     let settings = service.settings().map_err(vibex_core::VibexError::from)?;
     let runtime_state = service.runtime_state();
     let profiles = provider.list_model_provider_profiles()?;
+
     let mut upstreams = Vec::new();
-    let mut models = Vec::new();
-    for upstream_id in &settings.upstreams {
-        let Some(profile) = profiles.iter().find(|profile| &profile.id == upstream_id) else {
+    for upstream_id in provider.gateway_route_members().unwrap_or_default() {
+        let Some(profile) = profiles.iter().find(|profile| profile.id == upstream_id) else {
             continue;
         };
         let keys = profile
@@ -1149,69 +1152,32 @@ fn read_gateway_snapshot(
                 .count(),
             keys,
         });
-        for model in profile
-            .configured_models
-            .iter()
-            .filter(|model| model.enabled)
-        {
-            models.push(vibex_core::GatewayModelSummary {
-                model_provider_profile_id: upstream_id.clone(),
-                provider_name: profile.display_name.clone(),
-                model_id: model.id.clone(),
-                display_id: format!(
-                    "{}/{}",
-                    provider_model_alias(&profile.display_name),
-                    model.id
-                ),
-                // The gateway decides what protocol to call upstream; the
-                // published entry keeps the model's declared capability
-                // namespace empty rather than inventing one.
-                wire_protocol_id: String::new(),
-                // This path lists one upstream's own models, not a route.
-                route_id: None,
-                source_count: 1,
-                model_count: 1,
-            });
-        }
     }
-    let active_agents = provider.gateway_active_agents().unwrap_or_default();
-    let settings_enabled = settings.policy.enabled;
-    let mut agents = Vec::new();
-    for (agent_id, _strategy, _enabled, unsupported) in provider.gateway_agent_options()? {
-        let agent_id_text = agent_id.as_str().to_string();
-        agents.push(vibex_core::GatewayAgentBinding {
-            display_name: agent_id_text.clone(),
-            // The switch is global, so every capable Agent reports the same
-            // intent; `unsupported` marks the ones it cannot serve.
-            enabled: settings_enabled && !unsupported,
-            active: active_agents.contains(&agent_id),
-            unsupported,
+
+    let models = provider
+        .gateway_model_catalog()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|model| vibex_core::GatewayModelSummary {
+            model_provider_profile_id: vibex_core::ModelProviderProfileId::new(),
+            provider_name: model.display_name.clone(),
+            model_id: model.model.clone(),
+            display_id: model.display_id(),
+            // The gateway decides what protocol to call a Provider; the
+            // published entry keeps the capability namespace empty rather than
+            // inventing one.
             wire_protocol_id: String::new(),
-            agent_id: agent_id_text,
-        });
-    }
-    let catalog = provider.list_model_provider_profiles().unwrap_or_default();
-    let upstream_candidates = catalog
-        .iter()
-        .map(|profile| vibex_core::GatewayUpstreamCandidate {
-            model_provider_profile_id: profile.id.clone(),
-            display_name: profile.display_name.clone(),
-            model_count: profile
-                .configured_models
-                .iter()
-                .filter(|model| model.enabled)
-                .count(),
-            key_count: profile.credentials.len(),
-            selected: settings.upstreams.contains(&profile.id),
+            route_id: model.route_id.clone(),
+            source_count: model.source_count,
+            model_count: model.model_count,
         })
         .collect::<Vec<_>>();
+
     Ok(GatewaySnapshot {
         settings,
         runtime: runtime_state,
         upstreams,
         models,
-        agents,
-        upstream_candidates,
     })
 }
 
@@ -1249,29 +1215,6 @@ fn refresh_gateway_catalog(
         None => provider.deactivate_gateway_profiles(),
     }
     .map(|_| ())
-}
-
-/// A URL-safe short name for an upstream, used in published model ids.
-fn provider_model_alias(display_name: &str) -> String {
-    let mut alias = String::with_capacity(display_name.len());
-    let mut last_dash = false;
-    for character in display_name.chars() {
-        if character.is_ascii_alphanumeric() {
-            alias.push(character.to_ascii_lowercase());
-            last_dash = false;
-        } else if !last_dash && !alias.is_empty() {
-            alias.push('-');
-            last_dash = true;
-        }
-    }
-    while alias.ends_with('-') {
-        alias.pop();
-    }
-    if alias.is_empty() {
-        "provider".to_string()
-    } else {
-        alias
-    }
 }
 
 fn sidebar_mutation_error(code: &'static str, message: &'static str) -> BackendError {
@@ -3059,18 +3002,17 @@ impl ManagementBackend for NativeBackend {
                 &vibex_db::open_database(service.database_path())?,
             )?;
             // A Key command names a Provider and a Key; both have to be real
-            // and still listed before anything is written, so a typo cannot
-            // create a state row for a Key that does not exist.
+            // and still named by an enabled group before anything is written,
+            // so a typo cannot create a state row for a Key that does not
+            // exist. The group list is the gateway's only upstream set.
             let profiles = provider.list_model_provider_profiles()?;
+            let route_members = provider.gateway_route_members().unwrap_or_default();
             for update in &payload.account_updates {
                 update.validate()?;
-                if !payload
-                    .upstreams
-                    .contains(&update.model_provider_profile_id)
-                {
+                if !route_members.contains(&update.model_provider_profile_id) {
                     return Err(vibex_core::VibexError::validation(
                         "model_gateway_account_upstream_unknown",
-                        "the account update names a Provider that is not an upstream",
+                        "the account update names a Provider that no enabled route group uses",
                     )
                     .into());
                 }
@@ -3096,8 +3038,6 @@ impl ManagementBackend for NativeBackend {
                 }
             }
             let mut policy = current.policy.clone();
-            policy.routing = payload.routing;
-            policy.pin = payload.pin;
             policy.token_limit = payload.token_limit;
             policy.account_limits = payload.account_limits;
             policy.translate = payload.translate;
@@ -3125,7 +3065,6 @@ impl ManagementBackend for NativeBackend {
             policy.validate()?;
             let mut next = current.clone();
             next.display_name = payload.display_name;
-            next.upstreams = payload.upstreams;
             next.policy = policy;
             next.revision = payload.expected_revision.saturating_add(1);
             let mut connection = vibex_db::open_database(service.database_path())?;
@@ -3242,13 +3181,14 @@ impl ManagementBackend for NativeBackend {
         &self,
         _request: MutationRequest<GatewayAgentUpdateRequest>,
     ) -> BackendFuture<'_, GatewaySnapshot> {
-        // The gateway is switched on or off for the whole installation. This
-        // entry point is kept only so an older client gets a clear refusal
-        // instead of a silent no-op.
+        // An Agent reaches the gateway by binding a route group, so there is no
+        // per-Agent gateway switch to set. This entry point survives only so an
+        // older client gets a refusal it can read instead of an unknown-variant
+        // decode failure.
         Box::pin(async {
             Err(vibex_core::VibexError::validation(
                 "model_gateway_agent_scope_removed",
-                "the gateway is a global setting; switch it on or off instead of per Agent",
+                "bind a route group to the Agent instead of switching the gateway per Agent",
             )
             .into())
         })

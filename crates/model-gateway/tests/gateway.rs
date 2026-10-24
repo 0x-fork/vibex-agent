@@ -22,11 +22,10 @@ use vibex_config_switch::ProviderConfigService;
 use vibex_config_switch::secrets;
 use vibex_core::{
     AgentCredential, AgentCredentialStatus, GatewayConversationPin, GatewayFailureKind,
-    GatewayPolicy, GatewayRequestOutcome, GatewayRoutingStrategy, GatewayTokenWindow,
-    ModelProviderAccountState, ModelProviderCatalogEntry, ModelProviderCredentialReference,
-    ModelProviderEndpoint, ModelProviderEndpointKind, ModelProviderProfileId,
-    ModelProviderProfileStatus, ModelProviderProxyPolicy, ProjectionSecretReference,
-    ProviderSecretSetupState, RequestId,
+    GatewayPolicy, GatewayRequestOutcome, GatewayTokenWindow, ModelProviderAccountState,
+    ModelProviderCatalogEntry, ModelProviderCredentialReference, ModelProviderEndpoint,
+    ModelProviderEndpointKind, ModelProviderProfileId, ModelProviderProfileStatus,
+    ModelProviderProxyPolicy, ProjectionSecretReference, ProviderSecretSetupState, RequestId,
 };
 use vibex_db::{
     GatewayConversationPinRepository, GatewayTokenWindowRepository,
@@ -295,20 +294,38 @@ fn seed_upstream(
     service.create_model_provider_profile(profile).unwrap().id
 }
 
+/// Configures the gateway and puts one Provider behind it in a group.
+///
+/// The gateway has no upstream list of its own, so a request can only name a
+/// model through a group. Returns that group's id, which is what a model id is
+/// built from.
 fn point_gateway_at(
     path: &std::path::Path,
     upstream: ModelProviderProfileId,
     policy: GatewayPolicy,
-) {
+) -> vibex_core::ModelRouteId {
     let mut connection = open_database(path).unwrap();
     apply_migrations(&mut connection).unwrap();
     let settings = vibex_db::ModelGatewaySettingsRepository::get_or_create(&connection).unwrap();
     let mut next = settings.clone();
     next.revision = settings.revision + 1;
-    next.upstreams = vec![upstream];
     next.policy = policy;
     vibex_db::ModelGatewaySettingsRepository::update(&connection, &next, settings.revision)
         .unwrap();
+    let route = vibex_core::ModelRoute {
+        display_name: "Test group".to_string(),
+        kind: vibex_core::RouteKind::ProviderGroup,
+        status: vibex_core::RouteStatus::Enabled,
+        members: vec![vibex_core::ModelRouteMember::provider(upstream, 0)],
+        ..Default::default()
+    };
+    vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
+    route.id
+}
+
+/// The model id a session selects from a group.
+fn group_model(group: &vibex_core::ModelRouteId, model: &str) -> String {
+    format!("group/{}/{}", group.as_str(), model)
 }
 
 async fn gateway(
@@ -371,6 +388,67 @@ data: {"type":"message_stop"}"#,
         + "\n\n"
 }
 
+/// A listener with no route group is running, not unavailable.
+///
+/// The gateway owns no Provider list, so "no upstreams" is the ordinary first
+/// launch of a fresh installation rather than a configuration error. It must
+/// bind, serve an empty model list, and refuse a model it has nothing for —
+/// never report itself broken or delete its own bindings.
+#[tokio::test]
+async fn a_gateway_with_no_groups_is_running_with_an_empty_model_list() {
+    let path = database_path();
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let state = service.runtime_state();
+    assert_eq!(state.status, vibex_core::ModelGatewayStatus::Running);
+    assert_eq!(
+        state.route_count,
+        Some(0),
+        "no groups means nothing to route, not a broken listener"
+    );
+    assert!(state.base_url().is_some(), "the port is bound");
+
+    let body: Value = reqwest::Client::new()
+        .get(format!("{gateway_url}/v1/models"))
+        .header(header::HOST, "127.0.0.1")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["data"].as_array().map(Vec::len),
+        Some(0),
+        "a listener with no groups publishes no models"
+    );
+
+    // Asking for a model it cannot serve is a request error, not a sign that
+    // the gateway failed to start.
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": "group/does-not-exist/deepseek-chat",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "model_not_found");
+    assert_eq!(
+        service.runtime_state().status,
+        vibex_core::ModelGatewayStatus::Running,
+        "one 404 must not take the listener down"
+    );
+
+    gateway_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
 #[tokio::test]
 async fn passthrough_stream_reaches_the_client_and_the_ledger() {
     let path = database_path();
@@ -383,14 +461,14 @@ async fn passthrough_stream_reaches_the_client_and_the_ledger() {
         &["deepseek-chat"],
         "sk-test-123",
     );
-    point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/deepseek-chat",
+            "model": group_model(&group, "deepseek-chat"),
             "messages": [{"role": "user", "content": "say hi"}],
             "stream": true
         }))
@@ -416,7 +494,11 @@ async fn passthrough_stream_reaches_the_client_and_the_ledger() {
         logs[0].wire_in,
         vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS
     );
-    assert_eq!(logs[0].model_requested, "deepseek/deepseek-chat");
+    assert_eq!(
+        logs[0].model_requested,
+        group_model(&group, "deepseek-chat"),
+        "the ledger records the id the Agent asked for"
+    );
     assert_eq!(logs[0].outcome, GatewayRequestOutcome::Ok);
     assert_eq!(logs[0].input_tokens, 11);
     assert_eq!(logs[0].output_tokens, 3);
@@ -444,14 +526,14 @@ async fn a_translated_call_is_re_encoded_for_the_client_protocol() {
         &["claude-sonnet-4-5"],
         "sk-ant-test",
     );
-    point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/claude-sonnet-4-5",
+            "model": group_model(&group, "claude-sonnet-4-5"),
             "messages": [{"role": "user", "content": "say hi"}],
             "stream": true
         }))
@@ -509,14 +591,14 @@ async fn a_non_streaming_client_gets_one_body() {
         &["deepseek-chat"],
         "sk-test",
     );
-    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/deepseek-chat",
+            "model": group_model(&group, "deepseek-chat"),
             "messages": [{"role": "user", "content": "say hi"}]
         }))
         .send()
@@ -550,14 +632,14 @@ async fn a_translated_non_streaming_client_gets_a_whole_body() {
         &["claude"],
         "sk-test",
     );
-    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/claude",
+            "model": group_model(&group, "claude"),
             "messages": [{"role": "user", "content": "say hi"}]
         }))
         .send()
@@ -610,14 +692,14 @@ async fn an_invalid_key_is_marked_and_the_next_key_answers() {
         profile.revision = revision + 1;
         vibex_db::ModelProviderProfileRepository::update(&connection, &profile, revision).unwrap();
     }
-    point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/deepseek-chat",
+            "model": group_model(&group, "deepseek-chat"),
             "messages": [{"role": "user", "content": "hi"}],
             "stream": true
         }))
@@ -685,7 +767,7 @@ async fn a_preferred_key_is_tried_before_the_provider_order() {
         vibex_db::ModelProviderProfileRepository::update(&connection, &profile, revision).unwrap();
         id
     };
-    point_gateway_at(
+    let group = point_gateway_at(
         &path,
         upstream.clone(),
         GatewayPolicy {
@@ -702,7 +784,7 @@ async fn a_preferred_key_is_tried_before_the_provider_order() {
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/deepseek-chat",
+            "model": group_model(&group, "deepseek-chat"),
             "messages": [{"role": "user", "content": "hi"}],
             "stream": true
         }))
@@ -741,14 +823,14 @@ async fn an_authentication_failure_cools_the_key_until_it_is_replaced() {
         &["deepseek-chat"],
         "sk-revoked",
     );
-    point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/deepseek-chat",
+            "model": group_model(&group, "deepseek-chat"),
             "messages": [{"role": "user", "content": "hi"}],
             "stream": true
         }))
@@ -792,14 +874,14 @@ async fn an_authentication_failure_fails_over_to_the_next_key() {
             value: "sk-good".to_string(),
         })
         .unwrap();
-    point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/deepseek-chat",
+            "model": group_model(&group, "deepseek-chat"),
             "messages": [{"role": "user", "content": "hi"}],
             "stream": true
         }))
@@ -873,14 +955,14 @@ async fn a_cooling_key_is_skipped_and_the_second_key_answers() {
         ModelProviderAccountStateRepository::upsert(&connection, &state).unwrap();
         credential.id
     };
-    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/deepseek-chat",
+            "model": group_model(&group, "deepseek-chat"),
             "messages": [{"role": "user", "content": "hi"}],
             "stream": true
         }))
@@ -965,14 +1047,14 @@ async fn a_failover_records_the_refused_key_and_why_it_moved_on() {
             .unwrap();
         profile.credentials[0].id.clone()
     };
-    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/deepseek-chat",
+            "model": group_model(&group, "deepseek-chat"),
             "messages": [{"role": "user", "content": "hi"}],
             "stream": true
         }))
@@ -1048,14 +1130,14 @@ async fn a_first_try_success_on_a_multi_key_provider_is_not_a_failover() {
         profile.revision = revision + 1;
         vibex_db::ModelProviderProfileRepository::update(&connection, &profile, revision).unwrap();
     }
-    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/deepseek-chat",
+            "model": group_model(&group, "deepseek-chat"),
             "messages": [{"role": "user", "content": "hi"}],
             "stream": true
         }))
@@ -1104,14 +1186,14 @@ async fn all_keys_cooling_is_a_429_without_an_upstream_call() {
         state.cooldown_until_ms = Some(vibex_core::unix_timestamp_ms() + 60_000);
         ModelProviderAccountStateRepository::upsert(&connection, &state).unwrap();
     }
-    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/deepseek-chat",
+            "model": group_model(&group, "deepseek-chat"),
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .send()
@@ -1141,14 +1223,14 @@ async fn an_unknown_model_lists_the_closest_configured_ones() {
         &["deepseek-chat", "deepseek-reasoner"],
         "sk-test",
     );
-    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepsek-chat",
+            "model": group_model(&group, "deepsek-chat"),
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .send()
@@ -1183,14 +1265,14 @@ async fn a_vendor_side_file_reference_fails_loudly_before_any_call() {
         &["deepseek-chat"],
         "sk-test",
     );
-    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/responses"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/deepseek-chat",
+            "model": group_model(&group, "deepseek-chat"),
             "input": [
                 {"type": "message", "role": "user", "content": [
                     {"type": "input_file", "file_id": "file-abc"}
@@ -1223,14 +1305,7 @@ async fn a_conversation_stays_on_its_pinned_key() {
         &["deepseek-chat"],
         "sk-first",
     );
-    point_gateway_at(
-        &path,
-        upstream.clone(),
-        GatewayPolicy {
-            routing: GatewayRoutingStrategy::RoundRobin,
-            ..GatewayPolicy::default()
-        },
-    );
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let client = reqwest::Client::new();
@@ -1240,7 +1315,7 @@ async fn a_conversation_stays_on_its_pinned_key() {
             .header(header::HOST, "127.0.0.1")
             .header("x-session-id", "conversation-1")
             .json(&json!({
-                "model": "deepseek/deepseek-chat",
+                "model": group_model(&group, "deepseek-chat"),
                 "messages": [
                     {"role": "system", "content": "be brief"},
                     {"role": "user", "content": "hi"}
@@ -1287,14 +1362,14 @@ async fn a_browser_origin_is_refused() {
         &["deepseek-chat"],
         "sk-test",
     );
-    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .header(header::ORIGIN, "http://127.0.0.1:3425")
-        .json(&json!({"model": "deepseek/deepseek-chat", "messages": []}))
+        .json(&json!({"model": group_model(&group, "deepseek-chat"), "messages": []}))
         .send()
         .await
         .unwrap();
@@ -1318,7 +1393,7 @@ async fn the_token_ceiling_stops_requests_and_the_window_rolls_over() {
         &["deepseek-chat"],
         "sk-test",
     );
-    point_gateway_at(
+    let group = point_gateway_at(
         &path,
         upstream.clone(),
         GatewayPolicy {
@@ -1349,7 +1424,7 @@ async fn the_token_ceiling_stops_requests_and_the_window_rolls_over() {
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/deepseek-chat",
+            "model": group_model(&group, "deepseek-chat"),
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .send()
@@ -1492,19 +1567,20 @@ async fn a_concurrency_limit_serializes_requests_rather_than_dropping_them() {
             ..vibex_core::GatewayAccountLimits::default()
         },
     );
-    point_gateway_at(&path, upstream, policy);
+    let group = point_gateway_at(&path, upstream, policy);
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let mut handles = Vec::new();
     for _ in 0..3 {
         let client = reqwest::Client::new();
         let url = format!("{gateway_url}/v1/chat/completions");
+        let group = group.clone();
         handles.push(tokio::spawn(async move {
             client
                 .post(url)
                 .header(header::HOST, "127.0.0.1")
                 .json(&json!({
-                    "model": "deepseek/deepseek-chat",
+                    "model": group_model(&group, "deepseek-chat"),
                     "messages": [{"role": "user", "content": "hi"}],
                     "stream": true
                 }))
@@ -1552,19 +1628,20 @@ async fn without_a_limit_the_same_requests_do_overlap() {
         &["deepseek-chat"],
         "sk-test",
     );
-    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let mut handles = Vec::new();
     for _ in 0..3 {
         let client = reqwest::Client::new();
         let url = format!("{gateway_url}/v1/chat/completions");
+        let group = group.clone();
         handles.push(tokio::spawn(async move {
             client
                 .post(url)
                 .header(header::HOST, "127.0.0.1")
                 .json(&json!({
-                    "model": "deepseek/deepseek-chat",
+                    "model": group_model(&group, "deepseek-chat"),
                     "messages": [{"role": "user", "content": "hi"}],
                     "stream": true
                 }))
@@ -1619,7 +1696,7 @@ async fn an_exhausted_minute_is_a_429_before_the_upstream_is_called() {
             ..vibex_core::GatewayAccountLimits::default()
         },
     );
-    point_gateway_at(&path, upstream, policy);
+    let group = point_gateway_at(&path, upstream, policy);
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let client = reqwest::Client::new();
@@ -1628,7 +1705,7 @@ async fn an_exhausted_minute_is_a_429_before_the_upstream_is_called() {
             .post(format!("{gateway_url}/v1/chat/completions"))
             .header(header::HOST, "127.0.0.1")
             .json(&json!({
-                "model": "deepseek/deepseek-chat",
+                "model": group_model(&group, "deepseek-chat"),
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": true
             }))
@@ -1688,23 +1765,27 @@ async fn repeated_failures_degrade_the_gateway_and_one_probe_recovers_it() {
         &["deepseek-chat"],
         "sk-test",
     );
-    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
     let client = reqwest::Client::new();
-    let call = |client: reqwest::Client, url: String| async move {
-        client
-            .post(url)
-            .header(header::HOST, "127.0.0.1")
-            .json(&json!({
-                "model": "deepseek/deepseek-chat",
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": true
-            }))
-            .send()
-            .await
-            .unwrap()
-            .status()
-            .as_u16()
+    let group_for_call = group.clone();
+    let call = |client: reqwest::Client, url: String| {
+        let group = group_for_call.clone();
+        async move {
+            client
+                .post(url)
+                .header(header::HOST, "127.0.0.1")
+                .json(&json!({
+                    "model": group_model(&group, "deepseek-chat"),
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": true
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
     };
 
     for _ in 0..vibex_model_gateway::ModelGatewayService::DEGRADE_AFTER_FAILURES {
@@ -1767,7 +1848,7 @@ async fn a_degraded_gateway_recovers_when_an_upstream_answers() {
         &["deepseek-chat"],
         "sk-test",
     );
-    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     // Put the gateway into `Degraded` directly: the failure counting itself is
@@ -1784,7 +1865,7 @@ async fn a_degraded_gateway_recovers_when_an_upstream_answers() {
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/deepseek-chat",
+            "model": group_model(&group, "deepseek-chat"),
             "messages": [{"role": "user", "content": "hi"}],
             "stream": true
         }))
@@ -1808,44 +1889,6 @@ async fn a_degraded_gateway_recovers_when_an_upstream_answers() {
     upstream_task.abort();
     service.shutdown().await;
     cleanup(path);
-}
-
-/// Creates a gateway route over the given members, in order.
-fn seed_route(
-    path: &std::path::Path,
-    name: &str,
-    members: &[(ModelProviderProfileId, &str)],
-    strategy: vibex_core::RouteStrategy,
-) -> vibex_core::ModelRouteId {
-    seed_route_with_timeout(path, name, members, strategy, None)
-}
-
-fn seed_route_with_timeout(
-    path: &std::path::Path,
-    name: &str,
-    members: &[(ModelProviderProfileId, &str)],
-    strategy: vibex_core::RouteStrategy,
-    first_token_timeout_ms: Option<u64>,
-) -> vibex_core::ModelRouteId {
-    let mut connection = open_database(path).unwrap();
-    apply_migrations(&mut connection).unwrap();
-    let route = vibex_core::ModelRoute {
-        display_name: name.to_string(),
-        kind: vibex_core::RouteKind::Gateway,
-        strategy,
-        first_token_timeout_ms,
-        status: vibex_core::RouteStatus::Enabled,
-        members: members
-            .iter()
-            .enumerate()
-            .map(|(index, (profile, model))| {
-                vibex_core::ModelRouteMember::new(profile.clone(), *model, index as i64)
-            })
-            .collect(),
-        ..Default::default()
-    };
-    vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
-    route.id.clone()
 }
 
 /// Seeds a provider group: Providers rather than `(Provider, model)` pairs.
@@ -2093,323 +2136,6 @@ async fn a_provider_group_refuses_a_model_only_one_provider_serves() {
     cleanup(path);
 }
 
-/// A route's second member answers when the first one cannot.
-///
-/// This is the stage-2 acceptance criterion. The first member's only Key is put
-/// on cooldown, so nothing can answer there; the gateway must walk to the
-/// second member, and the Agent, which asked for `route/<id>`, must receive the
-/// answer as if it had asked for one model.
-#[tokio::test]
-async fn a_route_falls_through_to_its_second_member() {
-    let path = database_path();
-    let (first_url, first_recorder, first_task) = mock_upstream(200, chat_stream(), None).await;
-    let (second_url, second_recorder, second_task) = mock_upstream(200, chat_stream(), None).await;
-    let config = ProviderConfigService::new(&path);
-    let first = seed_upstream(
-        &config,
-        &first_url,
-        WireProtocol::ChatCompletions,
-        &["first-model"],
-        "sk-first",
-    );
-    let second = seed_upstream(
-        &config,
-        &second_url,
-        WireProtocol::ChatCompletions,
-        &["second-model"],
-        "sk-second",
-    );
-
-    // Only the second member is a gateway upstream. The first is still a
-    // resolvable member: a route may name a Provider the global list omits, and
-    // the snapshot lists every enabled Provider a route points at.
-    point_gateway_at(&path, second.clone(), GatewayPolicy::default());
-    let route_id = seed_route(
-        &path,
-        "Standard",
-        &[
-            (first.clone(), "first-model"),
-            (second.clone(), "second-model"),
-        ],
-        vibex_core::RouteStrategy::Ordered,
-    );
-
-    // Cool the first member's only Key for an hour.
-    {
-        let connection = open_database(&path).unwrap();
-        let profile = vibex_db::ModelProviderProfileRepository::list(&connection)
-            .unwrap()
-            .into_iter()
-            .find(|profile| profile.id == first)
-            .expect("the first Provider");
-        let credential = profile.credentials.first().expect("its Key").id.clone();
-        let mut state = ModelProviderAccountState::ready(first.clone(), credential);
-        state.cooldown_reason = Some(GatewayFailureKind::Rate);
-        state.cooldown_until_ms = Some(vibex_core::unix_timestamp_ms() + 3_600_000);
-        ModelProviderAccountStateRepository::upsert(&connection, &state).unwrap();
-    }
-
-    let (service, gateway_url, gateway_task) = gateway(&path).await;
-    let status = reqwest::Client::new()
-        .post(format!("{gateway_url}/v1/chat/completions"))
-        .header(header::HOST, "127.0.0.1")
-        .json(&json!({
-            "model": format!("route/{}", route_id.as_str()),
-            "messages": [{"role": "user", "content": "hi"}],
-            "stream": true
-        }))
-        .send()
-        .await
-        .unwrap()
-        .status()
-        .as_u16();
-    assert_eq!(status, 200, "the second member should have answered");
-
-    assert!(
-        first_recorder.lock().await.path.is_empty(),
-        "a cooling member must not be called at all"
-    );
-    assert!(
-        !second_recorder.lock().await.path.is_empty(),
-        "the request should have reached the second member"
-    );
-
-    gateway_task.abort();
-    first_task.abort();
-    second_task.abort();
-    service.shutdown().await;
-    cleanup(path);
-}
-
-/// The ledger explains a cross-member failover.
-///
-/// A request that walked past one member and answered on another is only
-/// diagnosable if the trace names the member it skipped. Without it the row
-/// says "a Provider answered" and nothing about the walk.
-#[tokio::test]
-async fn a_member_failover_is_recorded_in_the_route_trace() {
-    let path = database_path();
-    let (live_url, _live_recorder, live_task) = mock_upstream(200, chat_stream(), None).await;
-    // The first member answers 500, which is a failure before any byte of a
-    // reply: exactly the case a route may walk past.
-    let (dead_url, _dead_recorder, dead_task) = mock_upstream(500, String::new(), None).await;
-    let config = ProviderConfigService::new(&path);
-    let dead = seed_upstream(
-        &config,
-        &dead_url,
-        WireProtocol::ChatCompletions,
-        &["dead-model"],
-        "sk-dead",
-    );
-    let live = seed_upstream(
-        &config,
-        &live_url,
-        WireProtocol::ChatCompletions,
-        &["live-model"],
-        "sk-live",
-    );
-    point_gateway_at(&path, live.clone(), GatewayPolicy::default());
-    let route_id = seed_route(
-        &path,
-        "Standard",
-        &[(dead.clone(), "dead-model"), (live.clone(), "live-model")],
-        vibex_core::RouteStrategy::Ordered,
-    );
-
-    let (service, gateway_url, gateway_task) = gateway(&path).await;
-    let status = reqwest::Client::new()
-        .post(format!("{gateway_url}/v1/chat/completions"))
-        .header(header::HOST, "127.0.0.1")
-        .json(&json!({
-            "model": format!("route/{}", route_id.as_str()),
-            "messages": [{"role": "user", "content": "hi"}],
-            "stream": true
-        }))
-        .send()
-        .await
-        .unwrap()
-        .status()
-        .as_u16();
-    assert_eq!(status, 200, "the live member should have answered");
-
-    let logs =
-        ModelGatewayRequestLogRepository::recent(&open_database(&path).unwrap(), 10).unwrap();
-    let log = logs.first().expect("the request was recorded");
-    assert_eq!(
-        log.model_provider_profile_id, live,
-        "the ledger names the member that answered"
-    );
-    let trace = log.route.as_ref().expect("the trace explains the walk");
-    assert!(
-        !trace.is_unremarkable(),
-        "a cross-member failover is worth recording: {trace:?}"
-    );
-    assert_eq!(
-        trace.skipped_members.len(),
-        1,
-        "the dead member should be named"
-    );
-    assert_eq!(
-        trace.skipped_members[0].model_provider_profile_id, dead,
-        "the skipped member is the one that could not answer"
-    );
-
-    gateway_task.abort();
-    live_task.abort();
-    dead_task.abort();
-    service.shutdown().await;
-    cleanup(path);
-}
-
-/// A route is one model id, however many members and models it holds.
-#[tokio::test]
-async fn a_route_is_listed_as_one_model() {
-    let path = database_path();
-    let (url, _recorder, task) = mock_upstream(200, chat_stream(), None).await;
-    let config = ProviderConfigService::new(&path);
-    let provider = seed_upstream(
-        &config,
-        &url,
-        WireProtocol::ChatCompletions,
-        &["a", "b"],
-        "sk-test",
-    );
-    point_gateway_at(&path, provider.clone(), GatewayPolicy::default());
-    let route_id = seed_route(
-        &path,
-        "Standard",
-        &[(provider.clone(), "a"), (provider.clone(), "b")],
-        vibex_core::RouteStrategy::Ordered,
-    );
-
-    let (service, gateway_url, gateway_task) = gateway(&path).await;
-    let body: Value = reqwest::Client::new()
-        .get(format!("{gateway_url}/v1/models"))
-        .header(header::HOST, "127.0.0.1")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let ids = body["data"]
-        .as_array()
-        .expect("a model list")
-        .iter()
-        .filter_map(|entry| entry["id"].as_str())
-        .collect::<Vec<_>>();
-    // The test seeds its own route; a migration may have seeded another one
-    // from the gateway's upstream list, so the assertion is about the shape of
-    // this route's entries rather than the total count.
-    let route_ids = ids
-        .iter()
-        .filter(|id| id.starts_with("route/"))
-        .collect::<Vec<_>>();
-    assert!(
-        route_ids.iter().any(|id| id.ends_with(&route_id.as_str())),
-        "the seeded route is listed: {ids:?}"
-    );
-    // The bare `upstream/model` entries stay because a direct Provider is still
-    // reachable by name; what must not happen is a route contributing one entry
-    // per member under the route's own prefix.
-    assert!(
-        !ids.iter()
-            .any(|id| id.starts_with("route/") && id.contains("/a")),
-        "a route must not list its members as models: {ids:?}"
-    );
-
-    gateway_task.abort();
-    task.abort();
-    service.shutdown().await;
-    cleanup(path);
-}
-
-/// A member that accepts the call and then stalls is abandoned for the next.
-///
-/// This is the case no error can report: the connection succeeds, so nothing
-/// fails over on its own, and the turn hangs until the client gives up. The
-/// route's first-token deadline turns that silence into a failover.
-#[tokio::test]
-async fn a_stalled_member_is_abandoned_for_the_next() {
-    let path = database_path();
-
-    // A mock that reads the request and never answers.
-    let stalled_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let stalled_address = stalled_listener.local_addr().unwrap();
-    let stalled_task = tokio::spawn(async move {
-        let mut held = Vec::new();
-        loop {
-            let Ok((stream, _)) = stalled_listener.accept().await else {
-                break;
-            };
-            // Hold the connection open without writing a byte.
-            held.push(stream);
-        }
-    });
-
-    let (live_url, _recorder, live_task) = mock_upstream(200, chat_stream(), None).await;
-    let config = ProviderConfigService::new(&path);
-    let stalled = seed_upstream(
-        &config,
-        &format!("http://{stalled_address}"),
-        WireProtocol::ChatCompletions,
-        &["stalled-model"],
-        "sk-stalled",
-    );
-    let live = seed_upstream(
-        &config,
-        &live_url,
-        WireProtocol::ChatCompletions,
-        &["live-model"],
-        "sk-live",
-    );
-    point_gateway_at(&path, live.clone(), GatewayPolicy::default());
-    // 300 ms is far below the test's own patience and far above a local mock.
-    let route_id = seed_route_with_timeout(
-        &path,
-        "Standard",
-        &[
-            (stalled.clone(), "stalled-model"),
-            (live.clone(), "live-model"),
-        ],
-        vibex_core::RouteStrategy::Ordered,
-        Some(300),
-    );
-
-    let (service, gateway_url, gateway_task) = gateway(&path).await;
-    let status = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        reqwest::Client::new()
-            .post(format!("{gateway_url}/v1/chat/completions"))
-            .header(header::HOST, "127.0.0.1")
-            .json(&json!({
-                "model": format!("route/{}", route_id.as_str()),
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": true
-            }))
-            .send(),
-    )
-    .await
-    .expect("the stalled member must not hang the request")
-    .unwrap()
-    .status()
-    .as_u16();
-    // The stalled member produced no bytes, so the gateway reports the failure
-    // in-stream rather than handing the client a truncated 200.
-    assert!(
-        status == 200 || status >= 400,
-        "the request must terminate, not hang; got {status}"
-    );
-
-    gateway_task.abort();
-    stalled_task.abort();
-    live_task.abort();
-    service.shutdown().await;
-    cleanup(path);
-}
-
 /// A real request announces itself while it runs, not only when it finishes.
 ///
 /// This is the channel the route graph draws from, so it has to exist for a
@@ -2429,7 +2155,7 @@ async fn a_live_request_publishes_begin_and_end() {
         &["deepseek-chat"],
         "sk-test",
     );
-    point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
     let (service, gateway_url, gateway_task) = gateway(&path).await;
 
     let seen: Arc<StdMutex<Vec<vibex_core::GatewayEvent>>> = Arc::new(StdMutex::new(Vec::new()));
@@ -2442,7 +2168,7 @@ async fn a_live_request_publishes_begin_and_end() {
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(header::HOST, "127.0.0.1")
         .json(&json!({
-            "model": "deepseek/deepseek-chat",
+            "model": group_model(&group, "deepseek-chat"),
             "messages": [{"role": "user", "content": "hi"}],
             "stream": true
         }))

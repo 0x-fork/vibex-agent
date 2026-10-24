@@ -178,9 +178,10 @@ impl RuntimeOptionCatalogService {
             live_by_profile,
         );
 
-        // A route is one selectable model, so the catalogue needs its name and
-        // shape beside the Profile list: the gateway Profile only carries
-        // `route/<id>`, which is not a name a reader can choose from.
+        // A route group is a set of selectable models, so the catalogue needs
+        // its name and shape beside the Profile list: the gateway Profile
+        // carries `group/<id>/<model>` ids, which are not names a reader can
+        // choose from.
         let route_facts = self.route_facts();
         let mut catalog = build_runtime_option_catalog(
             &agents.agents,
@@ -193,7 +194,7 @@ impl RuntimeOptionCatalogService {
         );
         // A direct route never enters the gateway's model list, so it would be
         // selectable nowhere without this. A gateway route is already in the
-        // catalogue under its `route/<id>` entry.
+        // catalogue under its `group/<id>/<model>` entries.
         vibex_agent_acp::append_direct_route_runtime_options(
             &mut catalog,
             &agents.agents,
@@ -299,8 +300,8 @@ impl RuntimeOptionCatalogService {
     /// What the catalogue needs to know about each route.
     ///
     /// A route the catalogue cannot describe is left out rather than shown
-    /// namelessly: the gateway Profile still lists its `route/<id>`, and that
-    /// entry falls back to the raw id.
+    /// namelessly: the gateway Profile still lists its `group/<id>/<model>`
+    /// ids, and each entry falls back to the raw id.
     fn route_facts(&self) -> BTreeMap<vibex_core::ModelRouteId, RuntimeRouteFacts> {
         let Ok(routes) = self.provider_config.list_enabled_model_routes() else {
             return BTreeMap::new();

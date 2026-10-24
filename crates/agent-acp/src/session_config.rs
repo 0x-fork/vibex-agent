@@ -837,8 +837,8 @@ pub struct RuntimeOptionCatalogAgentEvidence {
 /// no profile config is consulted for modes, efforts, or Features.
 /// What the catalog needs to know about a route.
 ///
-/// The gateway Profile only carries `route/<id>`, so the name a reader picked
-/// and the number of sources behind it arrive beside the profile list.
+/// A gateway Profile carries `group/<id>/<model>` entries, so the name a reader
+/// picked and the number of sources behind it arrive beside the profile list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeRouteFacts {
     /// The route's display name, as its owner wrote it.
@@ -863,8 +863,10 @@ pub struct RuntimeRouteFacts {
 impl RuntimeRouteFacts {
     /// The model id a session selects for one of this route's models.
     ///
-    /// A plain route is one selectable model and keeps its own id. A group is
-    /// many models, so each carries the model in the id.
+    /// A group is many models, so each carries the model in the id. A direct
+    /// route never reaches the gateway, so it has no gateway id at all: the
+    /// id it returns here only labels the option, and the launch path resolves
+    /// it through the direct Provider instead.
     pub fn option_model_id(&self, route_id: &vibex_core::ModelRouteId, model: &str) -> String {
         match self.kind {
             vibex_core::RouteKind::ProviderGroup => format!(
@@ -873,8 +875,13 @@ impl RuntimeRouteFacts {
                 route_id.as_str(),
                 model
             ),
-            vibex_core::RouteKind::Gateway | vibex_core::RouteKind::Direct => {
-                format!("{}route/{}", "", route_id.as_str())
+            vibex_core::RouteKind::Direct => {
+                format!(
+                    "{}{}/{}",
+                    vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
+                    route_id.as_str(),
+                    model
+                )
             }
         }
     }
@@ -911,15 +918,14 @@ fn route_fact_maps(
     (labels, counts, models)
 }
 
-/// The option id a `route/` or `group/` entry names.
+/// The route a `group/<id>/<model>` entry names.
+///
+/// Groups are the only gateway shape, so a model id either names one or is a
+/// Provider model; there is no other gateway prefix to recognise.
 fn route_model_ids(model_id: &str) -> Option<(vibex_core::ModelRouteId, Option<&str>)> {
-    if let Some(parsed) = vibex_core::provider_group_model_ref(model_id) {
-        let id = vibex_core::ModelRouteId::parse(parsed.group_id).ok()?;
-        return Some((id, Some(parsed.model_id)));
-    }
-    let rest = model_id.strip_prefix("route/")?;
-    let id = vibex_core::ModelRouteId::parse(rest).ok()?;
-    Some((id, None))
+    let parsed = vibex_core::provider_group_model_ref(model_id)?;
+    let id = vibex_core::ModelRouteId::parse(parsed.group_id).ok()?;
+    Some((id, Some(parsed.model_id)))
 }
 
 /// The route a model id names, when it names one.
@@ -1068,11 +1074,10 @@ pub fn build_runtime_option_catalog_for_agents(
                     .is_some_and(|model| !model.trim().is_empty()),
         );
         for (model_id, model_label) in model_ids {
-            // A gateway Profile carries one `route/<id>` entry per route and one
-            // `group/<id>/<model>` entry per group model. Each becomes its own
-            // group, because a route is what the reader picked: filing them
-            // under the gateway's name would show one group of unrelated
-            // compositions.
+            // A gateway Profile carries one `group/<id>/<model>` entry per
+            // group model. Each becomes its own group, because a group is what
+            // the reader picked: filing them under the gateway's name would
+            // show one group of unrelated compositions.
             let route_entry = route_model_ids(&model_id);
             let route_source = route_entry.as_ref().map(|(id, _)| id.as_str().to_string());
             // A group entry names one model, and that model is what the option
@@ -1288,11 +1293,11 @@ pub fn build_runtime_option_catalog(
                 })
                 .collect::<BTreeMap<_, _>>();
             // This builder is the one the runtime publishes, and it used to name
-            // a gateway model by its raw id. A route group's id is
-            // `group/<route>/<model>`, so the picker showed that whole string —
-            // and a plain route showed `route/<id>`. Resolve it here the same way
+            // a gateway model by its raw id. A group's id is
+            // `group/<route>/<model>`, so the picker would show that whole
+            // storage string. Resolve it here the same way
             // `build_runtime_option_catalog_for_agents` does, so the reader sees
-            // the group's name and the model, not the storage shape.
+            // the group's name and the model.
             let route_entry = route_model_ids(&model_id);
             let route_source = route_entry.as_ref().map(|(id, _)| id.as_str().to_string());
             let plain_provider = SessionRuntimeSelection::provider(
@@ -1396,10 +1401,11 @@ pub fn build_runtime_option_catalog(
 /// options are emitted only from evidence for the current context revision.
 /// Adds one option per Agent-bound route that the gateway does not serve.
 ///
-/// A gateway route already reaches the catalogue as a `route/<id>` entry in the
-/// gateway Profile's model list, because the Agent calls the gateway for it. A
-/// direct route does not: its whole point is bypassing the gateway, so it has no
-/// gateway model id to travel under, and it is appended here instead.
+/// A gateway route already reaches the catalogue as its `group/<id>/<model>`
+/// entries in the gateway Profile's model list, because the Agent calls the
+/// gateway for it. A direct route does not: its whole point is bypassing the
+/// gateway, so it has no gateway model id to travel under, and it is appended
+/// here instead.
 ///
 /// Without this a direct route would be visible in the route graph and selectable
 /// nowhere — the Agent could be given one but never choose it.
@@ -3643,7 +3649,7 @@ mod route_catalog_tests {
 
     fn route_facts(agent_id: &str, name: &str, count: usize) -> RuntimeRouteFacts {
         RuntimeRouteFacts {
-            kind: vibex_core::RouteKind::Gateway,
+            kind: vibex_core::RouteKind::ProviderGroup,
             display_name: name.to_string(),
             agent_ids: vec![AgentId::parse(agent_id).unwrap()],
             member_count: count,
@@ -3697,21 +3703,24 @@ mod route_catalog_tests {
         assert_eq!(agents, vec!["codex"], "claude is not bound to it");
     }
 
-    /// A `route/<id>` model is recognised as a route and nothing else is.
+    /// A `group/<id>/<model>` model is recognised as a route and nothing else
+    /// is. The retired `route/<id>` prefix must not resolve.
     #[test]
-    fn only_the_route_prefix_marks_a_route_model() {
-        assert!(route_source_for_model("route/model_route_abc").is_some());
+    fn only_the_group_prefix_marks_a_route_model() {
+        assert!(route_source_for_model("group/model_route_abc/deepseek-chat").is_some());
+        assert!(route_source_for_model("route/model_route_abc").is_none());
         assert!(route_source_for_model("deepseek/deepseek-chat").is_none());
         assert!(route_source_for_model("deepseek-chat").is_none());
-        assert!(route_source_for_model("route/").is_none());
+        assert!(route_source_for_model("group/").is_none());
+        assert!(route_source_for_model("group/id").is_none());
     }
 
-    /// A route selection carries the route's id as its model.
+    /// A route selection carries the group's prefix as its model.
     ///
     /// A failover must not look like a new selection, so the model a route
-    /// selection names is the route itself, never the member that answered.
+    /// selection names is the group, never the Provider that answered.
     #[test]
-    fn a_route_selection_names_the_route() {
+    fn a_route_selection_names_the_group() {
         let route_id = vibex_core::ModelRouteId::new();
         let selection = SessionRuntimeSelection::model_route(
             AgentId::parse("codex").unwrap(),
@@ -3719,7 +3728,7 @@ mod route_catalog_tests {
         );
         assert_eq!(
             selection.model_id(),
-            Some(format!("route/{}", route_id.as_str()).as_str())
+            Some(format!("group/{}/", route_id.as_str()).as_str())
         );
         assert_eq!(selection.auth_source.model_route_id(), Some(&route_id));
         assert!(selection.auth_source.provider_profile_id().is_none());
@@ -3779,7 +3788,8 @@ mod selector_route_priority_tests {
         }
     }
 
-    /// A `route/<id>` entry becomes a route selection, not a Provider one.
+    /// A `group/<id>/<model>` entry becomes a route selection, not a Provider
+    /// one.
     ///
     /// This is the priority rule: when a model id names a route, the session
     /// selects the route. Selecting the gateway Profile instead would record a
@@ -3789,7 +3799,7 @@ mod selector_route_priority_tests {
         let route_id = vibex_core::ModelRouteId::new();
         let mut profile = acp_profile("codex", &[]);
         profile.configured_models = vec![ProviderConfiguredModel {
-            id: format!("route/{}", route_id.as_str()),
+            id: format!("group/{}/deepseek-chat", route_id.as_str()),
             display_name: None,
             enabled: true,
             wire_api: None,
@@ -3803,7 +3813,7 @@ mod selector_route_priority_tests {
                 member_count: 2,
                 models: vec!["m".to_string()],
                 via_gateway: true,
-                kind: vibex_core::RouteKind::Gateway,
+                kind: vibex_core::RouteKind::ProviderGroup,
             },
         )]
         .into_iter()
@@ -4032,7 +4042,7 @@ mod direct_route_option_tests {
     fn facts(agent_id: &str, name: &str, via_gateway: bool) -> RuntimeRouteFacts {
         RuntimeRouteFacts {
             kind: if via_gateway {
-                vibex_core::RouteKind::Gateway
+                vibex_core::RouteKind::ProviderGroup
             } else {
                 vibex_core::RouteKind::Direct
             },
@@ -4075,8 +4085,9 @@ mod direct_route_option_tests {
 
     /// A gateway route is not appended twice.
     ///
-    /// It already arrives as a `route/<id>` entry in the gateway Profile's model
-    /// list; appending it again would show the same route as two options.
+    /// It already arrives as its `group/<id>/<model>` entries in the gateway
+    /// Profile's model list; appending it again would show the same route as
+    /// two options.
     #[test]
     fn a_gateway_route_is_not_duplicated() {
         let routes = [(

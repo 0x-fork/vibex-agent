@@ -84,7 +84,7 @@ impl GatewayError {
                 closest.join(", ")
             ),
             Self::AllKeysCooling { model, .. } => format!(
-                "Every Key serving `{model}` is cooling down after a failure. Automatic routing will resume when one recovers."
+                "Every Key serving `{model}` is cooling down after a failure. Requests will resume when one recovers."
             ),
             Self::TokenCeilingReached { provider } => format!(
                 "`{provider}` reached the token ceiling you set. Requests will resume when the window rolls over."

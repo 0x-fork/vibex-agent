@@ -9682,8 +9682,6 @@ pub enum Effect {
     },
     /// Change one part of the gateway policy, carrying the rest forward.
     SetGatewayPolicy {
-        routing: Option<vibex_core::GatewayRoutingStrategy>,
-        pin: Option<vibex_core::GatewayPinScope>,
         token_limit: Option<Option<vibex_core::GatewayTokenLimit>>,
     },
     ListAgents,

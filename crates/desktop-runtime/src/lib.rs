@@ -1365,9 +1365,13 @@ fn assemble_gateway_snapshot(
         .gateway_account_states()
         .unwrap_or_default();
     let now = vibex_core::unix_timestamp_ms();
+
+    // The upstream set is read from the enabled groups, not from the settings:
+    // the gateway owns no Provider list. This is a diagnostic view of who the
+    // groups name, so a reader can see whose Keys are backing the routes.
+    let route_members = provider.gateway_route_members().unwrap_or_default();
     let mut upstreams = Vec::new();
-    let mut models = Vec::new();
-    for upstream_id in &settings.upstreams {
+    for upstream_id in &route_members {
         let Some(profile) = profiles.iter().find(|profile| &profile.id == upstream_id) else {
             continue;
         };
@@ -1403,9 +1407,11 @@ fn assemble_gateway_snapshot(
             keys,
         });
     }
+
+    let mut models = Vec::new();
     for model in catalog {
-        // A route has no single Provider or protocol: those belong to its
-        // members, and naming one here would misreport what answers.
+        // A group model has no single Provider: the group chooses one per
+        // request, and naming one here would misreport what answers.
         models.push(vibex_core::GatewayModelSummary {
             model_provider_profile_id: vibex_core::ModelProviderProfileId::new(),
             provider_name: model.display_name.clone(),
@@ -1417,44 +1423,12 @@ fn assemble_gateway_snapshot(
             model_count: model.model_count,
         });
     }
-    let candidates = profiles
-        .iter()
-        .filter(|profile| profile.status == vibex_core::ModelProviderProfileStatus::Enabled)
-        .map(|profile| vibex_core::GatewayUpstreamCandidate {
-            model_provider_profile_id: profile.id.clone(),
-            display_name: profile.display_name.clone(),
-            model_count: profile
-                .configured_models
-                .iter()
-                .filter(|model| model.enabled)
-                .count(),
-            key_count: profile.credentials.len(),
-            selected: settings.upstreams.contains(&profile.id),
-        })
-        .collect::<Vec<_>>();
-    let active_agents = provider.gateway_active_agents().unwrap_or_default();
-    let settings_enabled = settings.policy.enabled;
-    let mut agents = Vec::new();
-    for (agent_id, _strategy, _enabled, unsupported) in provider.gateway_agent_options()? {
-        let agent_id_text = agent_id.as_str().to_string();
-        agents.push(vibex_core::GatewayAgentBinding {
-            display_name: agent_id_text.clone(),
-            // The switch is global, so every capable Agent reports the same
-            // intent. `unsupported` marks the ones the gateway cannot serve.
-            enabled: settings_enabled && !unsupported,
-            active: active_agents.contains(&agent_id),
-            unsupported,
-            wire_protocol_id: String::new(),
-            agent_id: agent_id_text,
-        });
-    }
+
     Ok(vibex_core::GatewaySnapshot {
         settings,
         runtime: runtime_state,
         upstreams,
         models,
-        agents,
-        upstream_candidates: candidates,
     })
 }
 
@@ -1638,17 +1612,16 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
         apply_migrations(&mut connection)?;
         let current = vibex_db::ModelGatewaySettingsRepository::get_or_create(&connection)?;
         // A Key command names a Provider and a Key; both have to be real and
-        // still listed before anything is written.
+        // still named by an enabled group before anything is written. The
+        // group list is the gateway's only upstream set.
         let profiles = provider.list_model_provider_profiles()?;
+        let route_members = provider.gateway_route_members().unwrap_or_default();
         for update in &request.account_updates {
             update.validate()?;
-            if !request
-                .upstreams
-                .contains(&update.model_provider_profile_id)
-            {
+            if !route_members.contains(&update.model_provider_profile_id) {
                 return Err(VibexError::validation(
                     "model_gateway_account_upstream_unknown",
-                    "the account update names a Provider that is not an upstream",
+                    "the account update names a Provider that no enabled route group uses",
                 ));
             }
             let profile = profiles
@@ -1672,8 +1645,6 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
             }
         }
         let mut policy = current.policy.clone();
-        policy.routing = request.routing;
-        policy.pin = request.pin;
         policy.token_limit = request.token_limit;
         policy.account_limits = request.account_limits;
         policy.translate = request.translate;
@@ -1701,7 +1672,6 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
         policy.validate()?;
         let mut next = current.clone();
         next.display_name = request.display_name;
-        next.upstreams = request.upstreams;
         next.policy = policy;
         next.revision = request.expected_revision.saturating_add(1);
         vibex_db::ModelGatewaySettingsRepository::update(
@@ -1839,13 +1809,13 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
         &self,
         _request: vibex_core::GatewayAgentUpdateRequest,
     ) -> VibexResult<vibex_core::GatewaySnapshot> {
-        // The gateway is switched on or off for the whole installation. A
-        // per-Agent toggle would let one Agent believe it is routed while the
-        // listener serves the others, so the request is refused rather than
-        // silently ignored.
+        // An Agent reaches the gateway by binding a route group, so there is no
+        // per-Agent gateway switch to set. This entry point survives only so an
+        // older client gets a refusal it can read instead of an unknown-variant
+        // decode failure.
         Err(VibexError::validation(
             "model_gateway_agent_scope_removed",
-            "the gateway is a global setting; switch it on or off instead of per Agent",
+            "bind a route group to the Agent instead of switching the gateway per Agent",
         ))
     }
 
@@ -3374,9 +3344,9 @@ impl DesktopRuntime {
         })
         .await?;
         // The gateway is bound after the runtime exists so a bind failure can
-        // be reported through the same handle the Config Center reads. Agents
-        // keep their direct Provider configuration when it fails, and the UI
-        // says so rather than pretending automatic routing is active.
+        // be reported through the same handle the Config Center reads. Route
+        // groups cannot be served when it fails, and the UI says so rather
+        // than pretending the gateway is running.
         // The gateway announces each request as it begins, answers, and ends;
         // this is what lets a client draw a request while it is still running.
         // The sink forwards onto the runtime's own bus so there is one event
@@ -3415,9 +3385,9 @@ impl DesktopRuntime {
                             }
                         }
                         None => {
-                            // Enabled but unusable (no upstreams, for example):
-                            // a Profile pointing at a listener that never bound
-                            // is worse than no Profile at all.
+                            // The listener did not bind (a taken port, for
+                            // example): a Profile pointing at a listener that
+                            // never bound is worse than no Profile at all.
                             if let Err(error) = provider.deactivate_gateway_profiles() {
                                 tracing::warn!(
                                     target: "vibex_model_gateway",

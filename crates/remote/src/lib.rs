@@ -581,7 +581,7 @@ pub trait RemoteManagementSnapshotSource: Send + Sync {
     /// Reads the local model gateway's surface.
     async fn model_gateway_snapshot(&self) -> VibexResult<vibex_core::GatewaySnapshot>;
 
-    /// Writes the gateway's routing policy and upstream list.
+    /// Writes the gateway's Key-level policy, not its upstream list.
     async fn update_model_gateway_settings(
         &self,
         request: vibex_core::GatewaySettingsUpdateRequest,
@@ -599,13 +599,16 @@ pub trait RemoteManagementSnapshotSource: Send + Sync {
         request: vibex_core::RemoveModelProviderCredentialRequest,
     ) -> VibexResult<vibex_core::ModelProviderProfile>;
 
-    /// Turns automatic routing on or off.
+    /// Turns the gateway on or off.
+    ///
+    /// Off stops the listener, so every bound route group becomes unusable and
+    /// each Agent falls back to its direct Provider.
     async fn set_model_gateway_enabled(
         &self,
         enabled: bool,
     ) -> VibexResult<vibex_core::GatewaySnapshot>;
 
-    /// Points one Agent at the gateway, or takes it back to a direct Provider.
+    /// The retired per-Agent gateway switch; answers a readable refusal.
     async fn set_model_gateway_agent(
         &self,
         request: vibex_core::GatewayAgentUpdateRequest,

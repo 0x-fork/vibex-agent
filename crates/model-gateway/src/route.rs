@@ -436,20 +436,6 @@ pub struct RouteMemberRef {
     pub reasoning_effort: Option<String>,
 }
 
-/// The `route/<id>` prefix a route's model id carries.
-pub const ROUTE_MODEL_PREFIX: &str = "route/";
-
-/// Splits a model id that names a route.
-///
-/// Returns `None` when the id is not route-shaped, so the caller falls back to
-/// ordinary Provider resolution. It returns `Some(None)` for a well-formed
-/// prefix with an empty id, which is a malformed request rather than a
-/// Provider lookup.
-pub fn route_id_from_model(requested: &str) -> Option<Option<&str>> {
-    let rest = requested.strip_prefix(ROUTE_MODEL_PREFIX)?;
-    Some((!rest.trim().is_empty()).then_some(rest.trim()))
-}
-
 /// Chooses the member order, using observed usage for `LeastUsed`.
 ///
 /// The strategy applies across members; the Key strategy inside the chosen
@@ -1043,22 +1029,6 @@ mod route_members {
             model: model.to_string(),
             reasoning_effort: None,
         }
-    }
-
-    #[test]
-    fn a_route_model_id_is_recognised_and_anything_else_is_not() {
-        assert_eq!(
-            route_id_from_model("route/standard"),
-            Some(Some("standard")),
-            "a route id is split off"
-        );
-        // An ordinary Provider-qualified id must not look like a route.
-        assert_eq!(route_id_from_model("deepseek/deepseek-chat"), None);
-        assert_eq!(route_id_from_model("deepseek-chat"), None);
-        assert_eq!(route_id_from_model("routeyou"), None);
-        // A bare prefix is a malformed request, not a Provider lookup.
-        assert_eq!(route_id_from_model("route/"), Some(None));
-        assert_eq!(route_id_from_model("route/   "), Some(None));
     }
 
     #[test]

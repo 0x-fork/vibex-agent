@@ -258,8 +258,6 @@ impl GatewayAccountLimits {
 #[serde(rename_all = "camelCase")]
 pub struct GatewayPolicy {
     pub enabled: bool,
-    pub routing: GatewayRoutingStrategy,
-    pub pin: GatewayPinScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_limit: Option<GatewayTokenLimit>,
     #[serde(default)]
@@ -277,8 +275,6 @@ impl Default for GatewayPolicy {
     fn default() -> Self {
         Self {
             enabled: true,
-            routing: GatewayRoutingStrategy::Ordered,
-            pin: GatewayPinScope::Conversation,
             token_limit: None,
             translate: GatewayTranslatePolicy::default(),
             account_limits: BTreeMap::new(),
@@ -301,16 +297,17 @@ impl GatewayPolicy {
 
 /// The gateway's whole durable configuration.
 ///
-/// Upstreams are ordinary shared Provider Profiles; the gateway only keeps
-/// their ids and the order they are tried in. That is what lets one Provider
-/// serve several Agents without duplicating its endpoints or Keys.
+/// It holds no upstream list. The gateway is a transport and a scheduler, not a
+/// Provider collection: the Providers it may call are exactly the members of
+/// the enabled route groups, read fresh on every snapshot. That is what makes
+/// it independent of whether any route exists yet, and it is why switching it
+/// off simply makes every route group unusable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelGatewaySettings {
     pub display_name: String,
     /// The persisted listening port, or `0` before the first successful bind.
     pub port: u16,
-    pub upstreams: Vec<ModelProviderProfileId>,
     pub policy: GatewayPolicy,
     pub revision: i64,
     pub updated_at_ms: i64,
@@ -321,7 +318,6 @@ impl Default for ModelGatewaySettings {
         Self {
             display_name: "Vibex Gateway".to_string(),
             port: 0,
-            upstreams: Vec::new(),
             policy: GatewayPolicy::default(),
             revision: 1,
             updated_at_ms: 0,
@@ -333,7 +329,6 @@ impl ModelGatewaySettings {
     /// The largest display name the Config Center accepts, matching the
     /// Provider Profile limit so the gateway row is not the odd one out.
     pub const MAX_DISPLAY_NAME_LEN: usize = 160;
-    pub const MAX_UPSTREAMS: usize = 64;
 
     pub fn validate(&self) -> VibexResult<()> {
         let name = self.display_name.trim();
@@ -342,21 +337,6 @@ impl ModelGatewaySettings {
                 "model_gateway_display_name_invalid",
                 "gateway display name must be non-empty and within the supported length",
             ));
-        }
-        if self.upstreams.len() > Self::MAX_UPSTREAMS {
-            return Err(VibexError::validation(
-                "model_gateway_upstream_limit_exceeded",
-                "the gateway has more upstream Providers than it supports",
-            ));
-        }
-        let mut seen = std::collections::BTreeSet::new();
-        for upstream in &self.upstreams {
-            if !seen.insert(upstream.as_str()) {
-                return Err(VibexError::validation(
-                    "model_gateway_upstream_duplicate",
-                    "the gateway lists the same upstream Provider twice",
-                ));
-            }
         }
         // A port below 1024 is not usable by an unprivileged loopback service,
         // and a port of 0 means "not assigned yet" rather than "random".
@@ -377,19 +357,21 @@ pub enum ModelGatewayStatus {
     /// The runtime has not started the service yet.
     Starting,
     Running,
-    /// The service could not bind or was shut down. Agents fall back to their
-    /// direct Provider configuration and the UI says so.
+    /// The service could not bind or was shut down. Route groups cannot be
+    /// served while it is down; direct Providers are unaffected, because they
+    /// never reach the gateway.
     Unavailable,
-    /// The listener is up but upstream calls have failed repeatedly, so the
-    /// gateway has stepped out of the way and Agents fall back to their direct
-    /// Provider configuration.
+    /// The listener is up but upstream calls have failed repeatedly. The
+    /// gateway has stepped out of the way: every request but one is refused
+    /// while a single probe is allowed through.
     ///
     /// This is distinct from `Unavailable`: the port is still bound, and the
     /// state clears itself once an upstream answers again. Reporting it is the
-    /// whole point — a silent fallback would leave the user believing
-    /// automatic routing is still in effect.
+    /// whole point — a silent refusal would leave the user unable to tell a
+    /// broken group from an idle gateway.
     Degraded,
-    /// The user turned automatic routing off. The surface stays visible.
+    /// The user turned the gateway off. Every route group becomes unusable and
+    /// the surface stays visible.
     Disabled,
 }
 
@@ -411,8 +393,9 @@ pub struct ModelGatewayRuntimeState {
     pub status: ModelGatewayStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// How many enabled route groups the listener can serve right now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_count: Option<usize>,
+    pub route_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,
     pub updated_at_ms: i64,
@@ -423,7 +406,7 @@ impl Default for ModelGatewayRuntimeState {
         Self {
             status: ModelGatewayStatus::Starting,
             port: None,
-            upstream_count: None,
+            route_count: None,
             notice: None,
             updated_at_ms: unix_timestamp_ms(),
         }
@@ -431,11 +414,11 @@ impl Default for ModelGatewayRuntimeState {
 }
 
 impl ModelGatewayRuntimeState {
-    pub fn running(port: u16, upstream_count: usize) -> Self {
+    pub fn running(port: u16, route_count: usize) -> Self {
         Self {
             status: ModelGatewayStatus::Running,
             port: Some(port),
-            upstream_count: Some(upstream_count),
+            route_count: Some(route_count),
             notice: None,
             updated_at_ms: unix_timestamp_ms(),
         }
@@ -445,7 +428,7 @@ impl ModelGatewayRuntimeState {
         Self {
             status: ModelGatewayStatus::Unavailable,
             port: None,
-            upstream_count: None,
+            route_count: None,
             notice: Some(notice.into()),
             updated_at_ms: unix_timestamp_ms(),
         }
@@ -892,45 +875,6 @@ impl<'a> GatewayModelRef<'a> {
     }
 }
 
-/// One Agent's relationship to the gateway, as the Config Center shows it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GatewayAgentBinding {
-    pub agent_id: String,
-    pub display_name: String,
-    /// The user wants the Agent to walk through the gateway.
-    ///
-    /// This survives a stopped listener. The Agent is only actually projected
-    /// onto the gateway while [`Self::active`] is true.
-    pub enabled: bool,
-    /// The Agent is currently pointed at the gateway.
-    ///
-    /// When the listener is down the hidden Profile is removed so the Agent
-    /// falls back to a direct Provider; the user's choice stays in `enabled`.
-    #[serde(default)]
-    pub active: bool,
-    /// The Agent manages its own provider and cannot be routed.
-    pub unsupported: bool,
-    /// The protocol the Agent speaks to the gateway, for the model list.
-    pub wire_protocol_id: String,
-}
-
-/// A Provider the user could add as a gateway upstream.
-///
-/// The gateway's upstream list uses the shared v2 Provider identity, while the
-/// Config Center still lists legacy Profiles. The authority resolves the two
-/// once, so a client never has to derive one id from the other.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GatewayUpstreamCandidate {
-    pub model_provider_profile_id: ModelProviderProfileId,
-    pub display_name: String,
-    pub model_count: usize,
-    pub key_count: usize,
-    /// The Provider is already an upstream.
-    pub selected: bool,
-}
-
 /// One model the gateway serves, for the Config Center's read-only list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -941,33 +885,38 @@ pub struct GatewayModelSummary {
     /// The id an Agent's model picker shows.
     pub display_id: String,
     pub wire_protocol_id: String,
-    /// Present when this entry is a route rather than one upstream's model.
+    /// The route group this entry belongs to.
     ///
-    /// The Config Center shows the two differently: a route names a saved
-    /// composition and has no single Provider or protocol, while an upstream
-    /// entry belongs to one.
+    /// Every model the gateway serves comes from a group, so this is present on
+    /// every entry. It is an `Option` so a client written before groups is not
+    /// forced to interpret it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_id: Option<String>,
-    /// How many members can answer a route.
+    /// How many Providers can answer the group.
     #[serde(default)]
     pub source_count: usize,
-    /// How many distinct model names a route offers.
+    /// How many models the group offers.
     #[serde(default)]
     pub model_count: usize,
 }
 
 /// The whole Config Center read for the gateway.
+///
+/// There is no Agent list here: an Agent reaches the gateway by binding a route
+/// group, so the binding is the one switch and it lives with the route. There
+/// is no upstream candidate list either: the gateway may call exactly the
+/// members of the enabled route groups.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewaySnapshot {
     pub settings: ModelGatewaySettings,
     pub runtime: ModelGatewayRuntimeState,
+    /// The Providers the enabled route groups name, with their Keys.
+    ///
+    /// This is a read of the groups, not a configuration: adding a Provider
+    /// here would mean adding it to a group.
     pub upstreams: Vec<GatewayUpstreamSummary>,
     pub models: Vec<GatewayModelSummary>,
-    pub agents: Vec<GatewayAgentBinding>,
-    /// Every Provider that could become an upstream.
-    #[serde(default)]
-    pub upstream_candidates: Vec<GatewayUpstreamCandidate>,
 }
 
 impl GatewaySnapshot {
@@ -999,10 +948,19 @@ impl GatewaySnapshot {
     }
 
     /// Whether the surface can actually serve a request.
+    ///
+    /// A running listener with no route groups is routable in the sense that
+    /// matters here: it is up and nothing is broken. It simply has no models to
+    /// offer, which the model list already says. Treating "no routes yet" as
+    /// "cannot route" made the first launch of a fresh installation look like a
+    /// failure.
     pub fn is_routable(&self) -> bool {
         self.runtime.status.is_routable()
-            && !self.upstreams.is_empty()
-            && self.ready_key_count() > 0
+    }
+
+    /// Whether at least one group currently offers a usable model.
+    pub fn has_servable_models(&self) -> bool {
+        !self.models.is_empty() && self.ready_key_count() > 0
     }
 }
 
@@ -1030,7 +988,13 @@ pub struct GatewayKeySummary {
     pub limits: Option<GatewayAccountLimits>,
 }
 
-/// The Config Center's request to point one Agent at the gateway.
+/// The retired per-Agent gateway switch, kept only so an older client that
+/// still sends it gets a clear refusal instead of an unknown-variant decode
+/// failure.
+///
+/// An Agent reaches the gateway by binding a route group. There is no second
+/// switch, and adding one back would let an Agent believe it is routed while the
+/// listener serves a different set of groups.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayAgentUpdateRequest {
@@ -1269,11 +1233,8 @@ pub struct GatewayRouteAttemptSummary {
 #[serde(rename_all = "camelCase")]
 pub struct GatewaySettingsUpdateRequest {
     pub display_name: String,
-    pub routing: GatewayRoutingStrategy,
-    pub pin: GatewayPinScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_limit: Option<GatewayTokenLimit>,
-    pub upstreams: Vec<ModelProviderProfileId>,
     /// Concurrency and rate limits per credential. An omitted entry leaves that
     /// Key unlimited, and the whole map replaces the stored one.
     #[serde(default)]
@@ -1489,13 +1450,6 @@ mod tests {
     #[test]
     fn gateway_contracts_carry_no_money_fields() {
         let settings = ModelGatewaySettings {
-            upstreams: vec![
-                ModelProviderProfileId::parse(format!(
-                    "model_provider_{}",
-                    RequestId::new().as_str()
-                ))
-                .unwrap(),
-            ],
             policy: GatewayPolicy {
                 token_limit: Some(GatewayTokenLimit {
                     window: GatewayTokenWindow::Month,
@@ -1744,19 +1698,11 @@ mod tests {
     }
 
     #[test]
-    fn settings_reject_duplicate_upstreams_and_privileged_ports() {
-        let profile = ModelProviderProfileId::new();
+    fn settings_reject_privileged_ports() {
         let mut settings = ModelGatewaySettings {
-            upstreams: vec![profile.clone(), profile.clone()],
+            port: 80,
             ..ModelGatewaySettings::default()
         };
-        assert_eq!(
-            settings.validate().unwrap_err().code,
-            "model_gateway_upstream_duplicate"
-        );
-
-        settings.upstreams = vec![profile];
-        settings.port = 80;
         assert_eq!(
             settings.validate().unwrap_err().code,
             "model_gateway_port_invalid"
@@ -1764,6 +1710,14 @@ mod tests {
 
         settings.port = 3425;
         settings.validate().unwrap();
+    }
+
+    /// The gateway holds no upstream list, so its settings cannot name a
+    /// Provider. This is what makes it independent of whether any route exists.
+    #[test]
+    fn settings_carry_no_provider_list() {
+        let encoded = serde_json::to_string(&ModelGatewaySettings::default()).unwrap();
+        assert!(!encoded.contains("upstream"), "{encoded}");
     }
 
     #[test]

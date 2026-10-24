@@ -4931,11 +4931,11 @@ ManagementBackend::fetch_agent_model_provider_draft_models(request)
 ```rust
 // crates/core/src/model_gateway.rs
 GatewayPolicy {
-    enabled, routing: GatewayRoutingStrategy, pin: GatewayPinScope,
-    token_limit: Option<GatewayTokenLimit>, translate: GatewayTranslatePolicy,
+    enabled, token_limit: Option<GatewayTokenLimit>, translate: GatewayTranslatePolicy,
+    account_limits, preferred_keys,
 }
-ModelGatewaySettings { display_name, port, upstreams, policy, revision, updated_at_ms }
-GatewaySnapshot { settings, runtime, upstreams, models, agents, upstream_candidates }
+ModelGatewaySettings { display_name, port, policy, revision, updated_at_ms }
+GatewaySnapshot { settings, runtime, upstreams, models }
 
 // crates/model-gateway
 ModelGatewayService::{new, start, shutdown, settings, read_snapshot, prepare}
@@ -5010,16 +5010,18 @@ ProviderConfigService::{
   `prompt_cache_key`, then an explicit session header, then a hash of the system
   prompt, tool set, and first user message, scoped by Agent. Pins expire after
   `GatewayConversationPin::TTL_MS` and are pruned.
-- **Upstreams are shared Profiles.** The gateway stores only their ids; the
-  Profile keeps its endpoints and Keys. Pointing an Agent at the gateway creates
-  one hidden Profile (`vibex.internal.profileRole = model_gateway`) whose address
-  and model list follow the listener. That hidden Profile never appears in an
-  Agent's provider list, and its protocol is taken from the Agent's own
-  descriptor so the existing interface validation still passes.
-- **Published model ids resolve.** `/v1/models` and the Config Center list
-  `alias/model`, where the alias is the upstream's slugified display name. Two
-  upstreams that share a display name fall back to their unique Provider Profile
-  id, because a published id the resolver would refuse is a bug.
+- **The gateway's Providers are the groups' members.** It stores no list of its
+  own; `read_snapshot` collects them from the enabled route groups. Pointing an
+  Agent at the gateway creates one hidden Profile
+  (`vibex.internal.profileRole = model_gateway`) per bound Agent, whose address
+  follows the listener and whose model list is exactly that Agent's bound
+  groups. That hidden Profile never appears in an Agent's provider list, and its
+  protocol is taken from the Agent's own descriptor so the existing interface
+  validation still passes.
+- **Every published model id is a group id.** `/v1/models` and the Config Center
+  list `group/<id>/<model>`. A bare `alias/model` id is not a gateway model:
+  there is no upstream list left to derive an alias from, and resolving one
+  would reintroduce it.
 - **Usage is tokens only.** No `cost`, `price`, `currency`, `amount`, or `budget`
   field exists on any gateway contract, and `ModelGatewayRequestLog` carries no
   prompt, reply, image bytes, or Key material. It is pruned to a rolling seven
@@ -5110,10 +5112,12 @@ ProviderConfigService::{
   the token ceiling, and turning automatic routing off ask first. Removing a
   non-last Key, switching one Key off, and turning automatic routing on do not:
   they are reversible or restore service.
-- **The TUI's Provider columns are the gateway's vocabulary.** Upstreams, Keys,
-  State, and Agents: a direct Provider shows one upstream, its single secret as
-  0 or 1 Keys, ready/off, and its Agent; the gateway shows its counts and bound
-  Agents. The old Agent/Kind/Model/Credential facts remain in the row detail.
+- **The TUI's Provider columns are the gateway's vocabulary.** Groups, Keys,
+  State, and Models: a direct Provider shows one group, its single secret as 0 or
+  1 Keys, ready/off, and its model count; the gateway shows the enabled route
+  groups it serves, the aggregate Key summary, and the models those groups
+  publish. No column names an Agent, because the gateway has no Agent list. The
+  old Agent/Kind/Model/Credential facts remain in the row detail.
 - **A Key row wraps rather than truncating its own name.** The switch, state,
   preference, replacement, and removal controls are one wrapping cluster, so a
   narrow window pushes them to a second line instead of cutting the Key label.
@@ -5145,21 +5149,25 @@ ProviderConfigService::{
   - No money field exists anywhere in the catalogue, its cache, or its DTOs.
 - **The gateway steps aside when it is the problem.** Three consecutive requests
   that produce no upstream answer put the service into `Degraded`: the listener
-  stays bound, routing is refused with a `503` that names the fallback, and one
-  success clears both the count and the state. `Degraded` is deliberately
-  distinct from `Unavailable` — the port is alive either way, and only one of
-  them means "restart or wait". A failure older than the memory window starts the
-  count over, and the degraded refusal itself never counts, or the state could
-  never clear.
-- **The gateway's own switch reaches the listener and the bindings.** Turning
-  automatic routing off stops the listener and removes every hidden gateway
-  Profile, so each bound Agent really falls back to its direct Provider instead
-  of pointing at a dead port. The *choice* of Agents survives in
-  `model_gateway_agents`: a later start re-creates the Profiles for the same
-  Agents without asking again. A start failure publishes `Unavailable` rather
-  than leaving the surface at `Starting`, and a failed start removes the
-  Profiles for the same reason. `GatewayAgentBinding.enabled` is the durable
-  choice; `active` says whether the Profile currently exists.
+  stays bound, all but one request are refused with a `503` that says it stepped
+  aside, and one success clears both the count and the state. `Degraded` is
+  deliberately distinct from `Unavailable` — the port is alive either way, and
+  only one of them means "restart or wait". A failure older than the memory
+  window starts the count over, and the degraded refusal itself never counts, or
+  the state could never clear.
+- **The gateway's own switch reaches the listener and the bindings.** Turning it
+  off stops the listener and removes every hidden gateway Profile, so each bound
+  Agent really falls back to its direct Provider instead of pointing at a dead
+  port. The *bindings* survive, which is what a later start re-reads to recreate
+  the Profiles without asking again. A start failure publishes `Unavailable`
+  rather than leaving the surface at `Starting`, and a failed start removes the
+  Profiles for the same reason. `gateway_active_agents()` is the projection;
+  the bindings are the only durable choice.
+- **It starts with nothing.** A fresh installation has the gateway on and no
+  route group; the listener binds, `/v1/models` is empty, and the surface says
+  "no route groups" rather than "not running". A missing route is not a failure,
+  and reporting it as one is what made the gateway look like a feature of an
+  upstream list it no longer has.
 - **A Key is added and removed on the shared Provider.** The reference is
   written first with a placeholder and the value goes through the same secret
   store as every other credential, so plaintext never enters the profile row.
@@ -5189,10 +5197,11 @@ ProviderConfigService::{
   holds its preset value by re-reading the draft: nothing records "came from a
   preset", so an edit removes the mark by itself and restoring the value brings
   it back.
-- **The routing order is the upstream order.** Moving an upstream swaps it with
-  its neighbour and changes nothing else; an edge row offers no move past the
-  end rather than wrapping. The order lives in
-  `ModelGatewaySettings.upstreams`, which is the order the gateway tries.
+- **The routing order is the group's member order.** Moving a member swaps it
+  with its neighbour and changes nothing else; an edge row offers no move past
+  the end rather than wrapping. The order lives on `ModelRoute.members`, which
+  is the order the group's strategy tries them in; the gateway has no list of
+  its own to order.
 - **Clearing the ledger is confirmed and bounded by its copy.** The request is
   confirmed before it runs, and the wording names both the seven-day window and
   what the records never contained (prompt, reply, key, image content), so it
@@ -5223,13 +5232,14 @@ ProviderConfigService::{
   way a fresh dialog does, so a preset that was looked at and left behind cannot
   leave its addresses in a form the user asked to start empty.
 - **The TUI's Providers table mirrors the gateway's hierarchy.** The gateway
-  row is followed by one row per upstream (`├`) and one per Key (`│ ├`), so the
-  reader can see which account is cooling without opening the desktop. A Key
-  row offers `Toggle` and `Prefer`; the gateway row offers `Switching`, `Pin`,
-  `Token limit`, and `Recent requests`. The token
+  row is followed by one row per group member Provider (`├`) and one per Key
+  (`│ ├`), so the reader can see which account is cooling without opening the
+  desktop. A Key row offers `Toggle` and `Prefer`; the gateway row offers
+  `Token limit` and `Recent requests` only, because the member strategy and the
+  conversation pin belong to each route group. The token
   ceiling is a prompt because a character grid has no room for a combined
   number-and-window control; an empty answer removes the ceiling. The request
-  ledger is a read-only text view with the model, route, tokens, and skipped
+  ledger is a read-only text view with the model, group, tokens, and skipped
   Keys. Key creation, replacement, and removal stay on the desktop, which owns
   the masked input and the confirmation dialogs.
 - **The composer's model menu leads with the model the user already chose.** The
@@ -5299,8 +5309,8 @@ ProviderConfigService::{
   confirmation, the four translation switches, the cooldown wake-up target, the
   Provider-list Key summary, the in-place Key replacement, and the destructive
   confirmations.
-- `cargo test -p vibex-tui --test config_center` covers the Upstreams/Keys/
-  State/Agents Provider headings and the gateway row's ready/off wording.
+- `cargo test -p vibex-tui --test config_center` covers the Groups/Keys/
+  State/Models Provider headings and the gateway row's ready/off wording.
 - `cargo test -p vibex-model-gateway --test gateway` drives a real listener
   against a mock upstream: passthrough, translation, gathering, cooling, auth
   invalidation, the token ceiling, pinning, an unknown model, `file_id` refusal,
@@ -5389,13 +5399,13 @@ let (attempt, key) = service.open_attempt(&prepared).await?;
 service.record(&prepared, &RequestOutcome { credential: Some(key.id), .. });
 ```
 
-## Scenario: The Gateway Is One Global Setting
+## Scenario: The Gateway Has No Configuration Of Its Own
 
 ### 1. Scope / Trigger
 
 - Trigger: the Config Center switches the local model gateway on or off.
-- Trigger: an Agent is pointed at the gateway, or a running listener's address
-  moves.
+- Trigger: a running listener's address moves.
+- Trigger: an Agent is bound to, or unbound from, a route group.
 
 ### 2. Signatures
 
@@ -5405,32 +5415,50 @@ ProviderConfigService::gateway_active_agents()     -> Set<AgentId>   (projection
 ProviderConfigService::attach_gateway_to_agents(&url, &catalog) -> Vec<AgentId>
 ProviderConfigService::detach_gateway_from_agents() -> Vec<AgentId>
 ProviderConfigService::refresh_gateway_profiles(&url, &catalog) -> Vec<AgentId>
+ProviderConfigService::gateway_route_members()     -> Vec<ModelProviderProfileId>
+ModelGatewayService::start()                       -> ModelGatewayRuntimeState
 ```
 
 ### 3. Contracts
 
-- The gateway is enabled **once, for the whole installation**, through
-  `GatewayPolicy::enabled`. There is no per-Agent switch. A per-Agent toggle let
-  one Agent believe it was routed while the listener served the others.
-- `gateway_agents()` reports intent and is derived: when the policy is enabled it
-  is every gateway-capable Agent (configurable, and speaking one of the four
-  protocols the gateway serves). When disabled it is empty. It does not read a
-  per-Agent table.
-- Enabling attaches every capable Agent in one pass; disabling detaches all of
-  them. `detach_gateway_from_agents` scans the existing hidden Profiles, not the
-  intent set, because it has to run precisely when the intent set is empty.
-- `attach_gateway_to_agents` refuses an empty address and, when the policy is
-  disabled, detaches instead of attaching: a disabled gateway must never leave a
-  Profile pointing at it even if a listener is still bound.
-- Attaching is per-Agent fault tolerant. An Agent that is merely unconfigured
-  (an ACP Agent with no runtime config yet) is skipped and keeps its direct
-  Provider; it must not deny the gateway to every other Agent.
-- `set_model_gateway_agent` is refused with `model_gateway_agent_scope_removed`.
-  Keeping a working per-Agent write would reintroduce the split authority the
-  global switch exists to remove.
-- The gateway switch is rendered on the Providers page only. The Agent's
-  Provider card reports the resulting state (address, key health, routed or
-  not) and never offers a switch.
+- **The gateway is a transport and a scheduler, not a Provider collection.** It
+  holds no upstream list (`ModelGatewaySettings` has no `upstreams`), and it has
+  no per-Agent switch (`model_gateway_agents` is dropped). Its only inputs are
+  the enabled route groups: the Providers they name are the Providers it may
+  call, read fresh on every snapshot.
+- **It runs whether or not a route exists.** `start` binds whenever the policy is
+  enabled and the port is available. An empty group set is a valid state, not a
+  configuration error: `/v1/models` answers an empty list and a request for a
+  model the listener does not serve is a `404 model_not_found`. The runtime
+  state's count is `route_count`, because "how many upstreams" no longer means
+  anything.
+- **`GatewayPolicy` carries no routing strategy and no pin.** Both belong to the
+  composition, so they live on `ModelRoute` and the group decides them. What
+  remains gateway-wide is what describes the listener and the accounts: the
+  switch, the token ceiling, the Key limits, preferred Keys, and the translation
+  switches.
+- **A binding is the only way onto the gateway.** `attach_gateway_to_agents`
+  walks the live bindings, and each Agent's hidden Profile receives only the
+  model ids of the groups it is bound to. An Agent that loses its last enabled
+  binding loses its Profile, so it falls back to its own direct Provider.
+- **One Agent may bind several groups.** The hidden Profile's catalogue is the
+  union of those groups' model ids; exactly one binding is the Agent's default,
+  which is what a new session starts on.
+- **Switching the gateway off makes the groups unusable, and nothing else.** It
+  stops the listener and removes every hidden Profile. Direct Providers are
+  untouched because they never reached the gateway. The bindings survive, so a
+  later start re-creates the Profiles for the same Agents and groups without
+  asking again.
+- **A failure is reported, never silent.** A failed bind publishes
+  `Unavailable` and removes the Profiles; repeated upstream failures publish
+  `Degraded` (the listener stays bound, one request at a time is let through).
+  Neither state is `Disabled`, because neither means the user turned it off.
+- **There is no plain gateway route.** `RouteKind` has two shapes:
+  `ProviderGroup` (served by the gateway) and `Direct` (never is). The retired
+  `Gateway` kind and its `route/<id>` ids are gone from the model namespace;
+  every gateway model id is `group/<id>/<model>`.
+- `set_model_gateway_agent` is refused with `model_gateway_agent_scope_removed`,
+  and the request type survives only so an older client gets a readable refusal.
 
 ### 4. Validation & Error Matrix
 
@@ -5438,41 +5466,51 @@ ProviderConfigService::refresh_gateway_profiles(&url, &catalog) -> Vec<AgentId>
 | --- | --- |
 | Attach with an empty address | `model_gateway_unavailable` |
 | Attach while the policy is disabled | Detach instead; no Profile points at the gateway |
+| Attach with no bindings at all | No Profile is created; the listener is still `Running` |
 | Attach for an Agent lacking ACP configuration | Skipped; that Agent keeps its direct Provider |
 | Any per-Agent gateway write | `model_gateway_agent_scope_removed` |
 | Policy disabled | `gateway_agents()` is empty and every hidden Profile is removed |
+| A model id without `group/` | `404 model_not_found`; it is not a gateway model |
+| Settings write naming a Provider no group uses | `model_gateway_account_upstream_unknown` |
 
 ### 5. Good / Base / Bad Cases
 
-- Good: the user turns the gateway on once; every capable Agent is pointed at it
-  and the Config Center lists them as routed.
-- Base: one ACP Agent has no runtime configuration yet; it is skipped, the
-  rest attach, and the switch still works.
-- Bad: a per-Agent toggle turns the gateway on for one Agent while the listener
-  is off, so the Agent is paused while the UI claims it is routed.
+- Good: a fresh installation ships with the gateway on and no groups; the
+  listener is `Running` with an empty model list, and creating a group is the
+  first thing that makes it useful.
+- Base: an Agent is bound to two groups. Its Profile lists both groups' models,
+  one binding is its default, and unbinding one leaves the other usable.
+- Bad: a per-Agent toggle, or a gateway-owned upstream list, puts a second
+  authority beside the bindings; one of them then claims a model the other does
+  not serve.
 
 ### 6. Tests Required
 
-- `vibex-config-switch`: enabling attaches every capable Agent at once; a second
-  attach updates the same hidden Profiles; detaching removes all of them; the
-  intent follows the global switch; a stopped listener removes the Profiles but
-  keeps the switch; an Agent owning its Provider is never attached; an empty
-  address is refused.
-- `vibex-desktop`: no Agent row or Provider-card gateway block renders a
-  `Switch`; the per-Agent confirmation and pending marker no longer exist; the
-  one global switch still lives on the gateway page.
+- `vibex-model-gateway`: a listener with no groups is `Running`, publishes an
+  empty model list, and answers `404` for a group it does not have.
+- `vibex-config-switch`: an Agent with no binding is not attached; a binding
+  attaches only its own Agent with only its own groups' models; a second group
+  joins the same Profile; unbinding the last group removes it; a disabled group
+  leaves the Profile; detaching removes all of them; a stopped listener removes
+  the Profiles but keeps the bindings; an empty address is refused.
+- `vibex-desktop`: the gateway page renders no Agent card and no upstream
+  editor; no `snapshot.agents` or `snapshot.upstream_candidates` reference
+  remains.
+- `vibex-tui`: the gateway row counts groups and models, not Agents, and offers
+  no routing or pinning verb.
 
 ### 7. Wrong vs Correct
 
 #### Wrong
 
 ```rust
-// Remember which Agents the user routed, and project only those.
+// Give the gateway its own Provider list, and switch it per Agent.
+settings.upstreams = vec![provider];
 ModelGatewayAgentRepository::set(&conn, agent_id, true)?;
 ```
 
-This creates a second authority next to the gateway policy: the listener can be
-off while an Agent's row says it is routed.
+Both create a second authority beside the route groups: the listener can be off
+while an Agent says it is routed, or serve a Provider no group names.
 
 #### Correct
 
@@ -5480,12 +5518,14 @@ off while an Agent's row says it is routed.
 if !settings.policy.enabled {
     return self.deactivate_gateway_profiles();
 }
-for agent_id in self.gateway_capable_agents()? {
-    let _ = self.ensure_gateway_profile(&agent_id, base_url, catalog);
+// The bindings decide who is on the gateway, and each Profile gets only the
+// groups its own Agent references.
+for (agent_id, catalog) in catalogs_by_agent(&conn)? {
+    let _ = self.ensure_gateway_profile(&agent_id, base_url, &catalog);
 }
 ```
 
-The policy decides; the hidden Profiles are its projection, and a failure for
+The groups decide; the hidden Profiles are their projection, and a failure for
 one Agent is local to that Agent.
 
 ## Scenario: Route Groups Compose Whole Providers

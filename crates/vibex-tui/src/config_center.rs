@@ -241,13 +241,11 @@ pub enum ConfigAction {
     Logout,
     /// Make a model provider profile the active one.
     Activate,
-    /// Make one of a Provider's Keys the one the router tries first, or pin
-    /// the gateway's conversations to one.
+    /// Make one of a Provider's Keys the one the router tries first.
+    ///
+    /// Pinning and the member strategy are properties of a route group now, so
+    /// there is no gateway-wide verb for either.
     Prefer,
-    /// Keep the gateway's conversations on one Key.
-    Pin,
-    /// Cycle the gateway's routing strategy.
-    Routing,
     /// Edit the gateway's local token ceiling.
     TokenLimit,
     /// Read the recent requests the gateway served.
@@ -304,8 +302,6 @@ impl ConfigAction {
             Self::Logout => strings.config_action_sign_out(),
             Self::Activate => strings.config_action_activate(),
             Self::Prefer => strings.config_action_prefer(),
-            Self::Pin => strings.config_action_pin(),
-            Self::Routing => strings.config_action_routing(),
             Self::TokenLimit => strings.config_action_token_limit(),
             Self::Requests => strings.config_action_requests(),
             Self::Secret => strings.config_action_secret(),
@@ -448,7 +444,7 @@ pub fn columns(
             strings.config_col_upstreams(),
             strings.config_col_keys(),
             strings.config_col_state(),
-            strings.config_col_agents(),
+            strings.config_col_models(),
         ],
         ConfigSection::Servers => vec![
             strings.config_col_transport(),
@@ -1780,21 +1776,19 @@ fn gateway_row(data: &ManagementData, strings: Strings) -> Option<ConfigRow> {
             format!("{total_keys} keys · {cooling} cooling · {invalid} invalid")
         }
     };
-    let agents = snapshot
-        .agents
+    // The gateway has no Agent list of its own: an Agent reaches it through a
+    // route group, so the count that matters here is how many groups it serves.
+    let route_count = snapshot
+        .models
         .iter()
-        .filter(|agent| agent.active)
-        .map(|agent| agent.agent_id.clone())
-        .collect::<Vec<_>>();
+        .filter_map(|model| model.route_id.as_deref())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
     let mut row = ConfigRow::new("gateway", snapshot.settings.display_name.clone())
-        .cell(snapshot.upstreams.len().to_string())
+        .cell(route_count.to_string())
         .cell(key_summary)
         .cell(state)
-        .cell(if agents.is_empty() {
-            strings.config_state_off().to_string()
-        } else {
-            agents.join(", ")
-        })
+        .cell(snapshot.models.len().to_string())
         .chip(
             state,
             if snapshot.runtime.status == vibex_core::ModelGatewayStatus::Running {
@@ -1811,22 +1805,20 @@ fn gateway_row(data: &ManagementData, strings: Strings) -> Option<ConfigRow> {
                 .base_url()
                 .unwrap_or_else(|| "not running".to_string()),
         )
+        .detail("routes", route_count.to_string())
         .detail(
-            "routing",
-            snapshot.settings.policy.routing.label().to_string(),
+            "models",
+            snapshot
+                .models
+                .iter()
+                .map(|model| model.display_id.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
         )
-        .detail(
-            "agents",
-            if agents.is_empty() {
-                strings.config_state_off().to_string()
-            } else {
-                agents.join(", ")
-            },
-        )
+        // Routing strategy and pinning belong to a route group now, not to the
+        // gateway: one listener serves many groups and each decides its own.
         .actions(&[
             ConfigAction::Toggle,
-            ConfigAction::Routing,
-            ConfigAction::Pin,
             ConfigAction::TokenLimit,
             ConfigAction::Requests,
             ConfigAction::RefreshSnapshot,
@@ -1837,12 +1829,11 @@ fn gateway_row(data: &ManagementData, strings: Strings) -> Option<ConfigRow> {
     Some(row)
 }
 
-/// The upstream and Key rows under the gateway.
+/// The Provider and Key rows under the gateway.
 ///
-/// The table has no nested widget, so the hierarchy is drawn as prefixed rows:
-/// an upstream is `├` and each of its Keys is `│ ├`. They stay in the same
-/// table because the reader is answering the same question at every level —
-/// which Key serves this model — and a separate page would hide the parent.
+/// These are the Providers the enabled route groups name, drawn as `├` with
+/// each of their Keys as `│ ├`. They are a read: a Provider joins the gateway
+/// by being a group's member, not by being listed here.
 fn gateway_child_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
     let Some(snapshot) = data.gateway.as_ref() else {
         return Vec::new();
@@ -1966,8 +1957,8 @@ fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
                 profile.id.as_str().to_string(),
                 profile.display_name.clone(),
             )
-            // A direct Provider is one upstream with one stored secret, but it
-            // sits in the same five columns as the gateway so the two kinds of
+            // A direct Provider is one group of one with one stored secret, and
+            // it sits in the same columns as the gateway so the two kinds of
             // row can be read against one heading.
             .cell("1")
             .cell(if key_count { "1" } else { "0" })
@@ -1976,7 +1967,14 @@ fn provider_rows(data: &ManagementData, strings: Strings) -> Vec<ConfigRow> {
             } else {
                 strings.config_state_off()
             })
-            .cell(profile.agent_id.as_str())
+            .cell(
+                profile
+                    .configured_models
+                    .iter()
+                    .filter(|model| model.enabled)
+                    .count()
+                    .to_string(),
+            )
             .chip(
                 if enabled {
                     strings.config_state_ready()

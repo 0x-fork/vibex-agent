@@ -724,98 +724,6 @@ fn collect_rows<T>(
     Ok(out)
 }
 
-/// Seeds one route from the gateway's current upstream list.
-///
-/// Before routes existed the gateway had a single global upstream list and a
-/// single policy, shared by every Agent pointed at it. This turns that pair into
-/// one gateway route and binds it to each of those Agents, so an installation
-/// keeps exactly the behaviour it had: same models, same order, same strategy.
-///
-/// It is idempotent and self-disabling. A database with no upstreams, or one
-/// that already holds a route, is left alone — the second condition is what
-/// stops a deliberate deletion from resurrecting the route on the next launch.
-pub fn backfill_first_route(conn: &Connection) -> VibexResult<Option<ModelRouteId>> {
-    let settings = crate::ModelGatewaySettingsRepository::get(conn)?;
-    let Some(settings) = settings else {
-        return Ok(None);
-    };
-    if settings.upstreams.is_empty() {
-        return Ok(None);
-    }
-    // Any row at all — live or deleted — means this installation has already
-    // been through the migration. Counting only live routes would re-create
-    // the seed on the next launch after a user deliberately deleted it.
-    let seen: i64 = conn
-        .query_row("SELECT COUNT(*) FROM model_routes", [], |row| row.get(0))
-        .map_err(storage_err(
-            "model_route_seed_probe_failed",
-            "failed to check whether routes were already seeded",
-        ))?;
-    if seen > 0 {
-        return Ok(None);
-    }
-    let profiles = super::ModelProviderProfileRepository::list(conn)?;
-    let mut members = Vec::new();
-    for upstream_id in &settings.upstreams {
-        let Some(profile) = profiles.iter().find(|profile| &profile.id == upstream_id) else {
-            // An upstream that no longer exists is dropped rather than failing
-            // the whole migration: the route is a best-effort record of what
-            // the gateway was actually serving.
-            continue;
-        };
-        for model in profile
-            .configured_models
-            .iter()
-            .filter(|model| model.enabled)
-            .take(vibex_core::MAX_ROUTE_MEMBERS.saturating_sub(members.len()))
-        {
-            members.push(ModelRouteMember::new(
-                profile.id.clone(),
-                model.id.clone(),
-                members.len() as i64,
-            ));
-            if members.len() >= vibex_core::MAX_ROUTE_MEMBERS {
-                break;
-            }
-        }
-    }
-    if members.is_empty() {
-        return Ok(None);
-    }
-
-    let now = unix_timestamp_ms().max(1);
-    let route = ModelRoute {
-        display_name: settings.display_name.clone(),
-        description: Some("Created from the gateway's upstream list".to_string()),
-        kind: RouteKind::Gateway,
-        members,
-        // The gateway's own strategy is the closest existing intent. The route
-        // always uses ordered members, because the global setting only ever
-        // described how Keys within one Provider were chosen.
-        strategy: RouteStrategy::Ordered,
-        status: if settings.policy.enabled {
-            RouteStatus::Enabled
-        } else {
-            RouteStatus::Disabled
-        },
-        revision: 1,
-        created_at_ms: now,
-        updated_at_ms: now,
-        ..Default::default()
-    };
-    route.validate()?;
-    super::ModelRouteRepository::insert(conn, &route)?;
-
-    for agent_id in crate::ModelGatewayAgentRepository::list(conn)? {
-        let mut binding = AgentModelRouteBinding::new(agent_id.clone(), route.id.clone());
-        binding.is_default = true;
-        binding.created_at_ms = now;
-        binding.updated_at_ms = now;
-        super::AgentModelRouteBindingRepository::insert(conn, &binding)?;
-    }
-    Ok(Some(route.id))
-}
-
 /// Seeds one `Direct` route per legacy direct Provider Profile.
 ///
 /// A direct Profile carries its own `base_url`, its own Key and its own model
@@ -1001,23 +909,20 @@ pub fn legacy_profile_for_route(
             let profile = super::ProviderProfileRepository::get(conn, &legacy_id)?;
             Ok(profile.filter(|profile| &profile.agent_id == agent_id))
         }
-        vibex_core::RouteKind::Gateway | vibex_core::RouteKind::ProviderGroup => {
-            // The gateway Profile is per Agent and already lists every route
-            // id it serves. A group contributes one entry per shared model, so
-            // the check is by prefix rather than by the single route id.
-            let prefix = match route.kind {
-                vibex_core::RouteKind::ProviderGroup => route.model_id(),
-                vibex_core::RouteKind::Gateway | vibex_core::RouteKind::Direct => route.model_id(),
-            };
+        vibex_core::RouteKind::ProviderGroup => {
+            // A gateway Profile is per Agent and lists exactly the groups that
+            // Agent is bound to. A group contributes one entry per shared
+            // model, so the check is by prefix rather than by a single id.
+            let prefix = route.model_id();
             let profiles = super::ProviderProfileRepository::list_by_agent(conn, agent_id, true)?;
             Ok(profiles
                 .into_iter()
                 .find(is_gateway_profile)
                 .filter(|profile| {
-                    profile.configured_models.iter().any(|model| {
-                        model.id == prefix
-                            || (route.is_provider_group() && model.id.starts_with(&prefix))
-                    })
+                    profile
+                        .configured_models
+                        .iter()
+                        .any(|model| model.id.starts_with(&prefix))
                 }))
         }
     }
@@ -1075,15 +980,16 @@ mod tests {
         profile.id
     }
 
-    fn route(provider: &ModelProviderProfileId, models: &[&str]) -> ModelRoute {
+    /// A provider group naming one Provider.
+    ///
+    /// Groups are the only gateway shape, so the test helper builds one; a test
+    /// that needs the direct shape sets `kind` itself.
+    fn route(provider: &ModelProviderProfileId, _models: &[&str]) -> ModelRoute {
         ModelRoute {
             display_name: "Standard".to_string(),
             status: RouteStatus::Enabled,
-            members: models
-                .iter()
-                .enumerate()
-                .map(|(index, model)| ModelRouteMember::new(provider.clone(), *model, index as i64))
-                .collect(),
+            kind: RouteKind::ProviderGroup,
+            members: vec![ModelRouteMember::provider(provider.clone(), 0)],
             ..Default::default()
         }
     }
@@ -1143,19 +1049,19 @@ mod tests {
         let conn = migrated_connection();
         let provider = seed_provider(&conn, "DeepSeek");
 
-        let mut direct = route(&provider, &["a"]);
-        direct.kind = RouteKind::Direct;
-        direct.display_name = "Direct".to_string();
+        let direct = ModelRoute {
+            display_name: "Direct".to_string(),
+            kind: RouteKind::Direct,
+            status: RouteStatus::Enabled,
+            members: vec![ModelRouteMember::new(provider.clone(), "deepseek-chat", 0)],
+            ..Default::default()
+        };
         ModelRouteRepository::insert(&conn, &direct).unwrap();
         assert_eq!(
             ModelRouteRepository::count_user_authored(&conn).unwrap(),
             0,
             "a direct route is materialised, not composed"
         );
-
-        let mut gateway = route(&provider, &["a"]);
-        gateway.display_name = "Composed".to_string();
-        ModelRouteRepository::insert(&conn, &gateway).unwrap();
 
         let group = ModelRoute {
             display_name: "Group".to_string(),
@@ -1167,13 +1073,13 @@ mod tests {
         ModelRouteRepository::insert(&conn, &group).unwrap();
         assert_eq!(
             ModelRouteRepository::count_user_authored(&conn).unwrap(),
-            2,
-            "a plain route and a group are what the budget bounds"
+            1,
+            "a group is what the budget bounds"
         );
 
         // A soft-deleted route frees its place again.
-        ModelRouteRepository::delete(&conn, &gateway.id).unwrap();
-        assert_eq!(ModelRouteRepository::count_user_authored(&conn).unwrap(), 1);
+        ModelRouteRepository::delete(&conn, &group.id).unwrap();
+        assert_eq!(ModelRouteRepository::count_user_authored(&conn).unwrap(), 0);
     }
 
     #[test]
@@ -1201,25 +1107,14 @@ mod tests {
         );
     }
 
-    /// Puts the gateway row in the shape the pre-route build left it in.
-    fn seed_gateway(
-        conn: &Connection,
-        name: &str,
-        upstreams: &[ModelProviderProfileId],
-        enabled: bool,
-        agents: &[&str],
-    ) {
+    /// Writes the gateway's own settings row.
+    fn seed_gateway(conn: &Connection, name: &str, enabled: bool) {
         let settings = crate::ModelGatewaySettingsRepository::get_or_create(conn).unwrap();
         let mut next = settings.clone();
         next.revision = settings.revision + 1;
         next.display_name = name.to_string();
-        next.upstreams = upstreams.to_vec();
         next.policy.enabled = enabled;
         crate::ModelGatewaySettingsRepository::update(conn, &next, settings.revision).unwrap();
-        for agent in agents {
-            crate::ModelGatewayAgentRepository::set(conn, &AgentId::parse(*agent).unwrap(), true)
-                .unwrap();
-        }
     }
 
     /// A legacy direct Profile in the shape the Config Center writes: an
@@ -1385,130 +1280,14 @@ mod tests {
         assert!(routes.iter().all(|route| route.kind == RouteKind::Direct));
     }
 
+    /// The gateway no longer owns a Provider list, so there is nothing to seed
+    /// a route from. A route exists only because a user composed one.
     #[test]
-    fn the_first_route_is_built_from_the_gateway_upstreams() {
+    fn no_route_is_seeded_from_gateway_settings() {
         let conn = migrated_connection();
-        let deepseek = seed_provider(&conn, "DeepSeek");
-        let kimi = seed_provider(&conn, "Kimi");
-        // Give each Provider a catalogue so the backfill has models to copy.
-        for (id, model) in [(&deepseek, "deepseek-chat"), (&kimi, "kimi-k3")] {
-            let mut profile = crate::ModelProviderProfileRepository::get(&conn, id)
-                .unwrap()
-                .unwrap();
-            profile.configured_models = vec![vibex_core::ModelProviderCatalogEntry {
-                id: model.to_string(),
-                display_name: None,
-                enabled: true,
-                metadata: Vec::new(),
-                capabilities: Default::default(),
-            }];
-            profile.revision += 1;
-            crate::ModelProviderProfileRepository::update(&conn, &profile, profile.revision - 1)
-                .unwrap();
-        }
-        seed_gateway(
-            &conn,
-            "Vibex Gateway",
-            &[deepseek.clone(), kimi.clone()],
-            true,
-            &["codex", "claude"],
-        );
-
-        let created = backfill_first_route(&conn)
-            .unwrap()
-            .expect("a route is seeded");
-        let route = ModelRouteRepository::get(&conn, &created).unwrap().unwrap();
-        assert_eq!(route.display_name, "Vibex Gateway");
-        assert_eq!(route.kind, RouteKind::Gateway);
-        assert_eq!(route.status, RouteStatus::Enabled);
-        assert_eq!(
-            route
-                .members
-                .iter()
-                .map(|member| member.model_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["deepseek-chat", "kimi-k3"],
-            "upstream order decides member order"
-        );
-
-        // Every Agent that was on the gateway now has exactly that route, as
-        // its default, so nothing changes for it.
-        for agent_id in ["codex", "claude"] {
-            let agent = AgentId::parse(agent_id).unwrap();
-            let bindings = AgentModelRouteBindingRepository::list_for_agent(&conn, &agent).unwrap();
-            assert_eq!(bindings.len(), 1);
-            assert_eq!(bindings[0].model_route_id, route.id);
-            assert!(bindings[0].is_default);
-        }
-    }
-
-    #[test]
-    fn the_backfill_is_idempotent_and_does_not_resurrect_a_deleted_route() {
-        let conn = migrated_connection();
-        let deepseek = seed_provider(&conn, "DeepSeek");
-        let mut profile = crate::ModelProviderProfileRepository::get(&conn, &deepseek)
-            .unwrap()
-            .unwrap();
-        profile.configured_models = vec![vibex_core::ModelProviderCatalogEntry {
-            id: "m".to_string(),
-            display_name: None,
-            enabled: true,
-            metadata: Vec::new(),
-            capabilities: Default::default(),
-        }];
-        profile.revision += 1;
-        crate::ModelProviderProfileRepository::update(&conn, &profile, profile.revision - 1)
-            .unwrap();
-        seed_gateway(&conn, "Vibex Gateway", &[deepseek], true, &["codex"]);
-
-        let first = backfill_first_route(&conn).unwrap().expect("seeded once");
-        assert!(
-            backfill_first_route(&conn).unwrap().is_none(),
-            "a second run must not add a second route"
-        );
-        assert_eq!(ModelRouteRepository::list(&conn).unwrap().len(), 1);
-
-        // Deleting the seeded route must stick: a later launch finds no routes
-        // but the gateway still lists upstreams, and must not re-create it.
-        ModelRouteRepository::delete(&conn, &first).unwrap();
-        assert!(backfill_first_route(&conn).unwrap().is_none());
+        seed_provider(&conn, "DeepSeek");
+        seed_gateway(&conn, "Vibex Gateway", true);
         assert!(ModelRouteRepository::list(&conn).unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_gateway_with_no_upstreams_seeds_nothing() {
-        let conn = migrated_connection();
-        seed_gateway(&conn, "Vibex Gateway", &[], true, &["codex"]);
-        assert!(backfill_first_route(&conn).unwrap().is_none());
-        assert!(ModelRouteRepository::list(&conn).unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_disabled_gateway_seeds_a_disabled_route() {
-        let conn = migrated_connection();
-        let deepseek = seed_provider(&conn, "DeepSeek");
-        let mut profile = crate::ModelProviderProfileRepository::get(&conn, &deepseek)
-            .unwrap()
-            .unwrap();
-        profile.configured_models = vec![vibex_core::ModelProviderCatalogEntry {
-            id: "m".to_string(),
-            display_name: None,
-            enabled: true,
-            metadata: Vec::new(),
-            capabilities: Default::default(),
-        }];
-        profile.revision += 1;
-        crate::ModelProviderProfileRepository::update(&conn, &profile, profile.revision - 1)
-            .unwrap();
-        seed_gateway(&conn, "Vibex Gateway", &[deepseek], false, &["codex"]);
-
-        let created = backfill_first_route(&conn).unwrap().expect("still seeded");
-        let route = ModelRouteRepository::get(&conn, &created).unwrap().unwrap();
-        assert_eq!(
-            route.status,
-            RouteStatus::Disabled,
-            "a turned-off gateway must not produce an enabled route"
-        );
     }
 
     #[test]
@@ -1525,22 +1304,28 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.display_name, "Standard");
         assert_eq!(loaded.strategy, RouteStrategy::LeastUsed);
-        assert_eq!(loaded.kind, RouteKind::Gateway);
-        assert_eq!(
-            loaded
-                .members
-                .iter()
-                .map(|member| member.model_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["first", "second", "third"]
+        assert_eq!(loaded.kind, RouteKind::ProviderGroup);
+        assert!(
+            loaded.members.iter().all(|member| !member.names_model()),
+            "a group names Providers, not models"
         );
     }
 
     #[test]
     fn updating_a_route_replaces_the_member_order_wholesale() {
         let conn = migrated_connection();
-        let provider = seed_provider(&conn, "DeepSeek");
-        let mut route = route(&provider, &["first", "second"]);
+        let first = seed_provider(&conn, "DeepSeek");
+        let second = seed_provider(&conn, "Kimi");
+        let mut route = ModelRoute {
+            display_name: "Group".to_string(),
+            kind: RouteKind::ProviderGroup,
+            status: RouteStatus::Enabled,
+            members: vec![
+                ModelRouteMember::provider(first.clone(), 0),
+                ModelRouteMember::provider(second.clone(), 1),
+            ],
+            ..Default::default()
+        };
         ModelRouteRepository::insert(&conn, &route).unwrap();
 
         // Reverse the order without changing which members exist.
@@ -1554,9 +1339,9 @@ mod tests {
             updated
                 .members
                 .iter()
-                .map(|member| member.model_id.as_str())
+                .map(|member| member.model_provider_profile_id.clone())
                 .collect::<Vec<_>>(),
-            vec!["second", "first"]
+            vec![second, first]
         );
     }
 
@@ -1574,9 +1359,18 @@ mod tests {
     #[test]
     fn a_direct_route_cannot_be_saved_with_two_members() {
         let conn = migrated_connection();
-        let provider = seed_provider(&conn, "DeepSeek");
-        let mut route = route(&provider, &["first", "second"]);
-        route.kind = RouteKind::Direct;
+        let first = seed_provider(&conn, "DeepSeek");
+        let second = seed_provider(&conn, "Kimi");
+        let route = ModelRoute {
+            display_name: "Direct".to_string(),
+            kind: RouteKind::Direct,
+            status: RouteStatus::Enabled,
+            members: vec![
+                ModelRouteMember::new(first, "deepseek-chat", 0),
+                ModelRouteMember::new(second, "kimi-k3", 1),
+            ],
+            ..Default::default()
+        };
         let error = ModelRouteRepository::insert(&conn, &route).unwrap_err();
         assert_eq!(error.code, "route_direct_member_count_invalid");
     }
@@ -1784,10 +1578,16 @@ mod tests {
         let conn = migrated_connection();
         let deepseek = seed_provider(&conn, "DeepSeek");
         let kimi = seed_provider(&conn, "Kimi");
-        let mut naming_both = route(&deepseek, &["a"]);
-        naming_both
-            .members
-            .push(ModelRouteMember::new(kimi.clone(), "k3", 1));
+        let naming_both = ModelRoute {
+            display_name: "Both".to_string(),
+            kind: RouteKind::ProviderGroup,
+            status: RouteStatus::Enabled,
+            members: vec![
+                ModelRouteMember::provider(deepseek.clone(), 0),
+                ModelRouteMember::provider(kimi.clone(), 1),
+            ],
+            ..Default::default()
+        };
         let only_deepseek = route(&deepseek, &["b"]);
         ModelRouteRepository::insert(&conn, &naming_both).unwrap();
         ModelRouteRepository::insert(&conn, &only_deepseek).unwrap();
@@ -1891,11 +1691,8 @@ mod route_policy_tests {
 
         let route = ModelRoute {
             display_name: "Standard".to_string(),
-            members: vec![vibex_core::ModelRouteMember::new(
-                provider,
-                "deepseek-chat",
-                0,
-            )],
+            kind: vibex_core::RouteKind::ProviderGroup,
+            members: vec![vibex_core::ModelRouteMember::provider(provider, 0)],
             status: vibex_core::RouteStatus::Enabled,
             pin: vibex_core::GatewayPinScope::Conversation,
             token_limit: Some(vibex_core::GatewayTokenLimit {

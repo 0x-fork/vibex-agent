@@ -4921,7 +4921,6 @@ fn the_gateway_leads_the_providers_table_and_reports_its_state() {
     app.management_data.gateway = Some(vibex_core::GatewaySnapshot {
         settings: vibex_core::ModelGatewaySettings {
             display_name: "Vibex Gateway".to_string(),
-            upstreams: vec![upstream.clone()],
             ..vibex_core::ModelGatewaySettings::default()
         },
         runtime: vibex_core::ModelGatewayRuntimeState::running(3425, 1),
@@ -4949,16 +4948,16 @@ fn the_gateway_leads_the_providers_table_and_reports_its_state() {
                 },
             ],
         }],
-        models: Vec::new(),
-        agents: vec![vibex_core::GatewayAgentBinding {
-            agent_id: "codex".to_string(),
-            display_name: "codex".to_string(),
-            enabled: true,
-            active: true,
-            unsupported: false,
+        models: vec![vibex_core::GatewayModelSummary {
+            model_provider_profile_id: vibex_core::ModelProviderProfileId::new(),
+            provider_name: "Team".to_string(),
+            model_id: "deepseek-chat".to_string(),
+            display_id: "group/model_route_test/deepseek-chat".to_string(),
             wire_protocol_id: String::new(),
+            route_id: Some("model_route_test".to_string()),
+            source_count: 1,
+            model_count: 1,
         }],
-        upstream_candidates: Vec::new(),
     });
     app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
     let strings = app.strings;
@@ -4985,9 +4984,22 @@ fn the_gateway_leads_the_providers_table_and_reports_its_state() {
         "the gateway row must say a Key is cooling: {:?}",
         rows[0].cells
     );
+    // The gateway row counts the route groups it serves, not the Agents that
+    // use it: an Agent reaches the gateway by binding a group, so an Agent
+    // column here would be a second authority.
+    assert_eq!(
+        rows[0].cells[0], "1",
+        "the gateway row must count the groups it serves: {:?}",
+        rows[0].cells
+    );
+    assert_eq!(
+        rows[0].cells[3], "1",
+        "the gateway row must count the models its groups publish: {:?}",
+        rows[0].cells
+    );
     assert!(
-        rows[0].cells.iter().any(|cell| cell.contains("codex")),
-        "the gateway row must name the Agents that use it: {:?}",
+        !rows[0].cells.iter().any(|cell| cell.contains("codex")),
+        "the gateway row must not name an Agent: {:?}",
         rows[0].cells
     );
 }
@@ -4998,7 +5010,6 @@ fn running_gateway() -> vibex_core::GatewaySnapshot {
     vibex_core::GatewaySnapshot {
         settings: vibex_core::ModelGatewaySettings {
             display_name: "Vibex Gateway".to_string(),
-            upstreams: vec![upstream.clone()],
             ..vibex_core::ModelGatewaySettings::default()
         },
         runtime: vibex_core::ModelGatewayRuntimeState::running(3425, 1),
@@ -5009,8 +5020,6 @@ fn running_gateway() -> vibex_core::GatewaySnapshot {
             keys: Vec::new(),
         }],
         models: Vec::new(),
-        agents: Vec::new(),
-        upstream_candidates: Vec::new(),
     }
 }
 
@@ -5065,7 +5074,6 @@ fn a_gateway_key_row_switches_and_prefers() {
     app.management_data.gateway = Some(vibex_core::GatewaySnapshot {
         settings: vibex_core::ModelGatewaySettings {
             display_name: "Vibex Gateway".to_string(),
-            upstreams: vec![upstream.clone()],
             ..vibex_core::ModelGatewaySettings::default()
         },
         runtime: vibex_core::ModelGatewayRuntimeState::running(3425, 1),
@@ -5082,8 +5090,6 @@ fn a_gateway_key_row_switches_and_prefers() {
             }],
         }],
         models: Vec::new(),
-        agents: Vec::new(),
-        upstream_candidates: Vec::new(),
     });
     app.show_config_module(ConfigModule::Agent, Some(ConfigSection::Providers));
     let key = app

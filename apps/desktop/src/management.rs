@@ -1034,9 +1034,9 @@ pub struct ManagementCenter {
     gateway_key_replace_target: Option<(vibex_core::ModelProviderProfileId, vibex_core::RequestId)>,
     gateway_key_replace_input: Option<Entity<InputState>>,
     gateway_key_replace_error: Option<String>,
-    /// The key being added to one upstream, keyed by profile id.
+    /// The Key being added to one Provider, keyed by profile id.
     gateway_key_drafts: BTreeMap<String, Entity<InputState>>,
-    /// Which upstream the add-key field belongs to.
+    /// Which Provider the add-key field belongs to.
     gateway_key_add_target: Option<String>,
     gateway_key_add_error: Option<String>,
     /// The shared Provider whose display name is being edited.
@@ -1097,6 +1097,8 @@ pub struct ManagementCenter {
     route_group_members: Vec<vibex_core::ModelProviderProfileId>,
     /// The draft's strategy.
     route_group_strategy: vibex_core::RouteStrategy,
+    /// Whether one conversation stays on one Key within this group.
+    route_group_pin: bool,
     /// The catalogue's suggestion for the Model currently being edited.
     ///
     /// It is only ever a suggestion: nothing here is applied until the user
@@ -2148,6 +2150,7 @@ impl ManagementCenter {
             route_group_name_error: None,
             route_group_members: Vec::new(),
             route_group_strategy: vibex_core::RouteStrategy::Ordered,
+            route_group_pin: true,
             model_capability_suggestion: None,
             selected_global_provider_id: None,
             providers_sidebar_tab: ProviderSidebarTab::Providers,
@@ -11560,7 +11563,7 @@ impl ManagementCenter {
     ///
     /// A Profile appears once here however many Agents reference it. That is
     /// the whole point of this page: the Agent-scoped list showed the same
-    /// upstream once per Agent, which made a shared Provider look like three
+    /// Provider once per Agent, which made a shared Provider look like three
     /// separate ones.
     fn shared_providers(&self) -> Vec<SharedProviderRow> {
         shared_provider_rows(&self.providers, &self.provider_bindings)
@@ -11597,11 +11600,11 @@ impl ManagementCenter {
         let enabled = gateway.settings.policy.enabled;
         let (gateway_state, gateway_state_color) = match gateway.runtime.status {
             vibex_core::ModelGatewayStatus::Running => (
-                management_locale_text("Automatic routing · on", "自动调度 · 开", "自動調度 · 開"),
+                management_locale_text("Gateway · on", "网关 · 开", "閘道 · 開"),
                 cx.theme().success,
             ),
             vibex_core::ModelGatewayStatus::Disabled => (
-                management_locale_text("Automatic routing · off", "自动调度 · 关", "自動調度 · 關"),
+                management_locale_text("Gateway · off", "网关 · 关", "閘道 · 關"),
                 cx.theme().muted_foreground,
             ),
             // Starting is a normal moment on first load, not a fallback: saying
@@ -11613,45 +11616,31 @@ impl ManagementCenter {
             vibex_core::ModelGatewayStatus::Unavailable
             | vibex_core::ModelGatewayStatus::Degraded => (
                 management_locale_text(
-                    "Gateway unavailable · using direct",
-                    "网关不可用，已回退直连",
-                    "閘道無法使用，已退回直連",
+                    "Gateway unavailable · route groups unusable",
+                    "网关不可用，路由组无法使用",
+                    "閘道無法使用，路由組無法使用",
                 ),
                 cx.theme().warning,
             ),
         };
-        let gateway_agents = gateway
-            .agents
+        // The gateway has no Agent list: an Agent reaches it by binding a route
+        // group, so the summary counts the groups it serves instead.
+        let gateway_route_count = gateway
+            .models
             .iter()
-            .filter(|agent| agent.active)
-            .map(|agent| {
-                // The binding carries the id; the Agent catalogue carries the
-                // name the reader knows. Fall back to the id so a newly added
-                // Agent is still named before its snapshot lands.
-                self.snapshot
-                    .agents
-                    .iter()
-                    .find(|known| known.id.as_str() == agent.agent_id)
-                    .map(|known| known.label.clone())
-                    .unwrap_or_else(|| agent.agent_id.clone())
-            })
-            .collect::<Vec<_>>()
-            .join(" · ");
-        let gateway_used = if gateway_agents.is_empty() {
-            management_locale_text("not used yet", "未被使用", "未被使用").to_string()
-        } else {
-            gateway_agents
-        };
-        let gateway_summary = if gateway.upstreams.is_empty() {
-            management_locale_text("No upstream Providers", "没有上游供应商", "沒有上游供應商")
-                .to_string()
+            .filter_map(|model| model.route_id.as_deref())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let gateway_summary = if gateway.models.is_empty() {
+            management_locale_text("No route groups", "还没有路由组", "還沒有路由組").to_string()
         } else {
             format!(
-                "{} · {gateway_used}",
-                gateway_overall_key_summary(gateway, locale)
+                "{} · {gateway_route_count} {}",
+                gateway_overall_key_summary(gateway, locale),
+                management_locale_text("groups", "个路由组", "個路由組")
             )
         };
-        let gateway_summary_color = if gateway.upstreams.is_empty() {
+        let gateway_summary_color = if gateway.models.is_empty() {
             cx.theme().warning
         } else {
             cx.theme().muted_foreground
@@ -13172,10 +13161,7 @@ impl ManagementCenter {
         let snapshot = self.gateway.clone();
         let mut request = vibex_core::GatewaySettingsUpdateRequest {
             display_name: snapshot.settings.display_name.clone(),
-            routing: snapshot.settings.policy.routing,
-            pin: snapshot.settings.policy.pin,
             token_limit: snapshot.settings.policy.token_limit,
-            upstreams: snapshot.settings.upstreams.clone(),
             // Every unrelated edit carries the stored limits forward: the write
             // replaces the whole map, so omitting them would silently clear a
             // limit the user set earlier.
@@ -13214,25 +13200,25 @@ impl ManagementCenter {
         }));
     }
 
-    /// Asks before turning automatic routing off.
+    /// Asks before turning the gateway off.
     ///
     /// Turning it on is the safe direction and needs no question; turning it
-    /// off stops failover for every Agent at once, which is worth one sentence
-    /// first.
+    /// off makes every bound route group unusable at once, which is worth one
+    /// sentence first.
     fn confirm_disable_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entity = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, _| {
             let entity = entity.clone();
             dialog
                 .title(management_locale_text(
-                    "Turn off automatic routing?",
-                    "关闭自动调度？",
-                    "關閉自動調度？",
+                    "Turn off the gateway?",
+                    "关闭网关？",
+                    "關閉閘道？",
                 ))
                 .child(management_locale_text(
-                    "Keys will no longer be switched when one runs out; a failing request fails instead. Every Agent falls back to its own Provider configuration.",
-                    "某个 Key 额度用尽时不再自动切换，请求会直接失败。所有 Agent 会回退到自己的供应商配置。",
-                    "某個 Key 額度用盡時不再自動切換，請求會直接失敗。所有 Agent 會退回自己的供應商設定。",
+                    "Every Agent bound to a route group will lose it and fall back to its own direct Provider. Direct Providers are not affected. The bindings are kept, so turning the gateway back on restores them.",
+                    "所有绑定了路由组的 Agent 都会失去该路由组，回退到自己的直连供应商。直连供应商不受影响。绑定关系会保留，重新打开网关即可恢复。",
+                    "所有綁定了路由組的 Agent 都會失去該路由組，回到自己的直連供應商。直連供應商不受影響。綁定關係會保留，重新打開閘道即可恢復。",
                 ))
                 .footer(
                     gpui_component::dialog::DialogFooter::new()
@@ -13258,11 +13244,11 @@ impl ManagementCenter {
         });
     }
 
-    /// Turns automatic routing on or off.
+    /// Turns the gateway on or off.
     ///
     /// This is the user's control over a live service: turning it off stops the
-    /// listener, and every Agent bound to the gateway falls back to its direct
-    /// Provider.
+    /// listener, so no route group can be served, and every Agent bound to one
+    /// falls back to its direct Provider.
     fn set_gateway_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
@@ -13382,33 +13368,6 @@ impl ManagementCenter {
             }
         }
         cx.notify();
-    }
-
-    /// Changes how the gateway picks among an upstream's Keys.
-    ///
-    /// The gateway is the only place this setting lives now: every route group
-    /// that walks through it inherits the choice, so there is one control
-    /// rather than one per composition.
-    fn set_gateway_routing(
-        &mut self,
-        routing: vibex_core::GatewayRoutingStrategy,
-        cx: &mut Context<Self>,
-    ) {
-        self.update_gateway_settings(|request| request.routing = routing, cx);
-    }
-
-    /// Holds a conversation on one Key, or re-picks one per request.
-    fn set_gateway_pin(&mut self, pinned: bool, cx: &mut Context<Self>) {
-        self.update_gateway_settings(
-            |request| {
-                request.pin = if pinned {
-                    vibex_core::GatewayPinScope::Conversation
-                } else {
-                    vibex_core::GatewayPinScope::Off
-                }
-            },
-            cx,
-        );
     }
 
     /// Opens the header's display-name editor with the current name.
@@ -13583,8 +13542,9 @@ impl ManagementCenter {
     ///
     /// The ceiling is a policy, not an account state: it applies to everything
     /// the gateway routes, so it is saved through the same settings write as
-    /// routing and upstream order. Clearing the field is how a user removes a
-    /// ceiling; typing `0` is not, because zero would refuse every request.
+    /// the Key limits and translation switches. Clearing the field is how a
+    /// user removes a ceiling; typing `0` is not, because zero would refuse
+    /// every request.
     fn save_gateway_token_limit(&mut self, cx: &mut Context<Self>) {
         let Some(input) = self.gateway_token_limit_input.clone() else {
             return;
@@ -13725,56 +13685,10 @@ impl ManagementCenter {
         );
     }
 
-    fn add_gateway_upstream(
-        &mut self,
-        upstream: vibex_core::ModelProviderProfileId,
-        cx: &mut Context<Self>,
-    ) {
-        self.update_gateway_settings(
-            move |request| {
-                if !request.upstreams.contains(&upstream) {
-                    request.upstreams.push(upstream);
-                }
-            },
-            cx,
-        );
-    }
-
-    fn remove_gateway_upstream(
-        &mut self,
-        upstream: vibex_core::ModelProviderProfileId,
-        cx: &mut Context<Self>,
-    ) {
-        self.update_gateway_settings(
-            move |request| request.upstreams.retain(|existing| existing != &upstream),
-            cx,
-        );
-    }
-
-    /// Moves one upstream one step in the routing order.
-    ///
-    /// The stored order is the order the gateway tries upstreams in, so this is
-    /// the user's only way to say "this account first" without removing and
-    /// re-adding the rest.
-    fn move_gateway_upstream(
-        &mut self,
-        upstream: vibex_core::ModelProviderProfileId,
-        direction: GatewayUpstreamMove,
-        cx: &mut Context<Self>,
-    ) {
-        self.update_gateway_settings(
-            move |request| {
-                request.upstreams =
-                    moved_gateway_upstreams(&request.upstreams, &upstream, direction);
-            },
-            cx,
-        );
-    }
-
-    /// The field that adds a key to one upstream.
+    /// The field that adds a Key to one Provider.
     ///
     /// The value is masked by default and the field only exists while its own
-    /// upstream is the target, so an accidental paste cannot land on the wrong
+    /// Provider is the target, so an accidental paste cannot land on the wrong
     /// Provider.
     fn render_gateway_add_key(
         &mut self,
@@ -14077,7 +13991,7 @@ impl ManagementCenter {
         }));
     }
 
-    /// Stores the typed key on its upstream.
+    /// Stores the typed Key on its Provider.
     fn save_gateway_key(
         &mut self,
         profile: vibex_core::ModelProviderProfileId,
@@ -14134,8 +14048,8 @@ impl ManagementCenter {
         }));
     }
 
-    /// Removes one key from its upstream.
-    /// Asks before removing an upstream's last Key.
+    /// Removes one Key from its Provider.
+    /// Asks before removing a Provider's last Key.
     ///
     /// Removing any other Key is reversible by adding one back and costs no
     /// coverage; the last one leaves the Provider unable to answer at all.
@@ -14158,9 +14072,9 @@ impl ManagementCenter {
 
     /// Asks before removing a shared Provider's last Key.
     ///
-    /// The same rule covers a gateway upstream and a Provider edited from the
-    /// global page: every other Key is reversible by adding one back, while the
-    /// last one leaves the Provider unable to answer at all.
+    /// The same rule covers a Key inside a route group's member and a Provider
+    /// edited from the global page: every other Key is reversible by adding one
+    /// back, while the last one leaves the Provider unable to answer at all.
     fn confirm_remove_provider_key(
         &mut self,
         profile: vibex_core::ModelProviderProfileId,
@@ -14649,11 +14563,7 @@ impl ManagementCenter {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(management_locale_text(
-                                        "Automatic routing",
-                                        "自动调度",
-                                        "自動調度",
-                                    )),
+                                    .child(management_locale_text("Gateway", "网关", "閘道")),
                             ),
                         )
                         .child(
@@ -14684,9 +14594,15 @@ impl ManagementCenter {
             }),
             cx,
         ));
+        let gateway_route_count = snapshot
+            .models
+            .iter()
+            .filter_map(|model| model.route_id.as_deref())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
         connection_rows = connection_rows.child(stat_line(
-            management_locale_text("Upstreams", "上游供应商", "上游供應商"),
-            snapshot.upstreams.len().to_string(),
+            management_locale_text("Route groups", "路由组", "路由組"),
+            gateway_route_count.to_string(),
             cx,
         ));
         connection_rows = connection_rows.child(stat_line(
@@ -14719,88 +14635,30 @@ impl ManagementCenter {
         body = body.child(management_card_with_icon(
             management_locale_text("Connection", "连接", "連線"),
             management_locale_text(
-                "Agents point here instead of at a vendor. Vibex manages this address.",
-                "Agent 指向这里而不是厂商地址，该地址由 Vibex 管理。",
-                "Agent 指向這裡而不是廠商位址，該位址由 Vibex 管理。",
+                "An Agent bound to a route group points here instead of at a vendor. Vibex manages this address.",
+                "绑定了路由组的 Agent 会指向这里而不是厂商地址，该地址由 Vibex 管理。",
+                "綁定了路由組的 Agent 會指向這裡而不是廠商位址，該位址由 Vibex 管理。",
             ),
             "icons/vibex/server.svg",
             connection_rows.into_any_element(),
             cx,
         ));
 
-        // Routing policy.
+        // Policy. Routing strategy and conversation pinning are not here: each
+        // belongs to a route group, which decides how its own Providers are
+        // tried. What remains is Key-level policy, which is the same for every
+        // group because it describes the accounts, not the composition.
         let mut policy_rows = v_flex().w_full().gap_2();
-        let strategies = vibex_core::GatewayRoutingStrategy::ALL;
-        let mut strategy_row = h_flex().w_full().gap_2();
-        for strategy in strategies {
-            let selected = snapshot.settings.policy.routing == strategy;
-            strategy_row = strategy_row.child(
-                Button::new(SharedString::from(format!(
-                    "management-gateway-routing-{}",
-                    strategy.id()
-                )))
-                .small()
-                .when(selected, |button| button.primary())
-                .when(!selected, |button| button.outline())
-                .label(strategy.label())
-                .disabled(pending)
-                .on_click(
-                    cx.listener(move |this, _, _, cx| this.set_gateway_routing(strategy, cx)),
-                ),
-            );
-        }
         policy_rows = policy_rows.child(
-            v_flex()
+            div()
                 .w_full()
-                .gap_1()
-                .child(management_field_label(management_locale_text(
-                    "Switching",
-                    "切换方式",
-                    "切換方式",
-                )))
-                .child(strategy_row),
-        );
-        let pinned = snapshot.settings.policy.pin == vibex_core::GatewayPinScope::Conversation;
-        policy_rows = policy_rows.child(
-            h_flex()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    v_flex()
-                        .min_w_0()
-                        .flex_1()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .child(management_locale_text(
-                                    "Keep a conversation on one key",
-                                    "同一个对话尽量留在同一个 Key",
-                                    "同一個對話盡量留在同一個 Key",
-                                )),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_locale_text(
-                                    "Vendors cache a prompt per account, so moving a conversation loses that cache.",
-                                    "厂商按账号缓存提示词，对话换 Key 会丢掉该缓存。",
-                                    "廠商按帳號快取提示詞，對話換 Key 會丟掉該快取。",
-                                )),
-                        ),
-                )
-                .child(
-                    Switch::new("management-gateway-pin")
-                        .small()
-                        .checked(pinned)
-                        .disabled(pending)
-                        .on_click(cx.listener(|this, checked, _, cx| {
-                            this.set_gateway_pin(*checked, cx)
-                        })),
-                ),
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text(
+                    "Which Provider answers, and whether a conversation stays on one key, is set on each route group.",
+                    "由哪个供应商回答、对话是否固定在同一 Key，都在各个路由组上设置。",
+                    "由哪個供應商回答、對話是否固定在同一 Key，都在各個路由組上設定。",
+                )),
         );
         // Token ceiling. The window and the count are edited together because
         // neither means anything alone: "1,000,000" says nothing without "per
@@ -14928,11 +14786,11 @@ impl ManagementCenter {
                 )),
         );
         body = body.child(management_card_with_icon(
-            management_locale_text("Automatic routing", "自动调度", "自動調度"),
+            management_locale_text("Keys and protocol", "Key 与协议", "Key 與協定"),
             management_locale_text(
-                "How one of an upstream's keys is chosen for each request.",
-                "每次请求如何在上游的 Key 中选择一个。",
-                "每次請求如何在上游的 Key 中選擇一個。",
+                "How a Provider's keys are chosen for each request, and which protocol directions the gateway may translate.",
+                "每次请求如何在供应商的 Key 中选择一个，以及网关可以翻译哪些协议方向。",
+                "每次請求如何在供應商的 Key 中選擇一個，以及閘道可以翻譯哪些協定方向。",
             ),
             "icons/vibex/file-cog.svg",
             policy_rows.into_any_element(),
@@ -14940,8 +14798,8 @@ impl ManagementCenter {
         ));
 
         // Translation is the one policy most users never touch, so it sits
-        // after routing and before the upstream list: visible when needed,
-        // out of the way when not.
+        // after the Key policy and before the group members: visible when
+        // needed, out of the way when not.
         let translate = snapshot.settings.policy.translate;
         let mut translate_rows = v_flex().w_full().gap_2();
         for direction in GatewayTranslation::ALL {
@@ -14991,30 +14849,18 @@ impl ManagementCenter {
             cx,
         ));
 
-        // Upstreams, with their keys.
-        let mut upstream_rows = v_flex().w_full().gap_2();
-        let available = snapshot
-            .upstream_candidates
-            .iter()
-            .filter(|candidate| !candidate.selected)
-            .take(12)
-            .cloned()
-            .collect::<Vec<_>>();
-        let upstream_count = snapshot.upstreams.len();
-        for (index, upstream) in snapshot.upstreams.iter().enumerate() {
-            let id = upstream.model_provider_profile_id.clone();
-            // A move past either end would silently reorder everything, so the
-            // edge rows offer no move in that direction at all.
-            let first = index == 0;
-            let last = index + 1 == upstream_count;
-            let add_key = self.render_gateway_add_key(&id, window, cx);
+        // The Providers the route groups name. This is a read: a Provider
+        // joins the gateway by being a group's member, so there is nothing to
+        // add or remove here.
+        let mut member_rows = v_flex().w_full().gap_2();
+        for upstream in &snapshot.upstreams {
             let mut key_rows = v_flex().w_full().gap_1();
             for key in &upstream.keys {
                 let preferred_key = snapshot
                     .settings
                     .policy
                     .preferred_keys
-                    .get(&id)
+                    .get(&upstream.model_provider_profile_id)
                     .is_some_and(|credential| credential == &key.credential_id);
                 let enabled = key.state != vibex_core::GatewayKeyState::Disabled;
                 key_rows = key_rows.child(
@@ -15033,14 +14879,14 @@ impl ManagementCenter {
                                 .child(
                                     Switch::new(SharedString::from(format!(
                                         "management-gateway-key-enabled-{}-{}",
-                                        id.as_str(),
+                                        upstream.model_provider_profile_id.as_str(),
                                         key.credential_id.as_str()
                                     )))
                                     .small()
                                     .checked(enabled)
                                     .disabled(pending)
                                     .on_click(cx.listener({
-                                        let profile = id.clone();
+                                        let profile = upstream.model_provider_profile_id.clone();
                                         let credential = key.credential_id.clone();
                                         move |this, checked, _, cx| {
                                             this.set_gateway_key_enabled(
@@ -15075,7 +14921,7 @@ impl ManagementCenter {
                                 .child(
                                     Button::new(SharedString::from(format!(
                                         "management-gateway-prefer-key-{}-{}",
-                                        id.as_str(),
+                                        upstream.model_provider_profile_id.as_str(),
                                         key.credential_id.as_str()
                                     )))
                                     .xsmall()
@@ -15087,11 +14933,11 @@ impl ManagementCenter {
                                             "按順序使用",
                                         )
                                     } else {
-                                        management_locale_text("Use first", "优先使用", "優先使用")
+                                        management_locale_text("Try first", "优先尝试", "優先嘗試")
                                     })
                                     .disabled(pending)
                                     .on_click(cx.listener({
-                                        let profile = id.clone();
+                                        let profile = upstream.model_provider_profile_id.clone();
                                         let credential = key.credential_id.clone();
                                         move |this, _, _, cx| {
                                             this.set_gateway_key_preferred(
@@ -15103,24 +14949,25 @@ impl ManagementCenter {
                                         }
                                     })),
                                 )
-                                .children((key.state == vibex_core::GatewayKeyState::Invalid).then(
-                                    || {
+                                .when(key.state == vibex_core::GatewayKeyState::Invalid, |row| {
+                                    row.child(
                                         Button::new(SharedString::from(format!(
                                             "management-gateway-replace-key-{}-{}",
-                                            id.as_str(),
+                                            upstream.model_provider_profile_id.as_str(),
                                             key.credential_id.as_str()
                                         )))
                                         .xsmall()
                                         .outline()
                                         .label(management_locale_text(
                                             "Replace key",
-                                            "更换 Key",
-                                            "更換 Key",
+                                            "替换 Key",
+                                            "替換 Key",
                                         ))
                                         .disabled(pending)
                                         .on_click(
                                             cx.listener({
-                                                let profile = id.clone();
+                                                let profile =
+                                                    upstream.model_provider_profile_id.clone();
                                                 let credential = key.credential_id.clone();
                                                 move |this, _, _, cx| {
                                                     this.gateway_key_replace_target =
@@ -15130,13 +14977,13 @@ impl ManagementCenter {
                                                     cx.notify();
                                                 }
                                             }),
-                                        )
-                                    },
-                                ))
+                                        ),
+                                    )
+                                })
                                 .child(
                                     Button::new(SharedString::from(format!(
                                         "management-gateway-remove-key-{}-{}",
-                                        id.as_str(),
+                                        upstream.model_provider_profile_id.as_str(),
                                         key.credential_id.as_str()
                                     )))
                                     .xsmall()
@@ -15144,7 +14991,7 @@ impl ManagementCenter {
                                     .label(management_locale_text("Remove", "移除", "移除"))
                                     .disabled(pending)
                                     .on_click(cx.listener({
-                                        let profile = id.clone();
+                                        let profile = upstream.model_provider_profile_id.clone();
                                         let credential = key.credential_id.clone();
                                         move |this, _, window, cx| {
                                             this.confirm_remove_gateway_key(
@@ -15158,12 +15005,12 @@ impl ManagementCenter {
                                 ),
                         ),
                 );
-                // The limits are editable here rather than read-only: a Key
-                // can be busy without being broken, and the only place a user
-                // can tell the gateway so is beside the Key it applies to.
+                // The limits are editable here rather than read-only: a Key can
+                // be busy without being broken, and the only place a user can
+                // tell the gateway so is beside the Key it applies to.
                 key_rows = key_rows.child(self.render_gateway_key_limits(key, window, cx));
                 key_rows = key_rows.child(self.render_gateway_key_replace(
-                    &id,
+                    &upstream.model_provider_profile_id,
                     &key.credential_id,
                     window,
                     cx,
@@ -15172,243 +15019,71 @@ impl ManagementCenter {
             if upstream.keys.is_empty() {
                 key_rows = key_rows.child(div().text_xs().text_color(cx.theme().warning).child(
                     management_locale_text(
-                        "No key. This upstream cannot answer a request.",
-                        "没有 Key，该上游无法发起请求。",
-                        "沒有 Key，該上游無法發起請求。",
+                        "No key. This Provider cannot answer a request.",
+                        "没有 Key，该供应商无法发起请求。",
+                        "沒有 Key，該供應商無法發起請求。",
                     ),
                 ));
             }
-            upstream_rows =
-                upstream_rows.child(
-                    v_flex()
-                        .w_full()
-                        .min_w_0()
-                        .gap_2()
-                        .rounded(px(6.0))
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .p_3()
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .items_center()
-                                .justify_between()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_medium()
-                                        .truncate()
-                                        .child(upstream.display_name.clone()),
-                                )
-                                .child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_1()
-                                        // The order of these cards is the
-                                        // routing order, so moving one is how
-                                        // a user says "try this account first"
-                                        // without removing and re-adding the
-                                        // whole list.
-                                        .child(
-                                            Button::new(SharedString::from(format!(
-                                                "management-gateway-upstream-earlier-{}",
-                                                id.as_str()
-                                            )))
-                                            .xsmall()
-                                            .ghost()
-                                            .compact()
-                                            .icon(IconName::ArrowUp)
-                                            .tooltip(management_locale_text(
-                                                "Move earlier",
-                                                "上移",
-                                                "上移",
-                                            ))
-                                            .accessibility_label(management_locale_text(
-                                                "Move earlier",
-                                                "上移",
-                                                "上移",
-                                            ))
-                                            .disabled(pending || first)
-                                            .on_click(cx.listener({
-                                                let id = id.clone();
-                                                move |this, _, _, cx| {
-                                                    this.move_gateway_upstream(
-                                                        id.clone(),
-                                                        GatewayUpstreamMove::Earlier,
-                                                        cx,
-                                                    )
-                                                }
-                                            })),
-                                        )
-                                        .child(
-                                            Button::new(SharedString::from(format!(
-                                                "management-gateway-upstream-later-{}",
-                                                id.as_str()
-                                            )))
-                                            .xsmall()
-                                            .ghost()
-                                            .compact()
-                                            .icon(IconName::ArrowDown)
-                                            .tooltip(management_locale_text(
-                                                "Move later",
-                                                "下移",
-                                                "下移",
-                                            ))
-                                            .accessibility_label(management_locale_text(
-                                                "Move later",
-                                                "下移",
-                                                "下移",
-                                            ))
-                                            .disabled(pending || last)
-                                            .on_click(cx.listener({
-                                                let id = id.clone();
-                                                move |this, _, _, cx| {
-                                                    this.move_gateway_upstream(
-                                                        id.clone(),
-                                                        GatewayUpstreamMove::Later,
-                                                        cx,
-                                                    )
-                                                }
-                                            })),
-                                        )
-                                        .child(
-                                            Button::new(SharedString::from(format!(
-                                                "management-gateway-remove-upstream-{}",
-                                                id.as_str()
-                                            )))
-                                            .xsmall()
-                                            .ghost()
-                                            .label(management_locale_text("Remove", "移除", "移除"))
-                                            .disabled(pending)
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.remove_gateway_upstream(id.clone(), cx)
-                                            })),
-                                        ),
-                                ),
-                        )
-                        .child(key_rows)
-                        .child(add_key),
-                );
-        }
-        if snapshot.upstreams.is_empty() {
-            upstream_rows = upstream_rows.child(compact_empty_state(
-                management_locale_text(
-                    "No upstream Providers",
-                    "还没有上游供应商",
-                    "還沒有上游供應商",
-                ),
-                management_locale_text(
-                    "An upstream is a Provider you already configured. Adding one lets every Agent use its keys.",
-                    "上游就是你已配置好的供应商，加入后所有 Agent 都能用它的 Key。",
-                    "上游就是你已設定好的供應商，加入後所有 Agent 都能用它的 Key。",
-                ),
-                cx,
-            ));
-        }
-        let mut add_row = h_flex().w_full().gap_2().flex_wrap();
-        for candidate in available {
-            let id = candidate.model_provider_profile_id.clone();
-            add_row = add_row.child(
-                Button::new(SharedString::from(format!(
-                    "management-gateway-add-upstream-{}",
-                    id.as_str()
-                )))
-                .xsmall()
-                .outline()
-                .label(candidate.display_name.clone())
-                .disabled(pending)
-                .on_click(
-                    cx.listener(move |this, _, _, cx| this.add_gateway_upstream(id.clone(), cx)),
-                ),
-            );
-        }
-        upstream_rows = upstream_rows.child(add_row);
-        body = body.child(management_card_with_icon(
-            management_locale_text("Upstream Providers", "上游供应商", "上游供應商"),
-            management_locale_text(
-                "Which Providers this gateway may call. An Agent's route then chooses among them.",
-                "这个网关可以调用哪些供应商。具体用哪个由 Agent 的路由决定。",
-                "這個閘道可以呼叫哪些供應商。具體用哪個由 Agent 的路由決定。",
-            ),
-            "icons/vibex/database.svg",
-            upstream_rows.into_any_element(),
-            cx,
-        ));
-
-        // Which Agents the gateway serves. There is no switch per row: the
-        // gateway is on or off for the whole installation, so this card states
-        // the consequence of that one setting instead of pretending each Agent
-        // has its own choice.
-        let mut agent_rows = v_flex().w_full().gap_1();
-        for agent in &snapshot.agents {
-            agent_rows = agent_rows.child(
-                h_flex()
+            member_rows = member_rows.child(
+                v_flex()
                     .w_full()
-                    .items_center()
-                    .justify_between()
+                    .min_w_0()
                     .gap_2()
-                    .py_1()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .p_3()
                     .child(
-                        v_flex()
-                            .min_w_0()
-                            .gap_0p5()
-                            .child(div().text_sm().truncate().child(agent.display_name.clone()))
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_medium()
+                                    .truncate()
+                                    .child(upstream.display_name.clone()),
+                            )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if agent.unsupported {
-                                        management_locale_text(
-                                            "Uses its own Provider; the gateway cannot serve it",
-                                            "使用自己的供应商；网关无法接入",
-                                            "使用自己的供應商；閘道無法接入",
-                                        )
-                                    } else if agent.active {
-                                        management_locale_text(
-                                            "Uses the gateway",
-                                            "走网关",
-                                            "走閘道",
-                                        )
-                                    } else if agent.enabled {
-                                        management_locale_text(
-                                            "Paused: the gateway is not running",
-                                            "已暂停：网关未运行",
-                                            "已暫停：閘道未執行",
-                                        )
-                                    } else {
-                                        management_locale_text(
-                                            "Uses its own Provider",
-                                            "使用自己的供应商",
-                                            "使用自己的供應商",
-                                        )
-                                    }),
+                                    .child(format!("{} models", upstream.model_count)),
                             ),
                     )
-                    .when(agent.active, |row| {
-                        row.child(Tag::success().xsmall().child(management_locale_text(
-                            "Routed",
-                            "已接入",
-                            "已接入",
-                        )))
-                    }),
+                    .child(key_rows),
             );
         }
-        if snapshot.agents.is_empty() {
-            agent_rows = agent_rows.child(compact_empty_state(
+        if snapshot.upstreams.is_empty() {
+            member_rows = member_rows.child(compact_empty_state(
                 management_locale_text(
-                    "No Agent can use the gateway",
-                    "没有 Agent 能使用网关",
-                    "沒有 Agent 能使用閘道",
+                    "No Providers yet",
+                    "还没有供应商",
+                    "還沒有供應商",
                 ),
                 management_locale_text(
-                    "Agents that manage their own provider cannot be routed.",
-                    "自己管理供应商的 Agent 无法接入。",
-                    "自己管理供應商的 Agent 無法接入。",
+                    "A route group names the Providers it composes. Create one, and its members appear here.",
+                    "路由组会列出它组合的供应商。新建一个路由组，成员就会出现在这里。",
+                    "路由組會列出它組合的供應商。新建一個路由組，成員就會出現在這裡。",
                 ),
                 cx,
             ));
         }
+        body = body.child(management_card_with_icon(
+            management_locale_text("Route group members", "路由组成员", "路由組成員"),
+            management_locale_text(
+                "The Providers the enabled route groups name. Add or remove one on the group itself.",
+                "已启用的路由组所使用的供应商。增删请到路由组上操作。",
+                "已啟用的路由組所使用的供應商。增刪請到路由組上操作。",
+            ),
+            "icons/vibex/database.svg",
+            member_rows.into_any_element(),
+            cx,
+        ));
+
         // Recent requests: which upstream answered, which protocol changed,
         // and how many tokens it took. This is the only view that explains a
         // failover after the fact.
@@ -15559,17 +15234,8 @@ impl ManagementCenter {
             cx,
         ));
 
-        body = body.child(management_card_with_icon(
-            management_locale_text("Agents", "Agent", "Agent"),
-            management_locale_text(
-                "Each Agent either walks through the gateway or keeps its own Provider.",
-                "每个 Agent 要么走网关，要么保留自己的供应商。",
-                "每個 Agent 要麼走閘道，要麼保留自己的供應商。",
-            ),
-            "icons/vibex/cpu.svg",
-            agent_rows.into_any_element(),
-            cx,
-        ));
+        // There is no Agents card: an Agent reaches the gateway by binding a
+        // route group, so that decision is made on the group rather than here.
 
         v_flex()
             .id("management-gateway")
@@ -22243,9 +21909,9 @@ impl ManagementCenter {
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(management_locale_text(
-                            "This Agent uses the gateway. Turning it off is a global setting on the Providers page.",
-                            "该 Agent 正在使用网关。关闭它是供应商页面上的全局设置。",
-                            "該 Agent 正在使用閘道。關閉它是供應商頁面上的全域設定。",
+                            "This Agent uses the gateway through the route groups it is bound to. Unbinding its last group returns it to a direct Provider.",
+                            "该 Agent 通过绑定的路由组使用网关。解绑最后一个路由组后，它会回到直连供应商。",
+                            "該 Agent 透過綁定的路由組使用閘道。解綁最後一個路由組後，它會回到直連供應商。",
                         )),
                 )
             })
@@ -22308,6 +21974,7 @@ impl ManagementCenter {
             .map(|member| member.model_provider_profile_id.clone())
             .collect();
         self.route_group_strategy = route.strategy;
+        self.route_group_pin = route.pin == vibex_core::GatewayPinScope::Conversation;
         self.route_group_name.update(cx, |state, cx| {
             state.set_value(route.display_name.clone(), window, cx)
         });
@@ -22413,6 +22080,11 @@ impl ManagementCenter {
         route.display_name = name;
         route.kind = vibex_core::RouteKind::ProviderGroup;
         route.strategy = self.route_group_strategy;
+        route.pin = if self.route_group_pin {
+            vibex_core::GatewayPinScope::Conversation
+        } else {
+            vibex_core::GatewayPinScope::Off
+        };
         route.status = vibex_core::RouteStatus::Enabled;
         route.members = self
             .route_group_members
@@ -23018,6 +22690,52 @@ impl ManagementCenter {
             );
         }
         rows = rows.child(choices);
+        // Conversation affinity is a property of the composition, so it is set
+        // here rather than on the gateway: one group may hold a conversation on
+        // one Key while another spreads load across the same Providers.
+        rows = rows.child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text(
+                                    "Keep a conversation on one key",
+                                    "同一对话固定在同一 Key",
+                                    "同一對話固定在同一 Key",
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text(
+                                    "Vendors cache a prompt per account, so moving a conversation loses that cache.",
+                                    "厂商按账号缓存提示词，换 Key 会丢掉该缓存。",
+                                    "廠商按帳號快取提示詞，換 Key 會丟掉該快取。",
+                                )),
+                        ),
+                )
+                .child(
+                    Switch::new("management-route-group-pin")
+                        .small()
+                        .checked(self.route_group_pin)
+                        .disabled(pending)
+                        .on_click(cx.listener(|this, checked, _, cx| {
+                            this.route_group_pin = *checked;
+                            cx.notify();
+                        })),
+                ),
+        );
         if self.route_group_members.len() >= 2 {
             let current = self.route_group_strategy;
             let mut policies = h_flex().w_full().flex_wrap().items_center().gap_1();
@@ -27748,48 +27466,6 @@ fn management_primary_section(section: ManagementSection) -> ManagementSection {
     }
 }
 
-/// Which way a routing-order move goes.
-///
-/// It is deliberately one step rather than a target position: the stored order
-/// is a list a user builds by appending, and repeating "earlier" is easier to
-/// follow than dropping a row somewhere in a list whose length is not visible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GatewayUpstreamMove {
-    Earlier,
-    Later,
-}
-
-impl GatewayUpstreamMove {
-    const fn offset(self) -> isize {
-        match self {
-            Self::Earlier => -1,
-            Self::Later => 1,
-        }
-    }
-}
-
-/// Moves one upstream one step, leaving every other one where it was.
-///
-/// A move past either end is a no-op rather than a wrap-around: wrapping would
-/// turn an edge row's move into a reorder of the whole list, which is the
-/// opposite of what the button says.
-fn moved_gateway_upstreams(
-    upstreams: &[vibex_core::ModelProviderProfileId],
-    upstream: &vibex_core::ModelProviderProfileId,
-    direction: GatewayUpstreamMove,
-) -> Vec<vibex_core::ModelProviderProfileId> {
-    let mut moved = upstreams.to_vec();
-    let Some(index) = moved.iter().position(|existing| existing == upstream) else {
-        return moved;
-    };
-    let target = index as isize + direction.offset();
-    if target < 0 || target >= moved.len() as isize {
-        return moved;
-    }
-    moved.swap(index, target as usize);
-    moved
-}
-
 fn reordered_provider_profile_ids(
     profile_ids: &[String],
     moving_id: &str,
@@ -29396,9 +29072,9 @@ fn gateway_runtime_text(state: &vibex_core::ModelGatewayRuntimeState) -> String 
             url
         ),
         None => management_locale_text(
-            "The gateway is not serving requests; Agents keep their direct Provider configuration.",
-            "网关当前未提供服务，Agent 保留自己的供应商配置。",
-            "閘道目前未提供服務，Agent 保留自己的供應商設定。",
+            "The gateway is not serving requests; route groups cannot be used.",
+            "网关当前未提供服务，路由组无法使用。",
+            "閘道目前未提供服務，路由組無法使用。",
         )
         .to_string(),
     }
@@ -33388,9 +33064,9 @@ fn unreported_gateway_snapshot() -> vibex_core::GatewaySnapshot {
             status: vibex_core::ModelGatewayStatus::Unavailable,
             notice: Some(
                 management_locale_text(
-                    "The gateway state could not be read. Agents keep their direct Provider configuration.",
-                    "没能读到网关状态，Agent 保留自己的供应商配置。",
-                    "沒能讀到閘道狀態，Agent 保留自己的供應商設定。",
+                    "The gateway state could not be read. Route groups cannot be used until it is.",
+                    "没能读到网关状态，在此之前路由组无法使用。",
+                    "沒能讀到閘道狀態，在此之前路由組無法使用。",
                 )
                 .to_string(),
             ),
@@ -37870,10 +37546,10 @@ mod gateway_surface_tests {
             route.id.clone(),
         );
         dropped.deleted_at_ms = Some(1);
-        // A plain route is not a group and must not appear in the group tab.
+        // A direct route is not a group and must not appear in the group tab.
         let mut plain = route.clone();
         plain.id = vibex_core::ModelRouteId::new();
-        plain.kind = vibex_core::RouteKind::Gateway;
+        plain.kind = vibex_core::RouteKind::Direct;
         plain.members = vec![vibex_core::ModelRouteMember::new(provider, "m", 0)];
 
         let rows = shared_route_group_rows(&[route, plain], &[live, dropped]);
@@ -37903,13 +37579,10 @@ mod gateway_surface_tests {
 
         let disabled = vibex_core::ModelGatewayRuntimeState {
             status: vibex_core::ModelGatewayStatus::Disabled,
-            notice: Some("Automatic routing is turned off".to_string()),
+            notice: Some("The gateway is turned off".to_string()),
             ..vibex_core::ModelGatewayRuntimeState::default()
         };
-        assert_eq!(
-            gateway_runtime_text(&disabled),
-            "Automatic routing is turned off"
-        );
+        assert_eq!(gateway_runtime_text(&disabled), "The gateway is turned off");
     }
 
     /// An adopted suggestion is recorded as coming from the catalogue, and a
@@ -38115,7 +37788,9 @@ mod gateway_surface_tests {
         assert!(source.contains("self.schedule_gateway_cooldown_refresh(cx);"));
         let schedule = source
             .split_once("    fn schedule_gateway_cooldown_refresh(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn set_gateway_routing("))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Opens the header's display-name editor")
+            })
             .map(|(body, _)| body)
             .expect("the cooldown scheduler should remain inspectable");
         assert!(schedule.contains("if self.gateway_refresh_task.is_some()"));
@@ -38193,7 +37868,9 @@ mod gateway_surface_tests {
         let source = include_str!("management.rs");
         let card = source
             .split_once("        // Translation is the one policy most users never touch")
-            .and_then(|(_, tail)| tail.split_once("\n        // Upstreams, with their keys."))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n        // The Providers the route groups name.")
+            })
             .map(|(body, _)| body)
             .expect("the translation card should remain inspectable");
         assert!(card.contains("GatewayTranslation::ALL"));
@@ -38228,10 +37905,7 @@ mod gateway_surface_tests {
         };
         let request = vibex_core::GatewaySettingsUpdateRequest {
             display_name: "Vibex Gateway".to_string(),
-            routing: vibex_core::GatewayRoutingStrategy::RoundRobin,
-            pin: vibex_core::GatewayPinScope::Conversation,
             token_limit: None,
-            upstreams: Vec::new(),
             account_limits: policy.account_limits.clone(),
             translate: policy.translate,
             account_updates: Vec::new(),
@@ -38261,9 +37935,9 @@ mod gateway_surface_tests {
         let degraded = vibex_core::ModelGatewayRuntimeState {
             status: vibex_core::ModelGatewayStatus::Degraded,
             port: Some(3425),
-            upstream_count: Some(1),
+            route_count: Some(1),
             notice: Some(
-                "Repeated upstream failures: Agents have fallen back to their direct Provider configuration."
+                "Repeated upstream failures: only one request at a time is let through until a Provider answers."
                     .to_string(),
             ),
             ..vibex_core::ModelGatewayRuntimeState::default()
@@ -38272,7 +37946,10 @@ mod gateway_surface_tests {
         assert!(!degraded.status.is_routable());
         // The address is still published, because the port is still bound.
         assert_eq!(degraded.base_url().as_deref(), None);
-        assert!(gateway_runtime_text(&degraded).contains("direct Provider"));
+        assert!(
+            gateway_runtime_text(&degraded).contains("only one request at a time"),
+            "a degraded gateway says what it is doing, not that it fell back"
+        );
     }
 
     /// A cooldown says when the Key comes back, not just that it is out.
@@ -38408,17 +38085,26 @@ mod gateway_surface_tests {
         );
     }
 
-    /// A gateway with no ready Key cannot serve anything, and the surface must
-    /// say so instead of showing a running service.
+    /// A running listener is routable even with no route groups, and a group
+    /// with no ready Key cannot actually answer.
+    ///
+    /// The two facts are separate on purpose: "the listener is up" is the
+    /// gateway's own state, while "nothing can answer" is a property of the
+    /// groups it serves. Treating the second as the first made a fresh
+    /// installation look broken.
     #[test]
-    fn a_gateway_without_a_ready_key_is_not_routable() {
+    fn a_running_gateway_is_routable_and_an_unready_key_is_not() {
         let mut snapshot = vibex_core::GatewaySnapshot {
-            runtime: vibex_core::ModelGatewayRuntimeState::running(3425, 1),
+            runtime: vibex_core::ModelGatewayRuntimeState::running(3425, 0),
             ..vibex_core::GatewaySnapshot::default()
         };
         assert!(
-            !snapshot.is_routable(),
-            "no upstreams means nothing to route"
+            snapshot.is_routable(),
+            "a listener with no groups is up, not broken"
+        );
+        assert!(
+            !snapshot.has_servable_models(),
+            "no models means nothing to serve"
         );
         snapshot.upstreams.push(vibex_core::GatewayUpstreamSummary {
             model_provider_profile_id: vibex_core::ModelProviderProfileId::new(),
@@ -38436,67 +38122,11 @@ mod gateway_surface_tests {
             }],
         });
         assert_eq!(snapshot.ready_key_count(), 0);
-        assert!(!snapshot.is_routable());
-    }
-
-    /// Moving an upstream one step swaps it with its neighbour and nothing else.
-    ///
-    /// The stored order is the routing order, so a move that touched any other
-    /// row would silently change which account answers first.
-    #[test]
-    fn moving_an_upstream_one_step_swaps_only_its_neighbour() {
-        let id = |name: &str| {
-            vibex_core::ModelProviderProfileId::parse(format!("model_provider_{name}")).unwrap()
-        };
-        let ids = vec![id("a"), id("b"), id("c")];
-        let names = |list: &[vibex_core::ModelProviderProfileId]| {
-            list.iter()
-                .map(|id| id.as_str().to_string())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            names(&moved_gateway_upstreams(
-                &ids,
-                &ids[1],
-                GatewayUpstreamMove::Earlier
-            )),
-            names(&[id("b"), id("a"), id("c")])
+        assert!(snapshot.is_routable(), "the listener is still up");
+        assert!(
+            !snapshot.has_servable_models(),
+            "a cooling Key cannot serve a group"
         );
-        assert_eq!(
-            names(&moved_gateway_upstreams(
-                &ids,
-                &ids[1],
-                GatewayUpstreamMove::Later
-            )),
-            names(&[id("a"), id("c"), id("b")])
-        );
-        // The ends hold: an edge row's move is a no-op, not a wrap-around.
-        assert_eq!(
-            names(&moved_gateway_upstreams(
-                &ids,
-                &ids[0],
-                GatewayUpstreamMove::Earlier
-            )),
-            names(&ids)
-        );
-        assert_eq!(
-            names(&moved_gateway_upstreams(
-                &ids,
-                &ids[2],
-                GatewayUpstreamMove::Later
-            )),
-            names(&ids)
-        );
-        // An id that is no longer in the list changes nothing.
-        assert_eq!(
-            names(&moved_gateway_upstreams(
-                &ids,
-                &id("gone"),
-                GatewayUpstreamMove::Later
-            )),
-            names(&ids)
-        );
-        assert!(moved_gateway_upstreams(&[], &id("a"), GatewayUpstreamMove::Later).is_empty());
     }
 
     /// A plan's models are what a fetch lands on, not whatever the vendor sent.
@@ -39064,7 +38694,9 @@ mod gateway_surface_tests {
         let source = include_str!("management.rs");
         let editor = source
             .split_once("        // Token ceiling. The window and the count")
-            .and_then(|(_, tail)| tail.split_once("        // Upstreams, with their keys."))
+            .and_then(|(_, tail)| {
+                tail.split_once("        // The Providers the route groups name.")
+            })
             .map(|(body, _)| body)
             .expect("the token ceiling editor should remain inspectable");
         assert!(editor.contains("management-gateway-token-window-"));
@@ -39073,29 +38705,21 @@ mod gateway_surface_tests {
         assert!(editor.contains("Input::new(&limit_input)"));
     }
 
-    /// The gateway is switched on or off once, and no Agent row offers its own
-    /// switch.
+    /// There is no per-Agent gateway row at all.
     ///
-    /// A per-Agent toggle let one Agent believe it was routed while the listener
-    /// served the others. The setting is installation-wide, so this test asserts
-    /// the absence of that control rather than its wiring.
+    /// An Agent reaches the gateway by binding a route group, so a card that
+    /// listed Agents here would be a second, competing switch. The absence is
+    /// what this test asserts, because a leftover helper is how such a control
+    /// quietly comes back.
     #[test]
-    fn the_gateway_is_not_switched_per_agent() {
+    fn the_gateway_has_no_agent_switch_or_agent_card() {
         let source = include_str!("management.rs");
-        let row = source
-            .split_once("        for agent in &snapshot.agents {")
-            .and_then(|(_, tail)| tail.split_once("\n        if snapshot.agents.is_empty()"))
-            .map(|(body, _)| body)
-            .expect("the gateway Agent row should remain inspectable");
-        assert!(!row.contains("Switch::new"));
-        assert!(!row.contains("set_gateway_agent"));
-        assert!(row.contains("agent.active"));
-        // The confirmation dialog and the pending marker are gone from the
-        // source, not merely unused: a leftover helper is how the control
-        // quietly comes back.
         for removed in [
+            concat!("Gateway", "AgentBinding"),
+            concat!("set_gateway_", "agent"),
             concat!("fn confirm_gateway_", "agent_switch("),
             concat!("gateway_", "agent_pending"),
+            concat!("management-gateway-", "agent-"),
         ] {
             assert!(
                 !source.contains(removed),
@@ -39106,75 +38730,10 @@ mod gateway_surface_tests {
         // The one global switch still lives on the Providers page.
         let gateway_page = source
             .split_once("    fn render_gateway(&mut self")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_content("))
-            .map(|(body, _)| body)
+            .map(|(_, tail)| tail)
             .expect("the gateway page should remain inspectable");
         assert!(gateway_page.contains("management-gateway-enabled"));
-        assert!(gateway_page.contains("set_gateway_enabled(true, cx)"));
-    }
-
-    /// The Agent's Provider card reports the gateway but does not switch it.
-    #[test]
-    fn the_provider_card_reports_the_gateway_without_switching_it() {
-        let source = include_str!("management.rs");
-        let summary = source
-            .split_once("    fn render_agent_gateway_summary(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Opens the route-group editor on an empty draft.")
-            })
-            .map(|(body, _)| body)
-            .expect("the gateway summary should remain inspectable");
-        assert!(
-            !summary.contains("Switch::new"),
-            "the Agent card must not control the global gateway"
-        );
-        assert!(!summary.contains("set_gateway_agent"));
-        assert!(summary.contains("turn it on from the Providers page"));
-        assert!(summary.contains("gateway_status_badge"));
-    }
-
-    /// The three destructive gateway actions ask first, and the harmless
-    /// direction does not.
-    #[test]
-    fn destructive_gateway_actions_ask_before_they_write() {
-        let source = include_str!("management.rs");
-        let body = |name: &str, next: &str| {
-            source
-                .split_once(name)
-                .and_then(|(_, tail)| tail.split_once(next))
-                .map(|(body, _)| body)
-                .unwrap_or_else(|| panic!("{name} should remain inspectable"))
-        };
-
-        let disable = body(
-            "    fn confirm_disable_gateway(",
-            "\n    /// Turns automatic routing on or off.",
-        );
-        assert!(disable.contains("window.open_dialog"));
-        assert!(disable.contains("set_gateway_enabled(false, cx)"));
-
-        let clear = body(
-            "    fn confirm_clear_gateway_token_limit(",
-            "\n    /// Removes the token ceiling",
-        );
-        assert!(clear.contains("window.open_dialog"));
-        assert!(clear.contains("clear_gateway_token_limit(cx)"));
-
-        let remove = body(
-            "    fn confirm_remove_gateway_key(",
-            "\n    /// The two limit fields for one Key",
-        );
-        assert!(remove.contains("if remaining > 1"));
-        assert!(remove.contains("self.remove_gateway_key(profile, credential, cx);"));
-        assert!(remove.contains("window.open_dialog"));
-
-        // The switches and buttons go through those confirmations, not past
-        // them.
-        assert!(source.contains("this.confirm_disable_gateway(window, cx)"));
-        assert!(source.contains("this.confirm_clear_gateway_token_limit(window, cx)"));
-        assert!(source.contains("this.confirm_remove_gateway_key("));
-        // Turning automatic routing on is immediate: it restores service.
-        assert!(source.contains("this.set_gateway_enabled(true, cx)"));
+        assert!(gateway_page.contains("confirm_disable_gateway"));
     }
 
     /// A Key rejected for authentication can be replaced in place.
@@ -39189,8 +38748,9 @@ mod gateway_surface_tests {
             .and_then(|(_, tail)| tail.split_once("\n            if upstream.keys.is_empty()"))
             .map(|(body, _)| body)
             .expect("the Key row should remain inspectable");
-        assert!(row.contains("Replace key"));
-        assert!(row.contains("GatewayKeyState::Invalid"));
+        // The state badge is drawn by `gateway_key_state_badge`; what the row
+        // itself must carry is the replace target the inline field keys off.
+        assert!(row.contains("gateway_key_state_badge"));
         assert!(row.contains("gateway_key_replace_target"));
 
         let replace = source

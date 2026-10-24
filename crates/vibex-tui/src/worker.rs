@@ -2255,10 +2255,7 @@ impl Dispatch {
                 let settings = &snapshot.settings;
                 let request = vibex_core::GatewaySettingsUpdateRequest {
                     display_name: settings.display_name.clone(),
-                    routing: settings.policy.routing,
-                    pin: settings.policy.pin,
                     token_limit: settings.policy.token_limit,
-                    upstreams: settings.upstreams.clone(),
                     account_limits: settings.policy.account_limits.clone(),
                     translate: settings.policy.translate,
                     account_updates: vec![vibex_core::GatewayAccountUpdate {
@@ -2288,11 +2285,7 @@ impl Dispatch {
                     }
                 }
             }
-            Effect::SetGatewayPolicy {
-                routing,
-                pin,
-                token_limit,
-            } => {
+            Effect::SetGatewayPolicy { token_limit } => {
                 let snapshot = match self.facade.management().model_gateway_snapshot().await {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
@@ -2306,10 +2299,7 @@ impl Dispatch {
                 let settings = &snapshot.settings;
                 let request = vibex_core::GatewaySettingsUpdateRequest {
                     display_name: settings.display_name.clone(),
-                    routing: routing.unwrap_or(settings.policy.routing),
-                    pin: pin.unwrap_or(settings.policy.pin),
                     token_limit: token_limit.unwrap_or(settings.policy.token_limit),
-                    upstreams: settings.upstreams.clone(),
                     account_limits: settings.policy.account_limits.clone(),
                     translate: settings.policy.translate,
                     account_updates: Vec::new(),

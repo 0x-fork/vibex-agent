@@ -5,14 +5,13 @@
 //! it, while a route says *how* a request reaches a model — which sources are
 //! tried, in what order, and under which policy.
 //!
-//! Three shapes exist, and only two of them are records:
+//! Two shapes exist:
 //!
-//! - [`RouteKind::Gateway`] — the route is served by the local gateway, which
-//!   may fail over across its members and translate protocols.
 //! - [`RouteKind::ProviderGroup`] — the route composes whole Providers: every
 //!   model their enabled catalogues share is offered once, and a request for
 //!   that model is routed across the Providers that serve it. This is what
-//!   makes a Provider set look like one Provider to a session.
+//!   makes a Provider set look like one Provider to a session. A group is the
+//!   gateway's only input: the gateway owns no Provider list of its own.
 //! - [`RouteKind::Direct`] — the route names exactly one Provider and skips the
 //!   gateway entirely. Its `base_url` is the Provider's, not the loopback one.
 //! - An account (`RuntimeAuthSource::AgentAccount`) is *not* a route. Its
@@ -42,46 +41,41 @@ pub const MAX_ROUTE_MEMBERS: usize = 16;
 /// This bounds the route list rather than the graph: a route is a saved
 /// composition, and past this many the picker stops being a picker.
 ///
-/// It counts the routes a user composed — plain gateway routes and provider
-/// groups. A `Direct` route is materialised from a Provider Profile by
+/// It counts the routes a user composed — provider groups. A `Direct` route is
+/// materialised from a Provider Profile by
 /// `backfill_direct_routes`, one per direct Profile already on the installation,
 /// so counting those would let a long Provider list exhaust the budget before a
 /// single route was authored. See `ModelRouteRepository::count_user_authored`.
 pub const MAX_ROUTES: usize = 32;
 
-/// The prefix a plain route's model id carries.
-pub const ROUTE_MODEL_PREFIX: &str = "route/";
-
 /// The prefix a provider group's model ids carry.
 ///
-/// The two prefixes are distinct so a group and a single-model route can never
-/// be mistaken for one another, even when their ids collide.
+/// Every model the gateway serves is addressed through a group, so this is the
+/// only prefix a request against the gateway may carry.
 pub const PROVIDER_GROUP_MODEL_PREFIX: &str = "group/";
 
 /// How a route delivers a model to an Agent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteKind {
-    /// Served by the local gateway: members fail over, protocols translate.
-    #[default]
-    Gateway,
     /// Served by the local gateway, composed from whole Providers.
     ///
-    /// Unlike a gateway route, a provider group names no models of its own:
-    /// its members are Providers, and the models it offers are the intersection
-    /// of their enabled catalogues. One model id may therefore be served by
-    /// several Providers, and the group's strategy picks which one answers.
+    /// A provider group names no models of its own: its members are Providers,
+    /// and the models it offers are the intersection of their enabled
+    /// catalogues. One model id may therefore be served by several Providers,
+    /// and the group's strategy picks which one answers. This is the only shape
+    /// the gateway serves, and therefore its only source of upstreams.
+    #[default]
     ProviderGroup,
     /// One Provider, called directly. The gateway is not involved.
     Direct,
 }
 
 impl RouteKind {
-    pub const ALL: [Self; 3] = [Self::Gateway, Self::ProviderGroup, Self::Direct];
+    pub const ALL: [Self; 2] = [Self::ProviderGroup, Self::Direct];
 
     pub const fn id(self) -> &'static str {
         match self {
-            Self::Gateway => "gateway",
             Self::ProviderGroup => "provider_group",
             Self::Direct => "direct",
         }
@@ -95,13 +89,13 @@ impl RouteKind {
     ///
     /// A direct route is the one shape that never reaches the listener.
     pub const fn via_gateway(self) -> bool {
-        matches!(self, Self::Gateway | Self::ProviderGroup)
+        matches!(self, Self::ProviderGroup)
     }
 
     /// Direct routes carry exactly one member; gateway routes may carry more.
     pub const fn member_limit(self) -> usize {
         match self {
-            Self::Gateway | Self::ProviderGroup => MAX_ROUTE_MEMBERS,
+            Self::ProviderGroup => MAX_ROUTE_MEMBERS,
             Self::Direct => 1,
         }
     }
@@ -255,10 +249,14 @@ pub struct ModelRoute {
     pub context_tokens: Option<u32>,
     /// Whether one conversation stays on one Key.
     ///
-    /// Route-scoped rather than gateway-scoped: a route with several Keys per
-    /// member may want to hold a conversation on one of them, while another
-    /// route over the same Providers prefers to re-pick each request. Off is the
-    /// default so a route behaves the way it did before this field existed.
+    /// Route-scoped rather than gateway-scoped: a group with several Keys per
+    /// Provider may want to hold a conversation on one of them, while another
+    /// group over the same Providers prefers to re-pick each request.
+    ///
+    /// Conversation affinity is the default because it is what preserves a
+    /// vendor's prompt cache, and it is what the gateway did for every request
+    /// before pinning became a property of the composition. A group that wants
+    /// to spread load instead turns it off.
     #[serde(default)]
     pub pin: crate::GatewayPinScope,
     /// A ceiling on the tokens this route may spend in its window.
@@ -312,12 +310,12 @@ impl Default for ModelRoute {
             id: ModelRouteId::new(),
             display_name: String::new(),
             description: None,
-            kind: RouteKind::Gateway,
+            kind: RouteKind::ProviderGroup,
             members: Vec::new(),
             strategy: RouteStrategy::Ordered,
             first_token_timeout_ms: None,
             context_tokens: None,
-            pin: crate::GatewayPinScope::Off,
+            pin: crate::GatewayPinScope::Conversation,
             token_limit: None,
             status: RouteStatus::Disabled,
             revision: 1,
@@ -365,26 +363,19 @@ impl ModelRoute {
         self.enabled_members().count()
     }
 
-    /// The model id an Agent asks the gateway for.
+    /// The prefix every model of a provider group is addressed by.
     ///
-    /// One route is one selectable model: the Agent never sees the members.
-    /// That is what keeps failover invisible to it — a member change must not
-    /// require a new selection.
-    ///
-    /// A provider group is several selectable models rather than one, so its
-    /// ids carry the model after the route: `group/<id>/<model>`. The model has
-    /// to live in the id because the group itself is not a model; the provider
-    /// is chosen per request, which is exactly what the id's first half leaves
+    /// A group is several selectable models rather than one, so its ids carry
+    /// the model after the route: `group/<id>/<model>`. The model has to live
+    /// in the id because the group itself is not a model; the Provider is
+    /// chosen per request, which is exactly what the id's first half leaves
     /// out.
+    ///
+    /// A direct route never reaches the gateway, so it has no gateway id and
+    /// this prefix describes nothing callable; it exists for the group shape
+    /// every gateway route now has.
     pub fn model_id(&self) -> String {
-        match self.kind {
-            RouteKind::ProviderGroup => {
-                format!("{}{}/", PROVIDER_GROUP_MODEL_PREFIX, self.id.as_str())
-            }
-            RouteKind::Gateway | RouteKind::Direct => {
-                format!("{}{}", ROUTE_MODEL_PREFIX, self.id.as_str())
-            }
-        }
+        format!("{}{}/", PROVIDER_GROUP_MODEL_PREFIX, self.id.as_str())
     }
 
     /// The id one model of a provider group is selected by.
@@ -416,7 +407,7 @@ impl ModelRoute {
                 "a route must name at least one model",
             ));
         }
-        if self.members.len() > RouteKind::Gateway.member_limit() {
+        if self.members.len() > MAX_ROUTE_MEMBERS {
             return Err(VibexError::validation(
                 "route_member_limit_exceeded",
                 "the route has more members than it supports",
@@ -670,17 +661,6 @@ pub fn provider_group_model_ref(requested: &str) -> Option<ProviderGroupModelRef
         .then_some(ProviderGroupModelRef { group_id, model_id })
 }
 
-/// Splits a `route/<id>` model id.
-///
-/// Returns `None` when the id is not route-shaped, so a caller falls back to
-/// ordinary Provider resolution. It returns `Some(None)` for a well-formed
-/// prefix with an empty id, which is a malformed request rather than a Provider
-/// lookup.
-pub fn route_id_from_model(requested: &str) -> Option<Option<&str>> {
-    let rest = requested.strip_prefix(ROUTE_MODEL_PREFIX)?;
-    Some((!rest.trim().is_empty()).then_some(rest.trim()))
-}
-
 /// Replaces a route, including its member order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -727,7 +707,11 @@ pub struct AgentModelRouteDefaultRequest {
 mod tests {
     use super::*;
 
-    fn member(order_index: i64, model: &str) -> ModelRouteMember {
+    fn provider_member(order_index: i64) -> ModelRouteMember {
+        ModelRouteMember::provider(ModelProviderProfileId::new(), order_index)
+    }
+
+    fn model_member(order_index: i64, model: &str) -> ModelRouteMember {
         ModelRouteMember::new(ModelProviderProfileId::new(), model, order_index)
     }
 
@@ -742,21 +726,14 @@ mod tests {
     }
 
     #[test]
-    fn a_gateway_route_may_hold_several_members() {
-        let route = route(
-            RouteKind::Gateway,
-            vec![member(0, "a"), member(1, "b"), member(2, "c")],
-        );
-        assert!(route.validate().is_ok());
-        assert_eq!(route.source_count(), 3);
-    }
-
-    #[test]
     fn a_direct_route_must_hold_exactly_one_member() {
-        let one = route(RouteKind::Direct, vec![member(0, "a")]);
+        let one = route(RouteKind::Direct, vec![model_member(0, "a")]);
         assert!(one.validate().is_ok());
 
-        let two = route(RouteKind::Direct, vec![member(0, "a"), member(1, "b")]);
+        let two = route(
+            RouteKind::Direct,
+            vec![model_member(0, "a"), model_member(1, "b")],
+        );
         let error = two.validate().unwrap_err();
         assert_eq!(error.code, "route_direct_member_count_invalid");
 
@@ -765,16 +742,16 @@ mod tests {
     }
 
     #[test]
-    fn the_gateway_member_limit_is_sixteen() {
+    fn a_provider_group_member_limit_is_sixteen() {
         let at_limit = route(
-            RouteKind::Gateway,
-            (0..16).map(|index| member(index, "m")).collect(),
+            RouteKind::ProviderGroup,
+            (0..16).map(provider_member).collect(),
         );
         assert!(at_limit.validate().is_ok());
 
         let over = route(
-            RouteKind::Gateway,
-            (0..17).map(|index| member(index, "m")).collect(),
+            RouteKind::ProviderGroup,
+            (0..17).map(provider_member).collect(),
         );
         assert_eq!(
             over.validate().unwrap_err().code,
@@ -784,7 +761,10 @@ mod tests {
 
     #[test]
     fn a_route_rejects_duplicate_positions() {
-        let route = route(RouteKind::Gateway, vec![member(0, "a"), member(0, "b")]);
+        let route = route(
+            RouteKind::ProviderGroup,
+            vec![provider_member(0), provider_member(0)],
+        );
         assert_eq!(
             route.validate().unwrap_err().code,
             "route_member_order_duplicate"
@@ -793,7 +773,10 @@ mod tests {
 
     #[test]
     fn a_disabled_member_keeps_its_place_but_is_not_counted() {
-        let mut route = route(RouteKind::Gateway, vec![member(0, "a"), member(1, "b")]);
+        let mut route = route(
+            RouteKind::ProviderGroup,
+            vec![provider_member(0), provider_member(1)],
+        );
         route.members[1].enabled = false;
         assert!(route.validate().is_ok());
         assert_eq!(route.source_count(), 1);
@@ -801,29 +784,21 @@ mod tests {
     }
 
     #[test]
-    fn one_route_is_one_model_id_however_many_members_it_has() {
-        let route = route(
-            RouteKind::Gateway,
-            vec![member(0, "a"), member(1, "b"), member(2, "c")],
+    fn every_gateway_model_id_is_a_group_id() {
+        let route = route(RouteKind::ProviderGroup, vec![provider_member(0)]);
+        assert_eq!(route.model_id(), format!("group/{}/", route.id.as_str()));
+        assert_eq!(
+            route.group_model_id("deepseek-chat"),
+            format!("group/{}/deepseek-chat", route.id.as_str())
         );
-        assert_eq!(route.model_id(), format!("route/{}", route.id.as_str()));
     }
 
     #[test]
-    fn the_same_model_at_several_providers_is_one_distinct_model() {
-        let route = route(
-            RouteKind::Gateway,
-            vec![
-                member(0, "deepseek-v4-flash"),
-                member(1, "deepseek-v4-flash"),
-                member(2, "kimi-k3"),
-            ],
-        );
-        assert_eq!(route.source_count(), 3);
-        assert_eq!(
-            route.distinct_models(),
-            vec!["deepseek-v4-flash", "kimi-k3"]
-        );
+    fn a_direct_route_model_id_describes_no_gateway_entry() {
+        // A direct route never reaches the gateway, so its id is only ever
+        // compared against a gateway Profile's catalogue, never called.
+        let route = route(RouteKind::Direct, vec![model_member(0, "deepseek-chat")]);
+        assert_eq!(route.model_id(), format!("group/{}/", route.id.as_str()));
     }
 
     #[test]

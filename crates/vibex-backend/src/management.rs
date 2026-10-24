@@ -202,11 +202,18 @@ pub trait ManagementBackend: BackendBound {
         request: ModelCapabilitySuggestionRequest,
     ) -> BackendFuture<'_, Option<GatewayCapabilitySuggestion>>;
 
-    /// Reads the whole gateway surface: its settings, the listener state, its
-    /// upstreams and Keys, and which Agents currently walk through it.
+    /// Reads the whole gateway surface: its settings, the listener state, and
+    /// the Providers and Keys its enabled route groups name.
+    ///
+    /// There is no Agent list and no upstream list of its own: an Agent reaches
+    /// the gateway by binding a route group, and the Providers it may call are
+    /// that group's members.
     fn model_gateway_snapshot(&self) -> BackendFuture<'_, GatewaySnapshot>;
 
-    /// Writes the gateway's routing policy and its upstream list.
+    /// Writes the gateway's Key-level policy.
+    ///
+    /// The member strategy and conversation pin belong to a route group, so
+    /// neither is part of this write.
     fn update_model_gateway_settings(
         &self,
         request: MutationRequest<GatewaySettingsUpdateRequest>,
@@ -224,13 +231,18 @@ pub trait ManagementBackend: BackendBound {
         request: MutationRequest<vibex_core::RemoveModelProviderCredentialRequest>,
     ) -> BackendFuture<'_, ModelProviderProfile>;
 
-    /// Turns automatic routing on or off.
+    /// Turns the gateway on or off.
     ///
-    /// Off stops the listener, so every bound Agent falls back to its direct
-    /// Provider; on re-binds the persisted port.
+    /// Off stops the listener, so every bound route group becomes unusable and
+    /// each Agent falls back to its direct Provider; on re-binds the persisted
+    /// port and restores the bindings.
     fn set_model_gateway_enabled(&self, enabled: bool) -> BackendFuture<'_, GatewaySnapshot>;
 
-    /// Points one Agent at the gateway, or takes it back to a direct Provider.
+    /// The retired per-Agent gateway switch.
+    ///
+    /// An Agent reaches the gateway by binding a route group, so this entry
+    /// point survives only to answer an older client with a readable refusal
+    /// instead of an unknown-variant decode failure.
     fn set_model_gateway_agent(
         &self,
         request: MutationRequest<GatewayAgentUpdateRequest>,

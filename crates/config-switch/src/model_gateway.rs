@@ -1,24 +1,31 @@
-//! Wiring the local model gateway into every Agent it can serve.
+//! Wiring the local model gateway into the Agents that use a route group.
 //!
-//! The gateway is one shared endpoint, and it is switched on or off for the
-//! whole installation — never per Agent. While it is enabled, this module keeps
-//! one hidden legacy Profile per gateway-capable Agent, whose base URL is the
-//! gateway, whose model list tracks the aggregated catalogue, and which is that
-//! Agent's default. Disabling the gateway removes those Profiles, and every
-//! Agent falls back to its own direct Provider.
+//! The gateway is one shared endpoint for the whole installation, and it has no
+//! Provider list of its own: the Providers it may call are the members of the
+//! enabled route groups. An Agent reaches it by binding a route group, so the
+//! binding is the only switch — there is no per-Agent gateway toggle.
+//!
+//! While the listener is up, this module keeps one hidden legacy Profile for
+//! each Agent that has at least one bound, enabled group. The Profile's address
+//! is the gateway and its model list is exactly the bound groups' model ids, so
+//! an Agent can only ask for something it was actually bound to. Behaviour of
+//! the whole feature follows from two switches:
+//!
+//! - switching the gateway off removes those Profiles, so no Agent can reach
+//!   the groups; direct Providers are untouched because they never used it;
+//! - unbinding the last group from an Agent removes its Profile, so it falls
+//!   back to its own direct Provider.
 //!
 //! The Profiles are marked with the internal role so they never appear in an
-//! Agent's provider list: the gateway is configured in one place and consumed
-//! here, rather than being duplicated into every Agent's editor.
+//! Agent's provider list.
 
 use std::collections::BTreeSet;
 
 use vibex_core::{
-    AgentId, GatewayRoutingStrategy, ModelProviderProfileStatus, ProviderConfiguredModel,
-    ProviderKind, ProviderModelCapabilities, ProviderModelWireApi, ProviderOptions,
-    ProviderProfile, ProviderProfileCreateRequest, ProviderProfileId, ProviderProfileStatus,
-    ProviderSecretBackend, ProviderSecretKind, ProviderSecretReferenceCreateRequest,
-    ProviderSecretSetupState, VibexError, VibexResult,
+    AgentId, ProviderConfiguredModel, ProviderKind, ProviderModelCapabilities,
+    ProviderModelWireApi, ProviderOptions, ProviderProfile, ProviderProfileCreateRequest,
+    ProviderProfileId, ProviderProfileStatus, ProviderSecretBackend, ProviderSecretKind,
+    ProviderSecretReferenceCreateRequest, ProviderSecretSetupState, VibexError, VibexResult,
 };
 use vibex_db::{
     AgentDefaultModelProviderProfileRepository, ModelProviderProfileRepository,
@@ -40,29 +47,24 @@ pub const GATEWAY_AGENT_OPTION_KEY: &str = "vibex.internal.gatewayAgent";
 pub const GATEWAY_LOCAL_KEY_HINT: &str = "managed by Vibex";
 
 impl ProviderConfigService {
-    /// The Agents the gateway serves: every Agent that can be pointed at it.
+    /// The Agents the gateway serves: the ones bound to an enabled group.
     ///
-    /// This is derived, not chosen per Agent. The gateway is a global switch,
-    /// so while it is on it covers each gateway-capable Agent; an Agent that
-    /// manages its own provider cannot be pointed at it at all and is absent.
+    /// This is derived, not chosen. An Agent with no group binding is not on
+    /// the gateway at all; an Agent that manages its own provider cannot be
+    /// bound to a group and so never appears.
     ///
     /// The hidden Profiles are only materialised while the listener is up. This
     /// answer therefore describes intent, which is what a Config Center needs:
     /// it stays the same across a gateway restart instead of blinking empty.
     pub fn gateway_agents(&self) -> VibexResult<BTreeSet<AgentId>> {
-        let configurable = vibex_core::model_provider_configurable_agent_ids()?;
-        let enabled = self
-            .open_connection()
-            .and_then(|conn| vibex_db::ModelGatewaySettingsRepository::get_or_create(&conn))
-            .map(|settings| settings.policy.enabled)
-            .unwrap_or(false);
-        if !enabled {
+        let conn = self.open_connection()?;
+        if !vibex_db::ModelGatewaySettingsRepository::get_or_create(&conn)?
+            .policy
+            .enabled
+        {
             return Ok(BTreeSet::new());
         }
-        Ok(configurable
-            .into_iter()
-            .filter(|agent_id| gateway_wire_api_for(agent_id).is_some())
-            .collect())
+        Ok(agents_with_gateway_routes(&conn)?.into_iter().collect())
     }
 
     /// The Agents currently pointed at the gateway's address.
@@ -84,36 +86,12 @@ impl ProviderConfigService {
         Ok(agents)
     }
 
-    /// Every Agent the gateway can serve, with the shared routing strategy.
+    /// Points every Agent that is bound to a route group at the gateway.
     ///
-    /// The switch is global, so `enabled` is the same for every row and the
-    /// strategy is the gateway's own. The pair is still returned per Agent
-    /// because the Config Center draws one row per Agent, and because an Agent
-    /// that manages its own provider has to be reported as unsupported rather
-    /// than silently omitted.
-    pub fn gateway_agent_options(
-        &self,
-    ) -> VibexResult<Vec<(AgentId, GatewayRoutingStrategy, bool, bool)>> {
-        let conn = self.open_connection()?;
-        let settings = vibex_db::ModelGatewaySettingsRepository::get_or_create(&conn)?;
-        let enabled = settings.policy.enabled;
-        let strategy = settings.policy.routing;
-        let mut options = vibex_core::model_provider_configurable_agent_ids()?
-            .into_iter()
-            .map(|agent_id| {
-                let unsupported = gateway_wire_api_for(&agent_id).is_none();
-                (agent_id, strategy, enabled && !unsupported, unsupported)
-            })
-            .collect::<Vec<_>>();
-        options.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
-        Ok(options)
-    }
-
-    /// Points every gateway-capable Agent at the gateway.
-    ///
-    /// This is the enabling half of the global switch. The listener's address
-    /// and the aggregated catalogue are the same for every Agent, so the work
-    /// is one pass over the capable Agents rather than a per-Agent decision.
+    /// This is the enabling half of the gateway switch. `model_catalog` is the
+    /// full set of group model ids the listener serves; each Agent's Profile
+    /// receives only the entries belonging to the groups it is bound to, so a
+    /// binding is what grants the model, not merely what grants the endpoint.
     /// Returns the Agents whose hidden Profile actually changed.
     pub fn attach_gateway_to_agents(
         &self,
@@ -137,21 +115,72 @@ impl ProviderConfigService {
             drop(conn);
             return self.deactivate_gateway_profiles();
         }
+        let bindings = vibex_db::AgentModelRouteBindingRepository::list_all(&conn)?;
+        let routes = vibex_db::ModelRouteRepository::list_enabled(&conn)?;
         drop(conn);
+
+        // Every Agent gets only the groups it references, and only while that
+        // group is enabled: an Agent whose groups were all disabled or deleted
+        // must lose its Profile rather than keep a catalogue it cannot call.
+        let mut per_agent: std::collections::BTreeMap<AgentId, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for binding in &bindings {
+            if binding.deleted_at_ms.is_some() {
+                continue;
+            }
+            let Some(route) = routes
+                .iter()
+                .find(|route| route.id == binding.model_route_id)
+            else {
+                continue;
+            };
+            if !route.kind.via_gateway() {
+                continue;
+            }
+            let entries = per_agent.entry(binding.agent_id.clone()).or_default();
+            for model in model_catalog {
+                if group_catalog_belongs_to(model, route) && !entries.contains(model) {
+                    entries.push(model.clone());
+                }
+            }
+        }
+
         let mut attached = Vec::new();
-        for agent_id in self.gateway_capable_agents()? {
+        let bound: BTreeSet<AgentId> = per_agent.keys().cloned().collect();
+        for agent_id in &bound {
+            if gateway_wire_api_for(agent_id).is_none() {
+                // The Agent speaks a protocol the gateway does not serve, so it
+                // cannot be pointed at it. Its binding still exists; it simply
+                // launches through a direct Provider.
+                continue;
+            }
+            let catalog = per_agent.remove(agent_id).unwrap_or_default();
             // One Agent failing must not deny the gateway to the rest. That is
             // exactly the shape of an Agent that is merely unconfigured — an
-            // ACP Agent with no runtime config yet — and the global switch has
-            // to work before every Agent has been set up. The skip is silent on
+            // ACP Agent with no runtime config yet. The skip is silent on
             // purpose: the Agent simply keeps its direct Provider, which is
             // also what `gateway_active_agents` reports.
-            if let Ok((_, changed)) =
-                self.ensure_gateway_profile(&agent_id, base_url, model_catalog)
+            if let Ok((_, changed)) = self.ensure_gateway_profile(agent_id, base_url, &catalog)
                 && changed
             {
-                attached.push(agent_id);
+                attached.push(agent_id.clone());
             }
+        }
+        // An Agent that lost its last binding must lose its Profile too.
+        for profile in ProviderProfileRepository::list_all(&self.open_connection()?)? {
+            if !is_gateway_profile(&profile) {
+                continue;
+            }
+            let Some(agent_id) = gateway_profile_agent(&profile) else {
+                continue;
+            };
+            if bound.contains(&agent_id) {
+                continue;
+            }
+            self.delete_profile(vibex_core::ProviderProfileDeleteRequest {
+                provider_profile_id: profile.id,
+            })?;
+            attached.push(agent_id);
         }
         Ok(attached)
     }
@@ -164,18 +193,6 @@ impl ProviderConfigService {
     /// nothing has to be remembered per Agent.
     pub fn detach_gateway_from_agents(&self) -> VibexResult<Vec<AgentId>> {
         self.deactivate_gateway_profiles()
-    }
-
-    /// Every Agent that can be pointed at the gateway at all.
-    ///
-    /// Two filters, both structural: the Agent must accept a Vibex-managed
-    /// Provider, and it must speak one of the four protocols the gateway
-    /// serves.
-    fn gateway_capable_agents(&self) -> VibexResult<BTreeSet<AgentId>> {
-        Ok(vibex_core::model_provider_configurable_agent_ids()?
-            .into_iter()
-            .filter(|agent_id| gateway_wire_api_for(agent_id).is_some())
-            .collect())
     }
 
     /// Removes every hidden gateway Profile.
@@ -376,15 +393,9 @@ impl ProviderConfigService {
         Ok(models
             .into_iter()
             .map(|model| {
-                if let Some(route) = routes.iter().find(|route| route.model_id() == model.id) {
-                    return ProviderConfiguredModel {
-                        capabilities: route_capabilities(conn, &profiles, route),
-                        ..model
-                    };
-                }
-                // A provider group publishes `group/<id>/<model>`, so its
-                // capabilities come from the Providers that serve that one
-                // model rather than from the group as a whole.
+                // Every gateway model belongs to a group and publishes
+                // `group/<id>/<model>`, so its capabilities come from the
+                // Providers that serve that one model.
                 let Some(parsed) = vibex_core::provider_group_model_ref(&model.id) else {
                     return model;
                 };
@@ -434,27 +445,39 @@ impl ProviderConfigService {
         Ok(())
     }
 
-    /// The durable per-Key routing state of every gateway upstream.
+    /// The durable per-Key routing state of every Provider the groups name.
     pub fn gateway_account_states(
         &self,
     ) -> VibexResult<Vec<vibex_core::ModelProviderAccountState>> {
         let conn = self.open_connection()?;
-        let settings = vibex_db::ModelGatewaySettingsRepository::get_or_create(&conn)?;
         let mut states = Vec::new();
-        for upstream in &settings.upstreams {
+        for provider in gateway_route_members_in(&conn)? {
             states.extend(vibex_db::ModelProviderAccountStateRepository::list(
-                &conn, upstream,
+                &conn, &provider,
             )?);
         }
         Ok(states)
     }
 
-    /// The Models the gateway currently exposes, for the Config Center.
+    /// Every Provider the enabled route groups name.
     ///
-    /// One entry per route, not per member: a route is one selectable model, so
-    /// an Agent must see one id for it. The members are what the gateway
-    /// decides between, and listing them here would ask the Agent to choose a
-    /// source the route is supposed to choose for it.
+    /// The Config Center reads this to show whose Keys back the routes; it is
+    /// not a configuration surface, because adding a Provider here would mean
+    /// adding it to a group.
+    pub fn gateway_route_members(&self) -> VibexResult<Vec<vibex_core::ModelProviderProfileId>> {
+        let conn = self.open_connection()?;
+        gateway_route_members_in(&conn)
+    }
+
+    /// The models the gateway currently exposes, for the Config Center.
+    ///
+    /// One entry per shared group model, not per member: a group is a set of
+    /// Providers, and the model is what a session actually picks. The Providers
+    /// behind it are the group's business, and listing them separately would
+    /// ask the Agent to choose a source the group exists to choose.
+    ///
+    /// A group with no reachable Provider, or with no model every Provider
+    /// serves, contributes nothing: it has nothing to answer with.
     pub fn gateway_model_catalog(&self) -> VibexResult<Vec<GatewayCatalogModel>> {
         let conn = self.open_connection()?;
         let profiles = ModelProviderProfileRepository::list(&conn)?;
@@ -467,62 +490,34 @@ impl ProviderConfigService {
             if !route.kind.via_gateway() {
                 continue;
             }
-            // A route whose members all point at Providers that no longer exist
-            // has nothing to serve, so it is not offered.
-            let served = route
-                .enabled_members()
-                .filter(|member| {
-                    profiles.iter().any(|profile| {
-                        profile.id == member.model_provider_profile_id
-                            && profile.status == ModelProviderProfileStatus::Enabled
-                    })
-                })
-                .count();
-            if served == 0 {
+            let models = vibex_core::provider_group_models(&route, &profiles);
+            if models.is_empty() {
                 continue;
             }
-            if route.is_provider_group() {
-                // A group is several models, so it publishes one entry per
-                // shared model. The model is part of the id because the group
-                // itself is not a model.
-                let models = vibex_core::provider_group_models(&route, &profiles);
-                if models.is_empty() {
-                    continue;
-                }
-                let model_count = models.len();
-                for model in models {
-                    catalog.push(GatewayCatalogModel {
-                        route_id: Some(route.id.as_str().to_string()),
-                        display_name: route.display_name.clone(),
-                        model: route.group_model_id(&model.model_id),
-                        kind: route.kind,
-                        source_count: model.provider_profile_ids.len(),
-                        model_count,
-                    });
-                }
-                continue;
+            let model_count = models.len();
+            for model in models {
+                catalog.push(GatewayCatalogModel {
+                    route_id: Some(route.id.as_str().to_string()),
+                    display_name: route.display_name.clone(),
+                    model: route.group_model_id(&model.model_id),
+                    kind: route.kind,
+                    source_count: model.provider_profile_ids.len(),
+                    model_count,
+                });
             }
-            catalog.push(GatewayCatalogModel {
-                route_id: Some(route.id.as_str().to_string()),
-                display_name: route.display_name.clone(),
-                model: route.model_id(),
-                kind: route.kind,
-                source_count: served,
-                model_count: route.distinct_models().len(),
-            });
         }
         Ok(catalog)
     }
 }
 
-/// One model the gateway serves: a route, or a single upstream.
+/// One model the gateway serves.
 ///
 /// The id an Agent asks for is `model`; `display_name` is what a picker groups
-/// it under. A route never carries a Provider name in `model`, because the
-/// Provider is the route's business, not the Agent's.
+/// it under. It never carries a Provider name, because the Provider is the
+/// group's business, not the Agent's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayCatalogModel {
-    /// Present for a route; absent for a legacy single-upstream entry.
+    /// The group this model belongs to.
     pub route_id: Option<String>,
     pub display_name: String,
     pub model: String,
@@ -536,8 +531,8 @@ pub struct GatewayCatalogModel {
 impl GatewayCatalogModel {
     /// The id an Agent's model list shows.
     ///
-    /// A route's id is already `route/<id>`; it must not gain a Provider
-    /// prefix, or the Agent would appear to have picked a vendor.
+    /// It is already `group/<id>/<model>`; it must not gain a Provider prefix,
+    /// or the Agent would appear to have picked a vendor.
     pub fn display_id(&self) -> String {
         self.model.clone()
     }
@@ -545,6 +540,59 @@ impl GatewayCatalogModel {
 
 /// The most models one Profile may carry.
 const MAX_GATEWAY_MODELS: usize = 512;
+
+/// Every Agent bound to at least one enabled group.
+///
+/// This is the gateway's whole Agent set: a binding is the only way onto it.
+fn agents_with_gateway_routes(conn: &vibex_db::DbConnection) -> VibexResult<BTreeSet<AgentId>> {
+    let routes = vibex_db::ModelRouteRepository::list_enabled(conn)?;
+    let mut agents = BTreeSet::new();
+    for binding in vibex_db::AgentModelRouteBindingRepository::list_all(conn)? {
+        if binding.deleted_at_ms.is_some() {
+            continue;
+        }
+        let served = routes
+            .iter()
+            .any(|route| route.id == binding.model_route_id && route.kind.via_gateway());
+        if served {
+            agents.insert(binding.agent_id);
+        }
+    }
+    Ok(agents)
+}
+
+/// Every Provider the enabled groups name, deduplicated.
+///
+/// This is the gateway's upstream set. It is read fresh rather than stored,
+/// which is what keeps the gateway from owning a Provider list.
+fn gateway_route_members_in(
+    conn: &vibex_db::DbConnection,
+) -> VibexResult<Vec<vibex_core::ModelProviderProfileId>> {
+    let mut members = Vec::new();
+    for route in vibex_db::ModelRouteRepository::list_enabled(conn)? {
+        if !route.kind.via_gateway() {
+            continue;
+        }
+        for member in route.enabled_members() {
+            if !members.contains(&member.model_provider_profile_id) {
+                members.push(member.model_provider_profile_id.clone());
+            }
+        }
+    }
+    Ok(members)
+}
+
+/// Whether a published model id belongs to one group.
+///
+/// A group publishes `group/<id>/<model>`, so membership is a prefix test on
+/// the group id followed by a non-empty model. The slash matters: without it
+/// `group/abc` would match `group/abcdef/model`.
+fn group_catalog_belongs_to(model: &str, route: &vibex_core::ModelRoute) -> bool {
+    let Some(parsed) = vibex_core::provider_group_model_ref(model) else {
+        return false;
+    };
+    parsed.group_id == route.id.as_str()
+}
 
 fn gateway_default_scope() -> vibex_core::ProviderProfileDefaultScope {
     vibex_core::ProviderProfileDefaultScope {
@@ -576,39 +624,6 @@ fn gateway_models(agent_id: &AgentId, catalog: &[String]) -> Vec<ProviderConfigu
             capabilities: ProviderModelCapabilities::default(),
         })
         .collect()
-}
-
-/// Fills in a route entry's capabilities from its members.
-///
-/// A route claims only what every member can do: the smallest context window,
-/// and the intersection of the boolean features. Without this the Agent would
-/// be told a route supports images because one member does, and then have the
-/// request routed to a member that does not.
-pub(crate) fn route_capabilities(
-    conn: &vibex_db::DbConnection,
-    profiles: &[vibex_core::ModelProviderProfile],
-    route: &vibex_core::ModelRoute,
-) -> vibex_core::ProviderModelCapabilities {
-    let caps = route
-        .enabled_members()
-        .filter_map(|member| {
-            let profile = profiles
-                .iter()
-                .find(|profile| profile.id == member.model_provider_profile_id)?;
-            profile
-                .configured_models
-                .iter()
-                .find(|model| model.id == member.model_id)
-                .map(|model| model.capabilities.clone())
-        })
-        .collect::<Vec<_>>();
-    let _ = conn;
-    let merged = vibex_core::intersect_route_capabilities(caps);
-    // An explicit route window overrides the smallest-member rule.
-    vibex_core::ProviderModelCapabilities {
-        context_tokens: route.context_tokens.or(merged.context_tokens),
-        ..merged
-    }
 }
 
 /// The protocol an Agent should keep speaking after it is pointed at the
@@ -750,6 +765,70 @@ mod tests {
         set_gateway_switch(service, false);
     }
 
+    /// A shared Provider with one model, for a group to name.
+    fn provider(service: &ProviderConfigService, name: &str) -> vibex_core::ModelProviderProfileId {
+        service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: name.to_string(),
+                vendor_hint: None,
+                endpoints: Vec::new(),
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
+                    id: "deepseek-chat".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities: Default::default(),
+                }],
+                default_model_id: Some("deepseek-chat".to_string()),
+                headers: Vec::new(),
+                status: vibex_core::ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap()
+            .id
+    }
+
+    /// A group over the given Providers, bound to the given Agents.
+    fn group_for(
+        service: &ProviderConfigService,
+        name: &str,
+        providers: Vec<vibex_core::ModelProviderProfileId>,
+        agents: &[&str],
+    ) -> vibex_core::ModelRouteId {
+        let route = service
+            .create_model_route(vibex_core::ModelRoute {
+                display_name: name.to_string(),
+                kind: vibex_core::RouteKind::ProviderGroup,
+                status: vibex_core::RouteStatus::Enabled,
+                members: providers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, provider)| {
+                        vibex_core::ModelRouteMember::provider(provider, index as i64)
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+        for agent_id in agents {
+            service
+                .bind_model_route(&agent(agent_id), &route.id, false)
+                .unwrap();
+        }
+        route.id
+    }
+
+    /// The catalogue a listener would publish, as display ids.
+    fn catalog(service: &ProviderConfigService) -> Vec<String> {
+        service
+            .gateway_model_catalog()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.display_id())
+            .collect()
+    }
+
     /// Replacing a Key's secret revives it; clearing the secret does not.
     ///
     /// An authentication failure has no expiry, so the only way back for a
@@ -824,43 +903,82 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// Enabling the gateway attaches every capable Agent at once.
+    /// No binding means no Profile: the gateway serves nobody until an Agent is
+    /// bound to a group.
     #[test]
-    fn enabling_attaches_every_capable_agent() {
+    fn an_agent_without_a_group_binding_is_not_attached() {
         let (path, service) = service();
         enable_gateway(&service);
+        provider(&service, "DeepSeek");
+
         let attached = service
-            .attach_gateway_to_agents(
-                "http://127.0.0.1:3425",
-                &["deepseek/deepseek-chat".to_string()],
-            )
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &catalog(&service))
             .unwrap();
-        assert!(!attached.is_empty(), "at least one Agent must be attached");
+        assert!(
+            attached.is_empty(),
+            "an installation with no group binding must attach nothing"
+        );
+        assert!(service.gateway_agents().unwrap().is_empty());
+        assert!(service.gateway_active_agents().unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A binding is what puts an Agent on the gateway, and the Profile carries
+    /// only that Agent's groups.
+    #[test]
+    fn a_binding_attaches_only_its_own_agent_with_only_its_own_groups() {
+        let (path, service) = service();
+        enable_gateway(&service);
+        let deepseek = provider(&service, "DeepSeek");
+        let kimi = provider(&service, "Kimi");
+        let claude_group = group_for(&service, "Claude group", vec![deepseek], &["claude"]);
+        let codex_group = group_for(&service, "Codex group", vec![kimi], &["codex"]);
+
+        let attached = service
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &catalog(&service))
+            .unwrap();
+        assert!(attached.contains(&agent("claude")));
+        assert!(attached.contains(&agent("codex")));
+        assert!(
+            !attached.contains(&agent("deepseek-harness")),
+            "an unbound Agent must not be attached"
+        );
 
         let conn = test_connection(&path).unwrap();
-        for agent_id in &attached {
-            let profile = gateway_profile_for(&conn, agent_id).unwrap().unwrap();
-            assert_eq!(profile.base_url.as_deref(), Some("http://127.0.0.1:3425"));
-            assert!(is_gateway_profile(&profile));
-            assert_eq!(
-                profile
-                    .configured_models
-                    .first()
-                    .map(|model| model.id.as_str()),
-                Some("deepseek/deepseek-chat")
-            );
-            assert_eq!(
-                default_profile_for(&conn, agent_id).unwrap(),
-                Some(profile.id.clone()),
-                "the gateway Profile is the Agent's default"
-            );
-        }
+        let claude_profile = gateway_profile_for(&conn, &agent("claude"))
+            .unwrap()
+            .unwrap();
+        let models = claude_profile
+            .configured_models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            models,
+            vec![format!("group/{}/deepseek-chat", claude_group.as_str()).as_str()],
+            "a Profile carries only the groups its Agent is bound to"
+        );
+        assert!(
+            !models
+                .iter()
+                .any(|model| model.contains(codex_group.as_str())),
+            "another Agent's group must not leak in"
+        );
+        assert_eq!(
+            claude_profile.base_url.as_deref(),
+            Some("http://127.0.0.1:3425")
+        );
+        assert_eq!(
+            default_profile_for(&conn, &agent("claude")).unwrap(),
+            Some(claude_profile.id.clone()),
+            "the gateway Profile is the bound Agent's default"
+        );
         drop(conn);
 
         // A hidden Profile must not appear in the Agent's visible provider list.
         let visible = service
             .list_agent_model_provider_profiles(vibex_core::AgentModelProviderProfileListRequest {
-                agent_id: attached[0].clone(),
+                agent_id: agent("claude"),
                 include_disabled: true,
             })
             .unwrap();
@@ -873,39 +991,155 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Binding a second group grows the same Profile rather than making a new
+    /// one, and the Agent may hold several.
+    #[test]
+    fn binding_a_second_group_adds_it_to_the_same_profile() {
+        let (path, service) = service();
+        enable_gateway(&service);
+        let deepseek = provider(&service, "DeepSeek");
+        let kimi = provider(&service, "Kimi");
+        group_for(&service, "First", vec![deepseek], &["claude"]);
+        service
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &catalog(&service))
+            .unwrap();
+        let conn = test_connection(&path).unwrap();
+        let first = gateway_profile_for(&conn, &agent("claude"))
+            .unwrap()
+            .unwrap();
+        drop(conn);
+
+        group_for(&service, "Second", vec![kimi], &["claude"]);
+        service
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &catalog(&service))
+            .unwrap();
+        let conn = test_connection(&path).unwrap();
+        let second = gateway_profile_for(&conn, &agent("claude"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.id, second.id, "one hidden Profile per Agent");
+        assert_eq!(
+            second.configured_models.len(),
+            2,
+            "both bound groups are listed"
+        );
+        assert_eq!(
+            service
+                .list_agent_model_routes(&agent("claude"))
+                .unwrap()
+                .len(),
+            2
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Unbinding an Agent's last group removes its Profile, so it falls back to
+    /// its direct Provider instead of pointing at a gateway that no longer
+    /// serves it.
+    #[test]
+    fn unbinding_the_last_group_removes_the_profile() {
+        let (path, service) = service();
+        enable_gateway(&service);
+        let deepseek = provider(&service, "DeepSeek");
+        let route = group_for(&service, "Only", vec![deepseek], &["claude"]);
+        service
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &catalog(&service))
+            .unwrap();
+        let conn = test_connection(&path).unwrap();
+        assert!(
+            gateway_profile_for(&conn, &agent("claude"))
+                .unwrap()
+                .is_some()
+        );
+        drop(conn);
+
+        service
+            .unbind_model_route(&agent("claude"), &route)
+            .unwrap();
+        let attached = service
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &catalog(&service))
+            .unwrap();
+        assert_eq!(attached, vec![agent("claude")]);
+        assert!(service.gateway_active_agents().unwrap().is_empty());
+        let conn = test_connection(&path).unwrap();
+        assert_eq!(default_profile_for(&conn, &agent("claude")).unwrap(), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Disabling a group unpublishes it, and the bound Agent loses its Profile
+    /// entry rather than keeping a model the gateway will refuse.
+    #[test]
+    fn a_disabled_group_leaves_the_agents_profile() {
+        let (path, service) = service();
+        enable_gateway(&service);
+        let deepseek = provider(&service, "DeepSeek");
+        let route_id = group_for(&service, "Team", vec![deepseek], &["claude"]);
+        service
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &catalog(&service))
+            .unwrap();
+
+        let mut route = service.get_model_route(&route_id).unwrap().unwrap();
+        route.status = vibex_core::RouteStatus::Disabled;
+        let revision = route.revision;
+        service.update_model_route(route, revision).unwrap();
+
+        assert!(
+            catalog(&service).is_empty(),
+            "a disabled group offers no model"
+        );
+        service
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &catalog(&service))
+            .unwrap();
+        assert!(service.gateway_active_agents().unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
     /// A second attach updates the same hidden Profile and address.
     #[test]
     fn attaching_twice_updates_the_same_profiles() {
         let (path, service) = service();
         enable_gateway(&service);
+        provider(&service, "DeepSeek");
+        group_for(
+            &service,
+            "Team",
+            vec![provider(&service, "Kimi")],
+            &["codex"],
+        );
         service
-            .attach_gateway_to_agents("http://127.0.0.1:3425", &[])
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &catalog(&service))
             .unwrap();
         let agent_id = agent("codex");
         let first = gateway_profile_for(&test_connection(&path).unwrap(), &agent_id)
             .unwrap()
             .unwrap();
         service
-            .attach_gateway_to_agents("http://127.0.0.1:3426", &["a/b".to_string()])
+            .attach_gateway_to_agents("http://127.0.0.1:3426", &catalog(&service))
             .unwrap();
         let second = gateway_profile_for(&test_connection(&path).unwrap(), &agent_id)
             .unwrap()
             .unwrap();
         assert_eq!(first.id, second.id);
         assert_eq!(second.base_url.as_deref(), Some("http://127.0.0.1:3426"));
-        assert_eq!(second.configured_models.len(), 1);
         let _ = std::fs::remove_file(path);
     }
 
-    /// Detaching removes every hidden Profile, and the intent follows the switch.
+    /// Detaching removes every hidden Profile.
     #[test]
     fn detaching_removes_every_hidden_profile() {
         let (path, service) = service();
         enable_gateway(&service);
+        provider(&service, "DeepSeek");
+        group_for(
+            &service,
+            "Team",
+            vec![provider(&service, "Kimi")],
+            &["codex", "claude"],
+        );
         service
-            .attach_gateway_to_agents("http://127.0.0.1:3425", &[])
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &catalog(&service))
             .unwrap();
-        assert!(!service.gateway_agents().unwrap().is_empty());
+        assert!(!service.gateway_active_agents().unwrap().is_empty());
 
         service.detach_gateway_from_agents().unwrap();
         assert!(service.gateway_active_agents().unwrap().is_empty());
@@ -919,37 +1153,55 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// The gateway's intent is global: off means no Agent reports using it.
+    /// The gateway's intent is global: off means no Agent reports using it, and
+    /// the bindings alone decide who is on it when it is on.
     #[test]
     fn the_gateway_intent_follows_the_global_switch() {
         let (path, service) = service();
-        // A fresh installation ships with the gateway on, so the switch has to
-        // be turned off explicitly before the "off" answer means anything.
+        provider(&service, "DeepSeek");
+        group_for(
+            &service,
+            "Team",
+            vec![provider(&service, "Kimi")],
+            &["codex"],
+        );
+
         disable_gateway(&service);
         assert!(
             service.gateway_agents().unwrap().is_empty(),
             "a disabled gateway serves no Agent"
         );
         enable_gateway(&service);
-        assert!(
-            !service.gateway_agents().unwrap().is_empty(),
-            "an enabled gateway serves every capable Agent"
+        assert_eq!(
+            service
+                .gateway_agents()
+                .unwrap()
+                .into_iter()
+                .map(|agent| agent.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["codex".to_string()],
+            "only the bound Agent is served"
         );
         disable_gateway(&service);
         assert!(service.gateway_agents().unwrap().is_empty());
         let _ = std::fs::remove_file(path);
     }
 
-    /// A stopped listener removes the Profiles while the intent stays on.
+    /// A stopped listener removes the Profiles while the bindings stay, so a
+    /// working listener restores them without asking again.
     #[test]
-    fn a_stopped_gateway_removes_profiles_but_keeps_the_switch() {
+    fn a_stopped_gateway_removes_profiles_but_keeps_the_bindings() {
         let (path, service) = service();
         enable_gateway(&service);
+        provider(&service, "DeepSeek");
+        group_for(
+            &service,
+            "Team",
+            vec![provider(&service, "Kimi")],
+            &["codex"],
+        );
         service
-            .attach_gateway_to_agents(
-                "http://127.0.0.1:3425",
-                &["deepseek/deepseek-chat".to_string()],
-            )
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &catalog(&service))
             .unwrap();
         let agent_id = agent("codex");
         let conn = test_connection(&path).unwrap();
@@ -959,18 +1211,14 @@ mod tests {
         let deactivated = service.deactivate_gateway_profiles().unwrap();
         assert!(deactivated.contains(&agent_id));
         assert!(service.gateway_active_agents().unwrap().is_empty());
-        // The switch is still on, so a working listener restores the Profiles
-        // without asking the user again.
+        // The binding is still there, so a working listener restores it.
         assert!(!service.gateway_agents().unwrap().is_empty());
         let conn = test_connection(&path).unwrap();
         assert_eq!(default_profile_for(&conn, &agent_id).unwrap(), None);
         drop(conn);
 
         service
-            .refresh_gateway_profiles(
-                "http://127.0.0.1:3426",
-                &["deepseek/deepseek-chat".to_string()],
-            )
+            .refresh_gateway_profiles("http://127.0.0.1:3426", &catalog(&service))
             .unwrap();
         assert!(service.gateway_active_agents().unwrap().contains(&agent_id));
         let conn = test_connection(&path).unwrap();
@@ -980,13 +1228,21 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// An Agent that owns its provider is never attached.
+    /// An Agent that owns its provider is never attached, even when a group
+    /// names it.
     #[test]
     fn an_agent_that_owns_its_provider_is_never_attached() {
         let (path, service) = service();
         enable_gateway(&service);
+        provider(&service, "DeepSeek");
+        group_for(
+            &service,
+            "Team",
+            vec![provider(&service, "Kimi")],
+            &["cursor"],
+        );
         service
-            .attach_gateway_to_agents("http://127.0.0.1:3425", &[])
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &catalog(&service))
             .unwrap();
         assert!(
             !service
@@ -1013,11 +1269,18 @@ mod tests {
         let (path, service) = service();
         let agent_id = agent("codex");
         enable_gateway(&service);
+        provider(&service, "DeepSeek");
+        group_for(
+            &service,
+            "Team",
+            vec![provider(&service, "Kimi")],
+            &["codex"],
+        );
         service
-            .attach_gateway_to_agents("http://127.0.0.1:3425", &[])
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &catalog(&service))
             .unwrap();
         let refreshed = service
-            .refresh_gateway_profiles("http://127.0.0.1:3426", &["x/y".to_string()])
+            .refresh_gateway_profiles("http://127.0.0.1:3426", &catalog(&service))
             .unwrap();
         assert!(refreshed.contains(&agent_id));
         let profile = gateway_profile_for(&test_connection(&path).unwrap(), &agent_id)
@@ -1028,7 +1291,7 @@ mod tests {
         // the projection fingerprint.
         assert!(
             service
-                .refresh_gateway_profiles("http://127.0.0.1:3426", &["x/y".to_string()])
+                .refresh_gateway_profiles("http://127.0.0.1:3426", &catalog(&service))
                 .unwrap()
                 .is_empty()
         );
@@ -1046,33 +1309,8 @@ mod tests {
     fn a_bound_group_appears_in_the_agents_profile_only_after_republishing() {
         let (path, service) = service();
         enable_gateway(&service);
-        let deepseek = service
-            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
-                display_name: "DeepSeek".to_string(),
-                vendor_hint: None,
-                endpoints: Vec::new(),
-                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
-                credentials: Vec::new(),
-                configured_models: vec![vibex_core::ModelProviderCatalogEntry {
-                    id: "deepseek-chat".to_string(),
-                    display_name: None,
-                    enabled: true,
-                    metadata: Vec::new(),
-                    capabilities: Default::default(),
-                }],
-                default_model_id: Some("deepseek-chat".to_string()),
-                headers: Vec::new(),
-                status: ModelProviderProfileStatus::Enabled,
-            })
-            .unwrap()
-            .id;
-
-        // An Agent already routed through the gateway, with the pre-group
-        // catalogue published.
+        let deepseek = provider(&service, "DeepSeek");
         let agent_id = agent("claude");
-        service
-            .attach_gateway_to_agents("http://127.0.0.1:3425", &[])
-            .unwrap();
 
         let group = service
             .create_model_route(vibex_core::ModelRoute {
@@ -1083,48 +1321,39 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+
+        // The group is in the catalogue the gateway would serve...
+        let published = catalog(&service);
+        assert_eq!(
+            published,
+            vec![format!("group/{}/deepseek-chat", group.id.as_str())]
+        );
+
+        // ...but until it is bound and republished, the Agent has no Profile at
+        // all, which is exactly what made the picker look empty.
+        service
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &published)
+            .unwrap();
+        assert!(
+            gateway_profile_for(&test_connection(&path).unwrap(), &agent_id)
+                .unwrap()
+                .is_none(),
+            "an unbound Agent has no gateway Profile"
+        );
+
+        // Binding is what grants the model.
         service
             .bind_model_route(&agent_id, &group.id, false)
             .unwrap();
-
-        // The group is in the catalogue the gateway would serve...
-        let catalog = service.gateway_model_catalog().unwrap();
-        let group_entry = catalog
-            .iter()
-            .find(|entry| entry.display_name == "Team")
-            .expect("the group is published by the gateway");
-        assert_eq!(
-            group_entry.model,
-            format!("group/{}/deepseek-chat", group.id.as_str())
-        );
-
-        // ...but until the catalogue is republished, the Agent's Profile does
-        // not list it, which is exactly what made the picker look empty.
-        let conn = test_connection(&path).unwrap();
-        let profile_id = default_profile_for(&conn, &agent_id).unwrap().unwrap();
-        let before = service.get_profile(&profile_id).unwrap().unwrap();
-        assert!(
-            before
-                .configured_models
-                .iter()
-                .all(|model| !model.id.starts_with("group/")),
-            "the stale Profile predates the group"
-        );
-
-        // Republishing is the step a route write now performs.
-        let catalog = service
-            .gateway_model_catalog()
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.display_id())
-            .collect::<Vec<_>>();
         let refreshed = service
-            .refresh_gateway_profiles("http://127.0.0.1:3425", &catalog)
+            .refresh_gateway_profiles("http://127.0.0.1:3425", &catalog(&service))
             .unwrap();
         assert!(
             refreshed.contains(&agent_id),
             "the refresh must report the Agent it changed, not silently skip it"
         );
+        let conn = test_connection(&path).unwrap();
+        let profile_id = default_profile_for(&conn, &agent_id).unwrap().unwrap();
         let after = service.get_profile(&profile_id).unwrap().unwrap();
         assert!(
             after
@@ -1149,9 +1378,10 @@ mod tests {
         let (path, service) = service();
         enable_gateway(&service);
         let agent_id = agent("deepseek-harness");
-
+        let deepseek = provider(&service, "DeepSeek");
+        let first = group_for(&service, "First", vec![deepseek], &["deepseek-harness"]);
         service
-            .attach_gateway_to_agents("http://127.0.0.1:3425", &["route/first".to_string()])
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &catalog(&service))
             .unwrap();
         let conn = test_connection(&path).unwrap();
         let profile_id = default_profile_for(&conn, &agent_id)
@@ -1165,16 +1395,15 @@ mod tests {
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["route/first"],
+            vec![format!("group/{}/deepseek-chat", first.as_str()).as_str()],
             "the gateway Profile starts with what was published"
         );
 
-        // A group arrives, so the catalogue changes.
+        // A second group arrives, so the catalogue changes.
+        let kimi = provider(&service, "Kimi");
+        group_for(&service, "Second", vec![kimi], &["deepseek-harness"]);
         let refreshed = service
-            .refresh_gateway_profiles(
-                "http://127.0.0.1:3425",
-                &["route/first".to_string(), "group/g1/m".to_string()],
-            )
+            .refresh_gateway_profiles("http://127.0.0.1:3425", &catalog(&service))
             .unwrap();
         assert!(
             refreshed.contains(&agent_id),
@@ -1182,13 +1411,9 @@ mod tests {
         );
         let after = service.get_profile(&profile_id).unwrap().unwrap();
         assert_eq!(
-            after
-                .configured_models
-                .iter()
-                .map(|model| model.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["route/first", "group/g1/m"],
-            "the Profile now lists the group's model"
+            after.configured_models.len(),
+            2,
+            "the Profile now lists both groups' models"
         );
         let _ = std::fs::remove_file(path);
     }
@@ -1287,13 +1512,30 @@ mod fingerprint_tests {
         let agent_id = vibex_core::AgentId::parse("codex").unwrap();
         let shared = upstream(&service, "DeepSeek");
 
-        // Point the Agent at the gateway.
+        // Point the Agent at the gateway through a group over that Provider.
         enable_gateway(&service);
         service
-            .attach_gateway_to_agents(
-                "http://127.0.0.1:3425",
-                &["deepseek/deepseek-chat".to_string()],
-            )
+            .create_model_route(vibex_core::ModelRoute {
+                display_name: "Team".to_string(),
+                kind: vibex_core::RouteKind::ProviderGroup,
+                status: vibex_core::RouteStatus::Enabled,
+                members: vec![vibex_core::ModelRouteMember::provider(shared.clone(), 0)],
+                ..Default::default()
+            })
+            .map(|route| {
+                service
+                    .bind_model_route(&agent_id, &route.id, false)
+                    .unwrap()
+            })
+            .unwrap();
+        let catalog = service
+            .gateway_model_catalog()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.display_id())
+            .collect::<Vec<_>>();
+        service
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &catalog)
             .unwrap();
         let agent_profile = gateway_profile_for(&test_connection(&path).unwrap(), &agent_id)
             .unwrap()
@@ -1351,7 +1593,12 @@ mod fingerprint_tests {
         service
             .attach_gateway_to_agents(
                 "http://127.0.0.1:3426",
-                &["deepseek/deepseek-chat".to_string()],
+                &service
+                    .gateway_model_catalog()
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| entry.display_id())
+                    .collect::<Vec<_>>(),
             )
             .unwrap();
         let moved = service

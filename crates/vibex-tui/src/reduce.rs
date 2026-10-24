@@ -1860,49 +1860,6 @@ impl App {
                     }],
                 )
             }
-            (ConfigSection::Providers, ConfigAction::Routing) if key == "gateway" => {
-                let Some(snapshot) = self.management_data.gateway.as_ref() else {
-                    return Outcome::quiet();
-                };
-                let strategies = vibex_core::GatewayRoutingStrategy::ALL;
-                let current = snapshot.settings.policy.routing;
-                let next = strategies
-                    .iter()
-                    .position(|strategy| *strategy == current)
-                    .map(|index| strategies[(index + 1) % strategies.len()])
-                    .unwrap_or(vibex_core::GatewayRoutingStrategy::Ordered);
-                self.begin_record_work(
-                    "gateway".to_string(),
-                    self.config_row_subject("gateway"),
-                    crate::config_center::ConfigVerb::Activate,
-                    vec![Effect::SetGatewayPolicy {
-                        routing: Some(next),
-                        pin: None,
-                        token_limit: None,
-                    }],
-                )
-            }
-            (ConfigSection::Providers, ConfigAction::Pin) if key == "gateway" => {
-                let Some(snapshot) = self.management_data.gateway.as_ref() else {
-                    return Outcome::quiet();
-                };
-                let pin =
-                    if snapshot.settings.policy.pin == vibex_core::GatewayPinScope::Conversation {
-                        vibex_core::GatewayPinScope::Off
-                    } else {
-                        vibex_core::GatewayPinScope::Conversation
-                    };
-                self.begin_record_work(
-                    "gateway".to_string(),
-                    self.config_row_subject("gateway"),
-                    crate::config_center::ConfigVerb::Activate,
-                    vec![Effect::SetGatewayPolicy {
-                        routing: None,
-                        pin: Some(pin),
-                        token_limit: None,
-                    }],
-                )
-            }
             (ConfigSection::Providers, ConfigAction::Requests) if key == "gateway" => self
                 .begin_record_work(
                     "gateway".to_string(),
@@ -5618,8 +5575,6 @@ impl App {
                     self.config_row_subject("gateway"),
                     crate::config_center::ConfigVerb::Save,
                     vec![Effect::SetGatewayPolicy {
-                        routing: None,
-                        pin: None,
                         token_limit: Some(limit),
                     }],
                 )

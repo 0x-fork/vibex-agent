@@ -13,7 +13,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use vibex_core::{
-    AgentId, GatewayConversationPin, GatewayFailureKind, GatewayRequestOutcome, GatewayRouteTrace,
+    GatewayConversationPin, GatewayFailureKind, GatewayRequestOutcome, GatewayRouteTrace,
     GatewayTokenWindow, GatewayTokenWindowUsage, ModelGatewayRequestLog, ModelGatewaySettings,
     ModelProviderAccountState, ModelProviderProfileId, RequestId, VibexError, VibexResult,
     unix_timestamp_ms,
@@ -49,7 +49,10 @@ impl ModelGatewaySettingsRepository {
                 SETTINGS_ID,
                 settings.display_name,
                 i64::from(settings.port),
-                encode_upstreams(&settings.upstreams)?,
+                // Retained for schema compatibility only: the gateway owns no
+                // upstream list any more, and this column is always written
+                // empty. Routes are its only input.
+                "[]",
                 encode_json("model_gateway_policy_encode_failed", &settings.policy)?,
                 settings.revision,
                 settings.updated_at_ms,
@@ -72,7 +75,7 @@ impl ModelGatewaySettingsRepository {
         let row = conn
             .query_row(
                 "
-                SELECT display_name, port, upstreams_json, policy_json,
+                SELECT display_name, port, policy_json,
                        revision, updated_at_ms
                 FROM model_gateway_settings
                 WHERE settings_id = ?1
@@ -83,9 +86,8 @@ impl ModelGatewaySettingsRepository {
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(3)?,
                         row.get::<_, i64>(4)?,
-                        row.get::<_, i64>(5)?,
                     ))
                 },
             )
@@ -94,7 +96,7 @@ impl ModelGatewaySettingsRepository {
                 "model_gateway_settings_read_failed",
                 "failed to read gateway settings",
             ))?;
-        let Some((display_name, port, upstreams, policy, revision, updated_at_ms)) = row else {
+        let Some((display_name, port, policy, revision, updated_at_ms)) = row else {
             return Ok(None);
         };
         let settings = ModelGatewaySettings {
@@ -105,7 +107,6 @@ impl ModelGatewaySettingsRepository {
                     "gateway settings hold an out-of-range port",
                 )
             })?,
-            upstreams: decode_upstreams(&upstreams)?,
             policy: decode_json("model_gateway_settings_invalid", &policy)?,
             revision,
             updated_at_ms,
@@ -139,16 +140,15 @@ impl ModelGatewaySettingsRepository {
                 UPDATE model_gateway_settings
                 SET display_name = ?1,
                     port = ?2,
-                    upstreams_json = ?3,
-                    policy_json = ?4,
-                    revision = ?5,
-                    updated_at_ms = ?6
-                WHERE settings_id = ?7 AND revision = ?8
+                    upstreams_json = '[]',
+                    policy_json = ?3,
+                    revision = ?4,
+                    updated_at_ms = ?5
+                WHERE settings_id = ?6 AND revision = ?7
                 ",
                 params![
                     settings.display_name,
                     i64::from(settings.port),
-                    encode_upstreams(&settings.upstreams)?,
                     encode_json("model_gateway_policy_encode_failed", &settings.policy)?,
                     settings.revision,
                     updated_at_ms,
@@ -187,77 +187,6 @@ impl ModelGatewaySettingsRepository {
         .map_err(storage_err(
             "model_gateway_port_store_failed",
             "failed to persist the gateway port",
-        ))?;
-        Ok(())
-    }
-}
-
-/// Which Agents the user has switched to the gateway.
-///
-/// This is the *desired* set, not the currently projected one. When the listener
-/// is down its hidden Profiles are removed so the Agents fall back to a direct
-/// Provider; the rows here survive, so bringing the listener back re-points the
-/// same Agents without asking the user again.
-pub struct ModelGatewayAgentRepository;
-
-impl ModelGatewayAgentRepository {
-    pub fn list(conn: &Connection) -> VibexResult<Vec<AgentId>> {
-        let mut stmt = conn
-            .prepare(
-                "
-                SELECT agent_id
-                FROM model_gateway_agents
-                WHERE enabled = 1
-                ORDER BY agent_id
-                ",
-            )
-            .map_err(storage_err(
-                "model_gateway_agent_list_failed",
-                "failed to list the gateway Agents",
-            ))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(storage_err(
-                "model_gateway_agent_list_failed",
-                "failed to list the gateway Agents",
-            ))?;
-        let mut agents = Vec::new();
-        for row in rows {
-            let value = row.map_err(storage_err(
-                "model_gateway_agent_list_failed",
-                "failed to list the gateway Agents",
-            ))?;
-            agents.push(AgentId::parse(value)?);
-        }
-        Ok(agents)
-    }
-
-    pub fn set(conn: &Connection, agent_id: &AgentId, enabled: bool) -> VibexResult<()> {
-        conn.execute(
-            "
-            INSERT INTO model_gateway_agents (agent_id, enabled, updated_at_ms)
-            VALUES (?1, ?2, ?3)
-            ON CONFLICT(agent_id) DO UPDATE SET
-                enabled = excluded.enabled,
-                updated_at_ms = excluded.updated_at_ms
-            ",
-            params![agent_id.as_str(), i64::from(enabled), unix_timestamp_ms()],
-        )
-        .map_err(storage_err(
-            "model_gateway_agent_write_failed",
-            "failed to remember the gateway Agent",
-        ))?;
-        Ok(())
-    }
-
-    pub fn remove(conn: &Connection, agent_id: &AgentId) -> VibexResult<()> {
-        conn.execute(
-            "DELETE FROM model_gateway_agents WHERE agent_id = ?1",
-            params![agent_id.as_str()],
-        )
-        .map_err(storage_err(
-            "model_gateway_agent_write_failed",
-            "failed to forget the gateway Agent",
         ))?;
         Ok(())
     }
@@ -975,30 +904,108 @@ pub(crate) fn migrate_gateway_agents(
     Ok(())
 }
 
-fn encode_upstreams(upstreams: &[ModelProviderProfileId]) -> VibexResult<String> {
-    let values = upstreams
-        .iter()
-        .map(ModelProviderProfileId::as_str)
-        .collect::<Vec<_>>();
-    serde_json::to_string(&values).map_err(|_| {
-        VibexError::storage(
-            "model_gateway_upstream_encode_failed",
-            "failed to encode the gateway upstream list",
+/// Retires the two inputs the gateway used to configure itself with.
+///
+/// The gateway is now a transport for route groups: it holds no Provider list
+/// and no per-Agent switch. Both had to go, not merely stop being read —
+/// leaving the rows behind would let a later reader believe they still mean
+/// something.
+///
+/// - `model_gateway_settings.upstreams_json` is cleared. The column stays for
+///   schema compatibility with older binaries, but nothing writes it again.
+/// - Every `kind = 'gateway'` route is soft-deleted along with its bindings.
+///   That shape existed only to express the global upstream list as one
+///   callable route; with the list gone it has no members to describe and no
+///   way to be re-created.
+/// - `model_gateway_agents` is dropped. An Agent reaches the gateway by binding
+///   a route group, which is the one switch and lives with the route.
+pub(crate) fn migrate_retire_gateway_inputs(
+    conn: &mut DbConnection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 77;
+    const NAME: &str = "retire_gateway_inputs";
+    if crate::migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start the gateway inputs retirement transaction",
+    ))?;
+    let now = unix_timestamp_ms().max(1);
+    tx.execute(
+        "UPDATE model_gateway_settings SET upstreams_json = '[]'",
+        [],
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to clear the gateway upstream list",
+    ))?;
+    // Soft-delete the plain gateway routes first, so their bindings can be
+    // retired by route id rather than by a join the next statement would have
+    // to repeat.
+    let retired: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT model_route_id FROM model_routes WHERE kind = 'gateway'")
+            .map_err(storage_err(
+                "migration_apply_failed",
+                "failed to read the retired gateway routes",
+            ))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage_err(
+                "migration_apply_failed",
+                "failed to read the retired gateway routes",
+            ))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row.map_err(storage_err(
+                "migration_apply_failed",
+                "failed to read a retired gateway route",
+            ))?);
+        }
+        ids
+    };
+    tx.execute(
+        "UPDATE model_routes SET deleted_at_ms = COALESCE(deleted_at_ms, ?1), updated_at_ms = ?1 \
+         WHERE kind = 'gateway'",
+        params![now],
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to retire the gateway routes",
+    ))?;
+    for route_id in &retired {
+        tx.execute(
+            "UPDATE agent_model_route_bindings \
+             SET deleted_at_ms = COALESCE(deleted_at_ms, ?2), updated_at_ms = ?2, is_default = 0 \
+             WHERE model_route_id = ?1",
+            params![route_id, now],
         )
-    })
-}
-
-fn decode_upstreams(encoded: &str) -> VibexResult<Vec<ModelProviderProfileId>> {
-    let values: Vec<String> = serde_json::from_str(encoded).map_err(|_| {
-        VibexError::storage(
-            "model_gateway_settings_invalid",
-            "gateway settings hold an invalid upstream list",
-        )
-    })?;
-    values
-        .into_iter()
-        .map(ModelProviderProfileId::parse)
-        .collect()
+        .map_err(storage_err(
+            "migration_apply_failed",
+            "failed to retire a gateway route binding",
+        ))?;
+    }
+    tx.execute_batch("DROP TABLE IF EXISTS model_gateway_agents;")
+        .map_err(storage_err(
+            "migration_apply_failed",
+            "failed to drop the gateway Agent table",
+        ))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, now],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the gateway inputs retirement",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to commit the gateway inputs retirement",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }
 
 fn encode_json<T: serde::Serialize>(code: &'static str, value: &T) -> VibexResult<String> {
@@ -1074,6 +1081,49 @@ mod tests {
         profile.id
     }
 
+    /// The retirement migration clears the two inputs the gateway used to
+    /// configure itself with.
+    ///
+    /// It has to do more than stop reading them: a leftover upstream list or a
+    /// per-Agent row would let a later reader believe they still mean
+    /// something.
+    #[test]
+    fn migration_77_retires_the_gateway_inputs() {
+        let (path, mut conn) = database();
+        assert!(crate::migration_applied(&conn, 77).unwrap());
+        // A fresh home has no gateway row until something reads it.
+        ModelGatewaySettingsRepository::get_or_create(&conn).unwrap();
+
+        // The column survives for compatibility, but holds nothing.
+        let stored: String = conn
+            .query_row(
+                "SELECT upstreams_json FROM model_gateway_settings WHERE settings_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "[]", "the upstream list must be cleared");
+
+        // The per-Agent switch table is gone, not merely unused.
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'model_gateway_agents'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 0, "the per-Agent gateway table must be dropped");
+
+        // Re-applying changes nothing.
+        let applied = apply_migrations(&mut conn).unwrap();
+        assert!(
+            !applied.iter().any(|entry| entry.starts_with("77:")),
+            "the retirement migration must not run twice"
+        );
+        cleanup(path);
+    }
+
     #[test]
     fn migration_64_creates_gateway_tables_and_is_idempotent() {
         let (path, mut conn) = database();
@@ -1093,7 +1143,6 @@ mod tests {
         );
         let settings = ModelGatewaySettingsRepository::get_or_create(&conn).unwrap();
         assert_eq!(settings.port, 0);
-        assert!(!settings.upstreams.is_empty() || settings.upstreams.is_empty());
         cleanup(path);
     }
 
@@ -1101,16 +1150,12 @@ mod tests {
     fn settings_round_trip_and_reject_stale_revisions() {
         let (path, conn) = database();
         let settings = ModelGatewaySettingsRepository::get_or_create(&conn).unwrap();
-        let upstream = profile(&conn);
         let mut next = settings.clone();
         next.revision = settings.revision + 1;
-        next.upstreams = vec![upstream.clone()];
         next.port = 3425;
-        next.policy.routing = vibex_core::GatewayRoutingStrategy::RoundRobin;
         let stored =
             ModelGatewaySettingsRepository::update(&conn, &next, settings.revision).unwrap();
         assert_eq!(stored.port, 3425);
-        assert_eq!(stored.upstreams, vec![upstream]);
 
         // A caller that read the row before the update tries to advance from
         // the revision it observed. Its replacement has the right shape, so

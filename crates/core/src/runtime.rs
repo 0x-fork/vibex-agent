@@ -762,16 +762,20 @@ impl SessionRuntimeSelection {
         }
     }
 
-    /// A selection that runs through a route.
+    /// A selection that runs through a route group.
     ///
-    /// The model field carries the route's own id, because a route is one
-    /// selectable model: the members are what the gateway chooses between, and
-    /// that choice must not move the session.
+    /// The model field carries the group's prefix, because a group publishes
+    /// `group/<id>/<model>` ids: the Provider is what the gateway chooses
+    /// between, and that choice must not move the session.
     pub fn model_route(agent_id: AgentId, model_route_id: ModelRouteId) -> Self {
         Self {
             agent_id,
             auth_source: RuntimeAuthSource::model_route(model_route_id.clone()),
-            model: RuntimeModelSelection::explicit(format!("route/{}", model_route_id.as_str())),
+            model: RuntimeModelSelection::explicit(format!(
+                "{}{}/",
+                crate::PROVIDER_GROUP_MODEL_PREFIX,
+                model_route_id.as_str()
+            )),
             reasoning_effort: None,
             mode_id: None,
             config_values: BTreeMap::new(),

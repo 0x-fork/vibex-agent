@@ -95,7 +95,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 76;
+pub const CURRENT_SCHEMA_VERSION: i64 = 77;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12451,14 +12451,13 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_drop_local_default_placeholders(conn, &mut applied)?;
     apply_binding_provider_optional(conn, &mut applied)?;
     apply_runtime_auth_source_route_shape(conn, &mut applied)?;
+    model_gateway::migrate_retire_gateway_inputs(conn, &mut applied)?;
 
     // Seeding the per-kind placeholders used to happen here, before the backfill,
     // so a caller always had a Provider id to fall back on. They are gone: a missing
     // Provider is reported as missing rather than stood in for by a row with no
     // address and no Key.
     ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(conn)?;
-    // Turns the gateway's pre-route upstream list into one reusable route, once.
-    model_route::backfill_first_route(conn)?;
     // Describes each Agent's direct Provider as a single-member route, so the
     // route graph can show direct connections beside gateway ones.
     model_route::backfill_direct_routes(conn)?;
@@ -18629,6 +18628,7 @@ mod tests {
                 "74:drop_local_default_placeholders",
                 "75:binding_provider_optional",
                 "76:runtime_auth_source_route_shape",
+                "77:retire_gateway_inputs",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -18789,6 +18789,7 @@ mod tests {
                 "74:drop_local_default_placeholders",
                 "75:binding_provider_optional",
                 "76:runtime_auth_source_route_shape",
+                "77:retire_gateway_inputs",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -18930,6 +18931,7 @@ mod tests {
                 "74:drop_local_default_placeholders",
                 "75:binding_provider_optional",
                 "76:runtime_auth_source_route_shape",
+                "77:retire_gateway_inputs",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -19109,6 +19111,7 @@ mod tests {
                 "74:drop_local_default_placeholders",
                 "75:binding_provider_optional",
                 "76:runtime_auth_source_route_shape",
+                "77:retire_gateway_inputs",
             ]
         );
         assert_eq!(
@@ -20548,6 +20551,7 @@ mod tests {
                 "74:drop_local_default_placeholders",
                 "75:binding_provider_optional",
                 "76:runtime_auth_source_route_shape",
+                "77:retire_gateway_inputs",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
