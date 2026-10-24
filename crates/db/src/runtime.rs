@@ -7221,6 +7221,127 @@ mod tests {
         cleanup_db(temp);
     }
 
+    /// A route session's switch and binding are storable.
+    ///
+    /// `RuntimeAuthSource` gained a `model_route` variant and every Rust path
+    /// was taught about it, but the two tables' `CHECK` constraints still
+    /// listed only `provider_profile` and `agent_account`. The decode path
+    /// accepted the kind, so the first route session failed on its `INSERT`
+    /// with "failed to insert initial runtime switch" — before any durable row
+    /// existed to inspect.
+    ///
+    /// A route carries no Profile of its own, so the compatibility columns must
+    /// stay empty for it, exactly as they do for an Agent account.
+    #[test]
+    fn a_route_session_persists_its_initial_switch_and_binding() {
+        let temp = temp_db_path("initial-switch-route-auth-source");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session_id = seeded_session(&conn, "initial-switch-route-auth-source");
+        let route_id = vibex_core::ModelRouteId::new();
+        let mut desired = SessionRuntimeSelection::model_route(
+            AgentId::parse("claude-code").unwrap(),
+            route_id.clone(),
+        );
+        desired.model = vibex_core::RuntimeModelSelection::explicit(format!(
+            "group/{}/deepseek-chat",
+            route_id.as_str()
+        ));
+        let request =
+            desired_enqueue_request(&session_id, "initial-switch-route", 0, desired.clone());
+        let record = AgentSessionRuntimeRepository::enqueue_initial_runtime_switch(
+            &mut conn,
+            RuntimeSwitchId::new(),
+            &request,
+        )
+        .expect("a route switch must be storable");
+        assert_eq!(record.target_auth_source, desired.auth_source);
+
+        let stored = RuntimeSwitchRepository::get(&conn, &record.switch_id)
+            .unwrap()
+            .expect("the route switch must round-trip");
+        assert_eq!(stored.target_auth_source, desired.auth_source);
+        // The record type does not surface the compatibility column, so read it
+        // where the constraint looks at it: a route names no Profile, so the
+        // column must stay empty for the `CHECK` to accept the row.
+        let stored_profile: Option<String> = conn
+            .query_row(
+                "SELECT target_profile_id FROM runtime_switches WHERE switch_id = ?1",
+                params![record.switch_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored_profile.is_none());
+
+        let mut binding = sample_binding(&session_id, BindingState::Current);
+        binding.auth_source = desired.auth_source.clone();
+        binding.auth_source_revision = 1;
+        RuntimeBindingRepository::insert(&conn, &binding)
+            .expect("a route binding must be storable");
+        let read = RuntimeBindingRepository::get(&conn, &binding.binding_id)
+            .unwrap()
+            .expect("the route binding must round-trip");
+        assert_eq!(read.auth_source, desired.auth_source);
+        let binding_profile: Option<String> = conn
+            .query_row(
+                "SELECT provider_profile_id FROM session_runtime_bindings WHERE binding_id = ?1",
+                params![binding.binding_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(binding_profile.is_none());
+
+        // Usage tables carry the same shape check, and a route session reaches
+        // them as soon as its first turn reports tokens. They are written
+        // straight here: the constraint is what this test is about, not the
+        // accounting that fills it.
+        let route = desired.auth_source.clone();
+        let route_agent = AgentId::parse("claude-code").unwrap();
+        let route_kind = enum_to_db(&route.kind()).unwrap();
+        conn.execute(
+            "INSERT INTO agent_usage_checkpoints (
+                usage_stream_id, session_id, binding_id, last_activation_generation,
+                agent_id, provider_profile_id, auth_source_kind, auth_source_id,
+                auth_source_revision, last_model_id, reset_epoch, counter_origin,
+                last_usage_execution_id, last_observation_sequence,
+                created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, 0, ?4, NULL, ?5, ?6, 1, 'deepseek-chat', 0,
+                       'reported', NULL, 0, 1, 1)",
+            params![
+                "usage_stream_route",
+                session_id.as_str(),
+                binding.binding_id.as_str(),
+                route_agent.as_str(),
+                route_kind,
+                route.id(),
+            ],
+        )
+        .expect("a route usage checkpoint must be storable");
+        conn.execute(
+            "INSERT INTO agent_turn_usage_facts (
+                usage_execution_id, session_id, project_id, workspace_id,
+                binding_id, activation_generation, reset_epoch, agent_id,
+                provider_profile_id, auth_source_kind, auth_source_id,
+                auth_source_revision, model_id, execution_status, reported_fields,
+                coverage, dispatched_at_ms, created_at_ms, updated_at_ms
+             )
+             SELECT ?1, ?2, p.project_id, s.workspace_id, ?3, 0, 0, ?4, NULL, ?5, ?6,
+                    1, 'deepseek-chat', 'reported', 0, 'reported', 1, 1, 1
+             FROM agent_sessions s JOIN projects p ON p.project_id = s.project_id
+             WHERE s.session_id = ?2",
+            params![
+                "usage_execution_route",
+                session_id.as_str(),
+                binding.binding_id.as_str(),
+                route_agent.as_str(),
+                route_kind,
+                route.id(),
+            ],
+        )
+        .expect("a route usage fact must be storable");
+        cleanup_db(temp);
+    }
+
     #[test]
     fn initial_switch_enqueue_waits_for_concurrent_writer_before_reading() {
         let temp = temp_db_path("initial-switch-concurrent-writer");

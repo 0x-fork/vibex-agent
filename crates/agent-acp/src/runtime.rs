@@ -28473,6 +28473,81 @@ for line in sys.stdin:
         fixture.fixture.cleanup();
     }
 
+    /// Creating a session on a group carries it all the way to a live binding.
+    ///
+    /// `resolve()` is only the first half: session creation then persists the
+    /// switch and its binding. Both tables carry a shape `CHECK` on the auth
+    /// source, and the route arm was missing from it, so a group session got
+    /// past resolution and died on the `INSERT` with
+    /// "failed to insert initial runtime switch".
+    ///
+    /// This test therefore drives the real creation path rather than the
+    /// resolver alone: it is the only way to prove the two halves agree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn creating_a_session_on_a_provider_group_reaches_a_current_binding() {
+        use vibex_core::CreateAgentSessionRequest;
+
+        let Some(fixture) = runtime_switch_fixture("create-provider-group").await else {
+            return;
+        };
+        let agent_id = fixture.selection.agent_id.clone();
+        let route_id = bind_fixture_provider_group(
+            &fixture.fixture,
+            &agent_id,
+            &["mock/model-1", "mock/model-2"],
+        );
+        let mut selection = SessionRuntimeSelection::model_route(agent_id, route_id.clone());
+        selection.model = RuntimeModelSelection::explicit(format!(
+            "{}{}/mock/model-1",
+            vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
+            route_id.as_str()
+        ));
+
+        let session = fixture
+            .manager
+            .create_session(CreateAgentSessionRequest {
+                session_id: None,
+                defer_runtime_materialization: false,
+                runtime: selection.clone(),
+                workspace_root: fixture.fixture.workspace.display().to_string(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                title: Some("group session".to_string()),
+                safety: None,
+            })
+            .await
+            .expect("a group session must be creatable");
+
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &session.id)
+            .unwrap()
+            .expect("the created session must have runtime state");
+        assert_eq!(
+            state.runtime_selection_status,
+            Some(vibex_core::SessionRuntimeSelectionStatus::Ready),
+            "the initial switch must commit rather than fail on persistence"
+        );
+        assert_eq!(state.desired_runtime_selection, Some(selection.clone()));
+        let binding_id = state
+            .current_binding_id
+            .as_ref()
+            .expect("a committed initial switch owns a current binding");
+        let binding = RuntimeBindingRepository::get(&conn, binding_id)
+            .unwrap()
+            .expect("the route binding must be durable");
+        assert_eq!(
+            binding.auth_source, selection.auth_source,
+            "the binding records the route, not the Profile it resolved through"
+        );
+        assert_eq!(session.state, AgentSessionState::Idle);
+
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
     /// A route selection that names no servable Profile still fails clearly.
     ///
     /// The fix above resolves a route through the Profile it names; a route
