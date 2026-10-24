@@ -8369,8 +8369,10 @@ impl CodeWorkbench {
             self.preview_revealed_tab_ids.remove(&pane_id);
         }
         // The folder bar scrolls itself (wheel included) and paints the tabs,
-        // so the strip only owns the chrome around it: the hairline under the
-        // bar, the drop-target wash, and the two trailing buttons.
+        // so the strip only owns the chrome around it: the drop-target wash
+        // and the two trailing buttons. It draws no hairline under the bar:
+        // the selected tab already takes the page color, and a line there
+        // would cut the tab off from the pane it opens into.
         let active_index = active
             .as_deref()
             .and_then(|active| tabs.iter().position(|tab| tab.id == active));
@@ -8499,11 +8501,17 @@ impl CodeWorkbench {
                     .flex_none()
                     .min_w_0()
                     .overflow_hidden()
+                    // No hairline under the bar: the selected tab already
+                    // carries the page color, and a line here would cut it
+                    // off from the pane it opens into. The edge is only
+                    // painted while a tab hovers the group, as its drop cue,
+                    // and stays transparent otherwise so lighting it up never
+                    // moves the strip by a pixel.
                     .border_b_1()
                     .border_color(if tab_group_drop_active {
                         cx.theme().primary.opacity(0.60)
                     } else {
-                        cx.theme().border
+                        cx.theme().transparent
                     })
                     .bg(tab_strip_tone)
                     .on_drag_move(cx.listener(

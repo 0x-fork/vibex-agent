@@ -45168,11 +45168,15 @@ impl VibexWorkbench {
             .min_w_0()
             .items_center()
             .overflow_hidden()
+            // The strip and the pane below it are one plate: no hairline, so
+            // the selected tab and the content it opens into keep one color.
+            // A tab hovering the strip still lights the edge as its drop cue,
+            // and the resting edge stays transparent so that costs no layout.
             .border_b_1()
             .border_color(if tab_group_drop_active {
                 cx.theme().primary.opacity(0.60)
             } else {
-                cx.theme().border
+                cx.theme().transparent
             })
             .bg(if tab_group_drop_active {
                 cx.theme().primary.opacity(0.10)
