@@ -7579,6 +7579,14 @@ struct AcpSwitchTargetContext {
     /// Resource-free identity used to look up the Agent-account model catalog.
     /// Only present for `RuntimeAuthSource::AgentAccount`.
     account_catalog_fingerprint: Option<String>,
+    /// The Profile this selection launches through: the named one for a
+    /// Provider selection, the one a route resolves to for a route selection.
+    ///
+    /// Everything that reasons about the selection's model or mode catalogue
+    /// reads this, not the auth source, because a route carries no Profile of
+    /// its own — treating "no Profile named" as "no Profile at all" is what
+    /// made a route selection fail its model check.
+    launch_profile_id: Option<ProviderProfileId>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -7731,6 +7739,18 @@ impl AcpRuntimeSwitchBridge {
                 "Agent session was not found",
             ));
         }
+        // The Profile this selection launches through, resolved once for the
+        // whole launch context. A route names no Profile of its own — it names
+        // the row it resolves to — so every check below reads this instead of
+        // the auth source; reading the auth source made a route look like a
+        // selection with no catalogue at all.
+        let launch_profile_id = match &selection.auth_source {
+            RuntimeAuthSource::ProviderProfile { .. } | RuntimeAuthSource::ModelRoute { .. } => {
+                self.client
+                    .source_profile_id(&selection.agent_id, &selection.auth_source)?
+            }
+            RuntimeAuthSource::AgentAccount { .. } => None,
+        };
         let (auth_source_revision, config, runtime_resources, env_unsets) = match &selection
             .auth_source
         {
@@ -7738,12 +7758,9 @@ impl AcpRuntimeSwitchBridge {
                 // A route resolves to its Profile before anything is read,
                 // so the rest of this arm is the same launch contract a
                 // Provider selection uses.
-                let provider_profile_id = self
-                    .client
-                    .source_profile_id(&selection.agent_id, &selection.auth_source)?
-                    .ok_or_else(|| {
-                        runtime_configuration_unavailable("model_route_not_launchable")
-                    })?;
+                let provider_profile_id = launch_profile_id.clone().ok_or_else(|| {
+                    runtime_configuration_unavailable("model_route_not_launchable")
+                })?;
                 let profile = self
                     .client
                     .config_service
@@ -7875,6 +7892,7 @@ impl AcpRuntimeSwitchBridge {
             pool_fallback_reason,
             spawn_snapshot,
             account_catalog_fingerprint,
+            launch_profile_id,
         })
     }
 
@@ -8907,6 +8925,7 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         let pi_reasoning_supported = pi_model_reasoning_supported(
             &self.client.config_service,
             &effective_selection,
+            context.launch_profile_id.as_ref(),
             model_id.as_deref(),
         );
         normalize_pi_runtime_selection(
@@ -8914,7 +8933,12 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
             current_config.as_ref(),
             pi_reasoning_supported,
         );
-        let models = match selection.provider_profile_id() {
+        // The model catalogue belongs to the Profile the selection launches
+        // through, so a route asks its Profile the same question a Provider
+        // selection asks: the route names no Profile of its own, and reading
+        // that absence as "no catalogue" made every route selection fail its
+        // model check.
+        let models = match context.launch_profile_id.as_ref() {
             Some(provider_profile_id) => Some(
                 self.manager
                     .list_models(AgentModelListRequest {
@@ -8985,7 +9009,7 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         }
         let session_probe = if (effective_selection.reasoning_effort.is_some()
             || effective_selection.mode_id.is_some())
-            && let Some(provider_profile_id) = selection.provider_profile_id()
+            && let Some(provider_profile_id) = context.launch_profile_id.as_ref()
         {
             let probe = if context.agent_id.as_str() == CLAUDE_AGENT_ID
                 && let Some(model_id) = model_id.as_deref()
@@ -9092,7 +9116,7 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
             };
             if let Some(normalized) = normalize_claude_model_mode(
                 &context.agent_id,
-                selection.provider_profile_id().is_some(),
+                context.launch_profile_id.is_some(),
                 model_id.as_deref().is_some(),
                 session_probe.as_ref().map(|probe| probe.modes.as_slice()),
                 &mode,
@@ -9905,19 +9929,30 @@ fn runtime_configuration_unavailable(cause_code: &str) -> VibexError {
     )
 }
 
+/// Whether the model a Pi session selected carries reasoning.
+///
+/// The capability is read from the Profile the selection launches through, so a
+/// route selection answers the same question a Provider selection does: the
+/// route names no Profile, and Pi supports reasoning on any explicit model it
+/// launches, so an unresolvable Profile is read as "supported" rather than as
+/// "no reasoning".
 fn pi_model_reasoning_supported(
     config_service: &ProviderConfigService,
     selection: &SessionRuntimeSelection,
+    launch_profile_id: Option<&ProviderProfileId>,
     model_id: Option<&str>,
 ) -> bool {
-    if selection.agent_id.as_str() != PI_AGENT_ID || selection.provider_profile_id().is_none() {
+    let Some(provider_profile_id) = launch_profile_id else {
+        return true;
+    };
+    if selection.agent_id.as_str() != PI_AGENT_ID {
         return true;
     }
     let Some(model_id) = model_id else {
         return false;
     };
     config_service
-        .get_profile(selection.provider_profile_id().expect("checked above"))
+        .get_profile(provider_profile_id)
         .ok()
         .flatten()
         .and_then(|profile| {
@@ -28271,6 +28306,237 @@ for line in sys.stdin:
         assert!(error.diagnostics.iter().any(|diagnostic| {
             diagnostic.key == "causeCode" && diagnostic.value == expected_cause
         }));
+    }
+
+    /// Binds a provider group to `agent_id` and returns its id.
+    ///
+    /// The group points at the fixture's own Provider, so the model the group
+    /// offers is the model the mock Agent serves. The group is what a reader
+    /// picks when they point an Agent at several Providers at once, and the
+    /// selection it produces names no Profile of its own — which is exactly the
+    /// shape the resolver used to reject.
+    fn bind_fixture_provider_group(
+        fixture: &MockAcpFixture,
+        agent_id: &AgentId,
+        models: &[&str],
+    ) -> vibex_core::ModelRouteId {
+        let connection = open_database(&fixture.db_path).unwrap();
+        let shared = AgentModelProviderBindingRepository::get_by_legacy_profile(
+            &connection,
+            &fixture.profile_id,
+        )
+        .unwrap()
+        .expect("a created ACP Profile has a provider projection");
+        let provider_id = shared.model_provider_profile_id.expect(
+            "the fixture's projection must name a shared Provider, or the group has nothing to compose",
+        );
+        let route = vibex_core::ModelRoute {
+            id: vibex_core::ModelRouteId::new(),
+            display_name: "Team".to_string(),
+            description: None,
+            kind: vibex_core::RouteKind::ProviderGroup,
+            members: vec![vibex_core::ModelRouteMember::provider(provider_id, 0)],
+            strategy: vibex_core::RouteStrategy::Ordered,
+            first_token_timeout_ms: None,
+            context_tokens: None,
+            pin: vibex_core::GatewayPinScope::Off,
+            token_limit: None,
+            status: vibex_core::RouteStatus::Enabled,
+            revision: 1,
+            created_at_ms: unix_timestamp_ms().max(1),
+            updated_at_ms: unix_timestamp_ms().max(1),
+            deleted_at_ms: None,
+        };
+        vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
+        let binding = vibex_core::AgentModelRouteBinding::new(agent_id.clone(), route.id.clone());
+        vibex_db::AgentModelRouteBindingRepository::insert(&connection, &binding).unwrap();
+        drop(connection);
+        // A route launches through the gateway Profile, so the group needs one:
+        // it is the row that carries the group's `group/<route>/<model>` ids and
+        // the ACP command the launch path starts. Creating it here is what makes
+        // the route resolvable at all, and it is the piece whose absence used to
+        // be reported as "the model does not exist".
+        let service = fixture.service();
+        let mut config = service
+            .get_acp_profile_config_for_launch(fixture.profile_id.clone())
+            .unwrap();
+        config.models = models
+            .iter()
+            .map(|model| route.group_model_id(model))
+            .collect();
+        // A gateway Profile declares a coarse mode list of its own — the real
+        // ones carry little more than `default` — while the Agent advertises the
+        // modes it actually supports per Model. Keeping the two apart here is
+        // what makes the test prove the probe is consulted for a route.
+        config.modes = vec!["default".to_string()];
+        let gateway = service
+            .create_acp_profile(vibex_core::AcpProviderProfileCreateRequest {
+                agent_id: Some(agent_id.clone()),
+                display_name: "Vibex Gateway".to_string(),
+                account_alias: None,
+                preset_id: None,
+                config: Some(config),
+            })
+            .unwrap();
+        let mut options = service
+            .get_profile(&gateway.id)
+            .unwrap()
+            .expect("the gateway Profile was just created")
+            .provider_options;
+        options.entries.push(vibex_core::ProviderBindingMetadata {
+            key: vibex_config_switch::GATEWAY_PROFILE_ROLE_OPTION_KEY.to_string(),
+            value: vibex_config_switch::GATEWAY_PROFILE_ROLE.to_string(),
+        });
+        options.entries.push(vibex_core::ProviderBindingMetadata {
+            key: vibex_config_switch::GATEWAY_AGENT_OPTION_KEY.to_string(),
+            value: agent_id.as_str().to_string(),
+        });
+        service
+            .update_profile(vibex_core::ProviderProfileUpdateRequest {
+                provider_profile_id: gateway.id,
+                display_name: None,
+                status: None,
+                account_alias: None,
+                base_url: None,
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: None,
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: Some(options),
+            })
+            .unwrap();
+        route.id
+    }
+
+    /// A provider-group selection resolves through the Profile the group names.
+    ///
+    /// A group carries no Profile of its own: it composes whole Providers, and
+    /// the launch path resolves it to the Profile that serves the Agent. The
+    /// resolver's model check used to read the selection's own Profile and,
+    /// finding none, treat the model as unknown and refuse every group
+    /// selection with `model_unavailable` — before any switch was even
+    /// enqueued, so the failure left no durable switch behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_selection_resolver_accepts_a_provider_group_selection() {
+        let Some(fixture) = runtime_switch_fixture("selection-provider-group").await else {
+            return;
+        };
+        let agent_id = fixture.selection.agent_id.clone();
+        let route_id = bind_fixture_provider_group(
+            &fixture.fixture,
+            &agent_id,
+            &["mock/model-1", "mock/model-2"],
+        );
+        let mut selection = SessionRuntimeSelection::model_route(agent_id, route_id);
+        selection.model = RuntimeModelSelection::explicit(format!(
+            "{}{}/mock/model-1",
+            vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
+            selection
+                .auth_source
+                .model_route_id()
+                .expect("a route selection names its route")
+                .as_str()
+        ));
+        selection.reasoning_effort = Some("high".to_string());
+        // `build` is a mode the mock Agent advertises and the gateway Profile
+        // does not declare, which is exactly the shape a reader's remembered
+        // mode takes after switching Agents: only the probe can vouch for it.
+        selection.mode_id = Some("build".to_string());
+
+        let resolved = fixture
+            .bridge
+            .resolve(&fixture.session.id, &selection, None)
+            .await
+            .expect("a group selection must resolve through its Profile");
+        assert_eq!(resolved.selection.auth_source, selection.auth_source);
+        assert_eq!(resolved.selection.model, selection.model);
+        assert_eq!(
+            resolved.selection.reasoning_effort.as_deref(),
+            Some("high"),
+            "the mock Agent advertises this effort, so the probe keeps it"
+        );
+        assert_eq!(
+            resolved.selection.mode_id.as_deref(),
+            Some("build"),
+            "the Agent's own mode catalogue vouches for a mode the Profile omits"
+        );
+
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    /// A route selection that names no servable Profile still fails clearly.
+    ///
+    /// The fix above resolves a route through the Profile it names; a route
+    /// whose Provider was never projected must not resolve at all, and it must
+    /// say why instead of falling through to "the model does not exist".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_selection_resolver_refuses_an_unlaunchable_route() {
+        let Some(fixture) = runtime_switch_fixture("selection-route-unbound").await else {
+            return;
+        };
+        let agent_id = fixture.selection.agent_id.clone();
+        // A route bound to this Agent but composed of a Provider with no
+        // Profile of its own: nothing for the launch path to start.
+        let connection = open_database(&fixture.fixture.db_path).unwrap();
+        let provider = vibex_core::ModelProviderProfile {
+            display_name: "Unlaunchable".to_string(),
+            status: vibex_core::ModelProviderProfileStatus::Enabled,
+            ..Default::default()
+        };
+        vibex_db::ModelProviderProfileRepository::insert(&connection, &provider).unwrap();
+        let route = vibex_core::ModelRoute {
+            id: vibex_core::ModelRouteId::new(),
+            display_name: "Nowhere".to_string(),
+            description: None,
+            kind: vibex_core::RouteKind::ProviderGroup,
+            members: vec![vibex_core::ModelRouteMember::provider(
+                provider.id.clone(),
+                0,
+            )],
+            strategy: vibex_core::RouteStrategy::Ordered,
+            first_token_timeout_ms: None,
+            context_tokens: None,
+            pin: vibex_core::GatewayPinScope::Off,
+            token_limit: None,
+            status: vibex_core::RouteStatus::Enabled,
+            revision: 1,
+            created_at_ms: unix_timestamp_ms().max(1),
+            updated_at_ms: unix_timestamp_ms().max(1),
+            deleted_at_ms: None,
+        };
+        vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
+        let binding = vibex_core::AgentModelRouteBinding::new(agent_id.clone(), route.id.clone());
+        vibex_db::AgentModelRouteBindingRepository::insert(&connection, &binding).unwrap();
+        drop(connection);
+
+        let mut selection = SessionRuntimeSelection::model_route(agent_id, route.id.clone());
+        selection.model = RuntimeModelSelection::explicit(format!(
+            "{}{}/mock/model-1",
+            vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
+            route.id.as_str()
+        ));
+        let error = fixture
+            .bridge
+            .resolve(&fixture.session.id, &selection, None)
+            .await
+            .unwrap_err();
+        assert_runtime_configuration_cause(&error, "model_route_not_launchable");
+
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
     }
 
     #[test]
