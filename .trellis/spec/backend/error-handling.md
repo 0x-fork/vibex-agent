@@ -59,6 +59,22 @@ Vibex error categories. Required behavior:
   drain before classifying the failure. Absence of an explicit authentication
   signal remains `process/acp_process_exited`; do not infer authentication from
   an empty channel close alone.
+- A credential the Agent rejected on **shape** is not
+  `provider/provider_authentication_required`. Agents validate the Key before
+  they build a request, and one that is blank or carries a character an HTTP
+  header cannot hold is reported with wording that also matches the sign-in
+  vocabulary — DeepSeek Harness says "the API key resolved from `<ENV>`
+  contains characters no HTTP header can carry" and codes it
+  `INVALID_CREDENTIAL`. Classify that first, as
+  `provider/provider_credential_invalid`, with a hint that names the Provider
+  settings rather than a sign-in page: no request was made, so there is no
+  session to renew, and signing in cannot change a value the Agent never
+  accepted. Keep the raw bounded wording in `rpcMessage`, and let a genuine
+  rejection (401, revoked, expired) keep routing to the authentication path.
+  Note that this wording names the credential variable, so the shared redactor
+  replaces it whole — carry the actionable distinction in a derived
+  `credentialShape` token (`not_http_header_safe`, `blank`) instead of assuming
+  `rpcMessage` survives.
 
 ## Permission Errors
 

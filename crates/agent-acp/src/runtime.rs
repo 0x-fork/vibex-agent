@@ -1871,6 +1871,64 @@ fn codex_terminal_http_status(text: &str) -> Option<u16> {
     (400..=599).contains(&status).then_some(status)
 }
 
+/// A credential the Agent refuses on *shape*, before it contacts anything.
+///
+/// This is not an authentication failure in the sense the user can act on by
+/// signing in: the Agent never sent a request, so there is no upstream token to
+/// renew. It happens when a provisioned value is not a legal HTTP header value —
+/// a stray space, a newline, a JSON-quoted key — and the Agent validates that
+/// before building the request. DeepSeek Harness, for instance, allows printable
+/// ASCII only and reports `INVALID_CREDENTIAL`, whose wording the ACP layer then
+/// recognised as an authentication problem and reported as "sign in".
+///
+/// Classified separately so the message names the real fault. Kept to the
+/// phrasing Agents actually use, so a genuine "your key was rejected" (401,
+/// revoked, expired) still routes to the sign-in path.
+fn credential_shape_failure(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        // DeepSeek Harness: `assertUsableApiKey` rejects both a blank key and
+        // one carrying a character an HTTP header cannot hold, and reports both
+        // as `INVALID_CREDENTIAL`.
+        "characters no http header can carry",
+        "the api key resolved from",
+        "api key is blank",
+        "invalid_credential",
+        "invalid credential",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn provider_credential_shape_error(method: &str, rpc_message: &str) -> VibexError {
+    VibexError::provider(
+        "provider_credential_invalid",
+        "The configured provider credential has an unusable format",
+    )
+    .with_recovery_hint(
+        "The Agent rejected the API key before contacting the provider, so no request was made. Re-enter the raw key in the Provider settings; a key with spaces, line breaks, or quoting is rejected.",
+    )
+    .with_diagnostic("method", method)
+    // The Agent's own wording names the credential, so the shared redactor drops
+    // it whole and the field would carry nothing but a placeholder. Record the
+    // *reason* instead: it is derived, it cannot contain the value, and it is
+    // what distinguishes a blank key from one that cannot go in a header.
+    .with_diagnostic("credentialShape", credential_shape_reason(rpc_message))
+    .with_diagnostic("rpcMessage", redact_summary(rpc_message))
+}
+
+/// The actionable part of a credential shape rejection, as a stable token.
+fn credential_shape_reason(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("no http header can carry") {
+        "not_http_header_safe"
+    } else if lower.contains("blank") || lower.contains("empty") {
+        "blank"
+    } else {
+        "unspecified"
+    }
+}
+
 fn provider_access_requires_user_action(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     [
@@ -5940,6 +5998,16 @@ impl AcpProcess {
                         .await
                         .unwrap_or_default();
                 }
+                // A credential the Agent refused on shape has to be classified
+                // before the authentication check: its wording ("... the API
+                // key resolved from ... is not a legal header value") also
+                // matches the sign-in vocabulary, but signing in cannot fix a
+                // value the Agent never accepted.
+                if credential_shape_failure(&rpc_message)
+                    || credential_shape_failure(&stderr_summary)
+                {
+                    return Err(provider_credential_shape_error(method, &rpc_message));
+                }
                 if failure_requires_authentication
                     || acp_authentication_required_text(&rpc_message)
                     || acp_authentication_required_text(&stderr_summary)
@@ -6017,7 +6085,9 @@ impl AcpProcess {
             }
             Ok(Err(_)) => {
                 let stderr_summary = self.wait_for_stderr_summary().await.unwrap_or_default();
-                if acp_authentication_required_text(&stderr_summary) {
+                if credential_shape_failure(&stderr_summary) {
+                    Err(provider_credential_shape_error(method, ""))
+                } else if acp_authentication_required_text(&stderr_summary) {
                     Err(provider_authentication_required_error(
                         method,
                         "",
@@ -23008,6 +23078,84 @@ mod tests {
         assert_eq!(error.code, "provider_authentication_required");
         assert_eq!(error.message, "Agent authentication is required");
         assert!(error.recovery_hint.is_some());
+    }
+
+    /// A credential the Agent refuses on shape is not a sign-in problem.
+    ///
+    /// DeepSeek Harness validates the Key before it builds a request and
+    /// rejects one that carries a character an HTTP header cannot hold. The
+    /// wording it uses ("the API key resolved from DEEPSEEK_API_KEY ...") also
+    /// matches the authentication vocabulary, so the failure used to reach the
+    /// user as "Agent authentication is required" with a sign-in hint — advice
+    /// that cannot fix a value the Agent never accepted, and which hid the real
+    /// cause behind a settings page the user had already configured.
+    #[tokio::test]
+    async fn credential_shape_failures_are_not_reported_as_sign_in_required() {
+        let process = test_process(
+            AcpProcessInstanceId::new(),
+            None,
+            None,
+            None,
+            Arc::new(DisabledAcpTerminalHost),
+            false,
+            false,
+        );
+        let (response, receiver) = oneshot::channel();
+        response
+            .send(Err(AcpRpcFailure {
+                code: "-32000".to_string(),
+                message: "Authentication required: llm-pi-ai: the API key resolved from \
+                          DEEPSEEK_API_KEY contains characters no HTTP header can carry; set \
+                          DEEPSEEK_API_KEY to the raw key alone (the web Models page writes it)"
+                    .to_string(),
+                data_kind: protocol::AcpRpcFailureDataKind::Other,
+            }))
+            .unwrap();
+
+        let result = process
+            .finish_started_request(
+                AcpOperation::SessionPrompt.method(),
+                Duration::from_secs(1),
+                StartedAcpRequest {
+                    id: 1,
+                    prompt_session_id: None,
+                    stderr_sequence: 0,
+                    response: receiver,
+                    registration_release: None,
+                },
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a credential shape failure must not return an ACP response"),
+        };
+
+        assert_eq!(error.code, "provider_credential_invalid");
+        assert!(
+            !error
+                .recovery_hint
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("sign in"),
+            "a shaped-rejected key is fixed in the Provider settings, not by signing in"
+        );
+        assert!(
+            error.message.to_lowercase().contains("format"),
+            "the message has to name the fault the user can act on"
+        );
+        // The raw wording names the credential, so redaction replaces it whole.
+        // The derived reason is what keeps the cause inspectable, and it must
+        // not smuggle the rejected value back in.
+        assert!(error.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key == "credentialShape" && diagnostic.value == "not_http_header_safe"
+        }));
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .all(|diagnostic| { !diagnostic.value.contains("DEEPSEEK_API_KEY") })
+        );
     }
 
     fn lifecycle_spawn_snapshot(profile_id: ProviderProfileId) -> ProcessSpawnConfigSnapshot {
