@@ -694,12 +694,23 @@ fn gateway_provider_options(agent_id: &AgentId, profile_id: &str) -> ProviderOpt
     options
 }
 
-fn gateway_provider_kind(agent_id: &AgentId) -> ProviderKind {
-    match agent_id.as_str() {
-        "claude" => ProviderKind::Claude,
-        "codex" => ProviderKind::Codex,
-        _ => ProviderKind::Acp,
-    }
+/// The kind every gateway Profile is written with.
+///
+/// Always `Acp`, never the Agent's own kind. `ProviderKind::Claude` and
+/// `Codex` name the config file an Agent owns (`~/.claude/settings.json`,
+/// `~/.codex/config.toml`), which is what the native importer needs; they are
+/// not a launch contract. Both the option catalogue and the ACP launch path
+/// accept `Acp` only — `build_runtime_option_catalog` skips every other kind,
+/// and `runtime.rs` refuses a route Profile with
+/// `provider_profile_route_unavailable` — so a gateway Profile written with
+/// `Claude`/`Codex` was invisible: its route group reached the picker with no
+/// models at all, and could not have started a session if it had.
+///
+/// This is the same invariant the shared-Provider binding path states
+/// (`materialize_legacy_profile_for_agent` in `lib.rs`), and the reason adding a
+/// Provider from either entry point has always produced `Acp`.
+fn gateway_provider_kind(_agent_id: &AgentId) -> ProviderKind {
+    ProviderKind::Acp
 }
 
 pub(crate) fn is_gateway_profile(profile: &ProviderProfile) -> bool {
@@ -1376,6 +1387,49 @@ mod tests {
                 .any(|model| model.id == format!("group/{}/deepseek-chat", group.id.as_str())),
             "the republished Profile is what a session reads its models from"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A gateway Profile is always `Acp`, whatever the Agent calls itself.
+    ///
+    /// `ProviderKind::Claude`/`Codex` name an Agent's own config file, not a
+    /// launch contract: the option catalogue skips every Profile that is not
+    /// `Acp`, and the ACP runtime refuses to launch one. Writing the Agent's
+    /// own kind here is what made a bound route group show no models for claude
+    /// and codex while the same group worked for deepseek-harness.
+    #[test]
+    fn a_gateway_profile_is_written_with_the_acp_kind_for_every_agent() {
+        let (path, service) = service();
+        enable_gateway(&service);
+        let deepseek = provider(&service, "DeepSeek");
+        let published = catalog(&service);
+        service
+            .attach_gateway_to_agents("http://127.0.0.1:3425", &published)
+            .unwrap();
+
+        for agent_id in ["claude", "codex", "deepseek-harness"] {
+            let agent_id = agent(agent_id);
+            group_for(
+                &service,
+                "Team",
+                vec![deepseek.clone()],
+                &[agent_id.as_str()],
+            );
+            service
+                .refresh_gateway_profiles("http://127.0.0.1:3425", &catalog(&service))
+                .unwrap();
+            let conn = test_connection(&path).unwrap();
+            let profile_id = default_profile_for(&conn, &agent_id)
+                .unwrap()
+                .expect("a bound Agent has a gateway Profile");
+            let profile = service.get_profile(&profile_id).unwrap().unwrap();
+            assert_eq!(
+                profile.kind,
+                ProviderKind::Acp,
+                "{} must get a launchable kind, not its config-file kind",
+                agent_id.as_str()
+            );
+        }
         let _ = std::fs::remove_file(path);
     }
 

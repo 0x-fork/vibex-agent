@@ -95,7 +95,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 77;
+pub const CURRENT_SCHEMA_VERSION: i64 = 78;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12452,6 +12452,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_binding_provider_optional(conn, &mut applied)?;
     apply_runtime_auth_source_route_shape(conn, &mut applied)?;
     model_gateway::migrate_retire_gateway_inputs(conn, &mut applied)?;
+    apply_gateway_profile_kind_repair(conn, &mut applied)?;
 
     // Seeding the per-kind placeholders used to happen here, before the backfill,
     // so a caller always had a Provider id to fall back on. They are gone: a missing
@@ -13149,6 +13150,59 @@ fn apply_bound_provider_kind_repair(
     .map_err(storage_err(
         "migration_record_failed",
         "failed to record the bound Provider kind repair",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// Makes an Agent's gateway Profile `Acp`, the only kind the catalogue and the
+/// launch path accept.
+///
+/// Migration 71 repaired bound Providers and deliberately skipped the per-kind
+/// local defaults. Gateway Profiles were not in view then, and a later change
+/// started writing them with the Agent's own kind — `claude`, `codex` — under
+/// the same mistaken reading of `ProviderKind` as a launch contract. They are
+/// not covered by 71's `provider_profile_id NOT LIKE` predicate only by
+/// accident: the rows did not exist yet when it ran.
+///
+/// The damage is visible and total: `build_runtime_option_catalog` skips every
+/// Profile that is not `Acp`, so the route group reached the composer with no
+/// models at all, and `runtime.rs` would have refused the launch with
+/// `provider_profile_route_unavailable` even if it had.
+///
+/// Only the gateway role is touched. The per-kind local defaults carry those
+/// kinds by design, and a real Claude/Codex config file is what the native
+/// importer reads, so neither is this migration's business.
+fn apply_gateway_profile_kind_repair(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 78;
+    const NAME: &str = "gateway_profile_kind_repair";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE provider_profiles
+         SET provider_kind = 'acp'
+         WHERE provider_kind IN ('claude', 'codex')
+           AND deleted_at_ms IS NULL
+           AND provider_profile_id NOT LIKE 'provider_local_default_%'
+           AND provider_options_json LIKE '%vibex.internal.profileRole%'
+           AND provider_options_json LIKE '%model_gateway%'",
+        [],
+    )
+    .map_err(storage_err(
+        "gateway_profile_kind_repair_failed",
+        "failed to repair the kind of a gateway Profile",
+    ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the gateway Profile kind repair",
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
@@ -18629,6 +18683,7 @@ mod tests {
                 "75:binding_provider_optional",
                 "76:runtime_auth_source_route_shape",
                 "77:retire_gateway_inputs",
+                "78:gateway_profile_kind_repair",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -18790,6 +18845,7 @@ mod tests {
                 "75:binding_provider_optional",
                 "76:runtime_auth_source_route_shape",
                 "77:retire_gateway_inputs",
+                "78:gateway_profile_kind_repair",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -18932,6 +18988,7 @@ mod tests {
                 "75:binding_provider_optional",
                 "76:runtime_auth_source_route_shape",
                 "77:retire_gateway_inputs",
+                "78:gateway_profile_kind_repair",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -19112,6 +19169,7 @@ mod tests {
                 "75:binding_provider_optional",
                 "76:runtime_auth_source_route_shape",
                 "77:retire_gateway_inputs",
+                "78:gateway_profile_kind_repair",
             ]
         );
         assert_eq!(
@@ -20552,6 +20610,7 @@ mod tests {
                 "75:binding_provider_optional",
                 "76:runtime_auth_source_route_shape",
                 "77:retire_gateway_inputs",
+                "78:gateway_profile_kind_repair",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -26157,6 +26216,81 @@ mod tests {
             status: "ok".to_string(),
             at_ms,
         }
+    }
+
+    /// Only a gateway Profile written with a config-file kind is repaired.
+    ///
+    /// The predicate is what keeps this migration away from the two shapes that
+    /// legitimately carry `claude`/`codex`: the per-kind local defaults, and a
+    /// Provider whose kind names the config file the native importer reads.
+    #[test]
+    fn the_gateway_profile_kind_repair_touches_only_the_gateway_role() {
+        let temp = temp_db_path("gateway-profile-kind-repair");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let insert = |id: &str, kind: &str, options: &str| {
+            conn.execute(
+                "INSERT INTO provider_profiles (
+                     provider_profile_id, agent_id, provider_kind, display_name, status,
+                     account_alias, base_url, default_model, small_model, large_model,
+                     configured_models_json, reasoning_effort, sandbox_defaults_json,
+                     network_defaults_json, permission_defaults_json, provider_options_json,
+                     created_at_ms, updated_at_ms, deleted_at_ms
+                 ) VALUES (?1, 'claude', ?2, ?1, 'enabled', NULL, NULL, NULL, NULL, NULL,
+                     '[]', NULL, '{}', '{}', '{}', ?3, 1, 1, NULL)",
+                params![id, kind, options],
+            )
+            .unwrap();
+        };
+        let gateway = r#"{"schemaVersion":1,"entries":[{"key":"vibex.internal.profileRole","value":"model_gateway"}]}"#;
+        insert("provider_gateway_claude", "claude", gateway);
+        insert("provider_gateway_codex", "codex", gateway);
+        // A real Claude kind names `~/.claude/settings.json` for the native
+        // importer, so it must survive untouched.
+        insert(
+            "provider_native_claude",
+            "claude",
+            "{\"schemaVersion\":1,\"entries\":[]}",
+        );
+        insert("provider_local_default_claude", "claude", gateway);
+
+        // A fresh database already recorded 78, so drive the repair itself to
+        // prove the statement does the work rather than the schema.
+        conn.execute("DELETE FROM schema_migrations WHERE version = 78", [])
+            .unwrap();
+        let mut applied = Vec::new();
+        apply_gateway_profile_kind_repair(&mut conn, &mut applied).unwrap();
+        assert_eq!(applied, vec!["78:gateway_profile_kind_repair".to_string()]);
+
+        let kind_of = |id: &str| -> String {
+            conn.query_row(
+                "SELECT provider_kind FROM provider_profiles WHERE provider_profile_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(kind_of("provider_gateway_claude"), "acp");
+        assert_eq!(kind_of("provider_gateway_codex"), "acp");
+        assert_eq!(
+            kind_of("provider_native_claude"),
+            "claude",
+            "a real config-file kind belongs to the native importer, not a launch"
+        );
+        assert_eq!(
+            kind_of("provider_local_default_claude"),
+            "claude",
+            "the per-kind local defaults carry these kinds by design"
+        );
+
+        // Running again is a no-op, not a second application.
+        let mut applied = Vec::new();
+        apply_gateway_profile_kind_repair(&mut conn, &mut applied).unwrap();
+        assert!(applied.is_empty());
+
+        drop(conn);
+        cleanup_db(temp);
     }
 
     fn temp_db_path(label: &str) -> PathBuf {
