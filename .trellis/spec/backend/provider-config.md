@@ -5637,6 +5637,17 @@ shared_route_group_rows(&routes, &bindings) -> Vec<SharedRouteGroupRow>
   on the **binding**, not on the shared Provider record, because "this Agent
   talks to its own gateway" is a property of the binding. An ordinary Provider
   with an unset Key keeps failing loudly.
+- **The placeholder must be a legal credential, not a readable sentence.** The
+  Agent validates the Key's *shape* before it builds a request, so the injected
+  value is `GATEWAY_LOCAL_KEY` (`vibex-local-gateway`), while
+  `GATEWAY_LOCAL_KEY_HINT` (`managed by Vibex`) stays display text on the stored
+  credential summary. Sending the hint as the Key meant no request ever reached
+  the gateway: DeepSeek Harness allows printable ASCII only and rejected the
+  space with `INVALID_CREDENTIAL`, which the ACP layer's authentication
+  vocabulary then reported as "Agent authentication is required" — pointing the
+  user at a sign-in page that could not fix it. Any replacement placeholder has
+  to stay inside printable ASCII; the test asserts that rather than the exact
+  string, because nothing interprets the value and only its legality matters.
 
 ### 4. Validation & Error Matrix
 
@@ -5659,6 +5670,7 @@ shared_route_group_rows(&routes, &bindings) -> Vec<SharedRouteGroupRow>
 | The internal gateway role key stripped from the Profile | Next refresh creates a second Profile instead of updating |
 | A gateway launch without the placeholder | `agent_projection_secret_missing` |
 | An ordinary Provider with no Key | `agent_projection_secret_missing` (unchanged) |
+| The gateway placeholder containing a character no header can carry | Agent reports `INVALID_CREDENTIAL`; the gateway never sees the request |
 
 ### 5. Good / Base / Bad Cases
 

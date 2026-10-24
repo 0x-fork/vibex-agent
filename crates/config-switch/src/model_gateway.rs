@@ -44,6 +44,20 @@ pub const GATEWAY_AGENT_OPTION_KEY: &str = "vibex.internal.gatewayAgent";
 /// The placeholder the Agent sends as its API Key. The gateway ignores inbound
 /// credentials: it authenticates to the upstream with the Key it selects, so a
 /// local process never needs to hold one.
+///
+/// It is spelled as a single printable-ASCII token on purpose. Agents validate
+/// their credential *shape* before building a request, and DeepSeek Harness
+/// refuses any Key carrying a character an HTTP header cannot carry — a space is
+/// one. `managed by Vibex` therefore never reached the gateway at all: the
+/// launch died inside the Agent with `INVALID_CREDENTIAL`, which the ACP layer
+/// recognised through the "api key" vocabulary and reported as "Agent
+/// authentication is required". Nothing interprets the value, so it only has to
+/// be legal.
+pub const GATEWAY_LOCAL_KEY: &str = "vibex-local-gateway";
+
+/// The human-readable description of [`GATEWAY_LOCAL_KEY`] carried by the
+/// gateway Profile's stored credential summary. Display text only — never
+/// injected, because the Agent rejects a Key containing a space.
 pub const GATEWAY_LOCAL_KEY_HINT: &str = "managed by Vibex";
 
 impl ProviderConfigService {
