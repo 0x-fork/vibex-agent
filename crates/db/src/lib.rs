@@ -95,7 +95,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 79;
+pub const CURRENT_SCHEMA_VERSION: i64 = 80;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12454,6 +12454,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     model_gateway::migrate_retire_gateway_inputs(conn, &mut applied)?;
     apply_gateway_profile_kind_repair(conn, &mut applied)?;
     model_gateway::migrate_endpoint_protocol(conn, &mut applied)?;
+    apply_route_failover(conn, &mut applied)?;
 
     // Seeding the per-kind placeholders used to happen here, before the backfill,
     // so a caller always had a Provider id to fall back on. They are gone: a missing
@@ -13294,6 +13295,50 @@ fn apply_route_launch_policy(conn: &mut Connection, applied: &mut Vec<String>) -
     .map_err(storage_err(
         "migration_record_failed",
         "failed to record the route launch policy migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// Adds the route's failover choice to `model_routes`.
+///
+/// `pin` decides whether a conversation stays on one member; `failover` decides
+/// how it leaves when that member fails. They are two halves of one decision and
+/// live on the same row for the same reason: a group of interchangeable clones
+/// wants to switch silently, while a group that mixes vendors wants to ask.
+fn apply_route_failover(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 80;
+    const NAME: &str = "route_failover";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('model_routes') WHERE name = 'failover'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if exists == 0 {
+        // The default is the behaviour every route had before the column
+        // existed: fail over and report it, rather than stop and ask.
+        conn.execute_batch(
+            "ALTER TABLE model_routes ADD COLUMN failover TEXT NOT NULL DEFAULT 'auto';",
+        )
+        .map_err(|error| {
+            VibexError::storage(
+                "route_failover_alter_failed",
+                format!("failed to add failover to model_routes: {error}"),
+            )
+        })?;
+    }
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the route failover migration",
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
@@ -18686,6 +18731,7 @@ mod tests {
                 "77:retire_gateway_inputs",
                 "78:gateway_profile_kind_repair",
                 "79:model_gateway_endpoint_protocol",
+                "80:route_failover",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -18849,6 +18895,7 @@ mod tests {
                 "77:retire_gateway_inputs",
                 "78:gateway_profile_kind_repair",
                 "79:model_gateway_endpoint_protocol",
+                "80:route_failover",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -18993,6 +19040,7 @@ mod tests {
                 "77:retire_gateway_inputs",
                 "78:gateway_profile_kind_repair",
                 "79:model_gateway_endpoint_protocol",
+                "80:route_failover",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -19175,6 +19223,7 @@ mod tests {
                 "77:retire_gateway_inputs",
                 "78:gateway_profile_kind_repair",
                 "79:model_gateway_endpoint_protocol",
+                "80:route_failover",
             ]
         );
         assert_eq!(
@@ -20617,6 +20666,7 @@ mod tests {
                 "77:retire_gateway_inputs",
                 "78:gateway_profile_kind_repair",
                 "79:model_gateway_endpoint_protocol",
+                "80:route_failover",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

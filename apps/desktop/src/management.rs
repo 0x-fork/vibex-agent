@@ -1007,6 +1007,13 @@ pub struct ManagementCenter {
     /// running is the answer to "what is happening" while the page is open,
     /// and it is gone from every later read once it finishes.
     gateway_inflight: Vec<vibex_core::GatewayInflight>,
+    /// The failover prompt a session is currently showing, if any.
+    ///
+    /// At most one at a time: two prompts would mean two held requests against
+    /// one route, and whichever the user answered second would already have
+    /// expired. A newer prompt replaces an older one, whose request then takes
+    /// the countdown's default.
+    gateway_failover_prompt: Option<vibex_core::GatewayFailoverPrompt>,
     /// The ledger row whose detail is open, if any. A request carries no
     /// prompt and no reply, so this expands an explanation, not a transcript.
     gateway_request_detail: Option<vibex_core::RequestId>,
@@ -1099,6 +1106,9 @@ pub struct ManagementCenter {
     route_group_strategy: vibex_core::RouteStrategy,
     /// Whether one conversation stays on one Key within this group.
     route_group_pin: bool,
+    /// Whether the draft route switches members silently when the pinned one
+    /// fails. False means it asks first.
+    route_group_auto_failover: bool,
     /// The catalogue's suggestion for the Model currently being edited.
     ///
     /// It is only ever a suggestion: nothing here is applied until the user
@@ -2118,6 +2128,7 @@ impl ManagementCenter {
             agent_model_route_bindings: Vec::new(),
             gateway_requests: Vec::new(),
             gateway_inflight: Vec::new(),
+            gateway_failover_prompt: None,
             gateway_request_detail: None,
             gateway_limit_inputs: BTreeMap::new(),
             gateway_limits_error: None,
@@ -2151,6 +2162,7 @@ impl ManagementCenter {
             route_group_members: Vec::new(),
             route_group_strategy: vibex_core::RouteStrategy::Ordered,
             route_group_pin: true,
+            route_group_auto_failover: true,
             model_capability_suggestion: None,
             selected_global_provider_id: None,
             providers_sidebar_tab: ProviderSidebarTab::Providers,
@@ -13382,6 +13394,21 @@ impl ManagementCenter {
                 self.gateway_inflight
                     .retain(|entry| entry.request_id != request_id);
             }
+            vibex_core::GatewayEvent::FailoverAsked(prompt) => {
+                self.gateway_failover_prompt = Some(prompt);
+            }
+            vibex_core::GatewayEvent::FailoverSettled { prompt_id, .. } => {
+                if self
+                    .gateway_failover_prompt
+                    .as_ref()
+                    .is_some_and(|prompt| prompt.id == prompt_id)
+                {
+                    self.gateway_failover_prompt = None;
+                }
+            }
+            // A switch is reported by the prompt it answered, or by the ledger
+            // for an automatic one; the Config Center holds no state for it.
+            vibex_core::GatewayEvent::FailoverSwitched { .. } => {}
         }
         cx.notify();
     }
@@ -21991,6 +22018,7 @@ impl ManagementCenter {
             .collect();
         self.route_group_strategy = route.strategy;
         self.route_group_pin = route.pin == vibex_core::GatewayPinScope::Conversation;
+        self.route_group_auto_failover = route.failover == vibex_core::GatewayFailover::Auto;
         self.route_group_name.update(cx, |state, cx| {
             state.set_value(route.display_name.clone(), window, cx)
         });
@@ -22100,6 +22128,11 @@ impl ManagementCenter {
             vibex_core::GatewayPinScope::Conversation
         } else {
             vibex_core::GatewayPinScope::Off
+        };
+        route.failover = if self.route_group_auto_failover {
+            vibex_core::GatewayFailover::Auto
+        } else {
+            vibex_core::GatewayFailover::Ask
         };
         route.status = vibex_core::RouteStatus::Enabled;
         route.members = self
@@ -22753,6 +22786,53 @@ impl ManagementCenter {
                 ),
         );
         if self.route_group_members.len() >= 2 {
+            // Only a group with somewhere to go can fail over, which is why
+            // this sits inside the multi-member block: offering "switch
+            // automatically" on a one-member group would promise a switch that
+            // cannot happen.
+            rows = rows.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "Switch automatically when the current Provider fails",
+                                        "当前供应商请求异常时自动切换",
+                                        "目前供應商請求異常時自動切換",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "Off asks in the session first, and waits five seconds.",
+                                        "关闭时先在会话中询问，并等待五秒。",
+                                        "關閉時先在會話中詢問，並等待五秒。",
+                                    )),
+                            ),
+                    )
+                    .child(
+                        Switch::new("management-route-group-auto-failover")
+                            .small()
+                            .checked(self.route_group_auto_failover)
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                this.route_group_auto_failover = *checked;
+                                cx.notify();
+                            })),
+                    ),
+            );
             let current = self.route_group_strategy;
             let mut policies = h_flex().w_full().flex_wrap().items_center().gap_1();
             for strategy in vibex_core::RouteStrategy::ALL {

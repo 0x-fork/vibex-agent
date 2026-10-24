@@ -259,6 +259,14 @@ pub struct ModelRoute {
     /// to spread load instead turns it off.
     #[serde(default)]
     pub pin: crate::GatewayPinScope,
+    /// What happens when the member a conversation is pinned to fails.
+    ///
+    /// Route-scoped like `pin`, because the two are halves of one decision: a
+    /// route that pins a conversation has to say how it lets go. The default is
+    /// to switch and report it, which keeps a Provider outage from stranding a
+    /// session; a route that mixes vendors can ask instead.
+    #[serde(default)]
+    pub failover: crate::GatewayFailover,
     /// A ceiling on the tokens this route may spend in its window.
     ///
     /// `None` means no route-level ceiling; per-Key limits still apply. A route
@@ -316,6 +324,7 @@ impl Default for ModelRoute {
             first_token_timeout_ms: None,
             context_tokens: None,
             pin: crate::GatewayPinScope::Conversation,
+            failover: crate::GatewayFailover::Auto,
             token_limit: None,
             status: RouteStatus::Disabled,
             revision: 1,

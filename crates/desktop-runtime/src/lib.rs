@@ -1819,6 +1819,22 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
         ))
     }
 
+    async fn answer_model_gateway_failover(
+        &self,
+        prompt_id: vibex_core::RequestId,
+        answer: vibex_core::GatewayFailoverAnswer,
+    ) -> VibexResult<bool> {
+        let management = self.management.get().ok_or_else(|| {
+            VibexError::process(
+                "desktop_management_handle_unavailable",
+                "the runtime management handle is not installed yet",
+            )
+        })?;
+        Ok(management
+            .model_gateway()
+            .answer_failover(&prompt_id, answer))
+    }
+
     async fn model_gateway_requests(&self) -> VibexResult<Vec<vibex_core::GatewayRequestSummary>> {
         let management = self.management.get().ok_or_else(|| {
             VibexError::process(

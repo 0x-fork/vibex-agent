@@ -992,6 +992,30 @@ const SETTINGS_DIALOG_CONTENT_RADIUS: f32 = SETTINGS_DIALOG_RADIUS - 1.0;
 /// cards measure their row from the same value, so they line up with the panel.
 const SETTINGS_PAGE_PADDING_X: f32 = 70.0;
 
+/// A route's failover prompt, with the seconds it has left.
+///
+/// The countdown is local: the gateway publishes an absolute deadline, and each
+/// tick recomputes the remainder against the wall clock. Counting down from a
+/// number the gateway sent once would drift, and the request it is holding is
+/// released by the gateway's own timer regardless of what this shows.
+/// A switch that already happened, shown for a moment in the conversation.
+///
+/// The gateway reports an automatic switch after the fact — there is nothing to
+/// answer — so this is an announcement, not a prompt. It expires on its own
+/// because a switch that has already been paid for does not need to stay on
+/// screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailoverNotice {
+    message: String,
+    expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailoverCountdown {
+    prompt: vibex_core::GatewayFailoverPrompt,
+    remaining_seconds: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutoContinueCountdown {
     session_id: VibexSessionId,
@@ -7948,6 +7972,51 @@ fn restored_auto_continue_session_ids(state: &SessionUiState) -> BTreeSet<String
         .collect()
 }
 
+/// The one line a failover prompt reads as.
+///
+/// It names both Providers and the countdown, and deliberately asks nothing:
+/// silence is the default, so the line states what will happen rather than
+/// waiting for a reply it may never get.
+fn failover_prompt_label(
+    locale: locale::ResolvedLocale,
+    model: &str,
+    from_name: &str,
+    to_name: &str,
+    remaining_seconds: u8,
+) -> String {
+    match locale {
+        locale::ResolvedLocale::En => format!(
+            "Provider {from_name} failed. Switching {model} to {to_name} in {remaining_seconds}s."
+        ),
+        locale::ResolvedLocale::ZhCn => format!(
+            "供应商 {from_name} 请求异常，{remaining_seconds} 秒后将 {model} 切换到 {to_name}。"
+        ),
+        locale::ResolvedLocale::ZhTw => format!(
+            "供應商 {from_name} 請求異常，{remaining_seconds} 秒後將 {model} 切換到 {to_name}。"
+        ),
+    }
+}
+
+/// The line a completed switch leaves in the conversation.
+fn failover_switched_label(
+    locale: locale::ResolvedLocale,
+    model: &str,
+    from_name: &str,
+    to_name: &str,
+) -> String {
+    match locale {
+        locale::ResolvedLocale::En => {
+            format!("Route group switched {model} from {from_name} to {to_name}.")
+        }
+        locale::ResolvedLocale::ZhCn => {
+            format!("路由组已将 {model} 从 {from_name} 切换到 {to_name}。")
+        }
+        locale::ResolvedLocale::ZhTw => {
+            format!("路由組已將 {model} 從 {from_name} 切換到 {to_name}。")
+        }
+    }
+}
+
 fn auto_continue_countdown_label(locale: locale::ResolvedLocale, remaining_seconds: u8) -> String {
     match locale {
         locale::ResolvedLocale::En => format!("Continue ({remaining_seconds}s)"),
@@ -9665,6 +9734,16 @@ pub struct VibexWorkbench {
     auto_continue_probe_attempts: BTreeMap<String, AutoContinueProbeAttempt>,
     auto_continue_probe_tasks: BTreeMap<String, AutoContinueProbeTask>,
     auto_continue_countdowns: BTreeMap<String, AutoContinueCountdown>,
+    /// The failover prompt on screen, if any.
+    ///
+    /// One at a time: the gateway holds one request per prompt, and a second
+    /// prompt means a second concurrent request whose answer the user would have
+    /// to give without seeing the first.
+    failover_countdown: Option<FailoverCountdown>,
+    failover_countdown_task: Option<Task<()>>,
+    /// Switches already made, newest last. Each drops itself after a few
+    /// seconds so the composer is not permanently occupied by history.
+    failover_notices: Vec<FailoverNotice>,
     auto_continue_countdown_tasks: BTreeMap<String, Task<()>>,
     last_visibility: WorkbenchVisibility,
     boot_task: Option<Task<()>>,
@@ -11092,6 +11171,9 @@ impl VibexWorkbench {
             auto_continue_probe_attempts: BTreeMap::new(),
             auto_continue_probe_tasks: BTreeMap::new(),
             auto_continue_countdowns: BTreeMap::new(),
+            failover_countdown: None,
+            failover_countdown_task: None,
+            failover_notices: Vec::new(),
             auto_continue_countdown_tasks: BTreeMap::new(),
             last_visibility: WorkbenchVisibility::resolve(DEFAULT_WIDTH, DEFAULT_HEIGHT),
             boot_task: None,
@@ -17085,6 +17167,141 @@ impl VibexWorkbench {
         self.start_auto_continue_countdown(session_id.clone(), session_updated_at_ms, cx);
     }
 
+    /// Drops expired switch notices, repainting only when one actually leaves.
+    ///
+    /// It runs on its own timer rather than from the event handler, because
+    /// `apply_desktop_event` must not repaint: a burst of background gateway
+    /// events would then repaint every pane. This is the one path that does
+    /// paint, and only when the screen really changes.
+    fn retire_failover_notices(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(500))
+                        .await;
+                    let keep_going = entity
+                        .update(cx, |this, cx| {
+                            let now = vibex_core::unix_timestamp_ms();
+                            let before = this.failover_notices.len();
+                            this.failover_notices
+                                .retain(|notice| notice.expires_at_ms > now);
+                            if this.failover_notices.len() != before {
+                                cx.notify();
+                            }
+                            !this.failover_notices.is_empty()
+                        })
+                        .unwrap_or(false);
+                    if !keep_going {
+                        break;
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// Shows a failover prompt and starts its countdown.
+    ///
+    /// The prompt is accepted by default: an unanswered one switches, and this
+    /// surface must not contradict that. So the countdown expiring sends nothing
+    /// — the gateway's own deadline has already settled the request, and a late
+    /// answer would be refused. Only a click sends an answer.
+    fn show_failover_prompt(
+        &mut self,
+        prompt: vibex_core::GatewayFailoverPrompt,
+        cx: &mut Context<Self>,
+    ) {
+        let remaining_ms = prompt.remaining_ms(vibex_core::unix_timestamp_ms());
+        let remaining_seconds = u8::try_from((remaining_ms + 999) / 1000).unwrap_or(0);
+        let prompt_id = prompt.id.clone();
+        self.failover_countdown = Some(FailoverCountdown {
+            prompt,
+            remaining_seconds,
+        });
+        let task = cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(250))
+                        .await;
+                    let keep_ticking = entity
+                        .update(cx, |this, cx| this.tick_failover_countdown(&prompt_id, cx))
+                        .unwrap_or(false);
+                    if !keep_ticking {
+                        break;
+                    }
+                }
+            },
+        );
+        self.failover_countdown_task = Some(task);
+        cx.notify();
+    }
+
+    /// Recomputes the shown remainder; returns whether to keep ticking.
+    fn tick_failover_countdown(
+        &mut self,
+        prompt_id: &vibex_core::RequestId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(countdown) = self.failover_countdown.as_mut() else {
+            return false;
+        };
+        if &countdown.prompt.id != prompt_id {
+            return false;
+        }
+        let remaining_ms = countdown
+            .prompt
+            .remaining_ms(vibex_core::unix_timestamp_ms());
+        if remaining_ms <= 0 {
+            // The gateway has already taken the default; drop the prompt rather
+            // than leave a dead one on screen for the next repaint to draw.
+            self.failover_countdown = None;
+            self.failover_countdown_task = None;
+            cx.notify();
+            return false;
+        }
+        let remaining_seconds = u8::try_from((remaining_ms + 999) / 1000).unwrap_or(0);
+        if countdown.remaining_seconds != remaining_seconds {
+            countdown.remaining_seconds = remaining_seconds;
+            cx.notify();
+        }
+        true
+    }
+
+    /// Sends the user's answer and clears the prompt.
+    fn answer_failover(
+        &mut self,
+        answer: vibex_core::GatewayFailoverAnswer,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(countdown) = self.failover_countdown.take() else {
+            return;
+        };
+        self.failover_countdown_task = None;
+        let prompt_id = countdown.prompt.id.clone();
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        // Detached: the answer is fire-and-forget, and the prompt is already off
+        // screen, so there is nothing left for a handle to cancel.
+        cx.spawn(
+            async move |_entity: WeakEntity<Self>, _cx: &mut gpui::AsyncApp| {
+                let result = backend
+                    .management()
+                    .answer_model_gateway_failover(prompt_id, answer)
+                    .await;
+                // `Ok(false)` means the window closed first, which is a settled
+                // prompt and not something to report.
+                if let Err(error) = result {
+                    tracing::warn!(%error, "failed to answer a model gateway failover prompt");
+                }
+            },
+        )
+        .detach();
+        cx.notify();
+    }
+
     fn start_auto_continue_countdown(
         &mut self,
         session_id: VibexSessionId,
@@ -22624,6 +22841,116 @@ impl VibexWorkbench {
         }
     }
 
+    /// Draws the failover prompt above the composer.
+    ///
+    /// It sits with the generation status because it describes the same turn:
+    /// the request that is running, and which Provider will answer it.
+    fn render_failover_prompt(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let countdown = self.failover_countdown.as_ref()?.clone();
+        let locale = self.resolved_locale();
+        let label = failover_prompt_label(
+            locale,
+            &countdown.prompt.model,
+            &countdown.prompt.from_name,
+            &countdown.prompt.to_name,
+            countdown.remaining_seconds,
+        );
+        Some(
+            h_flex()
+                .id("failover-prompt")
+                .w_full()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().danger.opacity(0.35))
+                .bg(cx.theme().danger.opacity(0.08))
+                .px_3()
+                .py_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child(label),
+                )
+                .child(
+                    Button::new("failover-stay")
+                        .xsmall()
+                        .ghost()
+                        .label(locale::text("Stay", "保持当前", "保持目前"))
+                        .tooltip(locale::text(
+                            "Keep this conversation on the Provider that failed",
+                            "让这个对话继续使用出错的供应商",
+                            "讓這個對話繼續使用出錯的供應商",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.answer_failover(vibex_core::GatewayFailoverAnswer::Stay, cx)
+                        })),
+                )
+                .child(
+                    Button::new("failover-switch")
+                        .xsmall()
+                        .primary()
+                        .label(locale::text("Switch now", "立即切换", "立即切換"))
+                        .tooltip(locale::text(
+                            "Switch this conversation to the next Provider",
+                            "把这个对话切换到下一个供应商",
+                            "把這個對話切換到下一個供應商",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.answer_failover(vibex_core::GatewayFailoverAnswer::Switch, cx)
+                        })),
+                )
+                .child(
+                    Button::new("failover-always")
+                        .xsmall()
+                        .ghost()
+                        .label(locale::text(
+                            "Always switch",
+                            "总是自动切换",
+                            "總是自動切換",
+                        ))
+                        .tooltip(locale::text(
+                            "Switch automatically from now on, without asking",
+                            "以后自动切换，不再询问",
+                            "以後自動切換，不再詢問",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.answer_failover(
+                                vibex_core::GatewayFailoverAnswer::AlwaysSwitch,
+                                cx,
+                            )
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Draws switches that already happened, newest first.
+    ///
+    /// They are quiet: no border, no colour, no buttons. A switch is news, not
+    /// a problem to act on, and the conversation should not be pushed aside for
+    /// it the way a prompt is.
+    fn render_failover_notices(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.failover_notices.is_empty() {
+            return None;
+        }
+        let mut column = v_flex().w_full().flex_none().gap_1();
+        for notice in &self.failover_notices {
+            column = column.child(
+                div()
+                    .w_full()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(notice.message.clone()),
+            );
+        }
+        Some(column.into_any_element())
+    }
+
     fn render_agent_generation_status(
         &mut self,
         session_running: bool,
@@ -25213,9 +25540,47 @@ impl VibexWorkbench {
                 // is forwarded there and the workbench itself does not repaint:
                 // a request starting is not a reason to redraw the timeline.
                 self.management_view.update(cx, |management, cx| {
-                    management.apply_gateway_event(event, cx)
+                    management.apply_gateway_event(event.clone(), cx)
                 });
-                false
+                // A failover prompt is the one gateway event the conversation
+                // itself has to show: it is a question about the turn that is
+                // running, and its answer decides how that turn is served.
+                match event {
+                    vibex_core::GatewayEvent::FailoverAsked(prompt) => {
+                        self.show_failover_prompt(prompt, cx);
+                        true
+                    }
+                    vibex_core::GatewayEvent::FailoverSwitched {
+                        model,
+                        from_name,
+                        to_name,
+                        ..
+                    } => {
+                        let message = failover_switched_label(
+                            self.resolved_locale(),
+                            &model,
+                            &from_name,
+                            &to_name,
+                        );
+                        self.failover_notices.push(FailoverNotice {
+                            message,
+                            expires_at_ms: vibex_core::unix_timestamp_ms() + 8_000,
+                        });
+                        self.retire_failover_notices(cx);
+                        true
+                    }
+                    vibex_core::GatewayEvent::FailoverSettled { ref prompt_id, .. }
+                        if self
+                            .failover_countdown
+                            .as_ref()
+                            .is_some_and(|countdown| &countdown.prompt.id == prompt_id) =>
+                    {
+                        self.failover_countdown = None;
+                        self.failover_countdown_task = None;
+                        true
+                    }
+                    _ => false,
+                }
             }
             DesktopEvent::UsageInvalidated => {
                 let visible = self.ui_state.workbench.active_tab == "usage";
@@ -64904,6 +65269,8 @@ impl VibexWorkbench {
         let auto_continue_toggle_session_id = self.view_session_id.clone();
         let session_running = agent_turn_is_active(self.agent_turn_pending, session_state);
         let generation_status = self.render_agent_generation_status(session_running, cx);
+        let failover_prompt = self.render_failover_prompt(cx);
+        let failover_notices = self.render_failover_notices(cx);
         // The catalog handle is shared and the projection memoized, so a group
         // workspace derives one projection per distinct selection per frame
         // instead of one per pane.
@@ -65329,6 +65696,26 @@ impl VibexWorkbench {
                                 .min_w_0()
                                 .pb_2()
                                 .child(status),
+                        )
+                    })
+                    .when_some(failover_notices, |this, notices| {
+                        this.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .px(px(COMPOSER_QUEUE_HORIZONTAL_INSET))
+                                .pb_2()
+                                .child(notices),
+                        )
+                    })
+                    .when_some(failover_prompt, |this, prompt| {
+                        this.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .px(px(COMPOSER_QUEUE_HORIZONTAL_INSET))
+                                .pb_2()
+                                .child(prompt),
                         )
                     })
                     .when_some(composer_collaboration, |this, collaboration| {

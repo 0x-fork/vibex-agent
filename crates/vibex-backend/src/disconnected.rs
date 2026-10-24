@@ -911,6 +911,14 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn answer_model_gateway_failover(
+        &self,
+        _prompt_id: vibex_core::RequestId,
+        _answer: vibex_core::GatewayFailoverAnswer,
+    ) -> BackendFuture<'_, bool> {
+        disconnected_future!()
+    }
+
     fn model_gateway_requests(&self) -> BackendFuture<'_, Vec<vibex_core::GatewayRequestSummary>> {
         disconnected_future!()
     }

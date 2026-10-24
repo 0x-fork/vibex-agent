@@ -2328,6 +2328,7 @@ pub enum RemoteProviderOperationKind {
     SetModelGatewayEnabled,
     SetModelGatewayAgent,
     ListModelGatewayRequests,
+    AnswerModelGatewayFailover,
     ClearModelGatewayRequests,
     ListCapabilitySummaries,
     RunCapabilityProbes,
@@ -2868,6 +2869,23 @@ pub struct RemoteModelGatewayClearRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteModelGatewayClearResponse {
     pub cleared: usize,
+}
+
+/// Answers a failover prompt the gateway is holding a request on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelGatewayFailoverAnswerRequest {
+    pub auth: RemoteAuthProof,
+    pub prompt_id: crate::RequestId,
+    pub answer: crate::GatewayFailoverAnswer,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelGatewayFailoverAnswerResponse {
+    /// False when the prompt's window closed before the answer arrived, which
+    /// is a settled prompt rather than a failed call.
+    pub answered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3813,6 +3831,7 @@ pub enum RemoteProviderRequest {
     SetModelGatewayEnabled(RemoteModelGatewayEnabledRequest),
     SetModelGatewayAgent(RemoteModelGatewayAgentUpdateRequest),
     ListModelGatewayRequests(RemoteModelGatewayRequestListRequest),
+    AnswerModelGatewayFailover(RemoteModelGatewayFailoverAnswerRequest),
     ClearModelGatewayRequests(RemoteModelGatewayClearRequest),
     ListCapabilitySummaries(RemoteProviderCapabilitySummaryListRequest),
     RunCapabilityProbes(RemoteProviderRunCapabilityProbesRequest),
@@ -4020,6 +4039,9 @@ impl RemoteProviderRequest {
             Self::SetModelGatewayAgent(_) => RemoteProviderOperationKind::SetModelGatewayAgent,
             Self::ListModelGatewayRequests(_) => {
                 RemoteProviderOperationKind::ListModelGatewayRequests
+            }
+            Self::AnswerModelGatewayFailover(_) => {
+                RemoteProviderOperationKind::AnswerModelGatewayFailover
             }
             Self::ClearModelGatewayRequests(_) => {
                 RemoteProviderOperationKind::ClearModelGatewayRequests

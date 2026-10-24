@@ -4095,6 +4095,26 @@ impl ManagementBackend for WebRemoteBackend {
         )
     }
 
+    fn answer_model_gateway_failover(
+        &self,
+        prompt_id: vibex_core::RequestId,
+        answer: vibex_core::GatewayFailoverAnswer,
+    ) -> BackendFuture<'_, bool> {
+        self.gateway_rpc(
+            vibex_core::RemoteProviderRequest::AnswerModelGatewayFailover(
+                vibex_core::RemoteModelGatewayFailoverAnswerRequest {
+                    auth: self.auth(),
+                    prompt_id,
+                    answer,
+                },
+            ),
+            |value| {
+                decode::<vibex_core::RemoteModelGatewayFailoverAnswerResponse>(value)
+                    .map(|response| response.answered)
+            },
+        )
+    }
+
     fn model_gateway_requests(&self) -> BackendFuture<'_, Vec<vibex_core::GatewayRequestSummary>> {
         self.gateway_rpc(
             vibex_core::RemoteProviderRequest::ListModelGatewayRequests(

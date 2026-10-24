@@ -248,6 +248,17 @@ pub trait ManagementBackend: BackendBound {
         request: MutationRequest<GatewayAgentUpdateRequest>,
     ) -> BackendFuture<'_, GatewaySnapshot>;
 
+    /// Answers a route's failover prompt.
+    ///
+    /// The request that raised the prompt is parked until this arrives or the
+    /// prompt's own countdown expires, so this is what turns a click in the
+    /// session into a decision the gateway can act on.
+    fn answer_model_gateway_failover(
+        &self,
+        prompt_id: vibex_core::RequestId,
+        answer: vibex_core::GatewayFailoverAnswer,
+    ) -> BackendFuture<'_, bool>;
+
     /// Lists the metadata-only ledger for the diagnostics view.
     fn model_gateway_requests(&self) -> BackendFuture<'_, Vec<GatewayRequestSummary>>;
 

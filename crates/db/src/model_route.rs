@@ -44,7 +44,7 @@ impl ModelRouteRepository {
                 SELECT model_route_id, display_name, description, kind, strategy,
                     first_token_timeout_ms, context_tokens, pin, token_limit_json,
                     status, revision,
-                    created_at_ms, updated_at_ms, deleted_at_ms
+                    created_at_ms, updated_at_ms, deleted_at_ms, failover
                 FROM model_routes
                 WHERE model_route_id = ?1 AND deleted_at_ms IS NULL
                 ",
@@ -133,7 +133,8 @@ impl ModelRouteRepository {
                     token_limit_json = ?9,
                     status = ?10,
                     revision = revision + 1,
-                    updated_at_ms = ?11
+                    updated_at_ms = ?11,
+                    failover = ?13
                 WHERE model_route_id = ?1
                     AND revision = ?12
                     AND deleted_at_ms IS NULL
@@ -151,6 +152,7 @@ impl ModelRouteRepository {
                     enum_to_db(&route.status)?,
                     next_stamp(conn, route)?,
                     expected_revision,
+                    enum_to_db(&route.failover)?,
                 ],
             )
             .map_err(storage_err(
@@ -543,9 +545,9 @@ fn insert_route(conn: &Connection, route: &ModelRoute) -> VibexResult<()> {
             model_route_id, display_name, description, kind, strategy,
             first_token_timeout_ms, context_tokens, pin, token_limit_json,
             status, revision,
-            created_at_ms, updated_at_ms, deleted_at_ms
+            created_at_ms, updated_at_ms, deleted_at_ms, failover
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
         ",
         params![
             route.id.as_str(),
@@ -562,6 +564,7 @@ fn insert_route(conn: &Connection, route: &ModelRoute) -> VibexResult<()> {
             route.created_at_ms.max(1),
             route.updated_at_ms.max(1),
             route.deleted_at_ms,
+            enum_to_db(&route.failover)?,
         ],
     )
     .map_err(storage_err(
@@ -641,7 +644,7 @@ fn list_where(conn: &Connection, predicate: &str, order: &str) -> VibexResult<Ve
         SELECT model_route_id, display_name, description, kind, strategy,
             first_token_timeout_ms, context_tokens, pin, token_limit_json,
                     status, revision,
-            created_at_ms, updated_at_ms, deleted_at_ms
+            created_at_ms, updated_at_ms, deleted_at_ms, failover
         FROM model_routes
         WHERE {predicate}
         {order}
@@ -697,6 +700,7 @@ fn map_route(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRoute> {
         created_at_ms: row.get(11)?,
         updated_at_ms: row.get(12)?,
         deleted_at_ms: row.get(13)?,
+        failover: enum_from_db_sql(row.get(14)?)?,
     })
 }
 
@@ -1695,6 +1699,7 @@ mod route_policy_tests {
             members: vec![vibex_core::ModelRouteMember::provider(provider, 0)],
             status: vibex_core::RouteStatus::Enabled,
             pin: vibex_core::GatewayPinScope::Conversation,
+            failover: vibex_core::GatewayFailover::Ask,
             token_limit: Some(vibex_core::GatewayTokenLimit {
                 window: vibex_core::GatewayTokenWindow::Week,
                 tokens: 5_000_000,
@@ -1711,6 +1716,11 @@ mod route_policy_tests {
             read.pin,
             vibex_core::GatewayPinScope::Conversation,
             "a route's pinning choice must survive storage"
+        );
+        assert_eq!(
+            read.failover,
+            vibex_core::GatewayFailover::Ask,
+            "a route's failover choice must survive storage"
         );
         let limit = read.token_limit.expect("the ceiling must survive");
         assert_eq!(limit.window, vibex_core::GatewayTokenWindow::Week);

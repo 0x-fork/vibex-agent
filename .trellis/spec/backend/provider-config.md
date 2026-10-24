@@ -5269,6 +5269,28 @@ ProviderConfigService::{
   ledger is a read-only text view with the model, group, tokens, and skipped
   Keys. Key creation, replacement, and removal stay on the desktop, which owns
   the masked input and the confirmation dialogs.
+- **A conversation's pin and the group's failover setting are two halves of
+  one decision.** The pin names the member a conversation is already on, and it
+  is hoisted to the front of the attempt order before any strategy runs: the
+  strategy still orders the rest, so a conversation that has to leave its pinned
+  member inherits the group's preferred fallback order instead of an arbitrary
+  one. Pinning only inside the chosen member's Keys made the pin record
+  meaningless under round-robin, because the strategy re-picked the member every
+  turn and the pin re-ordered Keys inside whichever member it happened to
+  choose. The other half is `failover`, a per-route column beside `pin`:
+  `auto` leaves the failed member silently and reports the switch afterwards,
+  while `ask` puts the question to the session first. Asking is bounded by
+  `GatewayFailoverPrompt::ANSWER_WINDOW_MS` — five seconds — because the
+  gateway is a synchronous HTTP proxy and the Agent turn is blocked on the
+  response: an unbounded question would hang the turn. Silence accepts the
+  switch, so the prompt is a countdown rather than a blocking dialog, and the
+  client draws it the way the auto-continue box is drawn. A failure that does
+  not blame the upstream — a protocol-shape refusal, an unusable Key — moves the
+  conversation without asking, because leaving a member over the gateway's own
+  mistake would punish the wrong party. The prompt's one-click "always switch"
+  writes `failover = auto` to the route itself, so a choice made under pressure
+  survives the next restart. When no session can be found to ask, the gateway
+  behaves as `auto` and the switch is recorded rather than the request failing.
 - **The composer's model menu leads with the model the user already chose.** The
   remembered selections — most-recent-last, already capped — break ties inside a
   group after stars; a search term outranks both, so recency never displaces a
@@ -5313,7 +5335,10 @@ ProviderConfigService::{
 - Good: an Anthropic-speaking upstream answers a Chat-speaking Agent; frames are
   re-encoded as `chat.completion.chunk` and the ledger records both protocols.
 - Good: a conversation pinned to one Key stays there across turns even under
-  round-robin routing.
+  round-robin routing; when that Provider fails under `ask`, the session is
+  asked for five seconds and either answer settles the switch.
+- Good: a route set to `auto` switches a failing Provider silently, and the
+  conversation shows one line naming the model and both Providers.
 - Base: a Key's authentication is rejected; it becomes `Invalid`, never
   `Cooling`, and the next Key answers.
 - Bad: resolve the model id, pick a Key, or emit a marker that changes an Agent
@@ -5325,7 +5350,10 @@ ProviderConfigService::{
 
 - `cargo test -p vibex-model-gateway` covers the IR, all four decoders and
   encoders, SSE frame boundaries, tool-call accumulation, failure classification,
-  route planning, and the loopback perimeter.
+  route planning, the pin's hoist ahead of the strategy order, an answer
+  reaching the waiting request, and the loopback perimeter.
+- `cargo test -p vibex-db route_policy_round_trips` covers `failover` surviving
+  storage beside `pin` and the token ceiling.
 - `cargo test -p vibex-db model_gateway` covers a Key switched off before it
   ever failed and re-enabling clearing an authentication failure.
 - `cargo test -p vibex-model-gateway` covers a preferred Key leading the

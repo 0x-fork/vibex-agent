@@ -63,6 +63,73 @@ impl GatewayRoutingStrategy {
     }
 }
 
+/// The gateway asking the user whether a conversation may leave its pinned
+/// member.
+///
+/// The request that triggered this is already in flight, so the question cannot
+/// wait forever: `expires_at_ms` is when an unanswered prompt accepts the switch
+/// on its own. That is why the UI shows a countdown rather than a blocking
+/// dialog — doing nothing has to be a valid answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayFailoverPrompt {
+    pub id: RequestId,
+    /// The route whose pinned member failed.
+    pub model_route_id: String,
+    /// The route's display name, so the prompt does not have to be joined to a
+    /// route the reader may not have loaded.
+    pub route_name: String,
+    /// The model the conversation asked for, as the Agent names it.
+    pub model: String,
+    /// The member that failed, and the one that would take over.
+    pub from_profile_id: ModelProviderProfileId,
+    pub from_name: String,
+    pub to_profile_id: ModelProviderProfileId,
+    pub to_name: String,
+    /// When an unanswered prompt switches on its own.
+    pub expires_at_ms: i64,
+    /// When the prompt appeared, so a client can compute the remaining time
+    /// from its own clock instead of trusting a count it never saw tick.
+    pub asked_at_ms: i64,
+}
+
+impl GatewayFailoverPrompt {
+    /// How long the user has to answer before the switch is accepted.
+    ///
+    /// Five seconds is long enough to read a one-line prompt and short enough
+    /// that an unattended session is not held up: the request is blocked while
+    /// this runs, so the wait is a real cost paid by a turn the user may not
+    /// even be watching.
+    pub const ANSWER_WINDOW_MS: i64 = 5_000;
+
+    /// What the user chose for a prompt.
+    pub fn remaining_ms(&self, now_ms: i64) -> i64 {
+        (self.expires_at_ms - now_ms).max(0)
+    }
+}
+
+/// How the user answered a failover prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayFailoverAnswer {
+    /// Switch this one time.
+    Switch,
+    /// Keep the conversation where it is; the request fails.
+    Stay,
+    /// Switch, and stop asking for this route from now on.
+    AlwaysSwitch,
+}
+
+impl GatewayFailoverAnswer {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Switch => "switch",
+            Self::Stay => "stay",
+            Self::AlwaysSwitch => "always_switch",
+        }
+    }
+}
+
 /// How long a conversation stays on the Key it started on.
 ///
 /// Vendors cache a prompt per account, so re-picking a Key on every turn
@@ -76,6 +143,48 @@ pub enum GatewayPinScope {
     /// Keep a conversation on one Key until it is invalidated.
     #[default]
     Conversation,
+}
+
+/// What the gateway does when the member a conversation is pinned to fails.
+///
+/// Pinning a conversation to one Provider is what preserves a vendor's prompt
+/// cache, but it must not turn a Provider outage into a stuck session. The
+/// route decides how the escape hatch behaves, because the right answer differs
+/// by what the group is for: a group of interchangeable clones should just move
+/// on, while a group that deliberately mixes vendors should let the user choose.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayFailover {
+    /// Move to the next member and say so afterwards.
+    ///
+    /// The notice is informational: it reports which member took over, and
+    /// nothing waits on the user.
+    #[default]
+    Auto,
+    /// Offer the switch and count down.
+    ///
+    /// The user can take the switch, refuse it, or enable it permanently for
+    /// the group. Doing nothing accepts it, which is why the countdown exists:
+    /// a request is already in flight and a prompt that waits forever would
+    /// hang the turn.
+    Ask,
+}
+
+impl GatewayFailover {
+    pub const ALL: [Self; 2] = [Self::Auto, Self::Ask];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Ask => "ask",
+        }
+    }
+
+    pub fn from_id(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|failover| failover.id() == value.trim())
+    }
 }
 
 impl GatewayPinScope {
@@ -1210,6 +1319,30 @@ pub enum GatewayEvent {
         request_id: RequestId,
         outcome: GatewayRequestOutcome,
     },
+    /// A pinned member failed and the route asks before switching.
+    ///
+    /// The request is held while this is outstanding: the answer decides which
+    /// member serves it, so nothing can proceed until either the user answers or
+    /// the prompt expires.
+    FailoverAsked(GatewayFailoverPrompt),
+    /// The prompt is no longer outstanding, whatever settled it.
+    FailoverSettled {
+        prompt_id: RequestId,
+        answer: GatewayFailoverAnswer,
+    },
+    /// A conversation moved from one member to another.
+    ///
+    /// Emitted for every switch, whether it was automatic or answered, because
+    /// the point is the same in both cases: a reader has to learn that the
+    /// answer came from a different Provider than the one the model name might
+    /// suggest.
+    FailoverSwitched {
+        request_id: RequestId,
+        model_route_id: Option<String>,
+        model: String,
+        from_name: String,
+        to_name: String,
+    },
 }
 
 impl GatewayEvent {
@@ -1219,6 +1352,9 @@ impl GatewayEvent {
             Self::Began(inflight) => &inflight.request_id,
             Self::FirstToken { request_id, .. } => request_id,
             Self::Ended { request_id, .. } => request_id,
+            Self::FailoverAsked(prompt) => &prompt.id,
+            Self::FailoverSettled { prompt_id, .. } => prompt_id,
+            Self::FailoverSwitched { request_id, .. } => request_id,
         }
     }
 }
@@ -1476,6 +1612,44 @@ impl fmt::Display for GatewayRoutingStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failover_prompt_counts_down_to_its_deadline() {
+        let prompt = GatewayFailoverPrompt {
+            id: RequestId::new(),
+            model_route_id: "route-1".to_string(),
+            route_name: "Team".to_string(),
+            model: "deepseek-chat".to_string(),
+            from_profile_id: ModelProviderProfileId::new(),
+            from_name: "alpha".to_string(),
+            to_profile_id: ModelProviderProfileId::new(),
+            to_name: "beta".to_string(),
+            expires_at_ms: 10_500,
+            asked_at_ms: 5_500,
+        };
+        // The window is the one the prompt was built with, and it never goes
+        // negative: a client that asks after the deadline must not draw a
+        // countdown that counts up.
+        assert_eq!(prompt.remaining_ms(5_500), 5_000);
+        assert_eq!(prompt.remaining_ms(8_000), 2_500);
+        assert_eq!(prompt.remaining_ms(10_500), 0);
+        assert_eq!(prompt.remaining_ms(99_999), 0);
+    }
+
+    #[test]
+    fn a_failover_setting_round_trips_through_its_id() {
+        assert_eq!(GatewayFailover::default(), GatewayFailover::Auto);
+        for setting in GatewayFailover::ALL {
+            assert_eq!(GatewayFailover::from_id(setting.id()), Some(setting));
+        }
+        assert_eq!(GatewayFailover::from_id("nonsense"), None);
+        // The wire form is what the route table stores, so it has to be the id
+        // rather than the Rust variant name.
+        assert_eq!(
+            serde_json::to_string(&GatewayFailover::Ask).unwrap(),
+            "\"ask\""
+        );
+    }
 
     #[test]
     fn gateway_contracts_carry_no_money_fields() {

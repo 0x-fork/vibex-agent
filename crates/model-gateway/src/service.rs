@@ -131,6 +131,8 @@ pub struct GatewayProviderGroup {
     pub key_strategy: GatewayRoutingStrategy,
     pub first_token_timeout_ms: Option<u64>,
     pub pin: vibex_core::GatewayPinScope,
+    /// What happens when the member a conversation is pinned to fails.
+    pub failover: vibex_core::GatewayFailover,
     pub token_limit: Option<vibex_core::GatewayTokenLimit>,
     /// The Providers in attempt order, already filtered to the ones that exist.
     pub providers: Vec<crate::route::RouteMemberRef>,
@@ -357,7 +359,17 @@ pub struct ModelGatewayService {
     /// durable copy lives in `model_gateway_endpoint_protocol`, and this map
     /// only saves a database read per request.
     lessons: RwLock<BTreeMap<(ModelProviderProfileId, String), WireProtocol>>,
+    /// Failover prompts waiting for an answer, by prompt id.
+    ///
+    /// A request that has to ask parks itself on the entry's sender: the ask is
+    /// synchronous from the caller's point of view, so the answer has to arrive
+    /// through something the request can await. Entries are removed as they are
+    /// settled, so a prompt that was never drawn cannot leak.
+    failover_asks: Mutex<BTreeMap<String, FailoverSender>>,
 }
+
+/// The waiting end of one failover prompt.
+type FailoverSender = tokio::sync::oneshot::Sender<vibex_core::GatewayFailoverAnswer>;
 
 /// One route group's breaker.
 ///
@@ -445,6 +457,7 @@ impl ModelGatewayService {
             shutting_down: RwLock::new(false),
             breakers: Mutex::new(BTreeMap::new()),
             lessons: RwLock::new(BTreeMap::new()),
+            failover_asks: Mutex::new(BTreeMap::new()),
             inflight: RwLock::new(Vec::new()),
             events: RwLock::new(None),
         })
@@ -637,6 +650,7 @@ impl ModelGatewayService {
                         },
                         first_token_timeout_ms: route.first_token_timeout_ms,
                         pin: route.pin,
+                        failover: route.failover,
                         token_limit: route.token_limit,
                         providers,
                         models,
@@ -906,6 +920,83 @@ impl ModelGatewayService {
         }
     }
 
+    /// Publishes a failover prompt and waits for its answer.
+    ///
+    /// Returns `None` when nothing is listening (a headless runtime), which the
+    /// caller reads as "the user cannot be asked" — the request then does what
+    /// the route's setting says without a prompt, rather than blocking on an
+    /// answer that cannot arrive.
+    ///
+    /// The wait is bounded by the prompt's own window. An unanswered prompt is
+    /// an accepted switch, so the one outcome that must never happen is waiting
+    /// forever: the request is holding a live Agent turn.
+    async fn ask_failover(
+        &self,
+        prompt: vibex_core::GatewayFailoverPrompt,
+    ) -> Option<vibex_core::GatewayFailoverAnswer> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if let Ok(mut asks) = self.failover_asks.lock() {
+            asks.insert(prompt.id.as_str().to_string(), sender);
+        } else {
+            return None;
+        }
+        // Registered before the event is published: a client that answers the
+        // instant it draws the prompt must find the sender already waiting.
+        if self
+            .events
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .is_none()
+        {
+            if let Ok(mut asks) = self.failover_asks.lock() {
+                asks.remove(prompt.id.as_str());
+            }
+            return None;
+        }
+        self.publish_event(vibex_core::GatewayEvent::FailoverAsked(prompt.clone()));
+        let window = std::time::Duration::from_millis(
+            u64::try_from(prompt.remaining_ms(vibex_core::unix_timestamp_ms())).unwrap_or(0),
+        );
+        let answer = match tokio::time::timeout(window, receiver).await {
+            Ok(Ok(answer)) => answer,
+            // The window closed, or the sender was dropped because the client
+            // went away. Both mean nobody overrode the default.
+            Ok(Err(_)) | Err(_) => {
+                if let Ok(mut asks) = self.failover_asks.lock() {
+                    asks.remove(prompt.id.as_str());
+                }
+                vibex_core::GatewayFailoverAnswer::Switch
+            }
+        };
+        self.publish_event(vibex_core::GatewayEvent::FailoverSettled {
+            prompt_id: prompt.id.clone(),
+            answer,
+        });
+        Some(answer)
+    }
+
+    /// Answers an outstanding failover prompt.
+    ///
+    /// Returns whether a prompt was actually waiting: an answer that arrives
+    /// after its window closed is not an error, it is simply too late, and
+    /// pretending otherwise would let a stale click redirect a later request.
+    pub fn answer_failover(
+        &self,
+        prompt_id: &vibex_core::RequestId,
+        answer: vibex_core::GatewayFailoverAnswer,
+    ) -> bool {
+        let sender = self
+            .failover_asks
+            .lock()
+            .ok()
+            .and_then(|mut asks| asks.remove(prompt_id.as_str()));
+        match sender {
+            Some(sender) => sender.send(answer).is_ok(),
+            None => false,
+        }
+    }
+
     /// Whether any route group is currently stepping aside.
     pub fn is_degraded(&self) -> bool {
         self.runtime_state().degraded_routes > 0
@@ -1112,11 +1203,53 @@ impl ModelGatewayService {
             });
         }
 
+        let now = vibex_core::unix_timestamp_ms();
+        let connection = self.connection()?;
+        let agent_id = agent_id_from_headers(headers);
+        let header_pairs = headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect::<Vec<_>>();
+        // Pinning is a property of the composition, so the group decides it.
+        // There is no gateway-wide default: a model that does not belong to a
+        // group is not a gateway model at all.
+        //
+        // It is resolved *before* the members are ordered, because the pin is
+        // what decides the order: a conversation already on one Provider has to
+        // be offered that Provider first, or a round-robin group would walk away
+        // from the member holding its prompt cache on every single turn and the
+        // pin would never hold anything.
+        let pin = resolved_group_id(&request.model)
+            .and_then(|group_id| snapshot.groups.get(group_id))
+            .map(|group| group.pin)
+            .unwrap_or(GatewayPinScope::Off);
+        let conversation = (pin == GatewayPinScope::Conversation)
+            .then(|| conversation_key(agent_id.as_deref(), &header_pairs, &body_value))
+            .flatten();
+        let pinned = conversation
+            .as_deref()
+            .and_then(|key| {
+                GatewayConversationPinRepository::get(&connection, key)
+                    .ok()
+                    .flatten()
+            })
+            .filter(|pin| pin.is_live_at(now))
+            .map(|pin| (pin.model_provider_profile_id, pin.credential_id));
+
         // Resolve the request into the list of upstreams it may call. A route
         // expands to its members; anything else is a one-member list. Both then
         // take the same path, which is what keeps a direct Provider and a
         // route from growing two sets of routing rules.
-        let resolved_members = self.resolve_members(&snapshot, &request)?;
+        let resolved_members = self.resolve_members(
+            &snapshot,
+            &request,
+            pinned.as_ref().map(|(profile, _)| profile),
+        )?;
         if resolved_members.is_empty() {
             return Err(GatewayError::ModelNotFound {
                 model: request.model.clone(),
@@ -1140,38 +1273,6 @@ impl ModelGatewayService {
                 None => false,
             },
         };
-
-        let now = vibex_core::unix_timestamp_ms();
-        let connection = self.connection()?;
-        let agent_id = agent_id_from_headers(headers);
-        let header_pairs = headers
-            .iter()
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| (name.as_str().to_string(), value.to_string()))
-            })
-            .collect::<Vec<_>>();
-        // Pinning is a property of the composition, so the group decides it.
-        // There is no gateway-wide default: a model that does not belong to a
-        // group is not a gateway model at all.
-        let pin = resolved_group_id(&request.model)
-            .and_then(|group_id| snapshot.groups.get(group_id))
-            .map(|group| group.pin)
-            .unwrap_or(GatewayPinScope::Off);
-        let conversation = (pin == GatewayPinScope::Conversation)
-            .then(|| conversation_key(agent_id.as_deref(), &header_pairs, &body_value))
-            .flatten();
-        let pinned = conversation
-            .as_deref()
-            .and_then(|key| {
-                GatewayConversationPinRepository::get(&connection, key)
-                    .ok()
-                    .flatten()
-            })
-            .filter(|pin| pin.is_live_at(now))
-            .map(|pin| (pin.model_provider_profile_id, pin.credential_id));
 
         let mut members = Vec::new();
         let mut last_error: Option<GatewayError> = None;
@@ -1199,6 +1300,15 @@ impl ModelGatewayService {
             }));
         }
 
+        // The route's failover policy travels with the request, not with the
+        // snapshot: a prompt answered with "always" rewrites the route while
+        // this request is still in flight, and it must keep the answer it was
+        // given rather than start asking again mid-flight.
+        let (route_name, failover) = group_id
+            .as_deref()
+            .and_then(|group_id| snapshot.groups.get(group_id))
+            .map(|group| (group.display_name.clone(), group.failover))
+            .unwrap_or((String::new(), vibex_core::GatewayFailover::Auto));
         let prepared = PreparedCall {
             inbound,
             requested_model: request.model.clone(),
@@ -1209,6 +1319,13 @@ impl ModelGatewayService {
             group_id,
             probe: probe.armed,
             request_id: RequestId::new(),
+            route_name,
+            failover,
+            // A pin only means "this member was chosen on purpose" when a live
+            // conversation pin actually named it. The setting alone is not
+            // enough: a first turn in a conversation has the setting but no
+            // pin yet, and that turn has nothing to be disloyal to.
+            pinned: pinned.is_some() && pin == GatewayPinScope::Conversation,
         };
         // The slot now belongs to the caller of `open_attempt`.
         probe.armed = false;
@@ -1222,10 +1339,20 @@ impl ModelGatewayService {
     /// against a Provider list the gateway no longer owns: a bare vendor model
     /// id has no meaning here, and pretending otherwise was what made the
     /// listener look like it had upstreams of its own.
+    /// Expands a request into the members that may serve it, in attempt order.
+    ///
+    /// `pinned` is the Provider this conversation is already on, when there is
+    /// one. It is moved to the front: the plan's strategy decides how the
+    /// remaining members are ordered, but it must not decide that a conversation
+    /// leaves the member whose prompt cache it is paying for. Without this the
+    /// pin only ever reordered Keys *inside* whichever member the strategy
+    /// happened to pick, so a round-robin group re-pinned the conversation on
+    /// every turn and the record never meant anything.
     fn resolve_members(
         &self,
         snapshot: &GatewaySnapshot,
         request: &CanonicalRequest,
+        pinned: Option<&ModelProviderProfileId>,
     ) -> GatewayResult<Vec<ResolvedMember>> {
         let Some((group, model)) = snapshot.group_for_model(&request.model) else {
             let parsed = vibex_core::provider_group_model_ref(&request.model);
@@ -1281,12 +1408,16 @@ impl ModelGatewayService {
                     .collect(),
             });
         }
-        let plans = crate::route::plan_members_with_usage(
+        let mut plans = crate::route::plan_members_with_usage(
             &candidates,
             group.strategy,
             self.member_rotation.fetch_add(1, Ordering::Relaxed),
             &self.member_usage(snapshot),
         );
+        // The pinned member goes first, ahead of whatever the strategy chose.
+        // The strategy still orders everything else, so a group that pins and
+        // then has to fail over keeps its preferred fallback order.
+        hoist_pinned(&mut plans, pinned, |plan| &plan.profile);
         for candidate in &mut candidates {
             if let Some(plan) = plans.iter().find(|plan| plan.profile == candidate.profile) {
                 candidate.reasoning_effort = plan.reasoning_effort.clone();
@@ -1589,7 +1720,13 @@ impl ModelGatewayService {
         // gave them. A member that fails before any byte reaches the client
         // hands over to the next one; once a stream has started, the caller
         // decides and this loop never retries.
+        //
+        // A failure on the member the conversation was *pinned* to is different
+        // from any other failure: that member was chosen on purpose, so leaving
+        // it is a decision. Which decision it is belongs to the route, and
+        // asking is what `prepared.failover` reports.
         for (index, member) in prepared.members.iter().enumerate() {
+            let pinned_member = index == 0 && prepared.pinned;
             // Announce the attempt before it is sent: a client draws the dot
             // moving to this member while the call is in flight, which is the
             // only moment the information is useful.
@@ -1645,6 +1782,29 @@ impl ModelGatewayService {
                         last_error = Some(error);
                         break;
                     }
+                    // The pinned member failed. Either the route already said
+                    // to move on, or it asked, and the answer decides.
+                    if pinned_member && let Some(next) = prepared.members.get(index + 1) {
+                        match self.decide_failover(prepared, member, next, &error).await {
+                            FailoverDecision::Switch { announce } => {
+                                if announce {
+                                    self.publish_event(
+                                        vibex_core::GatewayEvent::FailoverSwitched {
+                                            request_id: prepared.request_id.clone(),
+                                            model_route_id: prepared.group_id.clone(),
+                                            model: bare_model_name(&prepared.requested_model),
+                                            from_name: member.provider_name.clone(),
+                                            to_name: next.provider_name.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                            FailoverDecision::Stay => {
+                                last_error = Some(error);
+                                break;
+                            }
+                        }
+                    }
                     last_error = Some(error);
                 }
             }
@@ -1660,6 +1820,88 @@ impl ModelGatewayService {
             model: prepared.requested_model.clone(),
             retry_after_ms: None,
         }))
+    }
+
+    /// Decides what a pinned member's failure means for the conversation.
+    ///
+    /// `Auto` moves on and says so afterwards. `Ask` puts the question to the
+    /// runtime and waits, bounded by the prompt's own countdown; the answer can
+    /// also settle the question for the whole route from then on.
+    async fn decide_failover(
+        &self,
+        prepared: &PreparedCall,
+        from: &PreparedMember,
+        to: &PreparedMember,
+        error: &GatewayError,
+    ) -> FailoverDecision {
+        // Only a failure that blames the member justifies leaving it. A wrong
+        // protocol or an unusable Key is the gateway's own problem, and moving
+        // the conversation would punish a Provider for the gateway's mistake.
+        if !error.blames_upstream() {
+            return FailoverDecision::Switch { announce: false };
+        }
+        if prepared.failover == vibex_core::GatewayFailover::Auto {
+            return FailoverDecision::Switch { announce: true };
+        }
+        let now = vibex_core::unix_timestamp_ms();
+        let prompt = vibex_core::GatewayFailoverPrompt {
+            id: vibex_core::RequestId::new(),
+            model_route_id: prepared.group_id.clone().unwrap_or_default(),
+            route_name: prepared.route_name.clone(),
+            model: prepared.requested_model.clone(),
+            from_profile_id: from.profile_id.clone(),
+            from_name: from.provider_name.clone(),
+            to_profile_id: to.profile_id.clone(),
+            to_name: to.provider_name.clone(),
+            expires_at_ms: now + vibex_core::GatewayFailoverPrompt::ANSWER_WINDOW_MS,
+            asked_at_ms: now,
+        };
+        match self.ask_failover(prompt.clone()).await {
+            // Nobody to ask: behave like the automatic setting, because the
+            // request still has to be served and there is no one to overrule.
+            None => FailoverDecision::Switch { announce: true },
+            Some(vibex_core::GatewayFailoverAnswer::Stay) => FailoverDecision::Stay,
+            Some(vibex_core::GatewayFailoverAnswer::AlwaysSwitch) => {
+                self.remember_route_failover(&prompt.model_route_id);
+                FailoverDecision::Switch { announce: true }
+            }
+            Some(vibex_core::GatewayFailoverAnswer::Switch) => {
+                FailoverDecision::Switch { announce: true }
+            }
+        }
+    }
+
+    /// Turns off asking for one route, durably.
+    ///
+    /// The prompt offers this as a one-click answer, so the write has to be the
+    /// same one the route's own settings page performs: a choice made under
+    /// pressure must survive the next restart, or it was not really a setting.
+    fn remember_route_failover(&self, model_route_id: &str) {
+        if model_route_id.is_empty() {
+            return;
+        }
+        let Ok(connection) = self.connection() else {
+            return;
+        };
+        let Ok(route_id) = vibex_core::ModelRouteId::parse(model_route_id) else {
+            return;
+        };
+        let Ok(Some(mut route)) = vibex_db::ModelRouteRepository::get(&connection, &route_id)
+        else {
+            return;
+        };
+        if route.failover == vibex_core::GatewayFailover::Auto {
+            return;
+        }
+        let revision = route.revision;
+        route.failover = vibex_core::GatewayFailover::Auto;
+        route.revision = revision.saturating_add(1);
+        route.updated_at_ms = vibex_core::unix_timestamp_ms();
+        if vibex_db::ModelRouteRepository::update(&connection, &route, revision).is_ok() {
+            // The snapshot carries the route's policy, so it has to be rebuilt
+            // before the next request reads the old answer.
+            self.invalidate_snapshot();
+        }
     }
 
     /// Tries every Key of one member until one answers.
@@ -2149,6 +2391,16 @@ fn resolved_group_id(model: &str) -> Option<&str> {
 
 /// A request that has been resolved but not yet sent.
 #[derive(Clone)]
+/// What a pinned member's failure means for the conversation.
+enum FailoverDecision {
+    /// Leave the pinned member. `announce` is false when the failure was not
+    /// the member's fault, which is not worth reporting as a switch.
+    Switch { announce: bool },
+    /// Keep the conversation where it is and let the request fail.
+    Stay,
+}
+
+#[derive(Clone)]
 pub struct PreparedCall {
     pub inbound: WireProtocol,
     pub requested_model: String,
@@ -2170,6 +2422,16 @@ pub struct PreparedCall {
     /// the ledger row, and the events a client draws all have to name the same
     /// thing.
     pub request_id: RequestId,
+    /// The route's display name, for prompts that must not re-read the route.
+    pub route_name: String,
+    /// What the route does when the pinned member fails.
+    pub failover: vibex_core::GatewayFailover,
+    /// Whether the first member is here because the conversation was pinned to
+    /// it, rather than because the strategy happened to pick it.
+    ///
+    /// It gates the failover prompt: only a member that was kept on purpose is
+    /// worth asking about, because only that switch is a decision the user made.
+    pub pinned: bool,
 }
 
 /// One upstream this request may call, with everything needed to call it.
@@ -2216,6 +2478,39 @@ pub struct MemberCall {
     pub passthrough: bool,
     pub endpoint: ModelProviderEndpoint,
     pub body: Value,
+}
+
+/// The model name as a reader knows it, without the group prefix.
+///
+/// A gateway id is `group/<route>/<model>`, which is an address, not a name.
+/// The prompt and the switch notice name the model, so they strip the routing
+/// prefix: `group/abc/deepseek-chat` reads as `deepseek-chat`.
+fn bare_model_name(requested: &str) -> String {
+    vibex_core::provider_group_model_ref(requested)
+        .map(|parsed| parsed.model_id.to_string())
+        .unwrap_or_else(|| requested.to_string())
+}
+
+/// Moves the pinned member to the front, if it is in the plan at all.
+///
+/// The strategy still orders the rest, so this only ever changes which member
+/// is tried first: a conversation that has to leave the pinned member inherits
+/// the group's preferred fallback order rather than an arbitrary one.
+fn hoist_pinned<T>(
+    plans: &mut Vec<T>,
+    pinned: Option<&ModelProviderProfileId>,
+    profile: impl Fn(&T) -> &ModelProviderProfileId,
+) {
+    let Some(pinned) = pinned else {
+        return;
+    };
+    let Some(index) = plans.iter().position(|plan| profile(plan) == pinned) else {
+        return;
+    };
+    if index > 0 {
+        let plan = plans.remove(index);
+        plans.insert(0, plan);
+    }
 }
 
 impl PreparedCall {
@@ -3246,6 +3541,7 @@ mod tests {
                     key_strategy: GatewayRoutingStrategy::Ordered,
                     first_token_timeout_ms: None,
                     pin: GatewayPinScope::Off,
+                    failover: vibex_core::GatewayFailover::Auto,
                     token_limit: None,
                     providers: Vec::new(),
                     models: vec![GatewayGroupModel {
@@ -3384,6 +3680,88 @@ mod inflight_tests {
         // Every event names the same request, which is what lets a client
         // follow one request rather than guess.
         assert!(events.iter().all(|event| event.request_id() == &request_id));
+    }
+
+    #[test]
+    fn a_prompt_names_the_model_without_its_routing_prefix() {
+        // A gateway id is an address, so the prompt and the notice have to show
+        // the model as the user knows it.
+        assert_eq!(
+            bare_model_name("group/route-1/deepseek-chat"),
+            "deepseek-chat"
+        );
+        // Anything that is not a group id is already a name.
+        assert_eq!(bare_model_name("deepseek-chat"), "deepseek-chat");
+        assert_eq!(bare_model_name("group/only-a-route"), "group/only-a-route");
+    }
+
+    #[test]
+    fn a_pinned_member_is_tried_before_the_strategy_order() {
+        let a = ModelProviderProfileId::new();
+        let b = ModelProviderProfileId::new();
+        let c = ModelProviderProfileId::new();
+        let mut plans = vec![a.clone(), b.clone(), c.clone()];
+        // The strategy put `c` last; pinning it must still make it first, and
+        // leave the rest in the order the strategy chose.
+        hoist_pinned(&mut plans, Some(&c), |plan| plan);
+        assert_eq!(plans, vec![c.clone(), a.clone(), b.clone()]);
+        // Already first: nothing moves, so a second turn in the same
+        // conversation does not reshuffle the fallbacks.
+        hoist_pinned(&mut plans, Some(&c), |plan| plan);
+        assert_eq!(plans, vec![c.clone(), a.clone(), b.clone()]);
+        // A pin for a member that has since left the group is ignored rather
+        // than dropping the request.
+        let gone = ModelProviderProfileId::new();
+        hoist_pinned(&mut plans, Some(&gone), |plan| plan);
+        assert_eq!(plans, vec![c.clone(), a.clone(), b.clone()]);
+        // No pin at all leaves the strategy's order untouched.
+        hoist_pinned(&mut plans, None, |plan| plan);
+        assert_eq!(plans, vec![c, a, b]);
+    }
+
+    #[test]
+    fn an_answer_reaches_the_request_that_is_waiting() {
+        let service = service();
+        service.set_event_sink(Arc::new(|_| {}));
+        let prompt = vibex_core::GatewayFailoverPrompt {
+            id: RequestId::new(),
+            model_route_id: "model_route_test".to_string(),
+            route_name: "Team".to_string(),
+            model: "route/model_route_test".to_string(),
+            from_profile_id: ModelProviderProfileId::new(),
+            from_name: "alpha".to_string(),
+            to_profile_id: ModelProviderProfileId::new(),
+            to_name: "beta".to_string(),
+            expires_at_ms: vibex_core::unix_timestamp_ms() + 5_000,
+            asked_at_ms: vibex_core::unix_timestamp_ms(),
+        };
+        let prompt_id = prompt.id.clone();
+        let waiting = Arc::clone(&service);
+        let task = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            runtime.block_on(waiting.ask_failover(prompt))
+        });
+        // The sender is registered before the event is published, so a client
+        // answering the instant it draws the prompt cannot miss it.
+        let mut answered = false;
+        for _ in 0..200 {
+            if service.answer_failover(&prompt_id, vibex_core::GatewayFailoverAnswer::Stay) {
+                answered = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(answered, "the prompt never became answerable");
+        assert_eq!(
+            task.join().unwrap(),
+            Some(vibex_core::GatewayFailoverAnswer::Stay)
+        );
+        // The entry is gone once settled: a second, stale click must not be
+        // able to redirect a later request.
+        assert!(!service.answer_failover(&prompt_id, vibex_core::GatewayFailoverAnswer::Stay));
     }
 
     /// A first token is only announced once.

@@ -3194,6 +3194,20 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn answer_model_gateway_failover(
+        &self,
+        prompt_id: vibex_core::RequestId,
+        answer: vibex_core::GatewayFailoverAnswer,
+    ) -> BackendFuture<'_, bool> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            // A `false` here is not a failure: the prompt's window closed while
+            // the click was in flight, and the request already took the default.
+            Ok(runtime.model_gateway().answer_failover(&prompt_id, answer))
+        })
+    }
+
     fn model_gateway_requests(&self) -> BackendFuture<'_, Vec<GatewayRequestSummary>> {
         let runtime = self.runtime.clone();
         Box::pin(async move {

@@ -614,6 +614,16 @@ pub trait RemoteManagementSnapshotSource: Send + Sync {
         request: vibex_core::GatewayAgentUpdateRequest,
     ) -> VibexResult<vibex_core::GatewaySnapshot>;
 
+    /// Answers a failover prompt the gateway is holding a request on.
+    ///
+    /// Returns false when the prompt had already expired, which settles the
+    /// request with its default rather than failing the caller.
+    async fn answer_model_gateway_failover(
+        &self,
+        prompt_id: vibex_core::RequestId,
+        answer: vibex_core::GatewayFailoverAnswer,
+    ) -> VibexResult<bool>;
+
     /// Lists the gateway's metadata-only request ledger.
     async fn model_gateway_requests(&self) -> VibexResult<Vec<vibex_core::GatewayRequestSummary>>;
 
@@ -4578,6 +4588,28 @@ async fn dispatch_provider_request(
             })?;
             let requests = source.model_gateway_requests().await?;
             serde_json::to_value(vibex_core::RemoteModelGatewayRequestListResponse { requests })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::AnswerModelGatewayFailover(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = state.management_snapshot.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "remote_model_gateway_unavailable",
+                    "the model gateway is not available on this service",
+                )
+            })?;
+            // Held only for the prompt's own five-second window, so this call
+            // is short even though the request it settles is blocked.
+            let answered = source
+                .answer_model_gateway_failover(request.prompt_id, request.answer)
+                .await?;
+            serde_json::to_value(vibex_core::RemoteModelGatewayFailoverAnswerResponse { answered })
                 .map_err(remote_payload_encode_error)
         }
         RemoteProviderRequest::ClearModelGatewayRequests(request) => {
