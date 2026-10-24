@@ -73399,8 +73399,12 @@ const RUNTIME_ROUTE_GROUP_FOLD_THRESHOLD: usize = 5;
 
 /// The one line a route's group heading shows.
 ///
-/// The design's rule is that this must never promise automatic recovery the
-/// route cannot deliver: a single-source route says nothing about failing over.
+/// Only a multi-source route says anything about its shape: the count tells the
+/// reader it can fail over, which is the one thing worth promising. A route
+/// with a single source has nothing to switch to, and what it *is* — a direct
+/// route or a one-member group — describes how it reaches the gateway, which
+/// the picker has no business putting in front of the reader. It gets the plain
+/// model count every other source gets.
 fn runtime_route_subtitle(sources: usize, model_count: usize) -> String {
     let models = runtime_model_count_label(model_count);
     if sources > 1 {
@@ -73410,13 +73414,7 @@ fn runtime_route_subtitle(sources: usize, model_count: usize) -> String {
             locale::ResolvedLocale::ZhTw => format!("{sources} 個來源 · {models}"),
         }
     } else {
-        // One source is a direct route or a one-member composition; either way
-        // there is nothing to switch to, so the count would mislead.
-        match locale::current_locale() {
-            locale::ResolvedLocale::En => format!("Direct · {models}"),
-            locale::ResolvedLocale::ZhCn => format!("直连 · {models}"),
-            locale::ResolvedLocale::ZhTw => format!("直連 · {models}"),
-        }
+        models
     }
 }
 
@@ -111768,15 +111766,19 @@ mod route_picker_tests {
         assert!(label.contains("sources"), "{label}");
     }
 
-    /// A single-source route says "Direct" instead of counting to one.
+    /// A single-source route never claims a shape, only what it holds.
     ///
-    /// "1 sources" is noise, and the reader needs to know there is nothing to
-    /// fail over to, which a count of one does not say.
+    /// Whether the route reaches the gateway directly or through a one-member
+    /// group is a transport detail. Calling a gateway group "Direct" was simply
+    /// wrong, and saying "1 sources" is noise, so the row carries the same model
+    /// count every other source does.
     #[test]
-    fn a_single_source_route_reads_as_direct() {
+    fn a_single_source_route_reads_as_its_model_count() {
         let label = runtime_auth_source_status_label(&route_source(), 1, 1);
-        assert!(label.contains("Direct"), "{label}");
-        assert!(!label.contains("sources"), "{label}");
+        assert_eq!(label, runtime_model_count_label(1));
+        for word in ["Direct", "直连", "直連", "sources", "来源", "來源"] {
+            assert!(!label.contains(word), "{word} leaked into {label}");
+        }
     }
 
     /// A Provider keeps the plain model count.
