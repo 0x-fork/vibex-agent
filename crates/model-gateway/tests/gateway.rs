@@ -90,6 +90,13 @@ struct MockState {
     /// One Authorization header the mock refuses, and with which status, so a
     /// test can make the first Key fail while the next one answers.
     refuse: Option<(String, u16)>,
+    /// Write the SSE body one frame per TCP write instead of as one body.
+    ///
+    /// A single write usually reaches the gateway as a single chunk, which
+    /// hides any per-chunk decoder state. Real vendors flush each frame as it
+    /// is produced, so a frame boundary is the normal case and has to be
+    /// covered.
+    frame_by_frame: bool,
 }
 
 async fn mock_handler(
@@ -140,7 +147,31 @@ async fn mock_handler(
         return response;
     }
     state.overlap.leave();
-    let mut response = Response::new(Body::from(state.stream));
+    let mut response = if state.frame_by_frame {
+        // A delay between frames is what makes them separate reads on the
+        // client side; without it the transport coalesces the whole body into
+        // one chunk and any per-chunk state bug stays hidden.
+        let frames = state
+            .stream
+            .split_inclusive("\n\n")
+            .filter(|frame| !frame.trim().is_empty())
+            .map(|frame| axum::body::Bytes::from(frame.to_string()))
+            .collect::<Vec<_>>();
+        let body = futures_util::stream::unfold(
+            (frames.into_iter(), false),
+            |(mut frames, first)| async move {
+                if !first {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                frames
+                    .next()
+                    .map(|frame| (Ok::<_, std::io::Error>(frame), (frames, false)))
+            },
+        );
+        Response::new(Body::from_stream(body))
+    } else {
+        Response::new(Body::from(state.stream))
+    };
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         header::HeaderValue::from_static("text/event-stream"),
@@ -192,6 +223,7 @@ async fn mock_upstream_with_refusal(
         stream,
         json: None,
         refuse: Some((refused_authorization.to_string(), refusal_status)),
+        frame_by_frame: false,
     };
     let router = Router::new()
         .route("/{*path}", post(mock_handler))
@@ -211,6 +243,23 @@ async fn mock_upstream_with_overlap(
     stream: String,
     json: Option<Value>,
 ) -> (String, Recorder, Arc<Overlap>, tokio::task::JoinHandle<()>) {
+    mock_upstream_flushing(status, stream, json, false).await
+}
+
+/// A mock that flushes every SSE frame as its own body chunk.
+async fn mock_upstream_frame_by_frame(
+    stream: String,
+) -> (String, Recorder, tokio::task::JoinHandle<()>) {
+    let (url, recorder, _overlap, task) = mock_upstream_flushing(200, stream, None, true).await;
+    (url, recorder, task)
+}
+
+async fn mock_upstream_flushing(
+    status: u16,
+    stream: String,
+    json: Option<Value>,
+    frame_by_frame: bool,
+) -> (String, Recorder, Arc<Overlap>, tokio::task::JoinHandle<()>) {
     let recorder: Recorder = Arc::new(Mutex::new(Recorded::default()));
     let overlap = Arc::new(Overlap::default());
     let state = MockState {
@@ -220,6 +269,7 @@ async fn mock_upstream_with_overlap(
         stream,
         json,
         refuse: None,
+        frame_by_frame,
     };
     let router = Router::new()
         .route("/{*path}", post(mock_handler))
@@ -446,6 +496,25 @@ data: {"type":"message_stop"}"#,
         + "\n\n"
 }
 
+/// A minimal Responses stream: one created event, one text delta, one end.
+///
+/// This is what the upstream of a route group sends when the Agent on the
+/// other side speaks Anthropic, so the gateway has to translate it.
+fn responses_stream() -> String {
+    [
+        r#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5","status":"in_progress","output":[]}}"#,
+        r#"event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant","status":"in_progress","content":[]}}"#,
+        r#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"hello"}"#,
+        r#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5","status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":1}}}"#,
+    ]
+    .join("\n\n")
+        + "\n\n"
+}
+
 /// A listener with no route group is running, not unavailable.
 ///
 /// The gateway owns no Provider list, so "no upstreams" is the ordinary first
@@ -615,6 +684,67 @@ async fn a_translated_call_is_re_encoded_for_the_client_protocol() {
     );
     // Anthropic requires `max_tokens`.
     assert!(recorded.body.as_ref().unwrap()["max_tokens"].is_number());
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// An Anthropic client must see exactly one message start and one stop.
+///
+/// This is the shape a Claude Code session on a route group uses: the client
+/// speaks Anthropic, the group's upstream speaks Responses, so the gateway
+/// translates. Claude's adapter treats a second `message_start` as a new
+/// message and forgets what it already streamed, which makes the consolidated
+/// assistant message print the whole answer again — the duplicate reply the
+/// user saw. A decoder rebuilt per upstream chunk produced exactly that,
+/// because every chunk then looked like the first frame of a new message.
+#[tokio::test]
+async fn an_anthropic_client_sees_one_message_start_and_one_stop() {
+    let path = database_path();
+    let (upstream_url, _recorder, upstream_task) =
+        mock_upstream_frame_by_frame(responses_stream()).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::Responses,
+        &["gpt-5"],
+        "sk-test",
+    );
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": group_model(&group, "gpt-5"),
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "say hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        body.matches("event: message_start").count(),
+        1,
+        "a second message start reads as a second message to Claude: {body}"
+    );
+    assert_eq!(
+        body.matches("event: message_stop").count(),
+        1,
+        "one reply, one terminal event: {body}"
+    );
+    assert_eq!(
+        body.matches(r#""text":"hello""#).count(),
+        1,
+        "the answer must be delivered once: {body}"
+    );
 
     gateway_task.abort();
     upstream_task.abort();

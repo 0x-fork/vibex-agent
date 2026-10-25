@@ -742,6 +742,13 @@ impl StreamEncoder for AnthropicEncoder {
                 if !model.is_empty() {
                     self.model = model.clone();
                 }
+                // One reply opens one message. A vendor that repeats its start
+                // event mid-stream, or a decoder that loses its place, must not
+                // reach the client as a second message: Anthropic clients read
+                // that as a new reply and discard what they already streamed.
+                if self.started {
+                    return Ok(String::new());
+                }
                 self.started = true;
                 sse_frame(
                     Some("message_start"),
@@ -1034,5 +1041,42 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("event: message_stop"), "{output}");
+    }
+
+    /// A repeated start is one message, not two.
+    ///
+    /// Claude's adapter reads `message_start` as "a new reply begins" and
+    /// forgets the chunks it already streamed, so a vendor that repeats the
+    /// event mid-reply makes the answer print twice.
+    #[test]
+    fn a_repeated_start_does_not_open_a_second_message() {
+        let mut encoder = AnthropicEncoder::new("m".into());
+        let start = CanonicalEvent::Start {
+            id: "m1".into(),
+            model: "m".into(),
+            usage: CanonicalUsage::default(),
+        };
+        let mut output = encoder.encode(&start).unwrap();
+        output.push_str(
+            &encoder
+                .encode(&CanonicalEvent::TextDelta("hi".into()))
+                .unwrap(),
+        );
+        output.push_str(&encoder.encode(&start).unwrap());
+        output.push_str(
+            &encoder
+                .encode(&CanonicalEvent::Stop(StopReason::EndTurn))
+                .unwrap(),
+        );
+        let starts = output
+            .lines()
+            .filter(|line| *line == "event: message_start")
+            .count();
+        assert_eq!(starts, 1, "{output}");
+        assert_eq!(
+            output.matches("event: content_block_stop").count(),
+            1,
+            "{output}"
+        );
     }
 }

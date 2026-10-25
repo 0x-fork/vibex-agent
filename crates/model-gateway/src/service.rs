@@ -41,8 +41,8 @@ use crate::route::{
 use crate::stream::{ReplyAccumulator, SseBuffer, UsageSniffer};
 use crate::wire::parse_reply;
 use crate::wire::{
-    StreamEncoder, WireProtocol, build_upstream_request, decoder, encoder, parse_request,
-    render_response, sse_frame,
+    StreamDecoder, StreamEncoder, WireProtocol, build_upstream_request, decoder, encoder,
+    parse_request, render_response, sse_frame,
 };
 
 /// A resolved upstream: one shared Provider Profile the gateway may call.
@@ -2853,6 +2853,14 @@ pub(crate) async fn forward(
     let mut sniffer = UsageSniffer::new(target);
     let mut buffer = SseBuffer::default();
     let request_for_encoder = CanonicalRequest::for_model(answered_model.clone());
+    // One decoder per upstream stream, not per chunk: its state is what tells
+    // the client's protocol where the reply stands. A fresh decoder reads every
+    // chunk as the first frame of a new message, so it re-announces the message
+    // start mid-reply and re-opens the terminal event at the end. Anthropic
+    // clients treat a second `message_start` as a new message — the Claude
+    // adapter drops its record of what already streamed and prints the whole
+    // answer again when the consolidated message arrives.
+    let mut decoder: Option<Box<dyn StreamDecoder>> = (!passthrough).then(|| decoder(target));
     let mut encoder: Option<Box<dyn StreamEncoder>> =
         (!passthrough).then(|| encoder(prepared.inbound, &request_for_encoder));
     let mut accumulator = ReplyAccumulator::default();
@@ -2907,10 +2915,9 @@ pub(crate) async fn forward(
             continue;
         }
         let frames = buffer.push(&chunk);
-        let Some(encoder) = encoder.as_mut() else {
+        let (Some(encoder), Some(decoded)) = (encoder.as_mut(), decoder.as_mut()) else {
             return;
         };
-        let mut decoded = decoder(target);
         let mut translated = String::new();
         let mut decode_error = None;
         for (_, data) in frames {
@@ -2967,8 +2974,7 @@ pub(crate) async fn forward(
         }
     }
 
-    if !passthrough && let Some(encoder) = encoder.as_mut() {
-        let mut decoded = decoder(target);
+    if !passthrough && let (Some(encoder), Some(decoded)) = (encoder.as_mut(), decoder.as_mut()) {
         for (_, data) in buffer.finish() {
             if data.trim() == "[DONE]" {
                 continue;
