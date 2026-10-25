@@ -3048,6 +3048,108 @@ async fn a_gemini_model_is_read_from_the_path() {
     cleanup(path);
 }
 
+/// A vendor tool type the upstream cannot serve is dropped, not fatal.
+///
+/// Codex offers Responses' built-in `web_search`, which the Chat-backed upstream
+/// rejects with `[code=unsupported_tool]`. Forwarding it killed the whole turn;
+/// dropping it keeps every tool call the Agent can actually make.
+#[tokio::test]
+async fn a_vendor_tool_type_the_upstream_cannot_serve_is_dropped() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) = mock_input_validating_upstream().await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::Responses,
+        &["gpt-5"],
+        "sk-test",
+    );
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/responses"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": group_model(&group, "gpt-5"),
+            "input": "say hi",
+            "tools": [
+                {"type": "function", "name": "exec", "parameters": {"type": "object"}},
+                {"type": "web_search"},
+                {"type": "web_search_preview"}
+            ],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "an unsupported vendor tool must not fail the turn: {body}"
+    );
+
+    let recorded = recorder.lock().await;
+    let sent = recorded.body.as_ref().unwrap();
+    let tools = sent["tools"]
+        .as_array()
+        .expect("the supported tool is still forwarded");
+    assert_eq!(tools.len(), 1, "{sent}");
+    assert_eq!(tools[0]["type"], "function", "{sent}");
+    assert_eq!(tools[0]["name"], "exec", "{sent}");
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A request whose only tools were dropped loses the `tools` key entirely.
+#[tokio::test]
+async fn dropping_every_tool_removes_the_key() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) = mock_input_validating_upstream().await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::Responses,
+        &["gpt-5"],
+        "sk-test",
+    );
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/responses"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": group_model(&group, "gpt-5"),
+            "input": "say hi",
+            "tools": [{"type": "web_search"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.text().await.unwrap();
+
+    let recorded = recorder.lock().await;
+    let sent = recorded.body.as_ref().unwrap();
+    assert!(
+        sent.get("tools").is_none(),
+        "an empty tool list must be removed, not sent: {sent}"
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
 /// A refusal that never reached an upstream still lands in the ledger.
 ///
 /// Without the row the ledger is empty at the moment the Agent shows an error,

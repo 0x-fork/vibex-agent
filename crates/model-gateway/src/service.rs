@@ -2768,6 +2768,7 @@ fn build_member_body(
         return build_upstream_request(target, member_request, model, stream);
     };
     fields.insert("model".to_string(), Value::String(model.to_string()));
+    drop_tools_the_target_cannot_express(fields, target, inbound);
     // The stream flag is the gateway's decision, not vendor state: a
     // translated call always asks for a stream so the terminal usage frame
     // exists, and a passthrough keeps whatever the client asked for.
@@ -2775,6 +2776,54 @@ fn build_member_body(
         fields.insert("stream".to_string(), Value::Bool(stream));
     }
     Ok(body)
+}
+
+/// Removes vendor tool types the target protocol cannot express.
+///
+/// A Responses client may offer built-in tools (`web_search`,
+/// `web_search_preview`, `file_search`, ...) that only OpenAI serves. A
+/// same-protocol passthrough forwards them verbatim and the upstream answers
+/// `400 [code=unsupported_tool] unsupported Responses tool type "web_search"`,
+/// which fails the whole turn — including every tool call the Agent could
+/// actually make. The gateway's job here is the same as for an unknown vendor
+/// field: keep the call the upstream *can* serve rather than lose it. Dropping
+/// the tool is recorded as a diagnostic notice so the missing capability is
+/// visible instead of silent.
+fn drop_tools_the_target_cannot_express(
+    fields: &mut serde_json::Map<String, Value>,
+    _target: WireProtocol,
+    _inbound: WireProtocol,
+) {
+    let Some(tools) = fields.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut dropped = Vec::new();
+    tools.retain(|tool| {
+        // Only the Responses shape tags a tool with `type`. A Chat-shaped
+        // `function` object has no `type` at all and is always kept.
+        match tool.get("type").and_then(Value::as_str) {
+            None | Some("function") => true,
+            Some(kind) => {
+                // `custom` carries a free-form grammar the Chat route cannot
+                // express either; every other built-in is vendor-owned.
+                dropped.push(kind.to_string());
+                false
+            }
+        }
+    });
+    if dropped.is_empty() {
+        return;
+    }
+    tracing::debug!(
+        target: "model_gateway.tools",
+        dropped = ?dropped,
+        "dropped tool types the upstream cannot serve"
+    );
+    // An empty array is not the same as no `tools` key: some vendors treat the
+    // key's presence as "tools are supported" and reject an empty list.
+    if tools.is_empty() {
+        fields.remove("tools");
+    }
 }
 
 /// Chooses the protocol the upstream is called with.

@@ -500,6 +500,22 @@ runtime switch or a turn on an Agent that was otherwise healthy.
   durable selection still naming it, so the binding converged on `thinking: on`
   while the submission asked for `off` and every dispatch was refused with
   `message_submission_runtime_binding_mismatch`.
+- **Antigravity needs gateway mode to accept a route-group Model.** Its built-in
+  catalogue holds only its own Gemini ids and refuses anything else through the
+  `model` config option ("not available for the current authentication method").
+  The projection therefore writes `auth.type = "gateway"` and injects
+  `AGY_LLM_GATEWAY_URL` (origin only — Antigravity appends the Google API path),
+  `AGY_LLM_GATEWAY_MODELS` (the projected *runtime* id, including the
+  thinking-level suffix its picker uses), and `AGY_ACP_ENABLE_GATEWAY_AUTH`.
+  This is the one Agent whose projection deliberately leaves its documented
+  credential mode, because that is the only mode that can serve a route group.
+- **A vendor tool type the upstream cannot serve is dropped, not fatal.** A
+  Responses client may offer built-ins (`web_search`, `web_search_preview`,
+  `custom`, ...) that only OpenAI serves; forwarding one verbatim makes the
+  upstream reject the whole turn (`[code=unsupported_tool]`), losing every tool
+  call the Agent could actually make. A passthrough now keeps `function`-typed
+  tools and drops the rest, removing `tools` entirely when none survive (an
+  empty array is not the same as an absent key), and logs what it dropped.
 - **Cline reaches a caller-supplied endpoint only through its provider store.**
   `openai-native` is Cline's own OpenAI client: it offers no base-URL config
   option and always posts to api.openai.com, so projecting it sent Vibex's
@@ -529,7 +545,10 @@ runtime switch or a turn on an Agent that was otherwise healthy.
 `reads_and_writes_the_gemini_3_tool_schema`,
 `cline_projection_pins_the_agent_endpoint_and_selects_the_provider_id`,
 `a_cline_store_entry_carries_the_fields_that_make_it_authoritative`,
+`a_vendor_tool_type_the_upstream_cannot_serve_is_dropped`,
+`dropping_every_tool_removes_the_key`,
 `a_probe_without_a_reasoning_dimension_reports_none`,
+`only_antigravity_gets_an_extra_overlay`,
 `a_refused_option_keeps_the_agents_own_words` and
 `a_field_refusal_reaches_the_operation_journal` for the detail path;
 `a_boolean_option_is_sent_with_the_acp_type_tag`,

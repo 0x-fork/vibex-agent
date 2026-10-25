@@ -2024,6 +2024,13 @@ fn apply_agent_projection_defaults(
                     .to_string(),
             );
         }
+        // See `antigravity_gateway_env`: without these the projected route id
+        // is not a model Antigravity will accept.
+        "antigravity" => {
+            for (key, value) in antigravity_gateway_env(endpoint, model, descriptor, provider) {
+                env.insert(key, value);
+            }
+        }
         "poolside" => {
             if let Some(endpoint) = endpoint {
                 env.insert(
@@ -2083,9 +2090,58 @@ fn agent_specific_overlays(
     vec![ManagedProjectionOverlay {
         relative_path: "antigravity-acp/settings.json".to_string(),
         format: "json".to_string(),
-        content: serde_json::json!({ "auth": { "type": "gemini-api-key" } }).to_string(),
+        // Gateway mode: Antigravity's own model catalogue holds only its Gemini
+        // ids, so a route-group model id is refused as "not available for the
+        // current authentication method". Its `gateway` auth type replaces that
+        // catalogue with the `AGY_LLM_GATEWAY_MODELS` allowlist, which is what
+        // `antigravity_gateway_env` fills in.
+        content: serde_json::json!({ "auth": { "type": "gateway" } }).to_string(),
         contains_secret_reference: false,
     }]
+}
+
+/// The gateway-mode environment Antigravity needs to accept a projected Model.
+///
+/// Antigravity keeps a built-in catalogue of its own Gemini model ids and
+/// refuses any other id through the `model` config option:
+///
+/// ```text
+/// Model 'group/<route>/<model>' is not available for the current
+/// authentication method.
+/// ```
+///
+/// Its `gateway` auth type replaces that catalogue with an allowlist read from
+/// `AGY_LLM_GATEWAY_MODELS`, so the projected route id becomes a legitimate
+/// model rather than an unknown one. `AGY_ACP_ENABLE_GATEWAY_AUTH` is what lets
+/// the ACP surface use the gateway credential instead of demanding a login.
+fn antigravity_gateway_env(
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    descriptor: &AgentProviderProjectionDescriptor,
+    provider: &ModelProviderProfile,
+) -> Vec<(String, String)> {
+    let (Some(endpoint), Some(model)) = (endpoint, model) else {
+        return Vec::new();
+    };
+    // The allowlist entry has to be the *runtime* id Antigravity will be asked
+    // for, which carries the thinking-level suffix its picker uses.
+    let model_id = projected_runtime_model_id(provider, descriptor, model);
+    if model_id.trim().is_empty() {
+        return Vec::new();
+    }
+    vec![
+        // The origin only: Antigravity appends the Google API path itself, and
+        // an OpenAI-style `/v1` suffix would produce `/v1/v1beta/models/...`.
+        (
+            "AGY_LLM_GATEWAY_URL".to_string(),
+            strip_google_api_path_suffix(&endpoint.url),
+        ),
+        ("AGY_LLM_GATEWAY_MODELS".to_string(), model_id),
+        (
+            "AGY_ACP_ENABLE_GATEWAY_AUTH".to_string(),
+            "true".to_string(),
+        ),
+    ]
 }
 
 /// Copilot CLI's BYOK provider type. Anthropic Messages is its own type; both
@@ -7842,17 +7898,84 @@ mod tests {
             .into_iter()
             .find(|descriptor| descriptor.route.agent_id.as_str() == "antigravity")
             .unwrap();
+        let (provider, runtime, binding) = typed_projection_fixture(&descriptor);
+        let mut model = binding.configured_models[0].clone();
+        model.agent_model_id = "group/model_route_x/deepseek-v4.1-flash".to_string();
+        model.provider_model_id = "group/model_route_x/deepseek-v4.1-flash".to_string();
+        let mut binding = binding.clone();
+        binding.configured_models = vec![model.clone()];
+
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            &descriptor,
+            "antigravity-gateway",
+        )
+        .unwrap();
+        // Antigravity's own catalogue refuses a route-group id, so the
+        // projection switches it into gateway mode with an allowlist that names
+        // exactly the projected Model.
+        assert_eq!(
+            plan.non_secret_env
+                .get("AGY_LLM_GATEWAY_URL")
+                .map(String::as_str),
+            Some("https://provider.example.invalid"),
+            "the gateway origin carries no /v1 suffix: {:?}",
+            plan.non_secret_env
+        );
+        assert_eq!(
+            plan.non_secret_env
+                .get("AGY_LLM_GATEWAY_MODELS")
+                .map(String::as_str),
+            Some("group/model_route_x/deepseek-v4.1-flash-high")
+        );
+        assert_eq!(
+            plan.non_secret_env
+                .get("AGY_ACP_ENABLE_GATEWAY_AUTH")
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let settings = plan
+            .overlay_files
+            .iter()
+            .find(|overlay| overlay.relative_path == "antigravity-acp/settings.json")
+            .expect("Antigravity needs an auth overlay");
+        let value: serde_json::Value = serde_json::from_str(&settings.content).unwrap();
+        assert_eq!(
+            value["auth"]["type"], "gateway",
+            "gemini-api-key refuses a route-group model id"
+        );
+    }
+
+    /// Every other Agent keeps exactly the overlays its provider control
+    /// described, and a second Antigravity file is not invented.
+    #[test]
+    fn only_antigravity_gets_an_extra_overlay() {
+        let descriptor = vibex_core::catalog_projection_descriptors()
+            .unwrap()
+            .into_iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "antigravity")
+            .unwrap();
         let overlays = agent_specific_overlays(&descriptor);
         let overlay = overlays
             .iter()
             .find(|overlay| overlay.relative_path == "antigravity-acp/settings.json")
             .expect("Antigravity needs an auth overlay");
         let value: serde_json::Value = serde_json::from_str(&overlay.content).unwrap();
-        assert_eq!(value["auth"]["type"], "gemini-api-key");
+        assert_eq!(
+            value["auth"]["type"], "gateway",
+            "gemini-api-key refuses a route-group model id; gateway mode accepts the allowlist"
+        );
         assert!(
             !overlay.contains_secret_reference,
             "the credential itself stays in the environment, not in this file"
         );
+        // With no endpoint or Model there is nothing to allowlist, so no
+        // gateway environment is projected.
+        let (provider, _, _) = typed_projection_fixture(&descriptor);
+        assert!(antigravity_gateway_env(None, None, &descriptor, &provider).is_empty());
 
         // Every other Agent keeps exactly the overlays its provider control
         // described.
