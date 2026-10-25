@@ -937,7 +937,7 @@ impl RuntimeSwitchCoordinator {
                 &current.session_id,
                 &switch_id,
                 &error.code,
-                Some(&error.code),
+                Some(&operation_failure_detail(&error)),
             )?;
         }
         let finished = self.required_switch(&switch_id)?;
@@ -1506,7 +1506,7 @@ impl RuntimeSwitchCoordinator {
                         self.record_active_work(kind, RuntimeMetricResult::Cancelled);
                     }
                     Err(error) => {
-                        self.mark_operation_failed(&operation, &error.code)?;
+                        self.mark_operation_failed(&operation, &error)?;
                         self.record_active_work(kind, RuntimeMetricResult::Failure);
                         return Err(error);
                     }
@@ -1590,7 +1590,7 @@ impl RuntimeSwitchCoordinator {
                     match mutation {
                         Ok(()) => self.mark_operation_succeeded(&operation, None)?,
                         Err(error) => {
-                            self.mark_operation_failed(&operation, &error.code)?;
+                            self.mark_operation_failed(&operation, &error)?;
                             return Err(error);
                         }
                     }
@@ -1628,7 +1628,7 @@ impl RuntimeSwitchCoordinator {
                     match apply {
                         Ok(()) => self.mark_operation_succeeded(&operation, None)?,
                         Err(error) => {
-                            self.mark_operation_failed(&operation, &error.code)?;
+                            self.mark_operation_failed(&operation, &error)?;
                             return Err(error);
                         }
                     }
@@ -1695,7 +1695,7 @@ impl RuntimeSwitchCoordinator {
                         Ok(process)
                     }
                     Err(error) => {
-                        self.mark_operation_failed(&operation, &error.code)?;
+                        self.mark_operation_failed(&operation, &error)?;
                         Err(error)
                     }
                 }
@@ -1810,7 +1810,7 @@ impl RuntimeSwitchCoordinator {
                         Ok(attachment)
                     }
                     Err(error) => {
-                        self.mark_operation_failed(&operation, &error.code)?;
+                        self.mark_operation_failed(&operation, &error)?;
                         Err(error)
                     }
                 }
@@ -2279,13 +2279,13 @@ impl RuntimeSwitchCoordinator {
     fn mark_operation_failed(
         &self,
         operation: &JournaledOperation,
-        error_code: &str,
+        error: &VibexError,
     ) -> VibexResult<()> {
         let conn = self.open_connection()?;
         SwitchOperationJournalRepository::mark_failed(
             &conn,
             &operation.operation_id,
-            Some(error_code),
+            Some(&operation_failure_detail(error)),
         )
     }
 
@@ -2358,6 +2358,32 @@ fn cancel_operation_kind(kind: ActiveWorkKind) -> &'static str {
         ActiveWorkKind::PendingPermission => OP_RESOLVE_PENDING_PERMISSION,
         ActiveWorkKind::ActiveTerminal => OP_CLOSE_TERMINAL,
         ActiveWorkKind::BackgroundWork => OP_CANCEL_BACKGROUND_WORK,
+    }
+}
+
+/// A bounded, secret-free description of why one switch operation failed.
+///
+/// The operation journal used to store the outer error code, which for a live
+/// configuration failure is always `runtime_switch_configuration_unavailable`.
+/// The specific cause travelled in the error diagnostics and was dropped on the
+/// way to storage, so a failed switch could only be explained by reading code.
+/// Persisting the diagnostic cause keeps the record actionable.
+fn operation_failure_detail(error: &VibexError) -> String {
+    let cause = error
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.key == "causeCode")
+        .map(|diagnostic| diagnostic.value.trim())
+        .filter(|cause| {
+            !cause.is_empty()
+                && cause.len() <= 96
+                && cause.chars().all(|character| {
+                    character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+                })
+        });
+    match cause {
+        Some(cause) if cause != error.code => format!("{}:{cause}", error.code),
+        _ => error.code.clone(),
     }
 }
 
@@ -2454,6 +2480,9 @@ mod tests {
         assessment: SwitchTargetAssessment,
         calls: Vec<String>,
         fail_on: Option<String>,
+        /// The diagnostic cause `fail_on` carries, so the journal record can be
+        /// checked against a failure shaped like a real configuration error.
+        fail_cause: Option<String>,
         restore_fresh_allowed: bool,
         delay_ms: u64,
         delay_on: Option<String>,
@@ -2466,6 +2495,7 @@ mod tests {
                 assessment: restart_assessment(),
                 calls: Vec::new(),
                 fail_on: None,
+                fail_cause: None,
                 restore_fresh_allowed: false,
                 delay_ms: 0,
                 delay_on: None,
@@ -2501,6 +2531,12 @@ mod tests {
             self.state.lock().unwrap().fail_on = Some(operation.to_string());
         }
 
+        fn fail_on_with_cause(&self, operation: &str, cause: &str) {
+            let mut state = self.state.lock().unwrap();
+            state.fail_on = Some(operation.to_string());
+            state.fail_cause = Some(cause.to_string());
+        }
+
         fn set_restore_fresh_allowed(&self, allowed: bool) {
             self.state.lock().unwrap().restore_fresh_allowed = allowed;
         }
@@ -2523,7 +2559,7 @@ mod tests {
 
         async fn before_operation(&self, operation: &str) -> VibexResult<()> {
             self.record(operation);
-            let (delay_ms, fail) = {
+            let (delay_ms, fail, cause) = {
                 let state = self.state.lock().unwrap();
                 (
                     if state
@@ -2536,16 +2572,19 @@ mod tests {
                         0
                     },
                     state.fail_on.as_deref() == Some(operation),
+                    state.fail_cause.clone(),
                 )
             };
             if delay_ms > 0 {
                 sleep(Duration::from_millis(delay_ms)).await;
             }
             if fail {
-                return Err(VibexError::provider(
-                    "mock_prepare_failed",
-                    "mock target preparation failed",
-                ));
+                let error =
+                    VibexError::provider("mock_prepare_failed", "mock target preparation failed");
+                return Err(match cause {
+                    Some(cause) => error.with_diagnostic("causeCode", cause),
+                    None => error,
+                });
             }
             Ok(())
         }
@@ -3458,6 +3497,73 @@ mod tests {
             env.switch_by_key("restore-failure").status,
             RuntimeSwitchStatus::Failed
         );
+    }
+
+    /// A configuration failure keeps its cause in the journal.
+    ///
+    /// The outer code for any live configuration failure is always
+    /// `runtime_switch_configuration_unavailable`, so a record carrying only
+    /// that code could not explain a failed switch without reading the code
+    /// that produced it. The cause travelled in a diagnostic and was dropped.
+    #[tokio::test]
+    async fn configuration_failure_journals_its_cause_beside_the_error_code() {
+        let env = TestEnvironment::new("configuration-cause");
+        env.executor
+            .fail_on_with_cause(OP_APPLY_SESSION_CONFIG, "mode_unavailable");
+
+        let error = env
+            .coordinator
+            .request_switch(env.request("configuration-cause"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "mock_prepare_failed");
+        let switch = env.switch_by_key("configuration-cause");
+        let operations =
+            SwitchOperationJournalRepository::list_by_switch(&env.connection(), &switch.switch_id)
+                .unwrap();
+        let apply = operations
+            .iter()
+            .find(|operation| operation.operation_kind == OP_APPLY_SESSION_CONFIG)
+            .expect("the configuration operation must be journaled");
+        assert_eq!(apply.status, SwitchOperationStatus::Failed);
+        let detail: String = env
+            .connection()
+            .query_row(
+                "SELECT error_detail_redacted FROM runtime_switch_operations WHERE operation_id = ?1",
+                (apply.operation_id.as_str(),),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(detail, "mock_prepare_failed:mode_unavailable");
+
+        // An error without a cause keeps the bare code.
+        let plain = TestEnvironment::new("configuration-no-cause");
+        plain.executor.fail_on(OP_APPLY_SESSION_CONFIG);
+        plain
+            .coordinator
+            .request_switch(plain.request("configuration-no-cause"))
+            .await
+            .unwrap_err();
+        let switch = plain.switch_by_key("configuration-no-cause");
+        let operations = SwitchOperationJournalRepository::list_by_switch(
+            &plain.connection(),
+            &switch.switch_id,
+        )
+        .unwrap();
+        let apply = operations
+            .iter()
+            .find(|operation| operation.operation_kind == OP_APPLY_SESSION_CONFIG)
+            .unwrap();
+        let detail: String = plain
+            .connection()
+            .query_row(
+                "SELECT error_detail_redacted FROM runtime_switch_operations WHERE operation_id = ?1",
+                (apply.operation_id.as_str(),),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(detail, "mock_prepare_failed");
     }
 
     #[tokio::test]

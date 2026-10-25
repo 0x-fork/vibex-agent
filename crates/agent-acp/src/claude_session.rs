@@ -108,6 +108,23 @@ pub(crate) fn session_settings_meta(
     }))
 }
 
+/// The alias slot each configured model claims, empty for any other Agent.
+///
+/// The same assignment `session_settings_meta` projects into
+/// `ANTHROPIC_DEFAULT_*_MODEL`, exposed so the model-id projection can speak
+/// the same vocabulary on the wire: Claude Code answers a Model selection with
+/// the slot it resolved, not the id it was handed, so a request that names a
+/// concrete id looks like a substitution and fails the switch.
+pub(crate) fn model_alias_slots(
+    agent_id: &AgentId,
+    config: &AcpProviderConfig,
+) -> BTreeMap<&'static str, String> {
+    if agent_id.as_str() != CLAUDE_AGENT_ID {
+        return BTreeMap::new();
+    }
+    model_slot_assignments(&config.models)
+}
+
 /// Attaches a previously built `_meta` value to a session request payload.
 pub(crate) fn attach_session_settings_meta(params: &mut Value, meta: Option<&Value>) {
     let Some(meta) = meta else {

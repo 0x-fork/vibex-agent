@@ -2510,6 +2510,48 @@ impl AcpModelIdProjection {
         Ok(projection)
     }
 
+    /// Teaches the projection the alias slots Claude Code actually answers with.
+    ///
+    /// Claude Code does not echo the id it is handed: it resolves the selection
+    /// onto one of its `opus`/`sonnet`/`haiku` picker rows and reports that row.
+    /// A Profile with its own `base_url` keeps concrete ids in the projection
+    /// (the aliases only mean what we intend on Anthropic's endpoint), so the
+    /// echoed slot looked like an unexplained substitution and failed the
+    /// switch. Sending the slot instead makes both sides speak one vocabulary —
+    /// the slot is already pinned to this Model through the session settings
+    /// tier, so Claude Code still expands it to the configured id.
+    ///
+    /// A slot already owned by a different Model is left alone: two Models
+    /// cannot share one picker row, and silently reassigning it would make the
+    /// projection lie about the other one.
+    ///
+    /// A Model the projection already sends under a meaningful runtime id keeps
+    /// it. That is the Anthropic-endpoint case, where the id carries its
+    /// context hint (`opus[1m]`); only an identity mapping — what a Profile with
+    /// its own `base_url` produces, and what a Profile with no projection
+    /// binding at all implies — has nothing to lose by becoming the slot.
+    fn with_alias_slots(mut self, slots: BTreeMap<&'static str, String>) -> Self {
+        for (slot, model) in slots {
+            match self.product_to_runtime.get(&model) {
+                Some(runtime_id) if runtime_id != &model => continue,
+                // An absent entry reads as the identity, which the slot may
+                // replace for the same reason.
+                Some(_) | None => {}
+            }
+            if self
+                .runtime_to_product
+                .get(slot)
+                .is_some_and(|owner| owner != &model)
+            {
+                continue;
+            }
+            self.runtime_to_product
+                .insert(slot.to_string(), model.clone());
+            self.product_to_runtime.insert(model, slot.to_string());
+        }
+        self
+    }
+
     fn insert_runtime_id(
         &mut self,
         runtime_model_id: &str,
@@ -13190,6 +13232,7 @@ impl AcpRuntimeClient {
         let adapter_identity = self.effective_adapter_identity(&agent_id, config)?;
         let startup_model = startup_model_from_config(config, agent_id.as_str());
         let claude_session_settings = claude_session::session_settings_meta(&agent_id, config);
+        let claude_alias_slots = claude_session::model_alias_slots(&agent_id, config);
         let model_id_projection = match auth_source {
             RuntimeAuthSource::AgentAccount { .. } => AcpModelIdProjection::default(),
             source => {
@@ -13204,7 +13247,8 @@ impl AcpRuntimeClient {
                         .unwrap_or_default(),
                 )?
             }
-        };
+        }
+        .with_alias_slots(claude_alias_slots);
         let command_path = Path::new(&config.command);
         if command_path.is_absolute() && !command_path.is_file() {
             return Err(VibexError::process(
@@ -22390,6 +22434,74 @@ mod tests {
         );
     }
 
+    /// A Model whose projection is the identity — a Claude Profile with its own
+    /// `base_url`, which keeps concrete ids on purpose — is sent under the alias
+    /// slot Claude Code will answer with.
+    ///
+    /// This is the regression: the request named
+    /// `group/<route>/deepseek-v4.1-flash`, the adapter resolved it onto its
+    /// `opus` row and echoed `opus`, and the mismatch failed the switch with
+    /// `runtime_switch_configuration_unavailable`.
+    #[test]
+    fn claude_alias_slots_round_trip_an_identity_model_projection() {
+        let model = "group/model_route_1/deepseek-v4.1-flash".to_string();
+        let projection = AcpModelIdProjection::new(vec![LegacyAgentProviderModelIdProjection {
+            product_model_id: model.clone(),
+            runtime_model_id: model.clone(),
+            runtime_model_id_aliases: Vec::new(),
+        }])
+        .unwrap()
+        .with_alias_slots(BTreeMap::from([("opus", model.clone())]));
+
+        assert_eq!(projection.runtime_id(&model), "opus");
+        // The slot resolves back to the Model it stands for, which is what the
+        // confirmation compares against the requested selection.
+        assert_eq!(projection.product_id("opus"), model);
+    }
+
+    /// A projection that already spells the Model meaningfully keeps it.
+    ///
+    /// On Anthropic's own endpoint the alias carries a context hint
+    /// (`opus[1m]`), and flattening it to the bare slot would drop the context
+    /// window the user selected.
+    #[test]
+    fn claude_alias_slots_leave_a_qualified_projection_alone() {
+        let model = "claude-opus-5[1m]".to_string();
+        let projection = AcpModelIdProjection::new(vec![LegacyAgentProviderModelIdProjection {
+            product_model_id: model.clone(),
+            runtime_model_id: "opus[1m]".to_string(),
+            runtime_model_id_aliases: Vec::new(),
+        }])
+        .unwrap()
+        .with_alias_slots(BTreeMap::from([("opus", model.clone())]));
+
+        assert_eq!(projection.runtime_id(&model), "opus[1m]");
+    }
+
+    /// Two Models cannot share one picker row, so a slot that another Model
+    /// already answers for is never reassigned.
+    #[test]
+    fn claude_alias_slots_do_not_steal_an_occupied_slot() {
+        let model = "claude-opus-5-5[1m]".to_string();
+        let projection = AcpModelIdProjection::new(vec![
+            LegacyAgentProviderModelIdProjection {
+                product_model_id: model.clone(),
+                runtime_model_id: model.clone(),
+                runtime_model_id_aliases: Vec::new(),
+            },
+            LegacyAgentProviderModelIdProjection {
+                product_model_id: "claude-opus-5[1m]".to_string(),
+                runtime_model_id: "opus".to_string(),
+                runtime_model_id_aliases: Vec::new(),
+            },
+        ])
+        .unwrap()
+        .with_alias_slots(BTreeMap::from([("opus", model.clone())]));
+
+        assert_eq!(projection.product_id("opus"), "claude-opus-5[1m]");
+        assert_eq!(projection.runtime_id(&model), model);
+    }
+
     #[test]
     fn model_id_projection_rejects_an_alias_owned_by_another_model() {
         let error = AcpModelIdProjection::new(vec![
@@ -25952,6 +26064,11 @@ initialize_mode = os.environ.get("VIBEX_MOCK_ACP_INITIALIZE_MODE", "success")
 session_new_delay = float(os.environ.get("VIBEX_MOCK_ACP_SESSION_NEW_DELAY", "0"))
 fail_first_session_new = os.environ.get("VIBEX_MOCK_ACP_FAIL_FIRST_SESSION_NEW") == "true"
 model_prefix = os.environ.get("VIBEX_MOCK_ACP_MODEL_PREFIX", "").strip("/")
+# Claude Code never echoes the id it is handed: it resolves the selection onto an
+# alias picker row (`opus`/`sonnet`/`haiku`) and reports that row. The switch that
+# sent a concrete id then saw an unexplained substitution. This reproduces the
+# echo so the alias projection is covered end to end.
+alias_echo = os.environ.get("VIBEX_MOCK_ACP_ALIAS_ECHO", "").strip()
 
 
 def control_value(name, fallback):
@@ -26318,6 +26435,10 @@ for line in sys.stdin:
                 "error": {"code": -32003, "message": "permission denied"},
             })
         else:
+            if alias_echo:
+                # Exactly Claude Code's answer: the selection resolved onto an
+                # alias row, so the reply names the row rather than the id.
+                model_id = alias_echo
             thought_levels = (
                 ["none", "on"]
                 if model_id == model_2
@@ -33300,6 +33421,69 @@ for line in sys.stdin:
         );
         // A default-model row would shadow the alias with the raw id.
         assert!(env.get("ANTHROPIC_MODEL").is_none());
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    /// Claude Code answers a Model selection with the alias row it resolved,
+    /// never the id it was handed.
+    ///
+    /// A Profile with its own `base_url` — the gateway route every route-group
+    /// selection launches through — projects concrete ids on purpose, so the
+    /// request named `group/<route>/deepseek-v4.1-flash` while the adapter
+    /// replied `opus`. The confirmation read that as an unexplained
+    /// substitution and failed the session with
+    /// `runtime_switch_configuration_unavailable`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claude_model_selection_uses_the_slot_the_adapter_answers_with() {
+        const GATEWAY_MODEL: &str = "group/model_route_1/deepseek-v4.1-flash";
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "claude-alias-echo",
+            Some(vibex_core::AgentId::parse(CLAUDE_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        let service = fixture.service();
+        let mut config = service
+            .get_acp_profile_config_for_launch(fixture.profile_id.clone())
+            .unwrap();
+        config.models = vec![GATEWAY_MODEL.to_string()];
+        service
+            .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                config,
+            })
+            .unwrap();
+        // The Model the session settings tier pins to the `opus` slot.
+        fixture.push_profile_env("VIBEX_MOCK_ACP_ALIAS_ECHO", "opus");
+
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: Some(GATEWAY_MODEL.to_string()),
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .expect("a slot echo is this Model's identity, not a substitution");
+
+        let log = fixture.request_log();
+        let set_model = find_logged_request(&log, "session/set_model");
+        assert_eq!(set_model["params"]["modelId"], "opus");
+        // The selection stays the concrete Model the user picked.
+        assert_eq!(
+            session
+                .session_config_state
+                .as_ref()
+                .and_then(|state| state.current_model.as_ref())
+                .map(|model| model.value.as_str()),
+            Some(GATEWAY_MODEL)
+        );
 
         let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
         client.close_session(&binding).await.unwrap();
