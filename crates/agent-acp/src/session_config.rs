@@ -339,6 +339,24 @@ impl SessionConfigPlanner {
         next
     }
 
+    /// Whether this Agent can express reasoning depth at all.
+    ///
+    /// A selection can carry a reasoning effort long before it reaches an Agent
+    /// that has no such dimension — the composer keeps one value per Agent, and
+    /// a switch can inherit one from a sibling. Asking an Agent without the
+    /// dimension for a level is not a capability failure the user can fix: the
+    /// control does not exist, so the field is dropped instead of failing the
+    /// switch.
+    pub fn advertises_reasoning_effort(&self) -> bool {
+        if self.antigravity_reasoning_model_bridge || self.reasoning_effort_mode_bridge {
+            return true;
+        }
+        let Ok(key) = CanonicalSessionConfigKey::parse(CANONICAL_REASONING_EFFORT) else {
+            return false;
+        };
+        self.option_for_key(&key).ok().flatten().is_some()
+    }
+
     /// Enables the provider-specific bridge used by Grok's xAI session
     /// metadata, where each reasoning level is a separate `mode` option.
     pub fn with_reasoning_effort_mode_bridge(mut self) -> Self {

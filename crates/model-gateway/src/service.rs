@@ -2326,6 +2326,60 @@ impl ModelGatewayService {
         }
     }
 
+    /// Records a request that `prepare` refused.
+    ///
+    /// A refusal before an upstream is reached is exactly the kind of failure a
+    /// user comes to the ledger to find: the Agent showed an error, and without
+    /// this row the ledger is empty at that moment, which reads as "the request
+    /// never happened". The row names the inbound protocol and the gateway's
+    /// own error code; it blames no Provider, because none was consulted.
+    pub(crate) fn record_refusal(
+        &self,
+        inbound: WireProtocol,
+        headers: &HeaderMap,
+        body: &[u8],
+        error: &GatewayError,
+    ) {
+        let Ok(connection) = self.connection() else {
+            return;
+        };
+        let requested_model = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let log = ModelGatewayRequestLog {
+            request_id: RequestId::new(),
+            agent_id: agent_id_from_headers(headers),
+            // A refusal that never matched a member has no Provider to blame;
+            // the ledger requires one, so an unreadable id stands in.
+            model_provider_profile_id: ModelProviderProfileId::new(),
+            credential_id: None,
+            model_requested: requested_model,
+            model_served: None,
+            wire_in: inbound.wire_protocol_id().to_string(),
+            wire_out: inbound.wire_protocol_id().to_string(),
+            status: Some(error.status()),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_read_tokens: 0,
+            cached_write_tokens: 0,
+            reasoning_tokens: 0,
+            latency_ms: None,
+            outcome: GatewayRequestOutcome::Rejected,
+            route: Some(GatewayRouteTrace {
+                error_code: Some(error.code().to_string()),
+                ..GatewayRouteTrace::new(0, 0)
+            }),
+            created_at_ms: vibex_core::unix_timestamp_ms(),
+        };
+        let _ = ModelGatewayRequestLogRepository::insert(&connection, &log);
+    }
+
     /// Lists the most recent ledger rows.
     pub fn recent_requests(&self, limit: usize) -> GatewayResult<Vec<ModelGatewayRequestLog>> {
         let connection = self.connection()?;

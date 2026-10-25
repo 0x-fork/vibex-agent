@@ -300,6 +300,16 @@ impl AgentProviderProjectionEngine {
             endpoint,
             &mut non_secret_env,
         );
+        for overlay in agent_specific_overlays(descriptor) {
+            targets.push(ProjectionTargetPreview {
+                field: "auth".to_string(),
+                target_kind: ProjectionTargetKind::ManagedOverlay,
+                target: overlay.relative_path.clone(),
+                value_preview: "API key".to_string(),
+                secret: false,
+            });
+            overlays.push(overlay);
+        }
 
         let runtime_home_env_key =
             private_home_env_key(descriptor.route.agent_id.as_str()).map(ToOwned::to_owned);
@@ -2055,6 +2065,27 @@ fn apply_agent_projection_defaults(
 /// has no base-URL-capable Cline provider, so nothing is projected.
 pub fn cline_provider_id(model: Option<&AgentConfiguredModelBinding>) -> Option<&'static str> {
     vibex_core::cline_provider_id(projection_wire_protocol(model))
+}
+
+/// Overlays an Agent needs beyond the one its provider control describes.
+///
+/// Antigravity resolves its credential from `settings.json` in its state home
+/// and does not infer it from `GEMINI_API_KEY` being present, unlike Gemini CLI
+/// which reads a user-level `security.auth.selectedType`. Without this file the
+/// ACP `session/new` is refused with `Authentication required`, so the session
+/// never reaches the prompt.
+fn agent_specific_overlays(
+    descriptor: &AgentProviderProjectionDescriptor,
+) -> Vec<ManagedProjectionOverlay> {
+    if descriptor.route.agent_id.as_str() != "antigravity" {
+        return Vec::new();
+    }
+    vec![ManagedProjectionOverlay {
+        relative_path: "antigravity-acp/settings.json".to_string(),
+        format: "json".to_string(),
+        content: serde_json::json!({ "auth": { "type": "gemini-api-key" } }).to_string(),
+        contains_secret_reference: false,
+    }]
 }
 
 /// Copilot CLI's BYOK provider type. Anthropic Messages is its own type; both
@@ -7042,6 +7073,11 @@ mod tests {
                 plan.overlay_files.len(),
                 if expected.agent_id == "kimi" || expected.agent_id == "deepseek-harness" {
                     2
+                } else if expected.agent_id == "antigravity" {
+                    // The auth mode is its own file beside whatever the
+                    // Provider control writes: Antigravity refuses
+                    // `session/new` without it.
+                    1
                 } else if expected.overlay_path.is_some() {
                     1
                 } else {
@@ -7676,6 +7712,42 @@ mod tests {
                 runtime_model_id
             );
         }
+    }
+
+    /// Antigravity reads its credential mode from `settings.json`.
+    ///
+    /// The Projection sets `GEMINI_API_KEY`, but Antigravity does not infer the
+    /// credential kind from an environment variable the way Gemini CLI infers it
+    /// from a user-level `security.auth.selectedType`. Without `auth.type` its
+    /// ACP `session/new` is refused with `Authentication required`, so the
+    /// session never reaches a prompt.
+    #[test]
+    fn antigravity_projects_its_auth_mode_into_the_state_home() {
+        let descriptor = vibex_core::catalog_projection_descriptors()
+            .unwrap()
+            .into_iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "antigravity")
+            .unwrap();
+        let overlays = agent_specific_overlays(&descriptor);
+        let overlay = overlays
+            .iter()
+            .find(|overlay| overlay.relative_path == "antigravity-acp/settings.json")
+            .expect("Antigravity needs an auth overlay");
+        let value: serde_json::Value = serde_json::from_str(&overlay.content).unwrap();
+        assert_eq!(value["auth"]["type"], "gemini-api-key");
+        assert!(
+            !overlay.contains_secret_reference,
+            "the credential itself stays in the environment, not in this file"
+        );
+
+        // Every other Agent keeps exactly the overlays its provider control
+        // described.
+        let kimi = vibex_core::catalog_projection_descriptors()
+            .unwrap()
+            .into_iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "kimi")
+            .unwrap();
+        assert!(agent_specific_overlays(&kimi).is_empty());
     }
 
     #[test]

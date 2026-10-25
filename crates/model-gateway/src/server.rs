@@ -87,7 +87,82 @@ async fn gemini_call(
     if model.is_empty() || !matches!(action, "generateContent" | "streamGenerateContent") {
         return not_found();
     }
+    // The model is part of the path in this protocol, and the Google SDKs never
+    // repeat it in the body. Everything downstream — routing, the ledger, the
+    // upstream `model` field — reads the request body, so the path model has to
+    // be carried into it here or every call resolves as "no model at all".
+    let model = percent_decode(model);
+    let body = match body_with_path_model(&body, &model) {
+        Ok(body) => body,
+        Err(error) => {
+            return state
+                .service
+                .error_response(WireProtocol::GeminiGenerateContent, &error);
+        }
+    };
     serve(state, WireProtocol::GeminiGenerateContent, headers, body).await
+}
+
+/// Decodes the model segment of a Gemini path.
+///
+/// A model id reaches this point already percent-encoded, because a route group
+/// id is a model id here and the Agent escapes the slashes inside it. A segment
+/// that is not valid percent-encoding is taken as written rather than refused.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let Some(high) = bytes.get(index + 1).and_then(|byte| hex_value(*byte))
+            && let Some(low) = bytes.get(index + 2).and_then(|byte| hex_value(*byte))
+        {
+            decoded.push(high * 16 + low);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Returns the request body with the path model filled in.
+///
+/// A body that already names a model keeps it: the path is the transport route,
+/// and a caller that also set the field said which one it means. Everything
+/// else is passed through untouched, so a vendor field the gateway does not
+/// understand still reaches the upstream.
+fn body_with_path_model(body: &[u8], model: &str) -> Result<bytes::Bytes, GatewayError> {
+    let mut value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| GatewayError::MalformedRequest("the body is not valid JSON".to_string()))?;
+    let Some(fields) = value.as_object_mut() else {
+        return Err(GatewayError::MalformedRequest(
+            "a Gemini request body must be a JSON object".to_string(),
+        ));
+    };
+    let named = fields
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|existing| !existing.trim().is_empty());
+    if !named {
+        fields.insert(
+            "model".to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+    }
+    serde_json::to_vec(&value)
+        .map(bytes::Bytes::from)
+        .map_err(|_| GatewayError::Internal("the Gemini body could not be re-encoded".to_string()))
 }
 
 /// Refuses a caller that is not loopback, or a browser request.
@@ -158,6 +233,11 @@ async fn serve(
             {
                 service.note_failure(&group_id);
             }
+            // The ledger is the one place a user can see why an Agent's turn
+            // failed. A refusal before routing never reached `record`, so
+            // without this row the ledger simply has no trace of the request the
+            // Agent is complaining about.
+            service.record_refusal(protocol, &headers, &body, &error);
             return service.error_response(protocol, &error);
         }
     };

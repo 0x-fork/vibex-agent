@@ -438,6 +438,54 @@ environment key and the final ACP authentication decision.
 - Round-trip unit: declared limits survive profile normalization, catalogue merge, and an authoritative catalogue refresh.
 - Projection units assert each Agent's keys for a declared and an undeclared Model.
 
+## Scenario: Agent Session Options The Agent Cannot Express
+
+### 1. Scope / Trigger
+
+Three failures with one shape: Vibex sends a session option the Agent has no
+field for, or sends the right field in the wrong wire shape. Each one failed a
+runtime switch or a turn on an Agent that was otherwise healthy.
+
+### 2. Contracts
+
+- **A boolean option carries the ACP `type` tag.** ACP 1.6 flattens
+  `SessionConfigOptionValue` into `session/set_config_option`, so a boolean is
+  `{ sessionId, configId, type: "boolean", value: true }` — the tag is a sibling
+  of `value`, not a wrapper around it. A bare `value: true` is read as a select's
+  value id and refused with `expected string, received boolean`, which failed the
+  whole configuration step. Current Cline and Copilot both validate this.
+- **An option the Agent does not advertise is dropped, not fatal.** A selection
+  carries one reasoning effort per Agent, but a route group is shared, so a
+  switch to an Agent with no depth dimension (Kimi Code publishes `thinking` as
+  an on/off toggle and no effort scale) routinely carries a level it never
+  offered. The field is removed from the patch, its preference is cleared, and
+  the remaining fields still apply. The check lives inside the per-field loop
+  because a Model switch can publish the dimension — an Agent that only
+  advertises an effort option for an effort-capable Model must still receive it.
+- **An option update reports what the Agent publishes, not a full state.** An
+  Agent that never reports a Model — Copilot binds it to the `--model` launch
+  argument and omits it from both `session/new` and every `config_option_update`
+  — must not have its effective Model cleared by an update that says nothing
+  about it. The launch model stays effective until a model option replaces it;
+  clearing it made the turn fence reject every prompt with
+  `turn_execution_identity_mismatch` against a binding that still named it.
+- **A projector writes every file its Agent needs to authenticate.** Antigravity
+  reads its credential mode from `settings.json` in its state home and does not
+  infer it from `GEMINI_API_KEY` being present; the projection writes
+  `antigravity-acp/settings.json` with `auth.type = "gemini-api-key"`. Without it
+  `session/new` is refused with `Authentication required` and the session never
+  reaches a prompt.
+
+### 3. Tests Required
+
+`a_boolean_option_is_sent_with_the_acp_type_tag`,
+`a_reasoning_effort_the_agent_cannot_express_is_dropped`,
+`an_option_update_that_reports_no_model_keeps_the_launch_model`, and
+`antigravity_projects_its_auth_mode_into_the_state_home` — one per contract.
+`session_runtime_config_applies_the_effort_its_model_switch_publishes` guards the
+ordering: a deferred effort option must still be applied after the Model switch
+that publishes it.
+
 ## Scenario: Kimi Code CLI Provider Projection
 
 ### 1. Scope / Trigger
@@ -4990,6 +5038,21 @@ ProviderConfigService::{
   image_url, file`), so an Agent failed the moment its first tool result entered
   the history and worked before it. A vendor-file reference is a content part
   like any other; returning it as the whole message dropped the text beside it.
+- **A Gemini model is in the path, so it has to be carried into the body.**
+  `generateContent` names the model in the URL
+  (`/v1beta/models/<model>:streamGenerateContent`) and the Google SDKs never
+  repeat it in the JSON. `gemini_call` decodes the path segment and fills
+  `model` into the body before routing; a body that already names one keeps it.
+  Reading only the body resolved the model as `""` and answered
+  `No configured Provider serves the model ""` for every Gemini call, while the
+  ACP handshake had already succeeded — so the Agent looked connected and every
+  prompt failed.
+- **A refusal before routing is still a ledger row.** `prepare` can refuse a call
+  before any member is consulted (no such group, no model, a bad body). Those
+  rows are written with `outcome = rejected` and the gateway's own `errorCode`,
+  because an empty ledger at the moment the Agent shows an error reads as "the
+  request never happened" — which is what hid the path-model bug for a whole
+  session.
 - **A translated non-streaming call is read from the upstream as a stream.**
   The gateway asks the upstream for `stream: true`, gathers the SSE frames, and
   renders one JSON body for the client. An upstream that ignores the flag and

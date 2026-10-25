@@ -4522,7 +4522,19 @@ impl AcpSessionAttachment {
                 for value in next.config_values.values_mut() {
                     value.effective = None;
                 }
-                next.effective_model = state.current_model_id.clone();
+                // An option update reports only what the Agent publishes. An
+                // Agent that never reports a Model — Copilot binds it to the CLI
+                // process and leaves it out of both `session/new` and every
+                // option update — would clear the effective Model that the
+                // launch already guaranteed, and the turn fence would then
+                // reject every prompt against a binding that still named it.
+                // Keep the previous value unless the Agent actually reported
+                // one; the loop below overwrites it as soon as a model option
+                // says something.
+                next.effective_model = state
+                    .current_model_id
+                    .clone()
+                    .or_else(|| next.effective_model.clone());
                 next.effective_mode = state.current_mode_id.clone();
                 next.effective_reasoning_effort = None;
                 for option in &options {
@@ -14667,6 +14679,45 @@ impl AcpRuntimeClient {
         for (index, field) in fields.iter().enumerate() {
             planner = self.refreshed_session_config_planner(&payload, planner);
 
+            // An Agent with no reasoning dimension cannot be asked for a level.
+            // The composer keeps one reasoning effort per Agent, but a route
+            // group is shared by several Agents, so a switch routinely carries a
+            // level this Agent never offered — Kimi Code publishes `thinking` as
+            // an on/off toggle and no effort scale at all. Failing here would
+            // report a capability error for a control the user cannot see on
+            // this Agent and would leave the whole selection unapplied; dropping
+            // the field applies the rest and clears the unusable preference.
+            //
+            // The check belongs inside this loop because a Model switch can
+            // publish the dimension: an Agent that only advertises an effort
+            // option for an effort-capable Model must still receive it.
+            if field.kind == SessionConfigFieldKind::ReasoningEffort
+                && field.value.is_some()
+                && !planner.advertises_reasoning_effort()
+            {
+                let cleared = RuntimeConfigField {
+                    key: field.key.clone(),
+                    kind: field.kind,
+                    value: None,
+                };
+                let mut state = payload.runtime_config_state();
+                if runtime_config_preferred_value(&state, &cleared).is_some()
+                    || state.effective_reasoning_effort.is_some()
+                {
+                    set_runtime_config_preferred(&mut state, &cleared);
+                    state.effective_reasoning_effort = None;
+                    state.state_revision = state.state_revision.checked_add(1).ok_or_else(|| {
+                        VibexError::conflict(
+                            "acp_session_config_revision_exhausted",
+                            "session runtime config revision is exhausted",
+                        )
+                    })?;
+                    state.applied_activation_generation = None;
+                    state.mark_generation_if_converged(generation);
+                    self.store_runtime_config_state(attachment, &state, mutation_mode)?;
+                }
+                continue;
+            }
             if field.value.is_some()
                 && !(allow_unadvertised_selection
                     && matches!(
@@ -14946,10 +14997,11 @@ impl AcpRuntimeClient {
                                 field.value.as_deref().unwrap_or_default(),
                             )
                         } else {
-                            protocol::build_session_set_config_option_raw_params(
+                            runtime_config_option_params(
                                 native_session_id,
                                 option_id.as_deref().unwrap_or(field.key.as_str()),
-                                runtime_config_wire_value(field, option_kind),
+                                field,
+                                option_kind,
                             )
                         }
                     }
@@ -14974,10 +15026,11 @@ impl AcpRuntimeClient {
                                     | ProviderSessionConfigOptionKind::String
                             )
                         ) {
-                            protocol::build_session_set_config_option_raw_params(
+                            runtime_config_option_params(
                                 native_session_id,
                                 option_id.as_deref().unwrap_or(field.key.as_str()),
-                                runtime_config_wire_value(field, option_kind),
+                                field,
+                                option_kind,
                             )
                         } else {
                             protocol::build_session_set_config_option_params(
@@ -14992,13 +15045,12 @@ impl AcpRuntimeClient {
                             "sessionId": native_session_id,
                             "modeId": field.value.as_deref().unwrap_or_default(),
                         }),
-                        AcpOperation::SessionSetConfigOption => {
-                            protocol::build_session_set_config_option_raw_params(
-                                native_session_id,
-                                option_id.as_deref().unwrap_or(field.key.as_str()),
-                                runtime_config_wire_value(field, option_kind),
-                            )
-                        }
+                        AcpOperation::SessionSetConfigOption => runtime_config_option_params(
+                            native_session_id,
+                            option_id.as_deref().unwrap_or(field.key.as_str()),
+                            field,
+                            option_kind,
+                        ),
                         _ => protocol::build_session_set_model_params(
                             native_session_id,
                             field.value.as_deref().unwrap_or_default(),
@@ -15019,11 +15071,7 @@ impl AcpRuntimeClient {
                         "modeId": field.value.as_deref().unwrap_or_default(),
                     }),
                     SessionConfigFieldKind::ReasoningEffort | SessionConfigFieldKind::Generic => {
-                        protocol::build_session_set_config_option_raw_params(
-                            native_session_id,
-                            id,
-                            runtime_config_wire_value(field, option_kind),
-                        )
+                        runtime_config_option_params(native_session_id, id, field, option_kind)
                     }
                 };
                 (method, params)
@@ -16385,6 +16433,33 @@ fn runtime_config_wire_value(
         return Value::Bool(value == "true");
     }
     Value::String(value.to_string())
+}
+
+/// Builds the `session/set_config_option` params for one field.
+///
+/// ACP 1.6 carries a boolean option's value in a `type`-discriminated form: the
+/// `type` tag sits beside `value`, and without it a bare `true` is read as a
+/// select's value id. Both a current Cline and a current Copilot validate that
+/// shape and reject the bare boolean with "expected string, received boolean",
+/// which failed the whole configuration step and left the session unable to run.
+fn runtime_config_option_params(
+    native_session_id: &str,
+    config_id: &str,
+    field: &RuntimeConfigField,
+    option_kind: Option<&ProviderSessionConfigOptionKind>,
+) -> Value {
+    if matches!(option_kind, Some(ProviderSessionConfigOptionKind::Boolean)) {
+        return protocol::build_session_set_config_option_boolean_params(
+            native_session_id,
+            config_id,
+            field.value.as_deref() == Some("true"),
+        );
+    }
+    protocol::build_session_set_config_option_raw_params(
+        native_session_id,
+        config_id,
+        runtime_config_wire_value(field, option_kind),
+    )
 }
 
 fn runtime_config_value_is_advertised(
@@ -33879,6 +33954,173 @@ for line in sys.stdin:
         fixture.cleanup();
     }
 
+    /// A reasoning effort a Model cannot express is dropped, not fatal.
+    ///
+    /// The composer keeps one reasoning effort per Agent, but a route group is
+    /// shared by several Agents, so a switch to an Agent with no depth dimension
+    /// (Kimi Code advertises `thinking` as an on/off toggle and no effort scale)
+    /// routinely carries a level it never offered. Failing the configuration
+    /// step there blocked the whole session on a control the user cannot see.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reasoning_effort_the_agent_cannot_express_is_dropped() {
+        let Some(fixture) = MockAcpFixture::create("drop-unadvertised-effort") else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let attachment = client.current_attachment(&session_id).unwrap();
+        // Publish an option set with no reasoning dimension at all, the way an
+        // Agent without a depth control describes itself.
+        attachment.payload().replace_config_options(&json!({
+            "configOptions": [
+                {
+                    "id": "model",
+                    "category": "model",
+                    "label": "Model",
+                    "type": "select",
+                    "currentValue": "mock/model-1",
+                    "options": [
+                        { "value": "mock/model-1", "label": "Model 1" },
+                        { "value": "mock/model-2", "label": "Model 2" }
+                    ]
+                },
+                {
+                    "id": "mode",
+                    "category": "mode",
+                    "label": "Mode",
+                    "type": "select",
+                    "currentValue": "build",
+                    "options": [
+                        { "value": "build", "label": "Build" },
+                        { "value": "review", "label": "Review" }
+                    ]
+                }
+            ]
+        }));
+        let planner = attachment.payload().session_config_planner().unwrap();
+        assert!(
+            !planner.advertises_reasoning_effort(),
+            "the fixture must not advertise a depth dimension: {planner:?}"
+        );
+        let state = attachment.payload().runtime_config_state();
+        let result = client
+            .update_session_runtime_config(SessionRuntimeConfigMutationRequest {
+                session_id: session_id.clone(),
+                expected_revision: state.state_revision,
+                expected_binding_id: attachment.binding_id().clone(),
+                expected_activation_generation: attachment.fence().activation_generation as i64,
+                patch: SessionRuntimeConfigPatch {
+                    model_id: Some("mock/model-2".to_string()),
+                    reasoning_effort: Some("off".to_string()),
+                    mode_id: Some("review".to_string()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.outcomes.iter().all(|outcome| matches!(
+                outcome.status,
+                SessionRuntimeConfigApplyStatus::Applied | SessionRuntimeConfigApplyStatus::NoOp
+            )),
+            "the effort must not fail the patch: {result:#?}"
+        );
+        assert!(
+            !result
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.key == "reasoning_effort"),
+            "a dropped field reports no outcome: {result:#?}"
+        );
+        assert_eq!(
+            result.state.effective_model.as_deref(),
+            Some("mock/model-2")
+        );
+        assert_eq!(result.state.effective_mode.as_deref(), Some("review"));
+        assert_eq!(
+            result.state.preferred_reasoning_effort, None,
+            "the dropped preference is cleared so it cannot block convergence"
+        );
+        assert_eq!(
+            result.state.preferred_reasoning_effort, result.state.effective_reasoning_effort,
+            "the effort dimension is settled on both sides: {result:#?}"
+        );
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    /// A boolean session option must go out in ACP 1.6's tagged form.
+    ///
+    /// The `type` discriminator is a sibling of `value`; a bare boolean is read
+    /// as a select's value id and refused with "expected string, received
+    /// boolean". That refusal failed the whole configuration step, so a Cline or
+    /// Copilot switch stopped there and the session never ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_boolean_option_is_sent_with_the_acp_type_tag() {
+        let Some(fixture) = MockAcpFixture::create("boolean-option-tag") else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let state = attachment.payload().runtime_config_state();
+        let result = client
+            .update_session_runtime_config(SessionRuntimeConfigMutationRequest {
+                session_id: session_id.clone(),
+                expected_revision: state.state_revision,
+                expected_binding_id: attachment.binding_id().clone(),
+                expected_activation_generation: attachment.fence().activation_generation as i64,
+                patch: SessionRuntimeConfigPatch {
+                    config_values: BTreeMap::from([("autoApply".to_string(), "false".to_string())]),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert!(
+            result
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.status == SessionRuntimeConfigApplyStatus::Applied),
+            "{result:#?}"
+        );
+
+        let request = find_logged_request(&fixture.request_log(), "session/set_config_option");
+        let params = &request["params"];
+        assert_eq!(params["configId"], "autoApply");
+        assert_eq!(
+            params["type"], "boolean",
+            "a boolean option needs the type tag: {params}"
+        );
+        assert_eq!(params["value"], json!(false), "{params}");
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
     /// Copilot can send its first config update immediately after the
     /// `session/new` response. The normal attachment registration barrier
     /// prevents the reader from observing that update, so Copilot's
@@ -34055,6 +34297,83 @@ for line in sys.stdin:
         assert_eq!(
             logged_request_count(&fixture.request_log(), "session/set_model"),
             0
+        );
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    /// Copilot never reports a Model, so an option update must not erase the
+    /// one the launch guaranteed.
+    ///
+    /// Copilot binds its Model to the CLI process: `session/new` has no `models`
+    /// block and no model config option, and every `config_option_update` it
+    /// pushes lists modes and permission toggles only. Reading that absence as
+    /// "the Agent now runs no model" cleared `effective_model`, and the turn
+    /// fence then rejected every prompt with `turn_execution_identity_mismatch`
+    /// against a binding that still named the Model.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_option_update_that_reports_no_model_keeps_the_launch_model() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "copilot-keeps-launch-model",
+            Some(vibex_core::AgentId::parse("copilot").unwrap()),
+        ) else {
+            return;
+        };
+        fixture.enable_post_session_config_update();
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: Some("mock/model-2".to_string()),
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let payload = attachment.payload();
+        assert_eq!(
+            payload.runtime_config_state().effective_model.as_deref(),
+            Some("mock/model-2")
+        );
+
+        // The shape Copilot pushes after `session/set_config_option`: modes and
+        // toggles, and no model option anywhere in the set.
+        payload.replace_config_options(&json!({
+            "configOptions": [
+                {
+                    "id": "mode",
+                    "category": "mode",
+                    "label": "Mode",
+                    "type": "select",
+                    "currentValue": "build",
+                    "options": [
+                        { "value": "build", "label": "Build" },
+                        { "value": "review", "label": "Review" }
+                    ]
+                },
+                {
+                    "id": "allow_all",
+                    "label": "Allow all",
+                    "type": "boolean",
+                    "currentValue": false
+                }
+            ]
+        }));
+
+        let state = payload.runtime_config_state();
+        assert_eq!(
+            state.effective_model.as_deref(),
+            Some("mock/model-2"),
+            "an update with no model option must not clear the launch model: {state:#?}"
+        );
+        assert_eq!(
+            state.effective_model, state.preferred_model,
+            "the launch model stays both preferred and effective: {state:#?}"
         );
 
         let binding = test_binding_for(&session_id, &fixture.profile_id, &session);

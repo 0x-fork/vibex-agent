@@ -1043,6 +1043,27 @@ pub(crate) fn build_session_set_config_option_raw_params(
     })
 }
 
+/// ACP 1.6 boolean option update.
+///
+/// The `type` discriminator is a sibling of `value`, not part of it: the schema
+/// flattens `SessionConfigOptionValue` into the request, so a boolean option is
+/// `{ sessionId, configId, type: "boolean", value: true }`. A bare `value: true`
+/// is read as a select's value id and answered with `expected string, received
+/// boolean`, which fails the whole configuration step even though the setting
+/// itself was acceptable.
+pub(crate) fn build_session_set_config_option_boolean_params(
+    native_session_id: &str,
+    config_id: &str,
+    value: bool,
+) -> Value {
+    json!({
+        "sessionId": native_session_id,
+        "configId": config_id,
+        "type": "boolean",
+        "value": value,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1314,6 +1335,27 @@ mod tests {
         assert_eq!(
             build_session_set_config_option_raw_params("native-1", "approval", json!(true)),
             json!({ "sessionId": "native-1", "configId": "approval", "value": true })
+        );
+        // ACP 1.6 tags a boolean option's value beside it. Without the tag the
+        // Agent reads the value as a select id and answers "expected string,
+        // received boolean", which fails the whole configuration step.
+        assert_eq!(
+            build_session_set_config_option_boolean_params("native-1", "approval", true),
+            json!({
+                "sessionId": "native-1",
+                "configId": "approval",
+                "type": "boolean",
+                "value": true
+            })
+        );
+        assert_eq!(
+            build_session_set_config_option_boolean_params("native-1", "approval", false),
+            json!({
+                "sessionId": "native-1",
+                "configId": "approval",
+                "type": "boolean",
+                "value": false
+            })
         );
     }
 

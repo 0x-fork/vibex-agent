@@ -477,6 +477,16 @@ fn chat_stream() -> String {
         + "\n\n"
 }
 
+/// A Gemini `streamGenerateContent` reply.
+fn gemini_stream() -> String {
+    [
+        r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"index":0}]}"#,
+        r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":" world"}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":3}}"#,
+    ]
+    .join("\n\n")
+        + "\n\n"
+}
+
 fn anthropic_stream() -> String {
     [
         r#"event: message_start
@@ -2963,6 +2973,113 @@ async fn a_same_protocol_call_is_forwarded_with_its_vendor_fields() {
 
     gateway_task.abort();
     upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A Gemini call names its model in the URL, never in the body.
+///
+/// The Google SDKs put the id in the path and send a body of `contents` alone,
+/// so a gateway that only reads the body resolves an empty model and answers
+/// `No configured Provider serves the model ""`. The path is the transport, so
+/// the model has to be carried into the request before routing happens.
+#[tokio::test]
+async fn a_gemini_model_is_read_from_the_path() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) = mock_upstream(200, gemini_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::GeminiGenerateContent,
+        &["gemini-2.5-pro"],
+        "sk-test",
+    );
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    // No `model` in the body, and the slashes inside the group id escaped the
+    // way the SDK escapes a path segment.
+    let model = group_model(&group, "gemini-2.5-pro");
+    let encoded = model.replace('/', "%2F");
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/v1beta/models/{encoded}:streamGenerateContent?alt=sse"
+        ))
+        .header(header::HOST, "127.0.0.1")
+        .header("x-goog-api-key", "vibex-local-gateway")
+        .json(&json!({
+            "contents": [{"role": "user", "parts": [{"text": "say hi"}]}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, 200, "the path model must route the call: {body}");
+
+    let recorded = recorder.lock().await;
+    let sent = recorded.body.as_ref().unwrap();
+    assert_eq!(
+        sent["model"], "gemini-2.5-pro",
+        "the upstream body names the member's model, not the group path: {sent}"
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A refusal that never reached an upstream still lands in the ledger.
+///
+/// Without the row the ledger is empty at the moment the Agent shows an error,
+/// which reads as "the request never happened" — the exact confusion that made
+/// a path-model bug invisible for a whole session.
+#[tokio::test]
+async fn a_request_refused_before_routing_is_still_a_ledger_row() {
+    let path = database_path();
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        "http://127.0.0.1:1",
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-test",
+    );
+    let _ = point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let model = "group/model_route_missing/deepseek-chat";
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    let _ = response.text().await.unwrap();
+
+    let connection = open_database(&path).unwrap();
+    let rows = ModelGatewayRequestLogRepository::recent(&connection, 5).unwrap();
+    let row = rows.first().expect("a refusal must be recorded");
+    assert_eq!(row.outcome, GatewayRequestOutcome::Rejected);
+    assert_eq!(row.model_requested, model);
+    assert_eq!(row.wire_in, "openai_chat_completions");
+    assert_eq!(
+        row.route
+            .as_ref()
+            .and_then(|route| route.error_code.as_deref()),
+        Some("model_not_found"),
+        "the row must name the gateway's own refusal: {:?}",
+        row.route
+    );
+
+    gateway_task.abort();
     service.shutdown().await;
     cleanup(path);
 }
