@@ -6205,12 +6205,16 @@ mod tests {
             },
             TypedProjectionExpectation {
                 agent_id: "cline",
+                // The endpoint reaches Cline only through its provider store:
+                // `openai-native` (the old provider for a Responses Model)
+                // ignores a base URL entirely and always posts to
+                // api.openai.com.
                 base_url_key: None,
-                fixed_base_url: Some(vibex_core::CLINE_FIXED_BASE_URL),
+                fixed_base_url: None,
                 secret_env_key: "CLINE_API_KEY",
                 model_env_key: None,
-                overlay_path: None,
-                overlay_format: None,
+                overlay_path: Some("settings/providers.json"),
+                overlay_format: Some("json"),
                 runtime_home_env_key: Some("CLINE_DATA_DIR"),
             },
             TypedProjectionExpectation {
@@ -8502,8 +8506,8 @@ mod tests {
         let descriptor = provider_descriptor("cline");
         assert_eq!(
             descriptor.provider_control,
-            AgentProviderControl::FixedEndpoint {
-                base_url: vibex_core::CLINE_FIXED_BASE_URL.to_string(),
+            AgentProviderControl::ManagedConfigOverlay {
+                strategy: ConfigOverlayStrategy::ClineProvidersJson,
             }
         );
         let (provider, runtime, binding) = typed_projection_fixture(&descriptor);
@@ -8511,7 +8515,7 @@ mod tests {
 
         for (protocol, expected_provider) in [
             (WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, "openai-compatible"),
-            (WIRE_PROTOCOL_OPENAI_RESPONSES, "openai-native"),
+            (WIRE_PROTOCOL_OPENAI_RESPONSES, "openai-compatible"),
         ] {
             let mut model = base.clone();
             model.wire_protocol_id = protocol.to_string();
@@ -8526,23 +8530,21 @@ mod tests {
             )
             .unwrap();
 
-            // The profile endpoint is never projected, whatever it holds.
-            assert!(plan.overlay_files.is_empty());
-            let endpoint_targets = plan
-                .preview
-                .targets
-                .iter()
-                .filter(|target| target.field == "endpoint")
-                .collect::<Vec<_>>();
-            assert_eq!(endpoint_targets.len(), 1);
-            // The preview is redacted to the origin, so it can only assert the
-            // host; the pinned path is the descriptor contract asserted above.
-            assert_eq!(endpoint_targets[0].value_preview, "https://api.openai.com");
-            assert!(
-                !plan
-                    .non_secret_env
-                    .values()
-                    .any(|value| value.contains("provider.example.invalid"))
+            // The endpoint reaches Cline through its provider store, because
+            // `CLINE_API_BASE_URL` and the ACP option surface offer no base URL
+            // and `openai-native` would ignore one anyway. Without this overlay
+            // every Cline call left for api.openai.com.
+            assert_eq!(plan.overlay_files.len(), 1);
+            let store = &plan.overlay_files[0];
+            assert_eq!(store.relative_path, "settings/providers.json");
+            let stored: serde_json::Value = serde_json::from_str(&store.content).unwrap();
+            assert_eq!(stored["lastUsedProvider"], expected_provider);
+            let settings = &stored["providers"][expected_provider]["settings"];
+            assert_eq!(settings["baseUrl"], "https://provider.example.invalid/v1/");
+            assert_eq!(settings["model"], "agent-model");
+            assert_eq!(
+                settings["apiKey"],
+                overlay_secret_placeholder("CLINE_API_KEY")
             );
 
             let mut env = BTreeMap::new();

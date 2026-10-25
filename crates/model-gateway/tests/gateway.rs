@@ -3015,8 +3015,25 @@ async fn a_gemini_model_is_read_from_the_path() {
         .await
         .unwrap();
     let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let body = response.text().await.unwrap();
     assert_eq!(status, 200, "the path model must route the call: {body}");
+    // The action suffix is the client's stream flag, and the reply has to be
+    // SSE: a `:streamGenerateContent` caller cannot read one JSON object.
+    assert!(
+        content_type
+            .as_deref()
+            .is_some_and(|value| value.starts_with("text/event-stream")),
+        "a streaming Gemini call must answer SSE, not a whole object: {content_type:?}"
+    );
+    assert!(
+        body.contains("data: "),
+        "the reply must be SSE frames: {body}"
+    );
 
     let recorded = recorder.lock().await;
     let sent = recorded.body.as_ref().unwrap();

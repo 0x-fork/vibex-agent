@@ -178,7 +178,13 @@ pub fn parse_request(value: &Value) -> GatewayResult<CanonicalRequest> {
             ),
             effort: None,
         },
-        stream: false,
+        // Gemini states streaming in the URL action suffix, which `gemini_call`
+        // copies into the body so every protocol reaches the router with the
+        // same shape. A body that names it directly is honoured too.
+        stream: value
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         opaque: Vec::new(),
     })
 }

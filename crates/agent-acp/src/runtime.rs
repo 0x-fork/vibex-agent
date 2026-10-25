@@ -15712,10 +15712,53 @@ impl AcpRuntimeClient {
             && required_runtime.matches_effective_config(&config)
             && config.is_applied_to_generation(execution_identity.activation_generation);
         if !matches {
-            return Err(VibexError::conflict(
+            // A fence refusal has to name the clause that failed. Every branch
+            // produces the same code, so without these the reader is told only
+            // that "something" did not match — which is how a reported-vs-
+            // projected Model divergence stayed unexplained.
+            let mut error = VibexError::conflict(
                 "turn_execution_identity_mismatch",
                 "ACP current attachment does not match the turn execution fence",
-            ));
+            );
+            error = error.with_diagnostic("fencedBinding", execution_identity.binding_id.as_str());
+            error = error.with_diagnostic("attachmentBinding", attachment.binding_id().as_str());
+            error = error.with_diagnostic(
+                "fencedGeneration",
+                execution_identity.activation_generation.to_string(),
+            );
+            error = error.with_diagnostic(
+                "attachmentGeneration",
+                attachment.fence().activation_generation.to_string(),
+            );
+            error = error.with_diagnostic(
+                "fencedModel",
+                execution_identity.model_id.as_deref().unwrap_or("<none>"),
+            );
+            error = error.with_diagnostic(
+                "effectiveModel",
+                config.effective_model.as_deref().unwrap_or("<none>"),
+            );
+            error = error.with_diagnostic(
+                "requiredModel",
+                required_runtime.model_id().unwrap_or("<none>"),
+            );
+            error = error.with_diagnostic("attachmentState", format!("{:?}", attachment.state()?));
+            error = error.with_diagnostic("sourceAvailable", source_available.to_string());
+            error = error.with_diagnostic(
+                "selectionMatches",
+                required_runtime
+                    .matches_effective_config(&config)
+                    .to_string(),
+            );
+            error = error.with_diagnostic("converged", config.is_converged().to_string());
+            error = error.with_diagnostic(
+                "appliedGeneration",
+                config
+                    .applied_activation_generation
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<none>".to_string()),
+            );
+            return Err(error);
         }
         Ok(())
     }

@@ -476,7 +476,25 @@ runtime switch or a turn on an Agent that was otherwise healthy.
   `session/new` is refused with `Authentication required` and the session never
   reaches a prompt.
 
-### 3. Contracts — failure detail
+### 3. Contracts — Gemini streaming and Cline's endpoint
+
+- **A Gemini action suffix is the stream flag.** `:generateContent` answers one
+  object, `:streamGenerateContent` answers SSE; the body carries neither. The
+  path model and the suffix are both copied into the body by `gemini_call`, so
+  the shared streaming pipeline sees the same shape it sees for the other three
+  protocols. Without it a streaming call was answered with a whole JSON object,
+  which the CLI cannot read as SSE — the request looked healthy in the ledger
+  and the turn still failed.
+- **Cline reaches a caller-supplied endpoint only through its provider store.**
+  `openai-native` is Cline's own OpenAI client: it offers no base-URL config
+  option and always posts to api.openai.com, so projecting it sent Vibex's
+  placeholder key to OpenAI and failed with "Incorrect API key provided".
+  Both OpenAI protocols therefore project `openai-compatible` and the
+  `ClineProvidersJson` overlay writes `<CLINE_DATA_DIR>/settings/providers.json`
+  with `provider`/`apiKey`/`model`/`baseUrl`. `CLINE_API_BASE_URL` is not read
+  by the ACP bridge.
+
+### 4. Contracts — failure detail
 
 - **A refusal keeps the Agent's own words.** Every live configuration failure is
   reported as `runtime_switch_configuration_unavailable`, and the inner
@@ -487,8 +505,10 @@ runtime switch or a turn on an Agent that was otherwise healthy.
   `error_detail_redacted`. Without it a rejected boolean read as an unexplained
   switch failure and the only way to learn why was to re-run the Agent by hand.
 
-### 4. Tests Required
+### 5. Tests Required
 
+`a_gemini_model_is_read_from_the_path` (which also asserts the SSE framing),
+`cline_projection_pins_the_agent_endpoint_and_selects_the_provider_id`,
 `a_refused_option_keeps_the_agents_own_words` and
 `a_field_refusal_reaches_the_operation_journal` for the detail path;
 `a_boolean_option_is_sent_with_the_acp_type_tag`,

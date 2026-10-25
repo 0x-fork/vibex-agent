@@ -2500,13 +2500,10 @@ mod tests {
         assert_eq!(editor.fixed_endpoint(), None);
         editor.replace_capability(capability);
 
-        // The endpoint control stays visible so the pinned value can be shown,
-        // but clients render it read-only.
+        // Cline accepts a caller-supplied endpoint now that its store carries
+        // one, so the control is editable rather than pinned to OpenAI.
         assert!(editor.shows(vibex_core::AgentProjectionFormControl::Endpoint));
-        assert_eq!(
-            editor.fixed_endpoint(),
-            Some(vibex_core::CLINE_FIXED_BASE_URL)
-        );
+        assert_eq!(editor.fixed_endpoint(), None);
         assert_eq!(
             editor.credential_surface(),
             ProjectionCredentialSurface::ApiKey

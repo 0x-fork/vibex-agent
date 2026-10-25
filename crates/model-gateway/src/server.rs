@@ -92,7 +92,8 @@ async fn gemini_call(
     // upstream `model` field — reads the request body, so the path model has to
     // be carried into it here or every call resolves as "no model at all".
     let model = percent_decode(model);
-    let body = match body_with_path_model(&body, &model) {
+    let streaming = action == "streamGenerateContent";
+    let body = match body_with_path_selection(&body, &model, streaming) {
         Ok(body) => body,
         Err(error) => {
             return state
@@ -136,13 +137,24 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// Returns the request body with the path model filled in.
+/// Returns the request body with the path's model and streaming intent filled in.
+///
+/// Gemini is the one protocol that states both in the URL: the model is a path
+/// segment, and the action suffix (`:generateContent` versus
+/// `:streamGenerateContent`) decides whether the reply is one object or SSE.
+/// The client's JSON carries neither. Everything downstream — routing, the
+/// ledger, the upstream request — reads the body, so both facts are copied into
+/// it here.
 ///
 /// A body that already names a model keeps it: the path is the transport route,
-/// and a caller that also set the field said which one it means. Everything
-/// else is passed through untouched, so a vendor field the gateway does not
-/// understand still reaches the upstream.
-fn body_with_path_model(body: &[u8], model: &str) -> Result<bytes::Bytes, GatewayError> {
+/// and a caller that also set the field said which one it means. Every other
+/// field is passed through untouched, so a vendor field the gateway does not
+/// model still reaches the upstream.
+fn body_with_path_selection(
+    body: &[u8],
+    model: &str,
+    streaming: bool,
+) -> Result<bytes::Bytes, GatewayError> {
     let mut value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|_| GatewayError::MalformedRequest("the body is not valid JSON".to_string()))?;
     let Some(fields) = value.as_object_mut() else {
@@ -160,6 +172,12 @@ fn body_with_path_model(body: &[u8], model: &str) -> Result<bytes::Bytes, Gatewa
             serde_json::Value::String(model.to_string()),
         );
     }
+    // The action suffix is the client's stream flag, and the body has no such
+    // field. Writing it here lets the shared pipeline make the same
+    // streaming-versus-gathered decision it makes for the other three
+    // protocols; without it a `:streamGenerateContent` call was answered with
+    // one JSON object and the CLI received a body it could not read as SSE.
+    fields.insert("stream".to_string(), serde_json::Value::Bool(streaming));
     serde_json::to_vec(&value)
         .map(bytes::Bytes::from)
         .map_err(|_| GatewayError::Internal("the Gemini body could not be re-encoded".to_string()))

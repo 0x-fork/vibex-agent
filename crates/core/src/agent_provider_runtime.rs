@@ -34,14 +34,6 @@ pub const AGENT_RUNTIME_PROBE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_PROBE_TIMEOUT_MS: u64 = 300_000;
 pub const MIN_PROBE_TIMEOUT_MS: u64 = 1_000;
 
-/// The endpoint Cline's own provider clients fall back to. Its ACP bridge
-/// resolves `CLINE_PROVIDER`, `CLINE_MODEL`, and `CLINE_API_KEY` from the
-/// environment and never reads the managed provider store, so a caller-supplied
-/// base URL cannot reach the request: the endpoint stays fixed at
-/// `api.openai.com`. Profiles bound to Cline are pinned to this value and the
-/// editor renders it read-only.
-pub const CLINE_FIXED_BASE_URL: &str = "https://api.openai.com/v1";
-
 /// A descriptor's product boundary.  This is intentionally separate from
 /// `ProjectionEvidenceState`: a documented AgentManaged capability is useful
 /// even when no operator account is available for a runtime smoke.
@@ -367,15 +359,19 @@ fn catalog_projection_shape(
                     catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
                 ],
             )),
-            // Cline's ACP bridge reads its provider id, key, and model from the
-            // environment (`CLINE_PROVIDER`, `CLINE_MODEL`, `CLINE_API_KEY`) and
-            // never consumes `<CLINE_DATA_DIR>/settings/providers.json`, so a
-            // caller-supplied endpoint cannot reach the request. The endpoint is
-            // therefore pinned to what Cline actually calls instead of being
-            // projected from the profile. The Model is applied over the ACP
+            // Cline reads the provider id from `CLINE_PROVIDER` and the key
+            // from `CLINE_API_KEY`, but its base URL only comes from
+            // `<CLINE_DATA_DIR>/settings/providers.json`. `openai-native` — the
+            // provider a Responses Model used to project — is Cline's own
+            // OpenAI client: it offers no config option for a base URL and
+            // always posts to api.openai.com, so the call left with Vibex's
+            // placeholder key and failed with "Incorrect API key provided".
+            // Both OpenAI protocols therefore go through `openai-compatible`,
+            // which does read the store, and the store is written by the
+            // `ClineProvidersJson` overlay. The Model still arrives over the ACP
             // `model` config option.
-            "cline" => Ok(fixed_endpoint_projection_shape(
-                CLINE_FIXED_BASE_URL,
+            "cline" => Ok(overlay_projection_shape(
+                ConfigOverlayStrategy::ClineProvidersJson,
                 "CLINE_API_KEY",
                 vec![
                     catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
@@ -705,36 +701,7 @@ fn overlay_projection_shape(
     }
 }
 
-/// A replaceable-provider Agent that accepts an API key and a Model, but owns
-/// its own endpoint. The profile's base URL is pinned to `base_url` rather than
-/// projected, so clients render the endpoint control read-only.
-fn fixed_endpoint_projection_shape(
-    base_url: &str,
-    secret_env_key: &str,
-    model_interfaces: Vec<AgentModelInterfaceDescriptor>,
-) -> CatalogProjectionShape {
-    CatalogProjectionShape {
-        provider_control: AgentProviderControl::FixedEndpoint {
-            base_url: base_url.to_string(),
-        },
-        credential_control: AgentCredentialControl::Environment {
-            secret_env_key: secret_env_key.to_string(),
-            accepted_secret_kinds: vec![ProviderSecretKind::ApiKey],
-        },
-        // The Agent advertises and applies the standard ACP `model` config
-        // option, which is how the selected Model reaches the session.
-        model_control: AgentModelControl::AcpConfigOption {
-            aliases: vec!["model".to_string()],
-        },
-        credential_kinds: vec![AgentCredentialKind::ApiKey],
-        model_interfaces,
-        runtime_home_strategy: AgentRuntimeHomeStrategy::VibexPrivate,
-        switch_behavior: ProviderSwitchBehavior::RestartAndResume,
-        evidence_state: ProjectionEvidenceState::Documented,
-        capability_diagnostic_code: Some("agent_projection_runtime_verification_required"),
-    }
-}
-
+/// One protocol an Agent can be pointed at, and how it is selected.
 fn catalog_interface(
     wire_protocol_id: &str,
     user_selectable: bool,
@@ -886,8 +853,18 @@ pub fn model_provider_configurable_agent_ids() -> VibexResult<BTreeSet<AgentId>>
 /// wire protocol rather than chosen freely.
 pub fn cline_provider_id(wire_protocol_id: &str) -> Option<&'static str> {
     match wire_protocol_id {
-        WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS => Some("openai-compatible"),
-        WIRE_PROTOCOL_OPENAI_RESPONSES => Some("openai-native"),
+        // Both OpenAI protocols go through Cline's `openai-compatible`
+        // provider, which is the only one that reads a caller-supplied
+        // `baseUrl`. `openai-native` is Cline's own OpenAI client: it ignores
+        // every base URL, offers no config option for one, and always posts to
+        // api.openai.com — so projecting it made every Cline call leave for
+        // OpenAI with Vibex's placeholder key and fail with "Incorrect API key
+        // provided". The wire protocol is still `responses` for that Model; the
+        // gateway translates, which is what a route group already does for
+        // every other Agent.
+        WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS | WIRE_PROTOCOL_OPENAI_RESPONSES => {
+            Some("openai-compatible")
+        }
         _ => None,
     }
 }
@@ -1912,9 +1889,13 @@ mod tests {
             cline_provider_id(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS),
             Some("openai-compatible")
         );
+        // A Responses Model goes through the same `openai-compatible`
+        // provider: `openai-native` is Cline's own OpenAI client and ignores
+        // every caller-supplied base URL, so projecting it sent the call to
+        // api.openai.com with Vibex's placeholder key.
         assert_eq!(
             cline_provider_id(WIRE_PROTOCOL_OPENAI_RESPONSES),
-            Some("openai-native")
+            Some("openai-compatible")
         );
         // Cline refuses a caller-supplied base URL for every other provider it
         // ships, so those protocols must not project an endpoint.

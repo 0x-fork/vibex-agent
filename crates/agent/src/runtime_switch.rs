@@ -2389,12 +2389,25 @@ fn operation_failure_detail(error: &VibexError) -> String {
     // apply. A bare `acp_rpc_error` — or a `causeCode` that only says
     // `acp_session_config_value_unavailable` — sends the reader back into the
     // source, which is how one rejected boolean stayed unexplained.
+    // A step that failed before any configuration was applied — `create_session`
+    // and the other handshake operations — carries no `agentRefusal`; its
+    // description is the raw `rpcMessage`. Reading only the configuration pair
+    // is what left Antigravity's failed `session/new` as a bare
+    // `acp_rpc_error`.
     let agent_refusal = error
         .diagnostics
         .iter()
         .find(|diagnostic| diagnostic.key == "agentRefusal")
         .map(|diagnostic| diagnostic.value.trim())
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            error
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.key == "rpcMessage")
+                .map(|diagnostic| diagnostic.value.trim())
+                .filter(|value| !value.is_empty())
+        });
     if let Some(refusal) = agent_refusal {
         let config_key = error
             .diagnostics
