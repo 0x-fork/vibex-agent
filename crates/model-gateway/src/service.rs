@@ -1281,6 +1281,7 @@ impl ModelGatewayService {
                 &snapshot,
                 &request,
                 inbound,
+                &body_value,
                 &resolved,
                 &connection,
                 pinned.as_ref(),
@@ -1462,6 +1463,7 @@ impl ModelGatewayService {
         snapshot: &GatewaySnapshot,
         request: &CanonicalRequest,
         inbound: WireProtocol,
+        original_body: &Value,
         resolved: &ResolvedMember,
         connection: &DbConnection,
         pinned: Option<&(ModelProviderProfileId, RequestId)>,
@@ -1597,18 +1599,32 @@ impl ModelGatewayService {
             None => request.clone(),
         };
         let upstream_stream = request.stream || !passthrough;
-        let body =
-            build_upstream_request(target, &member_request, &resolved.model, upstream_stream)?;
+        let body = build_member_body(
+            target,
+            passthrough,
+            inbound,
+            original_body,
+            request,
+            &member_request,
+            &resolved.model,
+            upstream_stream,
+        )?;
         // The other calls this member may make. They exist only when the first
         // one was a guess at an endpoint that declares nothing, so a wrong
-        // guess costs one extra request instead of every request.
+        // guess costs one extra request instead of every request. A corrected
+        // call is always a translation of a body the endpoint refused, never a
+        // passthrough of it.
         let mut alternates = Vec::new();
         for (alternate_target, alternate_passthrough) in &plan.alternates {
             let Some(endpoint) = upstream.endpoint_for_call(*alternate_target).cloned() else {
                 continue;
             };
-            let body = build_upstream_request(
+            let body = build_member_body(
                 *alternate_target,
+                *alternate_passthrough,
+                inbound,
+                original_body,
+                request,
                 &member_request,
                 &resolved.model,
                 request.stream || !alternate_passthrough,
@@ -1809,17 +1825,36 @@ impl ModelGatewayService {
                 }
             }
         }
-        if let Some(group_id) = prepared.group_id.as_deref() {
-            self.finish_attempt(group_id, prepared.probe);
-        }
-        self.note_finished(
-            &prepared.request_id,
-            vibex_core::GatewayRequestOutcome::Failed,
-        );
-        Err(last_error.unwrap_or_else(|| GatewayError::AllKeysCooling {
+        let error = last_error.unwrap_or_else(|| GatewayError::AllKeysCooling {
             model: prepared.requested_model.clone(),
             retry_after_ms: None,
-        }))
+        });
+        // A request that never reached an upstream still reaches the ledger.
+        // Without this row the only record of the failure was the message the
+        // Agent showed, and the ledger said every request had succeeded — which
+        // is exactly the state an investigation cannot start from.
+        let first_member = prepared.first_member();
+        let outcome = RequestOutcome {
+            kind: GatewayRequestOutcome::Failed,
+            profile_id: first_member.map(|member| member.profile_id.clone()),
+            target: first_member.map(|member| member.target),
+            skipped_cooling: first_member
+                .map(|member| member.skipped_cooling)
+                .unwrap_or(0),
+            skipped_over_limit: first_member
+                .map(|member| member.skipped_over_limit)
+                .unwrap_or(0),
+            credential: None,
+            status: Some(error.status()),
+            usage: CanonicalUsage::default(),
+            latency_ms: None,
+            served: None,
+            failed_attempts: failed_attempts.clone(),
+            skipped_members: skipped_members.clone(),
+            error_code: Some(error.code().to_string()),
+        };
+        self.record(prepared, &outcome);
+        Err(error)
     }
 
     /// Decides what a pinned member's failure means for the conversation.
@@ -2090,12 +2125,38 @@ impl ModelGatewayService {
                 }
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
+                // A shape refusal only means "wrong protocol" when the protocol
+                // is still a guess. Once the endpoint's protocol is settled —
+                // declared, remembered, or simply the one the client spoke on a
+                // passthrough — a body the vendor cannot read is the gateway's
+                // own mistake, and every protocol left to try speaks a different
+                // shape, so walking them would only fail again and could record
+                // the wrong verdict for good.
+                let settled = !guessing;
                 // A 404 only means "wrong protocol" when another protocol is
                 // left to try: on its own it is the address being wrong, and
                 // blaming the protocol would send the next request on the same
                 // hopeless walk.
                 let wrong_shape = is_protocol_mismatch(status, &body)
                     || (status == 404 && call_index + 1 < calls.len());
+                if wrong_shape && settled {
+                    // The Key worked and the protocol was right; the body the
+                    // gateway built was not something the endpoint can read.
+                    // Neither the Key nor the group is to blame, and no later
+                    // request should be told this endpoint speaks another
+                    // protocol, so nothing is remembered here.
+                    attempts.push(GatewayRouteAttempt {
+                        credential_id: candidate.credential.clone(),
+                        failure: GatewayFailureKind::Other,
+                    });
+                    call_error = Some(GatewayError::TranslationFailed {
+                        wire_protocol_id: call.target.wire_protocol_id().to_string(),
+                        status,
+                        message: upstream_message(&body),
+                    });
+                    // Another protocol cannot fix a body this one cannot read.
+                    break;
+                }
                 if wrong_shape {
                     // The Key worked; the body was addressed to the wrong API.
                     // Cooling the Key here is what turned one wrong guess into
@@ -2244,6 +2305,7 @@ impl ModelGatewayService {
             route: Some(GatewayRouteTrace {
                 failed_attempts: outcome.failed_attempts.clone(),
                 skipped_members: outcome.skipped_members.clone(),
+                error_code: outcome.error_code.clone(),
                 ..GatewayRouteTrace::new(outcome.skipped_cooling, outcome.skipped_over_limit)
             }),
             created_at_ms: now,
@@ -2566,6 +2628,12 @@ pub(crate) struct RequestOutcome {
     pub failed_attempts: Vec<GatewayRouteAttempt>,
     /// Members walked past before one answered.
     pub skipped_members: Vec<vibex_core::GatewaySkippedMember>,
+    /// The gateway's own failure code, when no reply was produced.
+    ///
+    /// This is what makes a failed request findable: the ledger row otherwise
+    /// says only "failed", with nothing linking it to the message the Agent
+    /// showed.
+    pub error_code: Option<String>,
 }
 
 /// The credential a request authenticates with.
@@ -2613,6 +2681,47 @@ const TRANSLATION_PREFERENCE: [WireProtocol; 4] = [
     WireProtocol::Responses,
     WireProtocol::GeminiGenerateContent,
 ];
+
+/// Builds the body one call sends, honouring a passthrough where there is one.
+///
+/// A same-protocol call must be the client's own bytes: the vendor's own
+/// fields (`store`, `previous_response_id`, `prompt_cache_key`, `metadata`,
+/// `text.format`, …) are what the prompt cache and the vendor's own state key
+/// on, and re-encoding the body silently drops every one this IR does not
+/// model. Re-encoding is for translation, where the body has to be rewritten
+/// anyway; a passthrough only rewrites `model`, which is the one field the
+/// gateway owns.
+///
+/// A member that overrides the reasoning effort has to be rebuilt: that
+/// override is a route setting the client did not send.
+#[allow(clippy::too_many_arguments)]
+fn build_member_body(
+    target: WireProtocol,
+    passthrough: bool,
+    inbound: WireProtocol,
+    original_body: &Value,
+    request: &CanonicalRequest,
+    member_request: &CanonicalRequest,
+    model: &str,
+    stream: bool,
+) -> GatewayResult<Value> {
+    let rewritten_effort = request.reasoning != member_request.reasoning;
+    if !passthrough || target != inbound || rewritten_effort {
+        return build_upstream_request(target, member_request, model, stream);
+    }
+    let mut body = original_body.clone();
+    let Some(fields) = body.as_object_mut() else {
+        return build_upstream_request(target, member_request, model, stream);
+    };
+    fields.insert("model".to_string(), Value::String(model.to_string()));
+    // The stream flag is the gateway's decision, not vendor state: a
+    // translated call always asks for a stream so the terminal usage frame
+    // exists, and a passthrough keeps whatever the client asked for.
+    if fields.get("stream").and_then(Value::as_bool) != Some(stream) {
+        fields.insert("stream".to_string(), Value::Bool(stream));
+    }
+    Ok(body)
+}
 
 /// Chooses the protocol the upstream is called with.
 ///
@@ -2689,7 +2798,11 @@ fn member_failure_kind(error: &GatewayError) -> GatewayFailureKind {
         GatewayError::TokenCeilingReached { .. } => GatewayFailureKind::Quota,
         // A wrong protocol is not a Key problem, so it must not be described
         // as one: `Auth` would retire the Key for the mistake of the address.
-        GatewayError::ProtocolMismatch { .. } => GatewayFailureKind::Other,
+        // A body the gateway built wrongly is the same kind of not-a-Key
+        // problem, and reporting it as `Upstream` would cool the Key for it.
+        GatewayError::ProtocolMismatch { .. } | GatewayError::TranslationFailed { .. } => {
+            GatewayFailureKind::Other
+        }
         GatewayError::NotConfigured(_) => GatewayFailureKind::Auth,
         GatewayError::TranslationDisabled { .. }
         | GatewayError::UnsupportedImageReference
@@ -3055,6 +3168,7 @@ pub(crate) async fn forward(
             served: None,
             failed_attempts,
             skipped_members,
+            error_code: failed.then_some("model_gateway_upstream_failed".to_string()),
         },
     );
 }
@@ -3101,6 +3215,7 @@ pub(crate) async fn gather(
                     served: None,
                     failed_attempts,
                     skipped_members,
+                    error_code: Some("model_gateway_upstream_failed".to_string()),
                 },
             );
             return Err(GatewayError::Upstream {
@@ -3177,6 +3292,7 @@ pub(crate) async fn gather(
             served: (!response.model.is_empty()).then(|| response.model.clone()),
             failed_attempts,
             skipped_members,
+            error_code: None,
         },
     );
     Ok(rendered)

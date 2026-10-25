@@ -48,6 +48,20 @@ pub enum GatewayError {
         status: u16,
         message: String,
     },
+    /// The gateway rebuilt a same-protocol body and the vendor refused its
+    /// shape.
+    ///
+    /// It is distinct from [`GatewayError::ProtocolMismatch`] because the
+    /// protocol was *not* in question: the client spoke what the endpoint
+    /// speaks, and the refusal names a field the gateway's own encoder got
+    /// wrong. Blaming the protocol sends the reader to a setting that cannot
+    /// fix anything, and — for an endpoint whose protocol was only a guess —
+    /// records the wrong answer for every later request.
+    TranslationFailed {
+        wire_protocol_id: String,
+        status: u16,
+        message: String,
+    },
     /// The gateway's own configuration is unusable.
     NotConfigured(String),
     /// An internal invariant broke. Never includes request content.
@@ -64,7 +78,7 @@ impl GatewayError {
             Self::UnsupportedImageReference => 400,
             Self::MalformedRequest(_) => 400,
             Self::Upstream { status, .. } => *status,
-            Self::ProtocolMismatch { .. } => 502,
+            Self::ProtocolMismatch { .. } | Self::TranslationFailed { .. } => 502,
             Self::NotConfigured(_) => 503,
             Self::Internal(_) => 500,
         }
@@ -80,6 +94,7 @@ impl GatewayError {
             Self::MalformedRequest(_) => "model_gateway_request_invalid",
             Self::Upstream { .. } => "model_gateway_upstream_failed",
             Self::ProtocolMismatch { .. } => "model_gateway_protocol_mismatch",
+            Self::TranslationFailed { .. } => "model_gateway_translation_failed",
             Self::NotConfigured(_) => "model_gateway_not_configured",
             Self::Internal(_) => "model_gateway_internal",
         }
@@ -118,6 +133,13 @@ impl GatewayError {
             } => format!(
                 "`{wire_protocol_id}` is the wrong protocol for this endpoint: {message}"
             ),
+            Self::TranslationFailed {
+                wire_protocol_id,
+                message,
+                ..
+            } => format!(
+                "The gateway could not build a `{wire_protocol_id}` request this endpoint accepts: {message}"
+            ),
             Self::NotConfigured(detail) => format!("The gateway is not configured: {detail}"),
             Self::Internal(detail) => format!("The gateway could not complete this request: {detail}"),
         }
@@ -134,9 +156,10 @@ impl GatewayError {
 
     /// Whether this failure says anything about the upstream or the Key.
     ///
-    /// A protocol mismatch and the gateway's own refusals do not: counting
-    /// them is what let one wrong-protocol guess cool a Key and then degrade
-    /// the whole gateway.
+    /// A protocol mismatch, a translation the gateway got wrong, and the
+    /// gateway's own refusals all say nothing about either: counting them is
+    /// what let one wrong-protocol guess cool a Key and then degrade the whole
+    /// gateway.
     pub const fn blames_upstream(&self) -> bool {
         matches!(
             self,
@@ -226,6 +249,31 @@ mod tests {
             }
             .blames_upstream(),
             "a wrong protocol must not be charged to the upstream"
+        );
+    }
+
+    /// A body the gateway built wrongly is reported as its own failure.
+    ///
+    /// It must read differently from a wrong protocol, because the protocol was
+    /// not in question and no Provider setting can fix it. It also must not be
+    /// charged to the Key or to the route group, or one encoder bug would cool
+    /// every Key and step the group aside.
+    #[test]
+    fn a_translation_failure_is_the_gateways_own_problem() {
+        let error = GatewayError::TranslationFailed {
+            wire_protocol_id: "openai_responses".into(),
+            status: 422,
+            message: "unknown variant `function_call_output`".into(),
+        };
+        assert_eq!(error.code(), "model_gateway_translation_failed");
+        assert_eq!(error.status(), 502);
+        assert_eq!(error.key_failure(), None);
+        assert!(!error.blames_upstream());
+        let message = error.message();
+        assert!(message.contains("could not build"), "got {message}");
+        assert!(
+            !message.contains("wrong protocol"),
+            "a broken body must not be described as a wrong protocol: {message}"
         );
     }
 

@@ -13994,6 +13994,14 @@ impl ManagementCenter {
                                 request.latency_ms.unwrap_or_default()
                             ))),
             )
+            .when_some(gateway_request_error_code(request), |this, code| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .child(label(management_locale_text("Failure", "失败", "失敗")))
+                        .child(div().min_w_0().text_xs().child(code)),
+                )
+            })
             .child(usage)
             .into_any_element()
     }
@@ -28807,6 +28815,23 @@ fn gateway_credential_name(
     }
 }
 
+/// The gateway's own failure code for a request that produced no reply.
+///
+/// A failed row used to read as a bare "failed" with nothing to look up. The
+/// code is what a reader can act on: `model_gateway_translation_failed` names
+/// the gateway, `model_gateway_protocol_mismatch` names the endpoint's protocol
+/// setting. Only a failed row has one — a successful request's trace is about
+/// the route it walked, not about an error.
+fn gateway_request_error_code(request: &vibex_core::GatewayRequestSummary) -> Option<String> {
+    if matches!(request.outcome, vibex_core::GatewayRequestOutcome::Ok) {
+        return None;
+    }
+    request
+        .route
+        .as_ref()
+        .and_then(|route| route.error_code.clone())
+}
+
 /// The route one request took, as the lines the detail view shows.
 ///
 /// The first line is always the chain; every later line is a reason the chain
@@ -38942,6 +38967,7 @@ mod gateway_surface_tests {
                     vibex_core::GatewayFailureKind::Quota,
                 )],
                 skipped_members: Vec::new(),
+                error_code: None,
             }),
         );
 
@@ -38972,6 +38998,7 @@ mod gateway_surface_tests {
                 skipped_over_limit: 2,
                 failed_attempts: Vec::new(),
                 skipped_members: Vec::new(),
+                error_code: None,
             }),
         );
         let lines = gateway_route_lines(&over_limit, ResolvedLocale::ZhCn);
@@ -39001,6 +39028,7 @@ mod gateway_surface_tests {
                     failed_attempt("Backup", vibex_core::GatewayFailureKind::Rate),
                 ],
                 skipped_members: Vec::new(),
+                error_code: None,
             }),
         );
         let lines = gateway_route_lines(&two_dead, ResolvedLocale::En);
@@ -39064,8 +39092,42 @@ mod gateway_surface_tests {
         assert!(detail.contains("gateway_route_lines(request"));
         assert!(detail.contains("request.input_tokens"));
         assert!(detail.contains("request.latency_ms"));
+        // A failed request names why in the ledger, not only in the message the
+        // Agent showed: the code is the one thing a reader can look up.
+        assert!(detail.contains("gateway_request_error_code(request"));
         // The detail is a reading of one row; it must not offer a mutation.
         assert!(!detail.contains("Button::new"));
         assert!(!detail.contains("on_click"));
+    }
+
+    /// A failed row names its code; a successful one has none to name.
+    #[test]
+    fn a_failed_ledger_row_names_the_gateways_error_code() {
+        let mut failed = ledger_request(
+            Some("Primary"),
+            Some(vibex_core::GatewayRouteSummary {
+                skipped_cooling: 0,
+                skipped_over_limit: 0,
+                failed_attempts: Vec::new(),
+                skipped_members: Vec::new(),
+                error_code: Some("model_gateway_translation_failed".to_string()),
+            }),
+        );
+        failed.outcome = vibex_core::GatewayRequestOutcome::Failed;
+        assert_eq!(
+            gateway_request_error_code(&failed).as_deref(),
+            Some("model_gateway_translation_failed")
+        );
+
+        // A success never prints a failure line, even if a trace carries a code
+        // from an earlier attempt.
+        let mut succeeded = failed.clone();
+        succeeded.outcome = vibex_core::GatewayRequestOutcome::Ok;
+        assert_eq!(gateway_request_error_code(&succeeded), None);
+
+        // A failure row written before the code existed stays readable.
+        let mut legacy = failed;
+        legacy.route = None;
+        assert_eq!(gateway_request_error_code(&legacy), None);
     }
 }

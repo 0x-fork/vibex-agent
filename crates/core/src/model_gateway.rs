@@ -845,6 +845,16 @@ pub struct GatewayRouteTrace {
     /// try" unreadable.
     #[serde(default)]
     pub skipped_members: Vec<GatewaySkippedMember>,
+    /// The gateway's own stable error code when the request never produced a
+    /// reply.
+    ///
+    /// A failed row used to be count-only: the ledger said "failed" and the
+    /// Agent's message said what the user read, and nothing joined the two. The
+    /// code is the join — `model_gateway_translation_failed` points at the
+    /// gateway, `model_gateway_protocol_mismatch` at the endpoint — so a later
+    /// investigation starts from the ledger instead of a session transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 /// One route member that did not answer, and why.
@@ -867,12 +877,17 @@ impl GatewayRouteTrace {
             skipped_over_limit: u32::try_from(skipped_over_limit).unwrap_or(u32::MAX),
             failed_attempts: Vec::new(),
             skipped_members: Vec::new(),
+            error_code: None,
         }
     }
 
     /// Whether the trace says anything beyond "the first Key answered".
+    ///
+    /// A failed request is always worth keeping, even when it walked past
+    /// nothing: the error code is the whole reason the row exists.
     pub fn is_unremarkable(&self) -> bool {
-        self.skipped_cooling == 0
+        self.error_code.is_none()
+            && self.skipped_cooling == 0
             && self.skipped_over_limit == 0
             && self.failed_attempts.is_empty()
             && self.skipped_members.is_empty()
@@ -1231,6 +1246,7 @@ impl GatewayRequestSummary {
                         failure: member.failure,
                     })
                     .collect(),
+                error_code: trace.error_code,
             });
         Self {
             model_provider_profile_id: profile
@@ -1369,6 +1385,9 @@ pub struct GatewayRouteSummary {
     /// Members the request walked past, with their Providers named.
     #[serde(default)]
     pub skipped_members: Vec<GatewaySkippedMemberSummary>,
+    /// The gateway's own error code, when the request never produced a reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 /// One skipped route member, named for display.

@@ -255,6 +255,14 @@ fn parse_arguments(value: &Value) -> Value {
     }
 }
 
+/// The content of one user message.
+///
+/// Only real content belongs here. A `function_call_output` is an *input item*
+/// of its own — a sibling of the message, not a content part. Nesting it inside
+/// `content` made every vendor that flattens `input` into a Chat-shaped message
+/// list reject the whole body (`unknown variant function_call_output, expected
+/// one of text, image_url, file`), which is why a turn failed the moment a tool
+/// result entered the history and never before.
 fn input_item_parts(parts: &[ContentPart]) -> GatewayResult<Vec<Value>> {
     let mut items = Vec::new();
     for part in parts {
@@ -262,31 +270,38 @@ fn input_item_parts(parts: &[ContentPart]) -> GatewayResult<Vec<Value>> {
             ContentPart::Text(text) => {
                 items.push(json!({"type": "input_text", "text": text}));
             }
-            ContentPart::Image { source } => items.push(json!({
-                "type": "input_image",
-                "image_url": match source {
-                    ImageSource::Base64 { media_type, data } => {
-                        format!("data:{media_type};base64,{data}")
-                    }
-                    ImageSource::Url(url) => url.clone(),
-                    ImageSource::VendorFileId(id) => {
-                        return Ok(vec![json!({"type": "input_file", "file_id": id})]);
-                    }
-                },
-            })),
-            ContentPart::ToolResult {
-                call_id, content, ..
-            } => {
-                items.push(json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": text_of(content),
-                }));
-            }
+            // A vendor file reference is a content part like any other. It used
+            // to be returned as the whole message content, which silently
+            // dropped every other part of that message.
+            ContentPart::Image { source } => match source {
+                ImageSource::VendorFileId(id) => {
+                    items.push(json!({"type": "input_file", "file_id": id}));
+                }
+                source => items.push(json!({
+                    "type": "input_image",
+                    "image_url": match source {
+                        ImageSource::Base64 { media_type, data } => {
+                            format!("data:{media_type};base64,{data}")
+                        }
+                        ImageSource::Url(url) => url.clone(),
+                        ImageSource::VendorFileId(_) => unreachable!("handled above"),
+                    },
+                })),
+            },
+            ContentPart::ToolResult { .. } => {}
             _ => {}
         }
     }
     Ok(items)
+}
+
+/// One `function_call_output` input item, the sibling a tool result has to be.
+fn tool_result_item(call_id: &str, content: &[ContentPart]) -> Value {
+    json!({
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": text_of(content),
+    })
 }
 
 fn text_of(parts: &[ContentPart]) -> Value {
@@ -320,6 +335,17 @@ pub fn build_request(request: &CanonicalRequest, _model: &str) -> GatewayResult<
     for message in &request.messages {
         match message.role {
             Role::User => {
+                // A tool result is its own input item, and it has to precede
+                // any text that follows it in the same turn — that order is
+                // what the vendor matches `call_id` against.
+                for part in &message.parts {
+                    if let ContentPart::ToolResult {
+                        call_id, content, ..
+                    } = part
+                    {
+                        items.push(tool_result_item(call_id, content));
+                    }
+                }
                 let parts = input_item_parts(&message.parts)?;
                 if !parts.is_empty() {
                     items.push(json!({"type": "message", "role": "user", "content": parts}));
@@ -922,6 +948,87 @@ mod tests {
         assert_eq!(body["instructions"], "brief");
         assert_eq!(body["input"][0]["type"], "function_call");
         assert_eq!(body["input"][0]["call_id"], "call-1");
+    }
+
+    /// A tool result is an input item, never a part of a message's content.
+    ///
+    /// The regression this guards is the one that broke every Agent after its
+    /// first tool call: a vendor that flattens `input` into Chat-shaped messages
+    /// answered `unknown variant function_call_output, expected one of text,
+    /// image_url, file` and refused the whole turn.
+    #[test]
+    fn a_tool_result_is_an_input_item_beside_its_message() {
+        let request = CanonicalRequest {
+            messages: vec![
+                CanonicalMessage {
+                    role: Role::User,
+                    parts: vec![ContentPart::Text("list the files".into())],
+                },
+                CanonicalMessage {
+                    role: Role::Assistant,
+                    parts: vec![ContentPart::ToolCall {
+                        id: "call-1".into(),
+                        name: "ls".into(),
+                        arguments: json!({}),
+                    }],
+                },
+                CanonicalMessage {
+                    role: Role::User,
+                    parts: vec![ContentPart::ToolResult {
+                        call_id: "call-1".into(),
+                        content: vec![ContentPart::Text("Cargo.toml".into())],
+                        is_error: false,
+                    }],
+                },
+            ],
+            ..CanonicalRequest::for_model("m")
+        };
+        let body = build_request(&request, "m").unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call-1");
+        assert_eq!(input[2]["output"], "Cargo.toml");
+        // Nothing may nest it: a content array that names it is the bug itself.
+        assert!(
+            !input.iter().any(|item| {
+                item.get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|content| {
+                        content
+                            .iter()
+                            .any(|part| part["type"] == "function_call_output")
+                    })
+            }),
+            "a tool result must not be nested in message content: {body}"
+        );
+    }
+
+    /// A file reference keeps the rest of its message.
+    ///
+    /// The encoder used to return the file as the whole content array, so a
+    /// message carrying text and a vendor file reached the vendor as a file
+    /// alone and the text disappeared.
+    #[test]
+    fn a_vendor_file_keeps_the_text_beside_it() {
+        let request = CanonicalRequest {
+            messages: vec![CanonicalMessage {
+                role: Role::User,
+                parts: vec![
+                    ContentPart::Text("read this".into()),
+                    ContentPart::Image {
+                        source: ImageSource::VendorFileId("file-abc".into()),
+                    },
+                ],
+            }],
+            ..CanonicalRequest::for_model("m")
+        };
+        let body = build_request(&request, "m").unwrap();
+        let content = body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[1]["type"], "input_file");
+        assert_eq!(content[1]["file_id"], "file-abc");
     }
 
     #[test]

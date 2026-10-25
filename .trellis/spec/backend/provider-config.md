@@ -4973,6 +4973,23 @@ ProviderConfigService::{
   usage. Translation runs only when the protocols differ, and a protocol the user
   disabled in `GatewayTranslatePolicy` is refused with
   `model_gateway_translation_disabled` rather than silently used.
+- **Passthrough means the client's bytes, not a re-encoding.** `build_member_body`
+  clones the inbound body and rewrites only `model` — plus `stream`, which the
+  gateway owns. The encoder runs for a translation, and for a member that
+  overrides the route's reasoning effort. Re-encoding a passthrough silently
+  dropped every vendor field the IR does not model (`store`,
+  `previous_response_id`, `prompt_cache_key`, `metadata`, `text.format`), so the
+  vendor's own conversation state and prompt cache were lost while the ledger
+  still reported a passthrough.
+- **A tool result is an input item, never message content.** Responses models
+  `function_call_output` as a sibling of the message that carries it.
+  `input_item_parts` therefore excludes `ContentPart::ToolResult`, and
+  `build_request` pushes the item before the text of the same turn. Nesting it
+  made every vendor that flattens `input` into a Chat-shaped message list reject
+  the whole turn (`unknown variant function_call_output, expected one of text,
+  image_url, file`), so an Agent failed the moment its first tool result entered
+  the history and worked before it. A vendor-file reference is a content part
+  like any other; returning it as the whole message dropped the text beside it.
 - **A translated non-streaming call is read from the upstream as a stream.**
   The gateway asks the upstream for `stream: true`, gathers the SSE frames, and
   renders one JSON body for the client. An upstream that ignores the flag and
@@ -5182,6 +5199,21 @@ ProviderConfigService::{
   Cooling the Key on that reply is how three wrong guesses closed the whole
   gateway: every retry then hit `429 model_gateway_keys_cooling`, which counted
   as another failure.
+- **Only a guess may be called a wrong protocol.** The same shape refusal on a
+  *settled* protocol — declared by the endpoint, remembered, or simply the one
+  the client spoke through a passthrough — is `GatewayError::TranslationFailed`
+  (`502 model_gateway_translation_failed`). The protocol was never in question and
+  no Provider setting can fix the body, so telling the reader to change it is a
+  false lead; and because nothing is rewritten in
+  `model_gateway_endpoint_protocol` on that path, one encoder bug cannot be
+  remembered as a wrong verdict for every later request. Both failures are
+  `blames_upstream() == false` and neither cools a Key.
+- **A failed request is still a ledger row.** `open_attempt` records the failure
+  before returning it, with the gateway's own error code in the route trace
+  (`GatewayRouteTrace::error_code`) and in the client's `GatewayRouteSummary`.
+  Previously only requests that reached `forward`/`gather` were recorded, so a
+  gateway-side refusal left the ledger reading "all ok" while every turn failed —
+  the one state an investigation cannot start from.
 - **The gateway's own switch reaches the listener and the bindings.** Turning it
   off stops the listener and removes every hidden gateway Profile, so each bound
   Agent really falls back to its direct Provider instead of pointing at a dead

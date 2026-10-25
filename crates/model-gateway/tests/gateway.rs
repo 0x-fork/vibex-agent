@@ -2067,6 +2067,326 @@ async fn mock_chat_only_upstream() -> (String, Paths, tokio::task::JoinHandle<()
     (format!("http://{address}"), paths, task)
 }
 
+/// A body the gateway rebuilt wrongly is its own failure, not a wrong protocol.
+///
+/// The endpoint declared Responses and the client spoke Responses, so the
+/// protocol was never in question. Reporting a shape refusal as a protocol
+/// mismatch sent the user to a setting that could not fix anything, and an
+/// endpoint whose protocol was only inferred would have had the wrong answer
+/// remembered for every later request. The row also has to be in the ledger: a
+/// failure nobody can find is a failure nobody can fix.
+#[tokio::test]
+async fn a_shape_refusal_on_a_settled_protocol_blames_the_gateway() {
+    let path = database_path();
+    let (upstream_url, _paths, upstream_task) = mock_shape_refusing_upstream().await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::Responses,
+        &["gpt-5"],
+        "sk-test",
+    );
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/responses"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": group_model(&group, "gpt-5"),
+            "input": "say hi",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(
+        body.pointer("/error/code").and_then(Value::as_str),
+        Some("model_gateway_translation_failed"),
+        "a body the gateway built is not a wrong protocol: {body}"
+    );
+    assert!(
+        !body
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("wrong protocol"),
+        "the message must not send the reader to a protocol setting: {body}"
+    );
+
+    // The Key was fine and the protocol was right, so nothing is charged and
+    // nothing is remembered for the next request.
+    let connection = open_database(&path).unwrap();
+    let states = ModelProviderAccountStateRepository::list(&connection, &upstream).unwrap();
+    assert!(
+        states.iter().all(|state| state.cooldown_until_ms.is_none()),
+        "the Key served the request; only the body was wrong: {states:?}"
+    );
+    assert_eq!(
+        vibex_db::GatewayEndpointProtocolRepository::get(&connection, &upstream, "api").unwrap(),
+        None,
+        "a settled protocol must not be re-learned from the gateway's own bug"
+    );
+    // And the failure is in the ledger, with the same code the client read.
+    let logs = ModelGatewayRequestLogRepository::recent(&connection, 10).unwrap();
+    assert_eq!(logs.len(), 1, "a failed request must reach the ledger");
+    assert_eq!(logs[0].outcome, GatewayRequestOutcome::Failed);
+    assert_eq!(
+        logs[0]
+            .route
+            .as_ref()
+            .and_then(|route| route.error_code.as_deref()),
+        Some("model_gateway_translation_failed")
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// An upstream that answers the shape error a whole-body flattener produces.
+async fn mock_shape_refusing_upstream() -> (String, Paths, tokio::task::JoinHandle<()>) {
+    let paths: Paths = Arc::new(Mutex::new(Vec::new()));
+    let state = paths.clone();
+    let router = Router::new().route(
+        "/{*path}",
+        post(move |uri: axum::http::Uri, _body: axum::body::Bytes| async move {
+            state.lock().await.push(uri.path().to_string());
+            let mut response = Response::new(Body::from(
+                json!({"error": {"message":
+                    "messages[6]: unknown variant `function_call_output`, expected one of `text`, `image_url`, `file`"
+                }})
+                .to_string(),
+            ));
+            *response.status_mut() = axum::http::StatusCode::UNPROCESSABLE_ENTITY;
+            response
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (format!("http://{address}"), paths, task)
+}
+
+/// An upstream that reads `input` the way the vendor does.
+///
+/// The real endpoint flattens `input` into a Chat-shaped `messages` list before
+/// it validates anything, and its content enum knows only `text`, `image_url`,
+/// and `file`. A `function_call_output` nested inside a message's `content` is
+/// therefore a hard 422 — which is exactly what every Agent hit the moment a
+/// tool result entered the conversation.
+async fn mock_input_validating_upstream() -> (String, Recorder, tokio::task::JoinHandle<()>) {
+    let recorder: Recorder = Arc::new(Mutex::new(Recorded::default()));
+    let state = recorder.clone();
+    let router = Router::new().route(
+        "/{*path}",
+        post(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+            let state = state.clone();
+            async move {
+                let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                {
+                    let mut recorded = state.lock().await;
+                    recorded.path = uri.path().to_string();
+                    recorded.body = Some(value.clone());
+                }
+                let mut messages = 0usize;
+                if let Some(items) = value.get("input").and_then(Value::as_array) {
+                    for item in items {
+                        if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+                            // A sibling input item is fine; the message count is
+                            // what the vendor's error names, so keep counting.
+                            messages += 1;
+                            continue;
+                        }
+                        if let Some(content) = item.get("content").and_then(Value::as_array) {
+                            for part in content {
+                                let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
+                                if !matches!(kind, "input_text" | "input_image" | "input_file") {
+                                    let mut response = Response::new(Body::from(
+                                        json!({"error": {"message": format!(
+                                            "messages[{messages}]: unknown variant `{kind}`, expected one of `text`, `image_url`, `file`"
+                                        )}})
+                                        .to_string(),
+                                    ));
+                                    *response.status_mut() =
+                                        axum::http::StatusCode::UNPROCESSABLE_ENTITY;
+                                    return response;
+                                }
+                            }
+                        }
+                        messages += 1;
+                    }
+                }
+                let mut response = Response::new(Body::from(responses_stream()));
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static("text/event-stream"),
+                );
+                response
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (format!("http://{address}"), recorder, task)
+}
+
+/// A tool round trip survives the translation into Responses.
+///
+/// This is the Claude path in the reported failure: the client speaks
+/// Anthropic, the group's member speaks Responses, so the gateway translates a
+/// `tool_result` on the way out. The translated body used to nest it inside
+/// `content`, so the vendor rejected the whole turn — after the first tool call
+/// and never before, which is what made it look like "it breaks after a while".
+#[tokio::test]
+async fn a_tool_result_survives_the_translation_into_responses() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) = mock_input_validating_upstream().await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::Responses,
+        &["deepseek-v4.1-flash"],
+        "sk-test",
+    );
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .header(header::HOST, "127.0.0.1")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": group_model(&group, "deepseek-v4.1-flash"),
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "list the files"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "ls", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "Cargo.toml"}
+                ]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, 200, "a tool round trip must not fail: {body}");
+
+    let recorded = recorder.lock().await;
+    let sent = recorded.body.as_ref().unwrap();
+    let input = sent["input"].as_array().unwrap();
+    // The tool result is a sibling item, and the call it answers is beside it.
+    assert!(
+        input
+            .iter()
+            .any(|item| item["type"] == "function_call_output" && item["call_id"] == "toolu_1"),
+        "the result must be an input item: {sent}"
+    );
+    assert!(
+        input.iter().any(|item| item["type"] == "function_call"),
+        "the call must be beside it: {sent}"
+    );
+    // And it never appears inside a message's content.
+    for item in input {
+        let nested = item
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| {
+                content
+                    .iter()
+                    .any(|part| part["type"] == "function_call_output")
+            });
+        assert!(!nested, "the result must not be nested in content: {sent}");
+    }
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A tool round trip survives a same-protocol passthrough unchanged.
+///
+/// This is the Codex path: the client speaks Responses and the member does too,
+/// so the body is forwarded as written. It used to be re-encoded, which both
+/// re-nested the tool result and dropped the vendor's own fields.
+#[tokio::test]
+async fn a_tool_result_survives_a_responses_passthrough() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) = mock_input_validating_upstream().await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::Responses,
+        &["gpt-5"],
+        "sk-test",
+    );
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/responses"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": group_model(&group, "gpt-5"),
+            "store": false,
+            "prompt_cache_key": "cache-key-1",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "list the files"}
+                ]},
+                {"type": "function_call", "call_id": "call_1", "name": "ls", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "Cargo.toml"}
+            ],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, 200, "a tool round trip must not fail: {body}");
+
+    let recorded = recorder.lock().await;
+    let sent = recorded.body.as_ref().unwrap();
+    assert_eq!(
+        sent["prompt_cache_key"], "cache-key-1",
+        "a passthrough keeps the vendor's own fields: {sent}"
+    );
+    assert_eq!(sent["store"], json!(false), "{sent}");
+    let input = sent["input"].as_array().unwrap();
+    assert!(
+        input
+            .iter()
+            .any(|item| item["type"] == "function_call_output" && item["call_id"] == "call_1"),
+        "{sent}"
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
 /// An undeclared endpoint is tried once and then remembered.
 ///
 /// This is the whole fix in one test: the first request guesses wrong, the
@@ -2581,6 +2901,65 @@ async fn a_live_request_publishes_begin_and_end() {
         service.inflight_requests().is_empty(),
         "nothing may stay drawn once the reply is done"
     );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A same-protocol call is forwarded as written, vendor fields and all.
+///
+/// Re-encoding a passthrough dropped every field the IR does not model —
+/// `store`, `previous_response_id`, `prompt_cache_key`, `metadata`,
+/// `text.format` — so a client that relied on the vendor's own conversation
+/// state lost it, and the prompt cache paid for a body that was no longer the
+/// one it had been primed with. Only `model` is the gateway's to rewrite.
+#[tokio::test]
+async fn a_same_protocol_call_is_forwarded_with_its_vendor_fields() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) =
+        mock_upstream(200, responses_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::Responses,
+        &["gpt-5"],
+        "sk-test",
+    );
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/responses"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": group_model(&group, "gpt-5"),
+            "input": "say hi",
+            "store": false,
+            "previous_response_id": "resp_previous",
+            "prompt_cache_key": "cache-key-1",
+            "metadata": {"trace": "abc"},
+            "text": {"format": {"type": "json_object"}},
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.text().await.unwrap();
+
+    let recorded = recorder.lock().await;
+    let body = recorded.body.as_ref().unwrap();
+    // The model is the gateway's to rewrite, and the group prefix is gone.
+    assert_eq!(body["model"], "gpt-5");
+    // Everything else is the client's own body, byte for byte.
+    assert_eq!(body["store"], json!(false));
+    assert_eq!(body["previous_response_id"], "resp_previous");
+    assert_eq!(body["prompt_cache_key"], "cache-key-1");
+    assert_eq!(body["metadata"]["trace"], "abc");
+    assert_eq!(body["text"]["format"]["type"], "json_object");
 
     gateway_task.abort();
     upstream_task.abort();

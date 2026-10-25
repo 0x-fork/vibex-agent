@@ -1491,6 +1491,7 @@ mod tests {
                     failure: GatewayFailureKind::Quota,
                 }],
                 skipped_members: Vec::new(),
+                error_code: None,
             }),
             created_at_ms: now,
         };
