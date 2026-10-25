@@ -528,6 +528,34 @@ pub struct AgentSessionConfigProbe {
     pub options: Vec<ProviderSessionConfigOption>,
 }
 
+impl AgentSessionConfigProbe {
+    /// Whether the probed option set has no reasoning dimension at all.
+    ///
+    /// `reasoning_efforts` is a derived view, so it is empty both for an Agent
+    /// with no depth control and for one whose control merely appears only after
+    /// a Model switch. Requiring that no advertised option claims the dimension
+    /// keeps the second case from being read as the first.
+    pub fn options_advertise_no_reasoning_effort(&self) -> bool {
+        !self.options.iter().any(|option| {
+            let id = option.id.to_ascii_lowercase();
+            let category = option
+                .category
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            [
+                "effort",
+                "reasoning_effort",
+                "reasoning",
+                "thinking_level",
+                "thought_level",
+            ]
+            .iter()
+            .any(|key| id == *key || category == *key)
+        })
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendAgentMessageRequest {

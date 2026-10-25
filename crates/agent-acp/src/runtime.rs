@@ -634,14 +634,23 @@ fn provider_backed_auth_method(
     agent_id: &AgentId,
     auth_source: &RuntimeAuthSource,
 ) -> Option<String> {
-    matches!(auth_source, RuntimeAuthSource::ProviderProfile { .. })
-        .then(|| match agent_id.as_str() {
-            // Antigravity requires an explicit authenticate request to select
-            // API-key auth; merely projecting GEMINI_API_KEY is insufficient.
-            "antigravity" => Some("gemini-api-key".to_string()),
-            _ => None,
-        })
-        .flatten()
+    // A route resolves to a Provider Profile, so it launches through the same
+    // credential contract a direct Profile selection uses. Keying on
+    // `ProviderProfile` alone skipped the ACP `authenticate` handshake for every
+    // route-group launch, and Antigravity then refused `session/new` with
+    // "No authentication method selected" even though `GEMINI_API_KEY` and
+    // `auth.type` were both present.
+    matches!(
+        auth_source,
+        RuntimeAuthSource::ProviderProfile { .. } | RuntimeAuthSource::ModelRoute { .. }
+    )
+    .then(|| match agent_id.as_str() {
+        // Antigravity requires an explicit authenticate request to select
+        // API-key auth; merely projecting GEMINI_API_KEY is insufficient.
+        "antigravity" => Some("gemini-api-key".to_string()),
+        _ => None,
+    })
+    .flatten()
 }
 
 fn build_initialize_params(
@@ -9169,6 +9178,22 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
         } else {
             None
         };
+        // An Agent with no reasoning dimension cannot be asked for a level. The
+        // composer keeps one reasoning effort per Agent, but a route group is
+        // shared, so a switch to an Agent like Kimi Code — `thinking` on/off, no
+        // effort scale — routinely carries a level it never offered. Dropping it
+        // here keeps the durable selection and the applied session config
+        // describing the same thing; reporting `reasoning_effort_unavailable`
+        // instead left the submission's selection disagreeing with the binding
+        // it had already converged to, and every later dispatch was refused with
+        // `message_submission_runtime_binding_mismatch`.
+        if effective_selection.reasoning_effort.is_some()
+            && let Some(probe) = session_probe.as_ref()
+            && probe.reasoning_efforts.is_empty()
+            && probe.options_advertise_no_reasoning_effort()
+        {
+            effective_selection.reasoning_effort = None;
+        }
         if let Some(effort) = effective_selection.reasoning_effort.as_deref() {
             let effort =
                 validate_effort_value(effort).map_err(runtime_configuration_unavailable)?;
@@ -34118,6 +34143,50 @@ for line in sys.stdin:
         );
 
         fixture.cleanup();
+    }
+
+    /// A probe with no reasoning dimension normalizes the selection before it
+    /// is journaled.
+    ///
+    /// Dropping the field only while applying the configuration left the
+    /// durable selection still naming it, so the binding converged on
+    /// `thinking: on` while the submission asked for `off` and every dispatch
+    /// was refused with `message_submission_runtime_binding_mismatch`.
+    #[test]
+    fn a_probe_without_a_reasoning_dimension_reports_none() {
+        let no_depth = vibex_core::AgentSessionConfigProbe {
+            models: vec!["mock/model-1".to_string()],
+            modes: Vec::new(),
+            reasoning_efforts: Vec::new(),
+            options: vec![vibex_core::ProviderSessionConfigOption {
+                id: "thinking".to_string(),
+                label: "Thinking".to_string(),
+                category: None,
+                description: None,
+                kind: vibex_core::ProviderSessionConfigOptionKind::Boolean,
+                current_value: None,
+                default_value: None,
+                values: Vec::new(),
+            }],
+        };
+        // A boolean `thinking` toggle is not a depth scale, so the Agent still
+        // reports no reasoning dimension.
+        assert!(no_depth.options_advertise_no_reasoning_effort());
+
+        let with_depth = vibex_core::AgentSessionConfigProbe {
+            options: vec![vibex_core::ProviderSessionConfigOption {
+                id: "reasoning_effort".to_string(),
+                label: "Reasoning effort".to_string(),
+                category: Some("thought_level".to_string()),
+                description: None,
+                kind: vibex_core::ProviderSessionConfigOptionKind::Select,
+                current_value: None,
+                default_value: None,
+                values: Vec::new(),
+            }],
+            ..no_depth
+        };
+        assert!(!with_depth.options_advertise_no_reasoning_effort());
     }
 
     /// A reasoning effort a Model cannot express is dropped, not fatal.

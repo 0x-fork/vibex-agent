@@ -3267,10 +3267,50 @@ fn zcode_overlay(
 /// is one of the two OpenAI-shaped ids Cline accepts a caller-supplied base URL
 /// for, and the same id travels in `CLINE_PROVIDER`.
 ///
-/// `version` and `lastUsedProvider` are part of the file Cline itself writes;
-/// the remaining fields (`updatedAt`, `tokenSource`) are omitted because a
-/// timestamp would make the projection fingerprint unstable and Cline falls
-/// back to its own defaults without them.
+/// `version`, `lastUsedProvider`, and `modes` are part of the file Cline itself
+/// writes. `tokenSource` and `updatedAt` are what make Cline treat the entry as
+/// a hand-configured provider: without them it keeps its own defaults and the
+/// request goes out with the provider's built-in model (`gpt-4o`) instead of the
+/// projected one. `updatedAt` is derived from the binding rather than read from
+/// the clock, so the projection fingerprint stays stable across rebuilds.
+/// Formats a binding's creation time the way Cline writes `updatedAt`.
+///
+/// The value only has to be a valid timestamp of the right shape — Cline uses
+/// it to decide the entry is not a stale default — and deriving it from the
+/// binding keeps the projection fingerprint deterministic.
+fn binding_timestamp(binding: &AgentModelProviderBinding) -> String {
+    let millis = binding.updated_at_ms.max(binding.created_at_ms);
+    let seconds = millis.div_euclid(1000);
+    let remainder = millis.rem_euclid(1000);
+    let days = seconds.div_euclid(86_400);
+    let time_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_date_from_days(days);
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{remainder:03}Z")
+}
+
+/// Converts days since the Unix epoch to a civil date.
+fn civil_date_from_days(days: i64) -> (i64, u32, u32) {
+    let days = days + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    } as u32;
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
+}
+
 fn cline_overlay(
     binding: &AgentModelProviderBinding,
     endpoint: Option<&ModelProviderEndpoint>,
@@ -3320,8 +3360,18 @@ fn cline_overlay(
     serialized_json(serde_json::json!({
         "version": 1,
         "lastUsedProvider": provider_id,
+        "modes": {},
         "providers": {
-            provider_id: { "settings": serde_json::Value::Object(settings) }
+            provider_id: {
+                "settings": serde_json::Value::Object(settings),
+                // `cline auth` writes these two, and its ACP bridge reads the
+                // entry as "configured by hand" only when `tokenSource` says so.
+                // Without `updatedAt` the store entry is ignored and the call
+                // goes out with the provider's built-in model (`gpt-4o`)
+                // instead of the projected one.
+                "tokenSource": "manual",
+                "updatedAt": binding_timestamp(binding),
+            }
         }
     }))
 }
@@ -7716,6 +7766,66 @@ mod tests {
                 runtime_model_id
             );
         }
+    }
+
+    /// A Cline store entry needs `tokenSource` and `updatedAt` to take effect.
+    ///
+    /// With only `provider`/`apiKey`/`model`/`baseUrl` Cline treats the entry
+    /// as an untouched default: it still reads the base URL, but the request
+    /// goes out with the provider's built-in model (`gpt-4o`) instead of the
+    /// projected one, so the gateway answers `model_not_found`. The timestamp is
+    /// derived from the binding, not the clock, so the projection fingerprint
+    /// stays stable.
+    #[test]
+    fn a_cline_store_entry_carries_the_fields_that_make_it_authoritative() {
+        let descriptor = provider_descriptor("cline");
+        let (provider, runtime, binding) = typed_projection_fixture(&descriptor);
+        let mut model = binding.configured_models[0].clone();
+        model.wire_protocol_id = vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES.to_string();
+        let mut binding = binding.clone();
+        binding.configured_models = vec![model.clone()];
+
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            &descriptor,
+            "cline-store-metadata",
+        )
+        .unwrap();
+        let store = plan
+            .overlay_files
+            .iter()
+            .find(|overlay| overlay.relative_path == "settings/providers.json")
+            .expect("Cline projects its provider store");
+        let value: serde_json::Value = serde_json::from_str(&store.content).unwrap();
+        assert_eq!(value["modes"], serde_json::json!({}));
+        let entry = &value["providers"]["openai-compatible"];
+        assert_eq!(entry["tokenSource"], "manual");
+        let updated_at = entry["updatedAt"].as_str().expect("updatedAt is a string");
+        assert!(
+            updated_at.ends_with('Z') && updated_at.len() == 24,
+            "Cline writes a millisecond ISO timestamp: {updated_at}"
+        );
+
+        // The same binding projects the same bytes, so the fingerprint holds.
+        let again = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            &descriptor,
+            "cline-store-metadata",
+        )
+        .unwrap();
+        assert_eq!(
+            again.overlay_files[0].content, plan.overlay_files[0].content,
+            "a rebuild must not change the timestamp"
+        );
+        // A Responses Model also stores the compatible provider id.
+        assert_eq!(
+            value["providers"]["openai-compatible"]["settings"]["provider"],
+            "openai-compatible"
+        );
     }
 
     /// Antigravity reads its credential mode from `settings.json`.

@@ -485,14 +485,32 @@ runtime switch or a turn on an Agent that was otherwise healthy.
   protocols. Without it a streaming call was answered with a whole JSON object,
   which the CLI cannot read as SSE — the request looked healthy in the ledger
   and the turn still failed.
+- **A route group needs the same ACP authentication as a Profile.** A route
+  resolves to a Provider Profile, so it launches through the same credential
+  contract. `provider_backed_auth_method` keyed on `ProviderProfile` alone and
+  skipped the `authenticate` handshake for every route-group launch; Antigravity
+  then refused `session/new` with "No authentication method selected" even
+  though both `GEMINI_API_KEY` and `auth.type` were present.
+- **Gemini 3 publishes its tool schema as `parametersJsonSchema`.** Reading only
+  the older `parameters` key gave every declaration an empty object, so a
+  translated tool call reached the upstream with no field names and the model
+  guessed them (`path` where the Agent requires `file_path`).
+- **A reasoning dimension the Agent does not have is normalized before
+  journaling.** Dropping it only while applying the configuration left the
+  durable selection still naming it, so the binding converged on `thinking: on`
+  while the submission asked for `off` and every dispatch was refused with
+  `message_submission_runtime_binding_mismatch`.
 - **Cline reaches a caller-supplied endpoint only through its provider store.**
   `openai-native` is Cline's own OpenAI client: it offers no base-URL config
   option and always posts to api.openai.com, so projecting it sent Vibex's
   placeholder key to OpenAI and failed with "Incorrect API key provided".
   Both OpenAI protocols therefore project `openai-compatible` and the
   `ClineProvidersJson` overlay writes `<CLINE_DATA_DIR>/settings/providers.json`
-  with `provider`/`apiKey`/`model`/`baseUrl`. `CLINE_API_BASE_URL` is not read
-  by the ACP bridge.
+  with `provider`/`apiKey`/`model`/`baseUrl` plus `tokenSource: "manual"` and an
+  `updatedAt` derived from the binding. Without those two fields Cline treats
+  the entry as an untouched default: it still reads the base URL but sends the
+  provider's built-in model (`gpt-4o`), so the gateway answers `model_not_found`.
+  `CLINE_API_BASE_URL` is not read by the ACP bridge.
 
 ### 4. Contracts — failure detail
 
@@ -508,7 +526,10 @@ runtime switch or a turn on an Agent that was otherwise healthy.
 ### 5. Tests Required
 
 `a_gemini_model_is_read_from_the_path` (which also asserts the SSE framing),
+`reads_and_writes_the_gemini_3_tool_schema`,
 `cline_projection_pins_the_agent_endpoint_and_selects_the_provider_id`,
+`a_cline_store_entry_carries_the_fields_that_make_it_authoritative`,
+`a_probe_without_a_reasoning_dimension_reports_none`,
 `a_refused_option_keeps_the_agents_own_words` and
 `a_field_refusal_reaches_the_operation_journal` for the detail path;
 `a_boolean_option_is_sent_with_the_acp_type_tag`,

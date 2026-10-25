@@ -124,8 +124,14 @@ pub fn parse_request(value: &Value) -> GatewayResult<CanonicalRequest> {
                 description: string_field(declaration, "description")
                     .unwrap_or_default()
                     .to_string(),
+                // Gemini 3 moved the tool schema to `parametersJsonSchema`;
+                // older revisions used `parameters`. Reading only the legacy
+                // key made every tool reach the upstream with an empty object,
+                // so the model had no field names to follow and guessed
+                // (`path` where the Agent requires `file_path`).
                 parameters: declaration
                     .get("parameters")
+                    .or_else(|| declaration.get("parametersJsonSchema"))
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object"})),
                 strict: false,
@@ -287,7 +293,7 @@ pub fn build_request(request: &CanonicalRequest, _model: &str) -> GatewayResult<
                     .map(|tool| json!({
                         "name": tool.name,
                         "description": tool.description,
-                        "parameters": tool.parameters,
+                        "parametersJsonSchema": tool.parameters,
                     }))
                     .collect::<Vec<_>>(),
             }]),
@@ -725,6 +731,48 @@ mod tests {
             request.messages[2].parts[0],
             ContentPart::ToolResult { .. }
         ));
+    }
+
+    /// Gemini 3 publishes its tool schema under `parametersJsonSchema`.
+    ///
+    /// Reading only the older `parameters` key left every declaration with an
+    /// empty object, so a translated tool call reached the upstream with no
+    /// field names and the model guessed them — `path` where the Agent required
+    /// `file_path`.
+    #[test]
+    fn reads_and_writes_the_gemini_3_tool_schema() {
+        let request = parse_request(&json!({
+            "model": "gemini-3",
+            "contents": [{"role": "user", "parts": [{"text": "read it"}]}],
+            "tools": [{
+                "functionDeclarations": [{
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parametersJsonSchema": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"]
+                    }
+                }]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(
+            request.tools[0]
+                .parameters
+                .pointer("/properties/file_path/type"),
+            Some(&json!("string")),
+            "{:?}",
+            request.tools[0].parameters
+        );
+
+        let rebuilt = build_request(&request, "gemini-3").unwrap();
+        assert_eq!(
+            rebuilt.pointer("/tools/0/functionDeclarations/0/parametersJsonSchema/required/0"),
+            Some(&json!("file_path")),
+            "the schema must survive the round trip: {rebuilt}"
+        );
     }
 
     #[test]
