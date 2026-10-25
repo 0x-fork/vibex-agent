@@ -8933,13 +8933,28 @@ impl AcpRuntimeSwitchBridge {
             || result.state.applied_activation_generation
                 != Some(attachment.binding.activation_generation)
         {
-            return Err(runtime_configuration_unavailable(
-                result
-                    .outcomes
-                    .iter()
-                    .find_map(|outcome| outcome.error_code.as_deref())
+            let blocked = result.outcomes.iter().find(|outcome| {
+                !matches!(
+                    outcome.status,
+                    SessionRuntimeConfigApplyStatus::Applied
+                        | SessionRuntimeConfigApplyStatus::NoOp
+                )
+            });
+            let mut error = runtime_configuration_unavailable(
+                blocked
+                    .and_then(|outcome| outcome.error_code.as_deref())
                     .unwrap_or("session_config_not_converged"),
-            ));
+            );
+            // The refused field's own words are the only description of why the
+            // switch stopped; the switch-level record collapses every
+            // configuration failure into one code.
+            if let Some(detail) = blocked.and_then(|outcome| outcome.error_detail.as_deref()) {
+                error = error.with_diagnostic("agentRefusal", detail);
+            }
+            if let Some(key) = blocked.map(|outcome| outcome.key.as_str()) {
+                error = error.with_diagnostic("configKey", key);
+            }
+            return Err(error);
         }
         self.persist_runtime_config_state(
             &attachment.binding.binding_id,
@@ -14706,12 +14721,13 @@ impl AcpRuntimeClient {
                 {
                     set_runtime_config_preferred(&mut state, &cleared);
                     state.effective_reasoning_effort = None;
-                    state.state_revision = state.state_revision.checked_add(1).ok_or_else(|| {
-                        VibexError::conflict(
-                            "acp_session_config_revision_exhausted",
-                            "session runtime config revision is exhausted",
-                        )
-                    })?;
+                    state.state_revision =
+                        state.state_revision.checked_add(1).ok_or_else(|| {
+                            VibexError::conflict(
+                                "acp_session_config_revision_exhausted",
+                                "session runtime config revision is exhausted",
+                            )
+                        })?;
                     state.applied_activation_generation = None;
                     state.mark_generation_if_converged(generation);
                     self.store_runtime_config_state(attachment, &state, mutation_mode)?;
@@ -14910,12 +14926,14 @@ impl AcpRuntimeClient {
                                 attempted_fallback = true;
                             }
                             Err(error) => {
-                                outcomes.push(runtime_config_outcome(
+                                let mut outcome = runtime_config_outcome(
                                     field,
                                     SessionRuntimeConfigApplyStatus::Failed,
                                     Some(&plan),
                                     Some(error.code.as_str()),
-                                ));
+                                );
+                                outcome.error_detail = runtime_config_failure_detail(&error);
+                                outcomes.push(outcome);
                                 break;
                             }
                         }
@@ -16582,7 +16600,40 @@ fn runtime_config_outcome(
             .and_then(SessionConfigPlan::encoding_name)
             .map(str::to_string),
         error_code: error_code.map(str::to_string),
+        error_detail: None,
     }
+}
+
+/// What the Agent said when it refused one field, safe to persist.
+///
+/// The message is the only description of *why* an option was refused: the
+/// code on its own (`acp_rpc_error`) sends the reader back into the source, and
+/// the switch-level record collapses every configuration failure into one
+/// `runtime_switch_configuration_unavailable`. The text is redacted and bounded
+/// here rather than at the storage edge so it cannot carry a credential into a
+/// diagnostic surface.
+fn runtime_config_failure_detail(error: &VibexError) -> Option<String> {
+    let rpc_message = error
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.key == "rpcMessage")
+        .map(|diagnostic| diagnostic.value.trim())
+        .filter(|value| !value.is_empty());
+    let method = error
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.key == "method")
+        .map(|diagnostic| diagnostic.value.trim())
+        .filter(|value| !value.is_empty());
+    match (method, rpc_message) {
+        (Some(method), Some(message)) => {
+            Some(format!("{method}: {}", crate::redact_summary(message)))
+        }
+        (None, Some(message)) => Some(crate::redact_summary(message)),
+        (Some(method), None) => Some(format!("{method}: {}", error.message)),
+        (None, None) => Some(crate::redact_summary(&error.message)),
+    }
+    .filter(|detail| !detail.trim().is_empty())
 }
 
 /// Reports the fields of a patch that were left untouched after an earlier
@@ -26659,6 +26710,19 @@ for line in sys.stdin:
         session_id = msg.get("params", {}).get("sessionId", "mock-session-1")
         config_id = msg.get("params", {}).get("configId", "model")
         value = msg.get("params", {}).get("value", model_1)
+        # A real Agent validates the shape before it looks at the value, and its
+        # complaint is the only description of what it wanted. Reproducing that
+        # refusal is what lets the host's diagnostics be checked end to end.
+        if control_value("set_config_option_mode", "success") == "shape_refusal":
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params: expected string, received boolean",
+                },
+            })
+            continue
         option = {
             "id": config_id,
             "label": config_id,
@@ -33951,6 +34015,65 @@ for line in sys.stdin:
 
         let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
         client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    /// A refused option keeps the Agent's own words.
+    ///
+    /// The code says only `acp_rpc_error`; that is why a rejected boolean read
+    /// as an unexplained switch failure. The Agent's sentence is what names the
+    /// shape it wanted, so it travels with the outcome and reaches the durable
+    /// switch record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_option_keeps_the_agents_own_words() {
+        let Some(fixture) = MockAcpFixture::create("refusal-detail-outcome") else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        fixture.set_control_value("set_config_option_mode", "shape_refusal");
+
+        let attachment = client.current_attachment(&session_id).unwrap();
+        let state = attachment.payload().runtime_config_state();
+        let result = client
+            .update_session_runtime_config(SessionRuntimeConfigMutationRequest {
+                session_id: session_id.clone(),
+                expected_revision: state.state_revision,
+                expected_binding_id: attachment.binding_id().clone(),
+                expected_activation_generation: attachment.fence().activation_generation as i64,
+                patch: SessionRuntimeConfigPatch {
+                    config_values: BTreeMap::from([("autoApply".to_string(), "false".to_string())]),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+
+        let failed = result
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.status == SessionRuntimeConfigApplyStatus::Failed)
+            .expect("the refused field must be reported: {result:#?}");
+        assert_eq!(failed.error_code.as_deref(), Some("acp_rpc_error"));
+        let detail = failed
+            .error_detail
+            .as_deref()
+            .expect("the Agent's refusal must be kept");
+        assert!(
+            detail.contains("expected string, received boolean"),
+            "the detail must quote what the Agent objected to: {detail}"
+        );
+
         fixture.cleanup();
     }
 

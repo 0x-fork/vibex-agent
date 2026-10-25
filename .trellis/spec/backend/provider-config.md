@@ -476,8 +476,21 @@ runtime switch or a turn on an Agent that was otherwise healthy.
   `session/new` is refused with `Authentication required` and the session never
   reaches a prompt.
 
-### 3. Tests Required
+### 3. Contracts — failure detail
 
+- **A refusal keeps the Agent's own words.** Every live configuration failure is
+  reported as `runtime_switch_configuration_unavailable`, and the inner
+  `causeCode` names a category (`acp_session_config_value_unavailable`), not a
+  cause. The Agent's `rpcMessage` is redacted and bounded into the field
+  outcome's `errorDetail`, carried on the switch error as `agentRefusal` +
+  `configKey`, and appended to the operation journal's
+  `error_detail_redacted`. Without it a rejected boolean read as an unexplained
+  switch failure and the only way to learn why was to re-run the Agent by hand.
+
+### 4. Tests Required
+
+`a_refused_option_keeps_the_agents_own_words` and
+`a_field_refusal_reaches_the_operation_journal` for the detail path;
 `a_boolean_option_is_sent_with_the_acp_type_tag`,
 `a_reasoning_effort_the_agent_cannot_express_is_dropped`,
 `an_option_update_that_reports_no_model_keeps_the_launch_model`, and

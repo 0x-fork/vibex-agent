@@ -2381,10 +2381,52 @@ fn operation_failure_detail(error: &VibexError) -> String {
                     character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
                 })
         });
-    match cause {
+    let mut detail = match cause {
         Some(cause) if cause != error.code => format!("{}:{cause}", error.code),
         _ => error.code.clone(),
+    };
+    // The Agent's own refusal is the only description of why one option did not
+    // apply. A bare `acp_rpc_error` — or a `causeCode` that only says
+    // `acp_session_config_value_unavailable` — sends the reader back into the
+    // source, which is how one rejected boolean stayed unexplained.
+    let agent_refusal = error
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.key == "agentRefusal")
+        .map(|diagnostic| diagnostic.value.trim())
+        .filter(|value| !value.is_empty());
+    if let Some(refusal) = agent_refusal {
+        let config_key = error
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.key == "configKey")
+            .map(|diagnostic| diagnostic.value.trim())
+            .filter(|value| !value.is_empty());
+        detail.push_str(" (");
+        if let Some(key) = config_key {
+            detail.push_str(key);
+            detail.push_str(": ");
+        }
+        detail.push_str(refusal);
+        detail.push(')');
     }
+    bounded_storage_detail(&detail)
+}
+
+/// Bounds a failure detail to what one TEXT column may hold.
+///
+/// The column is read by humans, not parsed, so a long Agent message is cut
+/// rather than rejected: losing the tail of an explanation is better than
+/// losing the whole failure record.
+fn bounded_storage_detail(detail: &str) -> String {
+    const MAX: usize = 512;
+    let trimmed = detail.trim();
+    if trimmed.chars().count() <= MAX {
+        return trimmed.to_string();
+    }
+    let mut bounded = trimmed.chars().take(MAX).collect::<String>();
+    bounded.push('…');
+    bounded
 }
 
 fn metric_operation_for_active_work(kind: ActiveWorkKind) -> RuntimeMetricOperation {
@@ -2483,6 +2525,9 @@ mod tests {
         /// The diagnostic cause `fail_on` carries, so the journal record can be
         /// checked against a failure shaped like a real configuration error.
         fail_cause: Option<String>,
+        /// The Agent's own refusal, shaped like the ACP bridge's
+        /// `agentRefusal`/`configKey` pair.
+        fail_refusal: Option<String>,
         restore_fresh_allowed: bool,
         delay_ms: u64,
         delay_on: Option<String>,
@@ -2496,6 +2541,7 @@ mod tests {
                 calls: Vec::new(),
                 fail_on: None,
                 fail_cause: None,
+                fail_refusal: None,
                 restore_fresh_allowed: false,
                 delay_ms: 0,
                 delay_on: None,
@@ -2535,6 +2581,14 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.fail_on = Some(operation.to_string());
             state.fail_cause = Some(cause.to_string());
+        }
+
+        /// Fails one operation the way the ACP bridge reports a field refusal.
+        fn fail_on_with_refusal(&self, operation: &str, cause: &str, refusal: &str) {
+            let mut state = self.state.lock().unwrap();
+            state.fail_on = Some(operation.to_string());
+            state.fail_cause = Some(cause.to_string());
+            state.fail_refusal = Some(refusal.to_string());
         }
 
         fn set_restore_fresh_allowed(&self, allowed: bool) {
@@ -2581,10 +2635,17 @@ mod tests {
             if fail {
                 let error =
                     VibexError::provider("mock_prepare_failed", "mock target preparation failed");
-                return Err(match cause {
+                let error = match cause {
                     Some(cause) => error.with_diagnostic("causeCode", cause),
                     None => error,
-                });
+                };
+                let error = match self.state.lock().unwrap().fail_refusal.clone() {
+                    Some(refusal) => error
+                        .with_diagnostic("configKey", "auto_approve")
+                        .with_diagnostic("agentRefusal", refusal),
+                    None => error,
+                };
+                return Err(error);
             }
             Ok(())
         }
@@ -3599,6 +3660,68 @@ mod tests {
                 .filter(|call| *call == OP_CREATE_SESSION)
                 .count(),
             1
+        );
+    }
+
+    /// The Agent's own refusal reaches the durable operation record.
+    ///
+    /// Every live configuration failure carries the same outer code, and the
+    /// inner `causeCode` only names the category. Cline's rejected boolean and
+    /// Kimi's unadvertised option were both "unavailable" from the journal's
+    /// point of view, so the one sentence the Agent said — which is what makes
+    /// the failure fixable — was lost between the bridge and SQLite.
+    #[tokio::test]
+    async fn a_field_refusal_reaches_the_operation_journal() {
+        let env = TestEnvironment::new("refusal-detail");
+        env.executor.fail_on_with_refusal(
+            OP_APPLY_SESSION_CONFIG,
+            "acp_session_config_value_unavailable",
+            "Invalid params: expected string, received boolean",
+        );
+
+        env.coordinator
+            .request_switch(env.request("refusal-detail"))
+            .await
+            .unwrap_err();
+
+        let switch = env.switch_by_key("refusal-detail");
+        let operations =
+            SwitchOperationJournalRepository::list_by_switch(&env.connection(), &switch.switch_id)
+                .unwrap();
+        let apply = operations
+            .iter()
+            .find(|operation| operation.operation_kind == OP_APPLY_SESSION_CONFIG)
+            .expect("the configuration operation must be journaled");
+        assert_eq!(apply.status, SwitchOperationStatus::Failed);
+        let detail: String = env
+            .connection()
+            .query_row(
+                "SELECT error_detail_redacted FROM runtime_switch_operations WHERE operation_id = ?1",
+                (apply.operation_id.as_str(),),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            detail,
+            "mock_prepare_failed:acp_session_config_value_unavailable \
+             (auto_approve: Invalid params: expected string, received boolean)"
+        );
+
+        // A switch-level record names the refusal too, so the failure is
+        // explainable without joining the operation rows.
+        let switch_detail: Option<String> = env
+            .connection()
+            .query_row(
+                "SELECT error_detail_redacted FROM runtime_switches WHERE switch_id = ?1",
+                (switch.switch_id.as_str(),),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            switch_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("expected string, received boolean")),
+            "{switch_detail:?}"
         );
     }
 

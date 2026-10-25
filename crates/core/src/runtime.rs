@@ -266,6 +266,16 @@ pub struct SessionRuntimeConfigFieldOutcome {
     pub operation: Option<String>,
     pub encoding: Option<String>,
     pub error_code: Option<String>,
+    /// What the Agent said when it refused the field, already redacted and
+    /// bounded.
+    ///
+    /// An `error_code` alone cannot explain a failure: every live configuration
+    /// error is reported as `runtime_switch_configuration_unavailable`, so a
+    /// record carrying only that code sends the reader back into the source.
+    /// Cline's rejected boolean and Kimi's missing option both arrived this way
+    /// and left no trace of what the Agent actually objected to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
