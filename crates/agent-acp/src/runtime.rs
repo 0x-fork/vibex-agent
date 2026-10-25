@@ -13365,8 +13365,18 @@ impl AcpRuntimeClient {
                 command.env(key, value);
             }
         }
-        for (key, value) in env_overlays {
-            command.env(key, value);
+        for (key, value) in &env_overlays {
+            command.env(key, value.clone());
+        }
+        // The subprocess environment loses to the user's `~/.claude/settings.json`
+        // for the endpoint, so state the connection on the session settings tier
+        // as well: that tier is applied last.
+        let mut claude_session_settings = claude_session_settings;
+        if purpose != AcpProcessPurpose::Probe {
+            claude_session::attach_connection_environment(
+                &mut claude_session_settings,
+                &env_overlays,
+            );
         }
         if purpose == AcpProcessPurpose::Probe {
             for (key, value) in PROBE_ENV {
@@ -33347,6 +33357,67 @@ for line in sys.stdin:
             .position(|entry| entry["method"] == "session/set_model")
             .unwrap();
         assert!(new_index < set_index);
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    /// The launch states its endpoint on the tier that outranks the user's file.
+    ///
+    /// Claude Code applies `~/.claude/settings.json` `env` *after* the
+    /// subprocess environment, so a user who points `ANTHROPIC_BASE_URL` at
+    /// another proxy keeps talking to it. A Vibex session then asks for a route
+    /// that proxy has never heard of, gets a 404, and reports "the selected
+    /// model may not exist". The session settings tier is applied last, so the
+    /// address and credential belong there too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claude_session_states_its_endpoint_on_the_settings_tier() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "claude-connection-settings",
+            Some(vibex_core::AgentId::parse(CLAUDE_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        let service = fixture.service();
+        let mut config = service
+            .get_acp_profile_config_for_launch(fixture.profile_id.clone())
+            .unwrap();
+        config.models = vec!["group/model_route_1/deepseek-v4.1-flash".to_string()];
+        config.env.push(vibex_core::AcpProviderEnvReference {
+            key: "ANTHROPIC_BASE_URL".to_string(),
+            source: AcpProviderEnvSource::Literal,
+            value: Some("http://127.0.0.1:37543".to_string()),
+            secret_lookup_key: None,
+            redacted_hint: "mock gateway address".to_string(),
+        });
+        service
+            .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                config,
+            })
+            .unwrap();
+
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: Some("group/model_route_1/deepseek-v4.1-flash".to_string()),
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+
+        let env = &find_logged_request(&fixture.request_log(), "session/new")["params"]["_meta"]["claudeCode"]
+            ["options"]["settings"]["env"];
+        assert_eq!(env["ANTHROPIC_BASE_URL"], json!("http://127.0.0.1:37543"));
+        // The credential is a secret reference, so it never travels as a
+        // profile literal; it is filled from the materialized overlay, which
+        // the unit test below covers.
+        assert!(env.get("ANTHROPIC_AUTH_TOKEN").is_none());
 
         let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
         client.close_session(&binding).await.unwrap();

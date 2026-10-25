@@ -125,6 +125,74 @@ pub(crate) fn model_alias_slots(
     model_slot_assignments(&config.models)
 }
 
+/// The environment key that decides which endpoint Claude Code talks to.
+///
+/// This must win over the user's `~/.claude/settings.json`, and the process
+/// environment is not enough to make it win: Claude Code applies the `env` block
+/// of that file *after* the subprocess environment, so a user who points
+/// `ANTHROPIC_BASE_URL` at another proxy silently keeps talking to it. A Vibex
+/// session then names a route the other proxy has never heard of, that proxy
+/// answers 404, and Claude Code reports "the selected model may not exist".
+///
+/// The `_meta` settings tier is applied last, so restating the launch's own
+/// address there is what actually routes the session through the Provider the
+/// selection named.
+///
+/// Only the address is restated. The credential deliberately stays on the
+/// subprocess environment: a Profile's key can be a real secret, and a
+/// materialized secret must never be copied into a request payload. That is
+/// enough for the case this fixes — the Vibex gateway ignores inbound
+/// credentials by design, so a stale user-supplied token cannot misroute it.
+const CLAUDE_CONNECTION_ENV_KEY: &str = "ANTHROPIC_BASE_URL";
+
+/// Restates the launch's endpoint on the tier that outranks the user's file.
+///
+/// `session_settings_meta` can only project what the Profile declares as
+/// literals; the address a launch actually resolves can also come from a
+/// projection that is materialized after the config is read. Taking it from the
+/// materialized overlay means this tier states the endpoint the process really
+/// targets, not a guess.
+///
+/// Nothing is invented: an overlay that names no address contributes nothing,
+/// so a Profile that leaves the endpoint to the user keeps doing so.
+pub(crate) fn attach_connection_environment(meta: &mut Option<Value>, env: &[(String, String)]) {
+    let Some(address) = env.iter().find_map(|(key, value)| {
+        (key.trim() == CLAUDE_CONNECTION_ENV_KEY)
+            .then(|| value.trim())
+            .filter(|value| !value.is_empty())
+    }) else {
+        return;
+    };
+    let meta = meta.get_or_insert_with(|| json!({ CLAUDE_SESSION_OPTIONS_NAMESPACE: {} }));
+    let Some(namespace) = meta
+        .get_mut(CLAUDE_SESSION_OPTIONS_NAMESPACE)
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let options = namespace
+        .entry("options".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(options) = options.as_object_mut() else {
+        return;
+    };
+    let settings = options
+        .entry("settings".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(settings) = settings.as_object_mut() else {
+        return;
+    };
+    let settings_env = settings
+        .entry("env".to_string())
+        .or_insert_with(|| json!({}));
+    if let Some(settings_env) = settings_env.as_object_mut() {
+        settings_env.insert(
+            CLAUDE_CONNECTION_ENV_KEY.to_string(),
+            Value::String(address.to_string()),
+        );
+    }
+}
+
 /// Attaches a previously built `_meta` value to a session request payload.
 pub(crate) fn attach_session_settings_meta(params: &mut Value, meta: Option<&Value>) {
     let Some(meta) = meta else {
@@ -360,6 +428,78 @@ mod tests {
             .is_none()
         );
         assert!(session_settings_meta(&claude(), &config(Vec::new(), &[])).is_none());
+    }
+
+    /// The materialized endpoint and credential outrank the user's own file.
+    #[test]
+    fn connection_environment_lands_on_the_settings_tier() {
+        let mut meta = session_settings_meta(&claude(), &config(Vec::new(), &["m"]));
+        attach_connection_environment(
+            &mut meta,
+            &[
+                (
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    "http://127.0.0.1:37543".to_string(),
+                ),
+                (
+                    "HTTP_PROXY".to_string(),
+                    "http://127.0.0.1:7890".to_string(),
+                ),
+            ],
+        );
+        let env = projected_env(meta.as_ref().expect("connection env is projected"));
+        assert_eq!(
+            env["ANTHROPIC_BASE_URL"],
+            Value::String("http://127.0.0.1:37543".to_string())
+        );
+        // Unrelated process keys stay on the environment, not in a payload.
+        assert!(!env.contains_key("HTTP_PROXY"));
+    }
+
+    /// A resolved credential is never copied into a request payload.
+    ///
+    /// A Profile's key can be a real secret, and this module already refuses to
+    /// copy one here; the address is the only connection key that needs the
+    /// higher-precedence tier.
+    #[test]
+    fn connection_environment_never_carries_a_credential() {
+        let mut meta = session_settings_meta(&claude(), &config(Vec::new(), &["m"]));
+        attach_connection_environment(
+            &mut meta,
+            &[
+                (
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    "http://127.0.0.1:37543".to_string(),
+                ),
+                (
+                    "ANTHROPIC_AUTH_TOKEN".to_string(),
+                    "resolved-secret".to_string(),
+                ),
+                ("ANTHROPIC_API_KEY".to_string(), "resolved-key".to_string()),
+            ],
+        );
+        let env = projected_env(meta.as_ref().expect("connection env is projected"));
+        assert!(env.get("ANTHROPIC_AUTH_TOKEN").is_none());
+        assert!(env.get("ANTHROPIC_API_KEY").is_none());
+        let rendered = format!("{meta:?}");
+        assert!(!rendered.contains("resolved-secret"));
+        assert!(!rendered.contains("resolved-key"));
+    }
+
+    /// A Profile that sets no endpoint keeps letting the user supply one.
+    #[test]
+    fn connection_environment_invents_nothing() {
+        let mut meta = session_settings_meta(&claude(), &config(Vec::new(), &["m"]));
+        let before = meta.clone();
+        attach_connection_environment(&mut meta, &[]);
+        attach_connection_environment(
+            &mut meta,
+            &[(
+                "HTTP_PROXY".to_string(),
+                "http://127.0.0.1:7890".to_string(),
+            )],
+        );
+        assert_eq!(meta, before);
     }
 
     #[test]
