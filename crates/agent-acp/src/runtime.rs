@@ -1969,16 +1969,63 @@ fn rpc_failure_message(error: &Value) -> String {
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or("unknown ACP error");
-    let details = error
-        .get("data")
+    let data = error.get("data");
+    let details = data
         .and_then(|data| data.get("details"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|details| !details.is_empty() && *details != message);
-    bounded_session_content(&details.map_or_else(
-        || message.to_string(),
-        |details| format!("{message}: {details}"),
-    ))
+    if let Some(details) = details {
+        return bounded_session_content(&format!("{message}: {details}"));
+    }
+    // A schema-refusing Agent puts the fields it objected to in `data`, not in
+    // a `details` string: Antigravity answers a refused `session/new` with
+    // `{"_errors": [], "<field>": {"_errors": ["..."]}}` and a bare
+    // `Invalid params` otherwise. Without this the refusal names no field and
+    // the reader is back to guessing which argument was wrong.
+    let fields = data.map(rpc_validation_fields).unwrap_or_default();
+    if fields.is_empty() {
+        return bounded_session_content(message);
+    }
+    bounded_session_content(&format!("{message}: {}", fields.join(", ")))
+}
+
+/// The field-level complaints in a JSON-RPC `error.data` payload.
+///
+/// Handles both shapes ACP Agents use: a top-level `_errors` list describing
+/// the whole request, and one nested object per field with its own `_errors`.
+fn rpc_validation_fields(data: &Value) -> Vec<String> {
+    let mut fields = Vec::new();
+    let Some(object) = data.as_object() else {
+        return fields;
+    };
+    for (key, value) in object {
+        if key == "details" {
+            continue;
+        }
+        let complaints = value
+            .get("_errors")
+            .and_then(Value::as_array)
+            .or_else(|| value.as_array().filter(|_| key == "_errors"))
+            .map(|errors| {
+                errors
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|error| !error.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if complaints.is_empty() {
+            continue;
+        }
+        if key == "_errors" {
+            fields.extend(complaints.into_iter().map(str::to_string));
+        } else {
+            fields.push(format!("{key}: {}", complaints.join("; ")));
+        }
+    }
+    fields
 }
 
 fn grok_upstream_capacity_failure(
@@ -34143,6 +34190,41 @@ for line in sys.stdin:
         );
 
         fixture.cleanup();
+    }
+
+    /// A schema refusal names the field the Agent objected to.
+    ///
+    /// Antigravity answers a refused `session/new` with `Invalid params` plus a
+    /// structured `data` body. Reading only `data.details` (a string) dropped
+    /// it, so the journal said "Invalid params" and nothing else.
+    #[test]
+    fn a_validation_refusal_names_its_fields() {
+        let failure = json!({
+            "code": -32602,
+            "message": "Invalid params",
+            "data": {
+                "_errors": [],
+                "mcpServers": {"_errors": ["Expected array, received null"]},
+                "cwd": {"_errors": ["Expected string"]}
+            }
+        });
+        let message = rpc_failure_message(&failure);
+        assert!(message.starts_with("Invalid params: "), "{message}");
+        assert!(message.contains("mcpServers: Expected array"), "{message}");
+        assert!(message.contains("cwd: Expected string"), "{message}");
+
+        // A `details` string still wins, and a bare refusal stays bare.
+        let with_details = json!({
+            "code": -32602,
+            "message": "Invalid params",
+            "data": {"details": "the field is wrong"}
+        });
+        assert_eq!(
+            rpc_failure_message(&with_details),
+            "Invalid params: the field is wrong"
+        );
+        let bare = json!({"code": -32602, "message": "Invalid params"});
+        assert_eq!(rpc_failure_message(&bare), "Invalid params");
     }
 
     /// A probe with no reasoning dimension normalizes the selection before it

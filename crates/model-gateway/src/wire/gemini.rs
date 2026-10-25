@@ -132,7 +132,7 @@ pub fn parse_request(value: &Value) -> GatewayResult<CanonicalRequest> {
                 parameters: declaration
                     .get("parameters")
                     .or_else(|| declaration.get("parametersJsonSchema"))
-                    .cloned()
+                    .map(lowercase_schema_types)
                     .unwrap_or_else(|| json!({"type": "object"})),
                 strict: false,
             });
@@ -193,6 +193,83 @@ pub fn parse_request(value: &Value) -> GatewayResult<CanonicalRequest> {
             .unwrap_or(false),
         opaque: Vec::new(),
     })
+}
+
+/// JSON Schema keywords whose value is a schema type name.
+const SCHEMA_TYPE_KEYS: [&str; 4] = ["type", "format", "x-type", "const"];
+
+/// Rewrites a Gemini JSON Schema's type names to the lowercase spelling every
+/// other protocol uses.
+///
+/// Gemini states schema types in upper case (`"OBJECT"`, `"STRING"`) while
+/// OpenAI, Anthropic and the JSON Schema specification use lower case. Passing
+/// them through made a translated tool declaration invalid — the upstream
+/// answered `Invalid schema for function 'read_file': "STRING" is not valid
+/// under any of the schemas listed in the 'anyOf' key` — which failed the whole
+/// turn. Only `type` values are touched: property names and enum literals are
+/// the caller's data and keep their case.
+fn lowercase_schema_types(schema: &Value) -> Value {
+    map_schema_types(schema, |name| name.to_ascii_lowercase())
+}
+
+/// The inverse of [`lowercase_schema_types`], for a schema going to Gemini.
+fn uppercase_schema_types(schema: &Value) -> Value {
+    map_schema_types(schema, |name| name.to_ascii_uppercase())
+}
+
+fn map_schema_types(schema: &Value, convert: impl Copy + Fn(&str) -> String) -> Value {
+    match schema {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    let converted = if SCHEMA_TYPE_KEYS.contains(&key.as_str()) {
+                        match value {
+                            Value::String(name) if is_schema_type_name(name) => {
+                                Value::String(convert(name))
+                            }
+                            other => other.clone(),
+                        }
+                    } else if matches!(key.as_str(), "properties" | "patternProperties" | "$defs") {
+                        // A map of arbitrary *names* to schemas: the keys are
+                        // the caller's property names, so only values convert.
+                        match value {
+                            Value::Object(properties) => Value::Object(
+                                properties
+                                    .iter()
+                                    .map(|(name, schema)| {
+                                        (name.clone(), map_schema_types(schema, convert))
+                                    })
+                                    .collect(),
+                            ),
+                            other => other.clone(),
+                        }
+                    } else {
+                        map_schema_types(value, convert)
+                    };
+                    (key.clone(), converted)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| map_schema_types(item, convert))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Whether a string names a schema type rather than a user value.
+///
+/// Only the seven primitive names and `object`/`array`/`null` are converted, so
+/// a `format` such as `date-time` and an enum literal like `"DONE"` survive.
+fn is_schema_type_name(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"
+    )
 }
 
 fn part_value(part: &ContentPart) -> GatewayResult<Option<Value>> {
@@ -293,7 +370,7 @@ pub fn build_request(request: &CanonicalRequest, _model: &str) -> GatewayResult<
                     .map(|tool| json!({
                         "name": tool.name,
                         "description": tool.description,
-                        "parametersJsonSchema": tool.parameters,
+                        "parametersJsonSchema": uppercase_schema_types(&tool.parameters),
                     }))
                     .collect::<Vec<_>>(),
             }]),
@@ -773,6 +850,60 @@ mod tests {
             Some(&json!("file_path")),
             "the schema must survive the round trip: {rebuilt}"
         );
+        // Gemini's own wire says `OBJECT`/`STRING`; the internal form is the
+        // lowercase every other protocol uses, and the outbound form is
+        // uppercase again.
+        assert_eq!(
+            rebuilt.pointer("/tools/0/functionDeclarations/0/parametersJsonSchema/type"),
+            Some(&json!("OBJECT")),
+            "{rebuilt}"
+        );
+        assert_eq!(
+            request.tools[0].parameters.get("type"),
+            Some(&json!("object")),
+            "{:?}",
+            request.tools[0].parameters
+        );
+    }
+
+    /// Gemini's upper-case schema types become the lower-case form the other
+    /// protocols and the JSON Schema spec use, and back again on the way out.
+    ///
+    /// Forwarding `"STRING"` unchanged made the upstream reject the whole
+    /// request: `Invalid schema for function 'read_file': "STRING" is not valid
+    /// under any of the schemas listed in the 'anyOf' key`.
+    #[test]
+    fn schema_type_names_are_normalized_between_protocols() {
+        let gemini_shape = json!({
+            "type": "OBJECT",
+            "properties": {
+                "file_path": {"type": "STRING"},
+                "limit": {"type": "INTEGER"},
+                "tags": {"type": "ARRAY", "items": {"type": "STRING"}},
+                // A literal that looks like a type name must survive.
+                "mode": {"type": "STRING", "enum": ["OBJECT", "fast"]},
+                "format_hint": {"type": "STRING", "format": "date-time"}
+            },
+            "required": ["file_path"]
+        });
+
+        let lowered = lowercase_schema_types(&gemini_shape);
+        assert_eq!(lowered["type"], "object");
+        assert_eq!(lowered["properties"]["file_path"]["type"], "string");
+        assert_eq!(lowered["properties"]["limit"]["type"], "integer");
+        assert_eq!(lowered["properties"]["tags"]["items"]["type"], "string");
+        // Property names keep their case, and so do enum literals and formats.
+        assert!(lowered["properties"].get("file_path").is_some());
+        assert_eq!(
+            lowered["properties"]["mode"]["enum"],
+            json!(["OBJECT", "fast"]),
+            "an enum literal is data, not a type"
+        );
+        assert_eq!(lowered["properties"]["format_hint"]["format"], "date-time");
+
+        let raised = uppercase_schema_types(&lowered);
+        assert_eq!(raised["type"], "OBJECT");
+        assert_eq!(raised["properties"]["file_path"]["type"], "STRING");
     }
 
     #[test]

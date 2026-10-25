@@ -509,6 +509,23 @@ runtime switch or a turn on an Agent that was otherwise healthy.
   thinking-level suffix its picker uses), and `AGY_ACP_ENABLE_GATEWAY_AUTH`.
   This is the one Agent whose projection deliberately leaves its documented
   credential mode, because that is the only mode that can serve a route group.
+- **A JSON Schema type name is lowercase outside Gemini.** Gemini's wire says
+  `"OBJECT"`/`"STRING"`; OpenAI, Anthropic, and the JSON Schema spec say
+  `object`/`string`. Forwarding the upper-case form made the upstream reject the
+  whole request (`Invalid schema for function 'read_file': "STRING" is not valid
+  under any of the schemas listed in the 'anyOf' key`). The Gemini codec
+  lowercases on the way in and uppercases on the way out; only `type`-keyword
+  values that name a schema type convert, so property names, enum literals, and
+  `format` strings keep their case.
+- **A schema refusal names the field it objected to.** Agents answer a refused
+  request with `Invalid params` plus a structured `data` body
+  (`{"<field>": {"_errors": [...]}}`). Reading only `data.details` (a string)
+  left the journal at "Invalid params", which is unactionable.
+- **A Boolean `thinking` toggle is not a reasoning dimension.** It cannot carry
+  `off`/`low`/`high`, so it must not make an Agent look depth-capable;
+  counting it kept Kimi Code's selection carrying a level the Agent has no
+  field for, and every dispatch was refused with
+  `message_submission_runtime_binding_mismatch`.
 - **A vendor tool type the upstream cannot serve is dropped, not fatal.** A
   Responses client may offer built-ins (`web_search`, `web_search_preview`,
   `custom`, ...) that only OpenAI serves; forwarding one verbatim makes the
@@ -545,6 +562,8 @@ runtime switch or a turn on an Agent that was otherwise healthy.
 `reads_and_writes_the_gemini_3_tool_schema`,
 `cline_projection_pins_the_agent_endpoint_and_selects_the_provider_id`,
 `a_cline_store_entry_carries_the_fields_that_make_it_authoritative`,
+`schema_type_names_are_normalized_between_protocols`,
+`a_validation_refusal_names_its_fields`,
 `a_vendor_tool_type_the_upstream_cannot_serve_is_dropped`,
 `dropping_every_tool_removes_the_key`,
 `a_probe_without_a_reasoning_dimension_reports_none`,

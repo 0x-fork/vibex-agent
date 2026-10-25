@@ -543,15 +543,22 @@ impl AgentSessionConfigProbe {
                 .as_deref()
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            [
+            // A `thinking` toggle is a Boolean switch, not a depth scale: it
+            // cannot carry `off`/`low`/`high`, so it does not make the Agent a
+            // consumer of `reasoning_effort`. Counting it kept Kimi Code looking
+            // like a depth-capable Agent and its selection went on carrying a
+            // level the Agent has no field for.
+            let is_toggle = option.kind == crate::ProviderSessionConfigOptionKind::Boolean;
+            let keys = [
                 "effort",
                 "reasoning_effort",
                 "reasoning",
                 "thinking_level",
                 "thought_level",
-            ]
-            .iter()
-            .any(|key| id == *key || category == *key)
+            ];
+            let named = keys.iter().any(|key| id == *key || category == *key);
+            let toggle_named = (id == "thinking" || category == "thinking") && !is_toggle;
+            named || toggle_named
         })
     }
 }
