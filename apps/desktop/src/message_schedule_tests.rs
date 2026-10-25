@@ -16,7 +16,46 @@ fn queued(id: u64, session: &VibexSessionId, at_ms: Option<i64>) -> ComposerQueu
         attachments: Vec::new(),
         command_invocation: None,
         scheduled_at_ms: at_ms,
+        dispatch_key: mint_composer_queue_dispatch_key(),
     }
+}
+
+/// A queued message is persisted with the key its send will use.
+///
+/// The key is what makes a replay after an abrupt restart join the original
+/// submission instead of dispatching the message twice, so losing it on the
+/// way to the file would silently restore exactly the bug it prevents.
+#[test]
+fn a_queued_message_persists_the_key_it_submits_with() {
+    let session = VibexSessionId::new();
+    let message = queued(4, &session, None);
+    let entry = persisted_composer_queue_entry(&message);
+    assert_eq!(
+        entry.dispatch_key.as_deref(),
+        Some(message.dispatch_key.as_str())
+    );
+    let restored = restored_composer_message(entry).expect("the entry round-trips");
+    assert_eq!(restored.dispatch_key, message.dispatch_key);
+}
+
+/// A queue written before the key was persisted still restores.
+///
+/// Such an entry may or may not have been sent, and only the key a real send
+/// used can prove which; guessing one would collide with a different message.
+/// It is therefore restored with a fresh key — the same replay an older build
+/// performed — and the durable-record check at adoption is what protects it.
+#[test]
+fn an_entry_written_without_a_key_is_restored_with_a_fresh_one() {
+    let session = VibexSessionId::new();
+    let mut entry = persisted_composer_queue_entry(&queued(1, &session, None));
+    entry.dispatch_key = None;
+    let first = restored_composer_message(entry.clone()).expect("legacy entry restores");
+    let second = restored_composer_message(entry).expect("legacy entry restores");
+    assert!(first.dispatch_key.starts_with("gpui:queued:"));
+    assert_ne!(
+        first.dispatch_key, second.dispatch_key,
+        "a missing key must not collapse two different messages onto one"
+    );
 }
 
 #[test]
@@ -160,6 +199,53 @@ fn the_persisted_queue_round_trips_a_scheduled_command() {
     let mut unknown_session = persisted_composer_queue_entry(&message);
     unknown_session.session_id = "not a session id".to_string();
     assert!(restored_composer_message(unknown_session).is_none());
+}
+
+/// An in-process reload re-reads the queue file while the shell is live.
+///
+/// The file is a restored copy, not the authority: a message queued after its
+/// last write is only in memory, and replacing the queue with the file would
+/// drop a send the reader already committed to.
+#[gpui::test]
+fn reloading_the_queue_from_disk_keeps_messages_only_memory_has(cx: &mut gpui::TestAppContext) {
+    struct Probe {
+        workbench: gpui::Entity<VibexWorkbench>,
+    }
+
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let (probe, cx) = cx.add_window_view(|window, cx| {
+        let workbench = cx.new(|cx| {
+            VibexWorkbench::with_initial_state(None, DesktopUiStateV1::default(), None, window, cx)
+        });
+        Probe { workbench }
+    });
+    let workbench = probe.read_with(cx, |probe, _| probe.workbench.clone());
+    let session = VibexSessionId::new();
+
+    workbench.update(cx, |workbench, _| {
+        let live_only = queued(1, &session, None);
+        let also_on_disk = queued(2, &session, Some(1_800_000_000_000));
+        workbench.composer_queue = vec![live_only.clone(), also_on_disk.clone()];
+
+        // The file the reload reads still holds the older copy of the second
+        // message and none of the first.
+        let mut stale = persisted_composer_queue_entry(&also_on_disk);
+        stale.text = "a stale copy".to_string();
+        workbench.restore_composer_queue(vec![stale]);
+
+        assert_eq!(
+            workbench.composer_queue,
+            vec![live_only, also_on_disk],
+            "the reload must not drop a send that only memory holds, \
+             nor resurrect the stored copy of one it already has"
+        );
+    });
 }
 
 #[test]

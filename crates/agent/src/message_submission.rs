@@ -2354,6 +2354,44 @@ mod tests {
         cleanup_db(db_path);
     }
 
+    /// A queue entry that outlived its own send is replayed with the key that
+    /// send used. The replay must join the existing submission instead of
+    /// dispatching the message a second time — this is what makes a restart
+    /// between handing a message over and persisting its removal harmless.
+    #[tokio::test]
+    async fn a_replay_under_the_original_key_does_not_dispatch_again() {
+        let db_path = temp_db_path("queued-replay");
+        let initial = selection("gpt-5");
+        let session_id = seed_session(&db_path, "queued-replay", initial.clone());
+        let key = format!("gpui:queued:{}", RequestId::new().as_str());
+        let (coordinator, _runtime, dispatcher) =
+            harness(&db_path, &session_id, initial.clone(), false);
+
+        let sent = coordinator
+            .submit(request(&session_id, &key, initial.clone()))
+            .await
+            .unwrap();
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+
+        // The restart restored the entry before its removal reached the file.
+        let replayed = coordinator
+            .submit(request(&session_id, &key, initial))
+            .await
+            .unwrap();
+        assert_eq!(
+            dispatcher.calls.load(Ordering::SeqCst),
+            1,
+            "the replayed entry must join the original submission"
+        );
+        assert_eq!(replayed, sent);
+        let conn = open_database(&db_path).unwrap();
+        let record = MessageSubmissionRepository::get_by_key(&conn, &session_id, &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, MessageSubmissionStatus::Completed);
+        cleanup_db(db_path);
+    }
+
     #[tokio::test]
     async fn caller_drop_does_not_cancel_detached_dispatch() {
         let db_path = temp_db_path("caller-drop");

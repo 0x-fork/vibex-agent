@@ -2999,6 +2999,7 @@ mod tests {
             mentions: Vec::new(),
             command: None,
             scheduled_at_ms,
+            dispatch_key: None,
         }
     }
 

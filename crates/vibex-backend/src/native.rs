@@ -1385,6 +1385,13 @@ impl SidebarBackend for NativeBackend {
                                 mentions: mentions.clone(),
                                 command: None,
                                 scheduled_at_ms: None,
+                                // Minted with the entry, so a hand-back that
+                                // replays this message is the same submission
+                                // instead of a second one.
+                                dispatch_key: Some(format!(
+                                    "queued:{}",
+                                    vibex_core::RequestId::new().as_str()
+                                )),
                             });
                     }
                 }

@@ -390,6 +390,7 @@ fn queued_worker_message() -> ComposerQueueMessage {
         command_invocation: None,
         scheduled_at_ms: Some(i64::MAX),
         mentions: vec![VibexUseMention::session(&session(0).id, Some("@Lead"))],
+        dispatch_key: mint_composer_queue_dispatch_key(),
     }
 }
 
@@ -409,6 +410,7 @@ fn head_queue_message(
         command_invocation: None,
         scheduled_at_ms: at_ms,
         mentions: Vec::new(),
+        dispatch_key: mint_composer_queue_dispatch_key(),
     }
 }
 
@@ -1133,10 +1135,14 @@ async fn team_queued_session_recovery_uses_metadata_and_drops_only_confirmed_del
     cx: &mut TestAppContext,
 ) {
     let (workbench, cx, receiver) = fixture(cx, 2);
+    // One message, kept so the assertion compares against the entry the
+    // recovery actually restored — including the key it submits with.
+    let surviving = queued_worker_message();
+    let surviving_for_queue = surviving.clone();
     cx.update(|window, cx| {
         workbench.update(cx, |workbench, cx| {
             workbench.delegated_sessions.clear();
-            workbench.composer_queue.push(queued_worker_message());
+            workbench.composer_queue.push(surviving_for_queue.clone());
             let mut deleted = queued_worker_message();
             deleted.id = 2;
             deleted.session_id = session(2).id;
@@ -1161,7 +1167,7 @@ async fn team_queued_session_recovery_uses_metadata_and_drops_only_confirmed_del
                 .registered_session(session(1).id.as_str())
                 .is_some()
         );
-        assert_eq!(workbench.composer_queue, [queued_worker_message()]);
+        assert_eq!(workbench.composer_queue, std::slice::from_ref(&surviving));
         assert_eq!(workbench.sessions.len(), 1);
     });
     assert!(
@@ -1788,6 +1794,106 @@ fn team_presentation_recovers_missing_groups_preserves_manual_layout_and_respect
             Some(VibexUseUnavailableReason::ForeignAuthority)
         );
         assert!(workbench.ui_state.sidebar.organization.groups.is_empty());
+    });
+}
+
+/// A restored entry whose submission already reached the provider is dropped.
+///
+/// The queue's removal is persisted through a throttled write, so an entry can
+/// outlive its own send. Replaying it would either send the message twice or —
+/// now that the entry carries its key — be refused as a payload conflict. The
+/// adoption pass asks the authority instead, and only a record that may have
+/// reached a provider is dropped; a failed or pending submission stays queued
+/// so its own worker can finish it.
+#[gpui::test]
+async fn a_restored_entry_the_authority_already_accepted_is_not_replayed(cx: &mut TestAppContext) {
+    use vibex_core::{MessageSubmissionStatus, SendAgentMessageRequest};
+
+    let (workbench, cx, _) = fixture(cx, 1);
+    let (runtime, _home) = attach_team_runtime(&workbench, cx).await;
+    let coordinator = runtime
+        .agent()
+        .manager()
+        .message_submission_coordinator()
+        .expect("the isolated runtime installs a coordinator");
+    let session_id = session(0).id.clone();
+
+    // One message that really was sent, and one whose send never landed.
+    let delivered = head_queue_message(1, &session_id, None);
+    let pending = head_queue_message(2, &session_id, None);
+    {
+        let mut conn = open_database(&runtime.config().database_path).unwrap();
+        for message in [&delivered, &pending] {
+            vibex_db::MessageSubmissionRepository::enqueue(
+                &mut conn,
+                MessageSubmissionId::new(),
+                &SendAgentMessageRequest {
+                    session_id: session_id.clone(),
+                    message_idempotency_key: message.dispatch_key.clone(),
+                    desired_runtime: message.desired_runtime.clone(),
+                    text: message.text.clone(),
+                    attachments: Vec::new(),
+                    reasoning_effort: message.desired_runtime.reasoning_effort.clone(),
+                    correlation_id: None,
+                    delivery: vibex_core::UserMessageDelivery::Prompt,
+                    prompt_context: None,
+                    provenance: vibex_core::MessageProvenance::HumanInput,
+                    mentions: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+        let record = vibex_db::MessageSubmissionRepository::get_by_key(
+            &conn,
+            &session_id,
+            &delivered.dispatch_key,
+        )
+        .unwrap()
+        .unwrap();
+        // Walk the submission to the one state that means "the provider may
+        // already have this": a replay of it would be a second turn.
+        for (from, to) in [
+            (
+                MessageSubmissionStatus::AwaitingRuntime,
+                MessageSubmissionStatus::ReadyToDispatch,
+            ),
+            (
+                MessageSubmissionStatus::ReadyToDispatch,
+                MessageSubmissionStatus::AboutToPrompt,
+            ),
+            (
+                MessageSubmissionStatus::AboutToPrompt,
+                MessageSubmissionStatus::AmbiguousPromptDispatch,
+            ),
+        ] {
+            vibex_db::MessageSubmissionRepository::advance_status(
+                &conn,
+                &record.submission_id,
+                from,
+                to,
+            )
+            .unwrap();
+        }
+    }
+    assert!(
+        coordinator
+            .get_submission(&GetMessageSubmissionRequest {
+                session_id: session_id.clone(),
+                message_idempotency_key: delivered.dispatch_key.clone(),
+            })
+            .is_ok()
+    );
+
+    cx.update(|_window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            workbench.composer_queue = vec![delivered.clone(), pending.clone()];
+            workbench.prune_composer_queue_against_submissions(cx);
+            assert_eq!(
+                workbench.composer_queue,
+                vec![pending],
+                "only the entry whose send reached the provider is dropped"
+            );
+        });
     });
 }
 

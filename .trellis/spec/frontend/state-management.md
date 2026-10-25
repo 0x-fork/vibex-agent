@@ -896,7 +896,8 @@ milliseconds or `After(u64)` seconds. On submission, resolve it once into
 The pre-send queue persists through `ComposerUiState.queue:
 Vec<ComposerQueueEntry>` in the versioned desktop UI state, and rebuilds
 `ComposerQueueMessage` on launch. A stored entry is bounded: session id, runtime
-selection, text, attachments, optional command, and `scheduledAtMs`.
+selection, text, attachments, optional command, `scheduledAtMs`, and the
+`dispatchKey` it submits with.
 
 `next_queue_message_index(queue, is_editing)` names the one entry the dispatcher
 may hand over — the head, unless it is being edited. One workbench timer checks
@@ -921,6 +922,27 @@ session's own state whether the turn still holds the queue.
   schedule timer, and re-evaluate each waiting session so a deadline that passed
   while Vibex was closed still fires once — under the same admission rules as a
   running app, so Manual queue mode still needs the reader's own send.
+- A queued message carries the idempotency key its send will use, minted when it
+  is queued rather than at the send boundary, and persisted with the entry. The
+  removal of an entry that leaves the queue reaches the file through a
+  throttled write, so a restart can restore an entry whose send already
+  happened; a key built from the clock at dispatch time cannot recognize that
+  replay, and the message is sent a second time. With the key on the entry, the
+  replay is the same durable submission and the `(session, key)` uniqueness
+  collapses it. Do not force the queue write to close that window instead: an
+  entry removed from the file before its submission is durable would be lost
+  rather than deduplicated.
+- Adoption asks the authority about each restored entry before dispatching it.
+  A submission that may have reached a provider — `AboutToPrompt`,
+  `Dispatched`, `Completed`, `AmbiguousPromptDispatch`, or a `Failed` record
+  that has a `dispatched_at_ms` — drops the entry and its optimistic row. A
+  failed or cancelled submission that never reached a provider, and one still
+  waiting for its own worker, keeps the entry queued: those are replayable, and
+  `reconcile_on_startup` resumes the pending ones.
+- An in-process reload re-reads the queue file while the shell is live, so it
+  merges instead of replacing: live entries keep their position and their key,
+  and only a message the file has and memory does not is folded in at the
+  position the file gives it.
 - A scheduled new-session submission creates the session with deferred runtime
   materialization and no initial prompt or optimistic user item. Keep its
   message in the queue until dispatch; show a countdown on its empty timeline.
@@ -1030,6 +1052,9 @@ session's own state whether the turn still holds the queue.
 | A restored entry's session no longer exists | Drop the entry and persist the pruned queue |
 | A restored deadline passed while Vibex was closed | Fire it once, under the ordinary admission rules, instead of dropping it |
 | A stored entry has no session, nothing to send, or a duplicate id | Drop it, or renumber the id, before the queue reaches the panel |
+| A restored entry's submission already reached a provider | Drop the entry and its optimistic row; never dispatch it again |
+| A restored entry has no `dispatchKey` (written by an older build) | Mint a fresh key; the record check at adoption is what protects the replay |
+| An in-process reload reads a file older than the live queue | Keep the live entries; fold in only the messages memory does not have |
 
 ### 5. Good / Base / Bad Cases
 
@@ -1043,8 +1068,12 @@ session's own state whether the turn still holds the queue.
   settled, without waiting for the deadline that used to be ahead of it.
 - Base: unscheduled messages keep their Auto/Manual behavior; a due schedule
   still fires in Manual queue mode.
+- Good: a restart between handing a message over and persisting its removal
+  restores the entry, recognizes its key, and adds nothing to the transcript.
 - Bad: render a scheduled prompt on the timeline at submission, or make queue
   resume send a future deadline early.
+- Bad: mint the submission key at dispatch time, so a restored entry becomes a
+  second submission with its own turn.
 - Bad: let a message behind a schedule leave because its own session is idle, or
   let a due schedule overtake another session's queued entry.
 - Bad: hold the whole queue on an unresolved completion probe, so one error

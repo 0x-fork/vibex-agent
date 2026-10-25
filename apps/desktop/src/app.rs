@@ -1521,6 +1521,14 @@ struct ComposerQueueMessage {
     /// textarea, because a queued message is sent long after the reader moved
     /// on — and the reference identity has to survive that wait.
     mentions: Vec<vibex_core::VibexUseMention>,
+    /// The idempotency key this message will submit with.
+    ///
+    /// It is minted when the message becomes queued rather than at the send
+    /// boundary, so the key a restored entry replays with is the key its
+    /// original send used. That is what turns a replay after an abrupt restart
+    /// into the same durable submission instead of a second turn. See
+    /// [`ComposerQueueEntry::dispatch_key`].
+    dispatch_key: String,
 }
 
 impl ComposerQueueMessage {
@@ -1535,6 +1543,23 @@ impl ComposerQueueMessage {
             .collect::<Vec<_>>()
             .join(" ")
     }
+}
+
+/// The idempotency key one queued message submits with.
+///
+/// The key names the message, not the moment it was sent: a queued entry keeps
+/// the key it was minted with, so a queue restored after a restart replays the
+/// submission its original send already made instead of minting a new one. A
+/// clock in the key defeats exactly the case this has to survive — the same
+/// entry handed over twice.
+///
+/// It is minted from a fresh request id rather than from the queue serial
+/// because a serial is only a local element id: the queue renumbers it when a
+/// file carries duplicates, and it restarts from the highest id whenever the
+/// persisted queue empties. A reused serial would make two different messages
+/// share one key, and the second would be swallowed as a replay of the first.
+fn mint_composer_queue_dispatch_key() -> String {
+    format!("gpui:queued:{}", RequestId::new().as_str())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12876,6 +12901,7 @@ impl VibexWorkbench {
                                     command_invocation: None,
                                     scheduled_at_ms: Some(*scheduled_at_ms),
                                     mentions: mentions.clone(),
+                                    dispatch_key: mint_composer_queue_dispatch_key(),
                                 });
                                 // The clock is the shell's, so the message is
                                 // armed on the window that owns it rather than on
@@ -28377,6 +28403,7 @@ impl VibexWorkbench {
             command_invocation,
             scheduled_at_ms,
             mentions: composer_mentions(&mentions),
+            dispatch_key: mint_composer_queue_dispatch_key(),
         };
         // Clear the captured draft before queueing or dispatch so completion can
         // never erase text the user typed for a later message.
@@ -28522,6 +28549,7 @@ impl VibexWorkbench {
             // A remote client's mentions travel the same way; the authority is
             // what resolves them.
             mentions,
+            dispatch_key: mint_composer_queue_dispatch_key(),
         };
         composer_input.update(cx, |input, cx| input.set_value("", window, cx));
         self.composer_attachments.clear();
@@ -28705,6 +28733,7 @@ impl VibexWorkbench {
             text,
             attachments,
             mentions,
+            dispatch_key,
             ..
         } = message;
         self.notification_suppressed_session_ids
@@ -28713,13 +28742,7 @@ impl VibexWorkbench {
         let reasoning_effort = selection.reasoning_effort.clone();
         let generation = self.session_generation;
         let submitted_session_id = session_id.clone();
-        let idempotency_key = format!(
-            "gpui-remote:{}:{}:{}:{}",
-            session_id.as_str(),
-            generation,
-            message_id,
-            unix_timestamp_ms()
-        );
+        let idempotency_key = dispatch_key;
         let after_sequence = self.session_view_end_sequence(&session_id).unwrap_or(0);
         self.install_optimistic_user_message(OptimisticUserMessage {
             mentions: mentions.clone(),
@@ -28928,6 +28951,7 @@ impl VibexWorkbench {
             attachments,
             command_invocation,
             mentions,
+            dispatch_key,
             ..
         } = message;
         self.notification_suppressed_session_ids
@@ -28939,13 +28963,7 @@ impl VibexWorkbench {
         let prompt_context = None;
         let generation = self.session_generation;
         let submitted_session_id = session_id.clone();
-        let idempotency_key = format!(
-            "gpui:{}:{}:{}:{}",
-            session_id.as_str(),
-            generation,
-            message_id,
-            unix_timestamp_ms()
-        );
+        let idempotency_key = dispatch_key;
         let optimistic_message = (!is_command).then(|| OptimisticUserMessage {
             mentions: mentions.clone(),
             session_id: session_id.clone(),
@@ -29318,6 +29336,10 @@ impl VibexWorkbench {
         }
         // The send left the queue, so its name no longer stands and the
         // persisted queue must not bring the message back on the next launch.
+        // The write is throttled, but the entry it would restore already
+        // carries the key this hand-over submitted with, so a restart that
+        // beats the write replays the same submission instead of sending the
+        // message a second time.
         self.composer_queue_changed();
         bounced.is_none()
     }
@@ -35403,6 +35425,7 @@ impl VibexWorkbench {
                 command_invocation: command_invocation.clone(),
                 scheduled_at_ms: Some(at_ms),
                 mentions: mentions.clone(),
+                dispatch_key: mint_composer_queue_dispatch_key(),
             });
             self.start_message_schedule_timer(window, cx);
             self.publish_sidebar_invalidation();
@@ -101449,6 +101472,7 @@ mod tests {
                 command_invocation: None,
                 scheduled_at_ms: None,
                 mentions: Vec::new(),
+                dispatch_key: mint_composer_queue_dispatch_key(),
             }];
             workbench.view_session_id = Some(session_id.clone());
             workbench
@@ -101541,6 +101565,7 @@ mod tests {
                 command_invocation: None,
                 scheduled_at_ms: Some(original_deadline),
                 mentions: Vec::new(),
+                dispatch_key: mint_composer_queue_dispatch_key(),
             }];
             workbench.view_session_id = Some(session_id.clone());
 
@@ -101618,6 +101643,7 @@ mod tests {
             command_invocation: None,
             scheduled_at_ms: None,
             mentions: Vec::new(),
+            dispatch_key: mint_composer_queue_dispatch_key(),
         };
         let mut queue = vec![
             queued(1, "session_queue_a"),

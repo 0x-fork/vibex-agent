@@ -849,6 +849,16 @@ impl VibexWorkbench {
     /// The queue is the reader's own instruction about what to send next, so it
     /// is stored with the rest of the shell state: a restart restores it instead
     /// of dropping messages that were already committed to.
+    ///
+    /// The write stays throttled on purpose. A throttled write can leave an
+    /// entry that already left the queue on disk, and the next launch replays
+    /// it — which is harmless, because the entry carries the
+    /// [`ComposerQueueEntry::dispatch_key`] its send used, so the replay is the
+    /// same durable submission rather than a second turn. Forcing the write
+    /// here instead would close that replay window and open a worse one: the
+    /// entry would be gone from disk while the submission it describes might
+    /// still fail to become durable, and the reader's message would be lost
+    /// rather than deduplicated.
     pub(super) fn persist_composer_queue(&mut self) {
         self.ui_state.composer.queue = self
             .composer_queue
@@ -1024,6 +1034,7 @@ impl VibexWorkbench {
                 command_invocation: None,
                 scheduled_at_ms: None,
                 mentions: mentions.to_vec(),
+                dispatch_key: mint_composer_queue_dispatch_key(),
             },
         );
         self.publish_sidebar_invalidation();
@@ -1175,11 +1186,43 @@ impl VibexWorkbench {
     ///
     /// The entries are held until the overview arrives. Missing owned sessions
     /// are resolved individually before a restored message can be dispatched.
+    ///
+    /// The file is not the only copy that matters. An in-process reload (a
+    /// runtime retry, an RC import) re-reads it while the shell is live, so the
+    /// memory queue may hold messages the file has not seen yet — queued after
+    /// its last write, or never written because the write is throttled. Those
+    /// survive, because the shell is the only thing that has seen the reader's
+    /// latest intent.
+    ///
+    /// The live queue is therefore kept as it is, and only a message the file
+    /// has and memory does not is folded in — at the position the file gives
+    /// it, so the single ordered list the dispatcher reads still decides which
+    /// head leaves. A message both sides have is taken from memory: the key it
+    /// carries is the one a send may already have used, and restoring the
+    /// stored copy would resurrect a key the authority no longer matches.
     pub(super) fn restore_composer_queue(&mut self, queue: Vec<ComposerQueueEntry>) {
-        self.composer_queue = queue
+        let stored = queue
             .into_iter()
             .filter_map(restored_composer_message)
-            .collect();
+            .collect::<Vec<_>>();
+        let live = std::mem::take(&mut self.composer_queue);
+        let mut merged = Vec::with_capacity(stored.len().max(live.len()));
+        let mut remaining = live.into_iter().peekable();
+        for entry in stored {
+            if remaining
+                .peek()
+                .is_some_and(|message| message.dispatch_key == entry.dispatch_key)
+            {
+                merged.extend(remaining.next());
+            } else if !remaining
+                .clone()
+                .any(|message| message.dispatch_key == entry.dispatch_key)
+            {
+                merged.push(entry);
+            }
+        }
+        merged.extend(remaining);
+        self.composer_queue = merged;
         self.composer_queue_serial = self
             .composer_queue
             .iter()
@@ -1274,8 +1317,16 @@ impl VibexWorkbench {
     /// A restored message whose session is gone is dropped, a due or ready one
     /// is re-evaluated on the next frame, and the schedule timer is re-armed so
     /// a deadline that passed while Vibex was closed is still honored.
+    ///
+    /// Before anything is dispatched, each entry is checked against the
+    /// authoritative submission record its key names. An entry can outlive its
+    /// own send — the removal is persisted through a throttled write — and a
+    /// send that already reached the provider must not be replayed. The check
+    /// is what makes the guarantee hold for an entry that has no key too, the
+    /// one a queue written by an older build leaves behind.
     fn adopt_restored_composer_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.composer_queue_restore_pending = false;
+        self.prune_composer_queue_against_submissions(cx);
         let session_ids = self
             .composer_queue
             .iter()
@@ -1299,6 +1350,67 @@ impl VibexWorkbench {
         self.start_message_schedule_timer(window, cx);
         self.apply_pending_scheduled_titles();
         self.persist_composer_queue();
+        cx.notify();
+    }
+
+    /// Drops restored entries the authority has already accepted.
+    ///
+    /// The submission table is the only place that knows whether a message that
+    /// left the queue was really sent, delivered but unresolved, or never left
+    /// at all. Every state except "the provider may have it" is replayable: a
+    /// failed or cancelled submission never reached a provider, and an
+    /// `AwaitingRuntime`/`ReadyToDispatch` one is still waiting for its own
+    /// worker, which `reconcile_on_startup` resumes.
+    ///
+    /// A record that is terminal *and* reached the provider is the one case the
+    /// queue must not touch. It is dropped and its optimistic row is discarded,
+    /// because the authoritative timeline already holds the turn.
+    pub(super) fn prune_composer_queue_against_submissions(&mut self, cx: &mut Context<Self>) {
+        let Some(runtime) = self.runtime.clone() else {
+            // A remote authority answers through the backend, and its record is
+            // the authority's own; the durable key on the entry is what makes a
+            // replay there the same submission, so nothing is pruned blindly.
+            return;
+        };
+        let coordinator = runtime.agent().manager().message_submission_coordinator();
+        let Some(coordinator) = coordinator else {
+            return;
+        };
+        let sessions = self
+            .composer_queue
+            .iter()
+            .map(|message| (message.session_id.clone(), message.dispatch_key.clone()))
+            .collect::<Vec<_>>();
+        for (session_id, dispatch_key) in sessions {
+            let request = GetMessageSubmissionRequest {
+                session_id: session_id.clone(),
+                message_idempotency_key: dispatch_key.clone(),
+            };
+            let Ok(state) = coordinator.get_submission(&request) else {
+                // No record under this key: the entry never became a durable
+                // submission, so it is an ordinary unsent message.
+                continue;
+            };
+            let delivered = matches!(
+                state.status,
+                MessageSubmissionStatus::Completed
+                    | MessageSubmissionStatus::Dispatched
+                    | MessageSubmissionStatus::AboutToPrompt
+                    | MessageSubmissionStatus::AmbiguousPromptDispatch
+            ) || composer_submission_failure_reached_provider(&state);
+            if !delivered {
+                continue;
+            }
+            self.composer_queue
+                .retain(|message| message.dispatch_key != dispatch_key);
+            // The turn is already in the transcript, so the pending row this
+            // launch never installed has nothing left to wait for.
+            self.discard_optimistic_user_message(&session_id);
+            eprintln!(
+                "vibex-foundation: dropped a restored queued message the authority already accepted ({:?})",
+                state.status
+            );
+        }
         cx.notify();
     }
 
@@ -1620,12 +1732,20 @@ fn persisted_composer_queue_entry(message: &ComposerQueueMessage) -> ComposerQue
                 prompt_id: invocation.prompt_id.clone(),
             }),
         scheduled_at_ms: message.scheduled_at_ms,
+        dispatch_key: Some(message.dispatch_key.clone()),
     }
 }
 
 /// Rebuilds a queued message from its persisted shape. A session id the
 /// authority would not accept cannot address a send, so it is dropped rather
 /// than queued against a session that cannot exist.
+///
+/// A queue written before the key was persisted carries none, and guessing one
+/// would be worse than minting a fresh key: the entry may or may not have been
+/// sent already, and only the key a send actually used can prove it. Such an
+/// entry is restored with a new key and is replayed once, which is exactly what
+/// an older build did — the difference is that everything queued from now on
+/// carries the key that makes the replay harmless.
 fn restored_composer_message(entry: ComposerQueueEntry) -> Option<ComposerQueueMessage> {
     let session_id = VibexSessionId::parse(&entry.session_id).ok()?;
     Some(ComposerQueueMessage {
@@ -1645,6 +1765,9 @@ fn restored_composer_message(entry: ComposerQueueEntry) -> Option<ComposerQueueM
         }),
         scheduled_at_ms: entry.scheduled_at_ms,
         mentions: entry.mentions,
+        dispatch_key: entry
+            .dispatch_key
+            .unwrap_or_else(mint_composer_queue_dispatch_key),
     })
 }
 

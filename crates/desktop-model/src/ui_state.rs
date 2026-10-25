@@ -1255,6 +1255,18 @@ pub struct ComposerQueueEntry {
     /// message that only waits for the session to be ready.
     #[serde(default)]
     pub scheduled_at_ms: Option<i64>,
+    /// The idempotency key this entry submits with, minted while it is queued
+    /// instead of at the send boundary.
+    ///
+    /// A message leaves the queue in memory before its submission is durable,
+    /// and that removal reaches this file through a throttled write. A restart
+    /// inside that window restores an entry that was already handed over, so
+    /// the queue replays it. A key built from the clock at dispatch time makes
+    /// the replay look like a new send and the reader gets a second turn;
+    /// carrying the key with the entry makes the replay the same submission,
+    /// which the durable `(session, key)` uniqueness collapses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_key: Option<String>,
 }
 
 /// The command a queued message runs instead of sending its text verbatim.
@@ -2269,6 +2281,14 @@ fn normalize_composer_queue(queue: &mut Vec<ComposerQueueEntry>) {
                 command.command_name = bounded_optional(command.command_name.take(), 256);
                 command.arguments = bounded_optional(command.arguments.take(), 4_096);
             }
+            // A key the submission path would refuse cannot dedupe anything, so
+            // it is treated as absent: the message is still the reader's, and a
+            // fresh key is minted for it rather than turning the entry into an
+            // unsendable one.
+            entry.dispatch_key = bounded_optional(
+                entry.dispatch_key.take(),
+                vibex_core::MAX_MESSAGE_IDEMPOTENCY_KEY_LEN,
+            );
             Some(entry)
         })
         .collect::<Vec<_>>();
@@ -2580,6 +2600,7 @@ mod tests {
             mentions: Vec::new(),
             command: None,
             scheduled_at_ms,
+            dispatch_key: None,
         };
         let mut state = DesktopUiStateV1::default();
         state.composer.queue = vec![
@@ -4511,6 +4532,7 @@ mod tests {
             mentions: vec![mention.clone(), mention.clone()],
             command: None,
             scheduled_at_ms: Some(1_800_000_000_000),
+            dispatch_key: None,
         });
         state.normalize().unwrap();
         let restored: DesktopUiStateV1 =
