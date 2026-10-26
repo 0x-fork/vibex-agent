@@ -39,6 +39,7 @@ use crate::route::{
     is_protocol_mismatch, plan_route,
 };
 use crate::stream::{ReplyAccumulator, SseBuffer, UsageSniffer};
+use crate::tool_names::ToolNameMap;
 use crate::wire::parse_reply;
 use crate::wire::{
     StreamDecoder, StreamEncoder, WireProtocol, build_upstream_request, decoder, encoder,
@@ -1276,6 +1277,11 @@ impl ModelGatewayService {
 
         let mut members = Vec::new();
         let mut last_error: Option<GatewayError> = None;
+        // The tool names as the client spelled them, and the form the strict
+        // protocols accept. Built once for the whole request because it is a
+        // property of the request: every member and every retry must send the
+        // same names, and the reply has to name the client's own tools.
+        let tool_names = ToolNameMap::build(&request);
         for resolved in resolved_members {
             match self.prepare_member(
                 &snapshot,
@@ -1286,6 +1292,7 @@ impl ModelGatewayService {
                 &connection,
                 pinned.as_ref(),
                 now,
+                &tool_names,
             ) {
                 Ok(member) => members.push(member),
                 // A member that cannot be called at all is skipped so the next
@@ -1327,6 +1334,7 @@ impl ModelGatewayService {
             // enough: a first turn in a conversation has the setting but no
             // pin yet, and that turn has nothing to be disloyal to.
             pinned: pinned.is_some() && pin == GatewayPinScope::Conversation,
+            tool_names,
         };
         // The slot now belongs to the caller of `open_attempt`.
         probe.armed = false;
@@ -1468,6 +1476,7 @@ impl ModelGatewayService {
         connection: &DbConnection,
         pinned: Option<&(ModelProviderProfileId, RequestId)>,
         now: i64,
+        tool_names: &ToolNameMap,
     ) -> GatewayResult<PreparedMember> {
         let profile_id = resolved.profile.clone();
         let upstream =
@@ -1599,7 +1608,7 @@ impl ModelGatewayService {
             None => request.clone(),
         };
         let upstream_stream = request.stream || !passthrough;
-        let body = build_member_body(
+        let mut body = build_member_body(
             target,
             passthrough,
             inbound,
@@ -1609,6 +1618,16 @@ impl ModelGatewayService {
             &resolved.model,
             upstream_stream,
         )?;
+        // A Gemini client may name a tool with `.` or `:`, which the OpenAI and
+        // Anthropic protocols refuse; the whole request fails on it, not just
+        // that tool. Only a translated call is rewritten: a passthrough has to
+        // stay the client's own bytes, and its reply is not re-encoded, so a
+        // rewritten name could never be restored on the way back. Every protocol
+        // that admits such a name (Gemini is the only one) is translated, so
+        // this covers the real cases without touching byte fidelity.
+        if !passthrough {
+            tool_names.rewrite_body(&mut body, target);
+        }
         // The other calls this member may make. They exist only when the first
         // one was a guess at an endpoint that declares nothing, so a wrong
         // guess costs one extra request instead of every request. A corrected
@@ -1619,7 +1638,7 @@ impl ModelGatewayService {
             let Some(endpoint) = upstream.endpoint_for_call(*alternate_target).cloned() else {
                 continue;
             };
-            let body = build_member_body(
+            let mut body = build_member_body(
                 *alternate_target,
                 *alternate_passthrough,
                 inbound,
@@ -1629,6 +1648,7 @@ impl ModelGatewayService {
                 &resolved.model,
                 request.stream || !alternate_passthrough,
             )?;
+            tool_names.rewrite_body(&mut body, *alternate_target);
             alternates.push(MemberCall {
                 target: *alternate_target,
                 passthrough: *alternate_passthrough,
@@ -2550,6 +2570,10 @@ pub struct PreparedCall {
     /// It gates the failover prompt: only a member that was kept on purpose is
     /// worth asking about, because only that switch is a decision the user made.
     pub pinned: bool,
+    /// The tool names as the client spelled them, and the form the strict
+    /// protocols accept. A reply that calls a tool names it in the rewritten
+    /// form, so translating it back needs this map.
+    pub(crate) tool_names: ToolNameMap,
 }
 
 /// One upstream this request may call, with everything needed to call it.
@@ -3051,6 +3075,7 @@ pub(crate) async fn forward(
     key: &KeyReference,
     sender: mpsc::Sender<Result<bytes::Bytes, GatewayError>>,
 ) {
+    let tool_names = prepared.tool_names.clone();
     let UpstreamAttempt {
         response,
         target,
@@ -3146,7 +3171,12 @@ pub(crate) async fn forward(
             }
             match decoded.decode(&data) {
                 Ok(events) => {
-                    for event in events {
+                    for mut event in events {
+                        // The upstream answers with the name it was given; the
+                        // client only knows its own. Restoring it before the
+                        // encoder runs means every protocol's reply names the
+                        // tool the client can actually call.
+                        tool_names.restore_event(&mut event);
                         accumulator.apply(&event);
                         match encoder.encode(&event) {
                             Ok(bytes) => translated.push_str(&bytes),
@@ -3199,14 +3229,16 @@ pub(crate) async fn forward(
             if data.trim() == "[DONE]" {
                 continue;
             }
-            for event in decoded.decode(&data).unwrap_or_default() {
+            for mut event in decoded.decode(&data).unwrap_or_default() {
+                tool_names.restore_event(&mut event);
                 accumulator.apply(&event);
                 if let Ok(bytes) = encoder.encode(&event) {
                     let _ = sender.send(Ok(bytes::Bytes::from(bytes))).await;
                 }
             }
         }
-        for event in decoded.finish().unwrap_or_default() {
+        for mut event in decoded.finish().unwrap_or_default() {
+            tool_names.restore_event(&mut event);
             accumulator.apply(&event);
             if let Ok(bytes) = encoder.encode(&event) {
                 let _ = sender.send(Ok(bytes::Bytes::from(bytes))).await;
@@ -3288,6 +3320,7 @@ pub(crate) async fn gather(
     attempt: UpstreamAttempt,
     key: &KeyReference,
 ) -> GatewayResult<Value> {
+    let tool_names = prepared.tool_names.clone();
     let UpstreamAttempt {
         response,
         target,
@@ -3333,7 +3366,7 @@ pub(crate) async fn gather(
             });
         }
     };
-    let (response, usage) = if passthrough {
+    let (mut response, usage) = if passthrough {
         let parsed = parse_reply(target, &bytes).unwrap_or_default();
         let usage = parsed.usage.clone();
         (parsed, usage)
@@ -3372,6 +3405,10 @@ pub(crate) async fn gather(
             (parsed, usage)
         }
     };
+    // The reply names the tool the upstream was asked for; the client only
+    // knows the name it declared, so the rewritten form is translated back
+    // before the reply is rendered in the client's protocol.
+    tool_names.restore_response(&mut response);
     let rendered = render_response(prepared.inbound, &response)?;
     if let Some(conversation) = prepared.conversation.as_deref() {
         service.pin_conversation(conversation, &profile_id, &key.id);

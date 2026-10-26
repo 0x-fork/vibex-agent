@@ -3106,6 +3106,154 @@ async fn a_vendor_tool_type_the_upstream_cannot_serve_is_dropped() {
     cleanup(path);
 }
 
+/// A Gemini tool name that the OpenAI protocols refuse is rewritten, and the
+/// reply is translated back to the client's own name.
+///
+/// Gemini permits `.` and `:` in a function name — its MCP bridge rewrites only
+/// `[^a-zA-Z0-9_\-.:]` — so a client forwards
+/// `mcp_com.browser-use_browser-use_browser_click`. The Chat-backed upstream
+/// rejects the whole request for it:
+///
+/// ```text
+/// Invalid 'tools[36].function.name': string does not match pattern.
+/// Expected a string that matches the pattern '^[a-zA-Z0-9_-]+$'
+/// ```
+///
+/// Dropping the tool would take the capability away; forwarding the name loses
+/// the turn. The gateway rewrites the name and restores it on the reply, or the
+/// client would be handed a tool it never declared.
+#[tokio::test]
+async fn a_tool_name_the_target_protocol_refuses_is_rewritten_and_restored() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    // The upstream speaks Chat, so the Gemini call is translated.
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-v4.1-flash"],
+        "sk-test",
+    );
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let model = group_model(&group, "deepseek-v4.1-flash");
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/v1beta/models/{}:streamGenerateContent?alt=sse",
+            model.replace('/', "%2F")
+        ))
+        .header(header::HOST, "127.0.0.1")
+        .header("x-goog-api-key", "vibex-local-gateway")
+        .json(&json!({
+            "contents": [{"role": "user", "parts": [{"text": "click it"}]}],
+            "tools": [{
+                "functionDeclarations": [{
+                    "name": "mcp_com.browser-use_browser-use_browser_click",
+                    "description": "click",
+                    "parametersJsonSchema": {"type": "OBJECT", "properties": {}}
+                }]
+            }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "the translated call must not be refused: {body}"
+    );
+
+    let recorded = recorder.lock().await;
+    let sent = recorded.body.as_ref().unwrap();
+    let forwarded = sent["tools"][0]["function"]["name"]
+        .as_str()
+        .expect("the tool is forwarded");
+    assert_eq!(
+        forwarded, "mcp_com_browser-use_browser-use_browser_click",
+        "the upstream body must carry a name it accepts: {sent}"
+    );
+    assert!(
+        forwarded
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')),
+        "every forwarded name must satisfy the strict pattern: {forwarded}"
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// The reply names the tool the client declared, not the rewritten one.
+///
+/// The rewrite only works if it is reversible: the upstream echoes the name it
+/// was given, and a client handed `mcp_com_browser-use_...` instead of its own
+/// `mcp_com.browser-use...` would report an unknown tool and drop the call.
+#[tokio::test]
+async fn a_rewritten_tool_name_comes_back_as_the_clients_own() {
+    let path = database_path();
+    let stream = [
+        r#"data: {"id":"c1","model":"deepseek-v4.1-flash","choices":[{"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"mcp_com_browser-use_browser-use_browser_click","arguments":""}}]}}]}"#,
+        r#"data: {"id":"c1","model":"deepseek-v4.1-flash","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+        r#"data: {"id":"c1","model":"deepseek-v4.1-flash","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3}}"#,
+        "data: [DONE]",
+    ]
+    .join("\n\n")
+        + "\n\n";
+    let (upstream_url, _recorder, upstream_task) = mock_upstream(200, stream, None).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-v4.1-flash"],
+        "sk-test",
+    );
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let model = group_model(&group, "deepseek-v4.1-flash");
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/v1beta/models/{}:streamGenerateContent?alt=sse",
+            model.replace('/', "%2F")
+        ))
+        .header(header::HOST, "127.0.0.1")
+        .header("x-goog-api-key", "vibex-local-gateway")
+        .json(&json!({
+            "contents": [{"role": "user", "parts": [{"text": "click it"}]}],
+            "tools": [{
+                "functionDeclarations": [{
+                    "name": "mcp_com.browser-use_browser-use_browser_click",
+                    "description": "click",
+                    "parametersJsonSchema": {"type": "OBJECT", "properties": {}}
+                }]
+            }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("mcp_com.browser-use_browser-use_browser_click"),
+        "the reply must restore the client's own tool name: {body}"
+    );
+    assert!(
+        !body.contains("mcp_com_browser-use_browser-use_browser_click"),
+        "the rewritten name must never reach the client: {body}"
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
 /// A request whose only tools were dropped loses the `tools` key entirely.
 #[tokio::test]
 async fn dropping_every_tool_removes_the_key() {

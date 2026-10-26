@@ -633,6 +633,7 @@ impl AcpDebugLog {
 fn provider_backed_auth_method(
     agent_id: &AgentId,
     auth_source: &RuntimeAuthSource,
+    env_overlays: &[(String, String)],
 ) -> Option<String> {
     // A route resolves to a Provider Profile, so it launches through the same
     // credential contract a direct Profile selection uses. Keying on
@@ -645,12 +646,34 @@ fn provider_backed_auth_method(
         RuntimeAuthSource::ProviderProfile { .. } | RuntimeAuthSource::ModelRoute { .. }
     )
     .then(|| match agent_id.as_str() {
+        // Antigravity's ACP surface only offers `gemini-api-key`,
+        // `oauth-*` and `agent-platform` — a gateway projection has no method
+        // to select, and requesting one rewrites its `auth.type`, which is
+        // what the projection is for. Verified against the real binary:
+        // `authenticate("gemini-api-key")` rewrites `settings.json` back from
+        // `{"auth":{"type":"gateway"}}` and the `model` config option then
+        // answers `Model '<route id>' is not available for the current
+        // authentication method`, because the API-key catalogue holds only
+        // Gemini ids. With `auth.type = gateway` and no `authenticate` call the
+        // same `session/new` succeeds and the allowlist is honoured.
+        "antigravity" if antigravity_gateway_mode_requested(env_overlays) => None,
         // Antigravity requires an explicit authenticate request to select
         // API-key auth; merely projecting GEMINI_API_KEY is insufficient.
         "antigravity" => Some("gemini-api-key".to_string()),
         _ => None,
     })
     .flatten()
+}
+
+/// Whether the projection launched this Antigravity process in gateway mode.
+///
+/// `AGY_ACP_ENABLE_GATEWAY_AUTH` is what the projection sets together with
+/// `auth.type = "gateway"` and the `AGY_LLM_GATEWAY_MODELS` allowlist, so it is
+/// also the signal that the ACP `authenticate` handshake must not run.
+fn antigravity_gateway_mode_requested(env_overlays: &[(String, String)]) -> bool {
+    env_overlays.iter().any(|(key, value)| {
+        key == "AGY_ACP_ENABLE_GATEWAY_AUTH" && value.trim().eq_ignore_ascii_case("true")
+    })
 }
 
 fn build_initialize_params(
@@ -1008,9 +1031,50 @@ fn resolve_acp_mcp_descriptor(
 
     Ok(AcpMcpServerDescriptor {
         id: id.to_string(),
-        name: name.to_string(),
+        name: acp_mcp_wire_name(name, id),
         transport,
     })
+}
+
+/// The MCP server name an Agent receives on the wire.
+///
+/// The ACP schema types this field as a server *name*, and Agents disagree
+/// about what that admits. Antigravity validates `mcpServers[].name` against
+/// `^[a-zA-Z0-9_-]+$` and refuses the whole `session/new` with
+/// `-32602 Invalid params` when a display name such as "Agent delegation"
+/// arrives. Gemini CLI turns the same value into `mcp_<server>_<tool>` function
+/// names, which its own OpenAI-backed upstream rejects for the same reason. A
+/// display name is a label, not an identifier, so the wire carries a sanitized
+/// form every Agent accepts.
+///
+/// The stable id is the fallback rather than the display name: an empty or
+/// wholly non-identifier label still has to produce a usable name, and the id
+/// is already the value that identifies the server locally.
+fn acp_mcp_wire_name(display_name: &str, id: &str) -> String {
+    let sanitize = |value: &str| {
+        let mut sanitized = String::with_capacity(value.len());
+        let mut separator = false;
+        for character in value.trim().chars() {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                sanitized.push(character);
+                separator = false;
+            } else if !separator && !sanitized.is_empty() {
+                sanitized.push('-');
+                separator = true;
+            }
+        }
+        sanitized.trim_matches('-').to_string()
+    };
+    let name = sanitize(display_name);
+    if !name.is_empty() {
+        return name;
+    }
+    let name = sanitize(id);
+    if name.is_empty() {
+        "vibex-mcp".to_string()
+    } else {
+        name
+    }
 }
 
 fn acp_config_mcp_forwarding_enabled(config: &AcpProviderConfig) -> bool {
@@ -1999,6 +2063,56 @@ fn rpc_validation_fields(data: &Value) -> Vec<String> {
     let Some(object) = data.as_object() else {
         return fields;
     };
+    // Pydantic's shape, which Antigravity uses: one entry per rejected field
+    // with its own `loc` path and message. Reading only the `_errors` shapes
+    // left every Antigravity refusal at a bare "Invalid params" that named no
+    // field, so a rejected MCP server name was indistinguishable from a
+    // rejected working directory.
+    if let Some(errors) = object.get("errors").and_then(Value::as_array) {
+        for error in errors {
+            let location = error
+                .get("loc")
+                .and_then(Value::as_array)
+                .map(|loc| {
+                    loc.iter()
+                        .filter_map(|segment| match segment {
+                            Value::String(text) => Some(text.clone()),
+                            Value::Number(number) => Some(number.to_string()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(".")
+                })
+                .unwrap_or_default();
+            let message = error
+                .get("msg")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|message| !message.is_empty());
+            let input = error
+                .get("input")
+                .map(|input| match input {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                })
+                .filter(|input| !input.trim().is_empty());
+            let Some(message) = message else {
+                continue;
+            };
+            let mut complaint = message.to_string();
+            if let Some(input) = input {
+                complaint.push_str(&format!(" (input: {input})"));
+            }
+            if location.is_empty() {
+                fields.push(complaint);
+            } else {
+                fields.push(format!("{location}: {complaint}"));
+            }
+        }
+        if !fields.is_empty() {
+            return fields;
+        }
+    }
     for (key, value) in object {
         if key == "details" {
             continue;
@@ -13526,7 +13640,8 @@ impl AcpRuntimeClient {
             Vec::new()
         };
 
-        let provider_auth_method = provider_backed_auth_method(&agent_id, auth_source);
+        let provider_auth_method =
+            provider_backed_auth_method(&agent_id, auth_source, &env_overlays);
         let process = Arc::new(AcpProcess {
             exit_reporter: (purpose == AcpProcessPurpose::Session).then(|| {
                 self.process_registry
@@ -22921,16 +23036,38 @@ mod tests {
         let antigravity = AgentId::parse("antigravity").unwrap();
         let profile = RuntimeAuthSource::provider_profile(ProviderProfileId::new());
         assert_eq!(
-            provider_backed_auth_method(&antigravity, &profile).as_deref(),
+            provider_backed_auth_method(&antigravity, &profile, &[]).as_deref(),
             Some("gemini-api-key")
+        );
+
+        // A gateway projection has no ACP method to select, and requesting one
+        // rewrites `auth.type` back to `gemini-api-key`, which then refuses the
+        // projected route model as "not available for the current
+        // authentication method". The projected gateway flag is the signal.
+        let gateway = vec![
+            (
+                "AGY_LLM_GATEWAY_URL".to_string(),
+                "http://127.0.0.1:42529".to_string(),
+            ),
+            (
+                "AGY_ACP_ENABLE_GATEWAY_AUTH".to_string(),
+                "true".to_string(),
+            ),
+        ];
+        assert_eq!(
+            provider_backed_auth_method(&antigravity, &profile, &gateway),
+            None
         );
 
         let account = RuntimeAuthSource::AgentAccount {
             auth_context_id: "agent_auth_context_test".parse().unwrap(),
         };
-        assert_eq!(provider_backed_auth_method(&antigravity, &account), None);
         assert_eq!(
-            provider_backed_auth_method(&AgentId::parse("gemini").unwrap(), &profile),
+            provider_backed_auth_method(&antigravity, &account, &[]),
+            None
+        );
+        assert_eq!(
+            provider_backed_auth_method(&AgentId::parse("gemini").unwrap(), &profile, &[]),
             None
         );
     }
@@ -24320,6 +24457,55 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             build_session_load_params("native-1", &cwd, &[], &servers, None)["mcpServers"],
             build_session_new_params(&cwd, &servers, None)["mcpServers"]
         );
+    }
+
+    /// Antigravity refuses a `session/new` whose MCP server name contains a
+    /// space or a slash.
+    ///
+    /// Its schema requires `^[a-zA-Z0-9_-]+$` on `mcpServers[].name`, and the
+    /// built-in servers are labelled "Agent delegation" and "Embedded browser".
+    /// The refusal is a `-32602 Invalid params` that named no field, so the
+    /// session failed to open with no visible cause. Gemini CLI derives its
+    /// `mcp_<server>_<tool>` function names from the same value, so a sanitized
+    /// wire name is also what keeps those names inside the Chat upstream's
+    /// pattern.
+    #[test]
+    fn mcp_server_wire_names_are_identifiers() {
+        assert_eq!(
+            acp_mcp_wire_name(
+                "Agent delegation",
+                vibex_core::AGENT_DELEGATION_MCP_SERVER_ID
+            ),
+            "Agent-delegation"
+        );
+        assert_eq!(
+            acp_mcp_wire_name("Embedded browser", vibex_core::BROWSER_MCP_SERVER_ID),
+            "Embedded-browser"
+        );
+        assert_eq!(
+            acp_mcp_wire_name("com.browser-use/browser-use", "vibex-browser"),
+            "com-browser-use-browser-use"
+        );
+        // A name that is already an identifier keeps its exact spelling, and a
+        // label with nothing usable in it falls back to the stable id.
+        assert_eq!(
+            acp_mcp_wire_name("vibex-browser", vibex_core::BROWSER_MCP_SERVER_ID),
+            "vibex-browser"
+        );
+        assert_eq!(acp_mcp_wire_name("!!!", "vibex-computer"), "vibex-computer");
+        assert_eq!(acp_mcp_wire_name("", ""), "vibex-mcp");
+        for name in [
+            acp_mcp_wire_name("Agent delegation", "x"),
+            acp_mcp_wire_name("com.browser-use/browser-use", "x"),
+            acp_mcp_wire_name("!!!", "vibex-computer"),
+        ] {
+            assert!(
+                name.chars()
+                    .all(|character| character.is_ascii_alphanumeric()
+                        || matches!(character, '-' | '_')),
+                "not an ACP-acceptable server name: {name}"
+            );
+        }
     }
 
     #[test]
@@ -34225,6 +34411,30 @@ for line in sys.stdin:
         );
         let bare = json!({"code": -32602, "message": "Invalid params"});
         assert_eq!(rpc_failure_message(&bare), "Invalid params");
+
+        // Pydantic's shape, which Antigravity returns: one entry per field with
+        // a `loc` path. A refused MCP server name arrived as a bare "Invalid
+        // params" before this, so the offending argument was invisible.
+        let pydantic = json!({
+            "code": -32602,
+            "message": "Invalid params",
+            "data": {"errors": [{
+                "type": "string_pattern_mismatch",
+                "loc": ["mcpServers", 0, "name"],
+                "msg": "String should match pattern '^[a-zA-Z0-9_-]+$'",
+                "input": "Agent delegation"
+            }]}
+        });
+        let message = rpc_failure_message(&pydantic);
+        assert!(message.starts_with("Invalid params: "), "{message}");
+        assert!(
+            message.contains("mcpServers.0.name"),
+            "the refusal must name the field path: {message}"
+        );
+        assert!(
+            message.contains("Agent delegation"),
+            "the refusal must quote the rejected value: {message}"
+        );
     }
 
     /// A probe with no reasoning dimension normalizes the selection before it
@@ -34780,10 +34990,25 @@ for line in sys.stdin:
 
         let stale_key =
             crate::session_config::CanonicalSessionConfigKey::parse("autoApply").unwrap();
+        // A depth category *is* the reasoning dimension, so the option is
+        // reachable under the canonical key rather than under the category's
+        // own spelling. Reading it under `thought_level` was the same
+        // disagreement that left Kimi's `thinking` level unappliable.
         let current_key =
+            crate::session_config::CanonicalSessionConfigKey::parse("reasoning_effort").unwrap();
+        let category_spelling =
             crate::session_config::CanonicalSessionConfigKey::parse("thought_level").unwrap();
         assert!(planner.option_for_key(&stale_key).unwrap().is_none());
-        assert!(planner.option_for_key(&current_key).unwrap().is_some());
+        assert_eq!(
+            planner.option_for_key(&current_key).unwrap().unwrap().id,
+            "thought_level"
+        );
+        assert!(
+            planner
+                .option_for_key(&category_spelling)
+                .unwrap()
+                .is_none()
+        );
 
         let evidence = client.profile_session_config_evidence().unwrap();
         let profile_evidence = evidence.get(&fixture.profile_id).unwrap();

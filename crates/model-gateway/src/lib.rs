@@ -26,6 +26,7 @@ mod route;
 mod server;
 mod service;
 pub mod stream;
+mod tool_names;
 mod wire;
 
 pub use error::GatewayError;

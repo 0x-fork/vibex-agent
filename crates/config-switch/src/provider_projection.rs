@@ -300,13 +300,20 @@ impl AgentProviderProjectionEngine {
             endpoint,
             &mut non_secret_env,
         );
-        for overlay in agent_specific_overlays(descriptor) {
+        for overlay in agent_specific_overlays(
+            descriptor,
+            model_provider,
+            binding,
+            endpoint,
+            selected_model,
+            descriptor_secret_env_key(descriptor),
+        )? {
             targets.push(ProjectionTargetPreview {
                 field: "auth".to_string(),
                 target_kind: ProjectionTargetKind::ManagedOverlay,
                 target: overlay.relative_path.clone(),
                 value_preview: "API key".to_string(),
-                secret: false,
+                secret: overlay.contains_secret_reference,
             });
             overlays.push(overlay);
         }
@@ -2083,21 +2090,45 @@ pub fn cline_provider_id(model: Option<&AgentConfiguredModelBinding>) -> Option<
 /// never reaches the prompt.
 fn agent_specific_overlays(
     descriptor: &AgentProviderProjectionDescriptor,
-) -> Vec<ManagedProjectionOverlay> {
-    if descriptor.route.agent_id.as_str() != "antigravity" {
-        return Vec::new();
+    provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: Option<&str>,
+) -> VibexResult<Vec<ManagedProjectionOverlay>> {
+    match descriptor.route.agent_id.as_str() {
+        "antigravity" => Ok(vec![ManagedProjectionOverlay {
+            relative_path: "antigravity-acp/settings.json".to_string(),
+            format: "json".to_string(),
+            // Gateway mode: Antigravity's own model catalogue holds only its
+            // Gemini ids, so a route-group model id is refused as "not
+            // available for the current authentication method". Its `gateway`
+            // auth type replaces that catalogue with the
+            // `AGY_LLM_GATEWAY_MODELS` allowlist, which is what
+            // `antigravity_gateway_env` fills in.
+            content: serde_json::json!({ "auth": { "type": "gateway" } }).to_string(),
+            contains_secret_reference: false,
+        }]),
+        // ZCode's ACP bridge lists user-added providers from the legacy
+        // `config.json` provider map, but the backend registry that actually
+        // resolves a Model id is built from the personal provider table
+        // (`provider_config.json`). Writing only `config.json` is enough for
+        // the picker to advertise the route model and not enough for a turn to
+        // run: the backend answers `Select a model before continuing`, because
+        // its registry never learned about the Provider at all. Both files are
+        // therefore projected from the same binding.
+        "zcode" => {
+            let secret_env_key = require_secret_env_key(secret_env_key)?;
+            Ok(vec![zcode_personal_provider_overlay(
+                provider,
+                binding,
+                endpoint,
+                model,
+                secret_env_key,
+            )?])
+        }
+        _ => Ok(Vec::new()),
     }
-    vec![ManagedProjectionOverlay {
-        relative_path: "antigravity-acp/settings.json".to_string(),
-        format: "json".to_string(),
-        // Gateway mode: Antigravity's own model catalogue holds only its Gemini
-        // ids, so a route-group model id is refused as "not available for the
-        // current authentication method". Its `gateway` auth type replaces that
-        // catalogue with the `AGY_LLM_GATEWAY_MODELS` allowlist, which is what
-        // `antigravity_gateway_env` fills in.
-        content: serde_json::json!({ "auth": { "type": "gateway" } }).to_string(),
-        contains_secret_reference: false,
-    }]
 }
 
 /// The gateway-mode environment Antigravity needs to accept a projected Model.
@@ -3314,6 +3345,149 @@ fn zcode_overlay(
             }
         }
     }))
+}
+
+/// ZCode's personal provider table (`<home>/.zcode/v2/provider_config.json`).
+///
+/// The ACP bridge lists a user-added Provider from the legacy `config.json`
+/// provider map, but the backend registry that a Model id is resolved against
+/// is built from this table instead: since ZCode 3.12 its desktop writes
+/// user-added Providers here and the legacy map stopped syncing. Projecting
+/// only `config.json` is therefore enough for the picker — it advertises the
+/// route model — and not enough to run a turn. The first prompt materializes
+/// the real session, the backend cannot resolve the model, and the turn fails
+/// with `CONFIGURATION_ERROR Select a model before continuing` at
+/// `turnPhase: model_creation`, while the ACP journal still records a
+/// successful `session/new`.
+///
+/// The schema is ZCode's, validated when the CLI loads the file:
+/// `schemaVersion` plus `providerConfigRules.providerRules` for the Provider and
+/// `modelConfigRules.providerModelRules` for each model's capabilities. A
+/// Provider in the `standard-personal` group must not declare `group`-level
+/// model lists (they belong to the built-in groups), and `access` is where the
+/// credential lives for a personal Provider.
+fn zcode_personal_provider_overlay(
+    provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<ManagedProjectionOverlay> {
+    let provider_id = sanitize_provider_id(
+        provider
+            .vendor_hint
+            .as_deref()
+            .unwrap_or_else(|| provider.id.as_str()),
+    );
+    let secret = serde_json::Value::String(overlay_secret_placeholder(secret_env_key));
+    // The wire protocol ZCode speaks to the upstream. `openai-compatible` is
+    // ZCode's own name for anything that is not Anthropic Messages.
+    let api_type = match model.map(zcode_provider_kind) {
+        Some("anthropic") => "anthropic-messages",
+        _ => "openai-chat-completions",
+    };
+    let group = overlay_model_group(binding, model, zcode_provider_kind);
+    let mut model_ids = Vec::new();
+    let mut model_rules = Vec::new();
+    for model_binding in &group {
+        let Some(model_id) = projection_model_id(Some(model_binding)) else {
+            continue;
+        };
+        model_ids.push(serde_json::Value::String(model_id.to_string()));
+        let configured = provider
+            .configured_models
+            .iter()
+            .find(|configured| configured.id == model_binding.provider_model_id);
+        let capabilities = configured.map(|configured| &configured.capabilities);
+        let mut config = serde_json::Map::new();
+        config.insert("enabled".to_string(), serde_json::Value::Bool(true));
+        let mut properties = serde_json::Map::new();
+        if let Some(context) = capabilities.and_then(|value| value.context_tokens) {
+            properties.insert(
+                "contextWindow".to_string(),
+                serde_json::Value::from(context),
+            );
+        }
+        if !properties.is_empty() {
+            config.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(properties),
+            );
+        }
+        // An always-thinking gateway rejects the thinking-off level ZCode emits
+        // for its own background queries, so the vocabulary keeps the concrete
+        // variants and never a disable level. Same reasoning as the
+        // `config.json` entry: see `zcode_model_entry`.
+        if capabilities.is_none_or(|value| value.reasoning != Some(false)) {
+            config.insert(
+                "optionSpecs".to_string(),
+                serde_json::json!({
+                    "reasoningLevel": {
+                        "values": ZCODE_PROJECTED_REASONING_VARIANTS,
+                    },
+                }),
+            );
+        }
+        model_rules.push(serde_json::json!({
+            "providerId": provider_id,
+            "modelId": model_id,
+            "config": serde_json::Value::Object(config),
+        }));
+    }
+    if model_ids.is_empty()
+        && let Some(model_id) = projection_model_id(model)
+    {
+        model_ids.push(serde_json::Value::String(model_id.to_string()));
+    }
+
+    let mut provider_config = serde_json::Map::new();
+    provider_config.insert(
+        "group".to_string(),
+        serde_json::Value::String("standard-personal".to_string()),
+    );
+    provider_config.insert(
+        "api".to_string(),
+        serde_json::json!({
+            "type": api_type,
+            "baseUrl": endpoint.map(|endpoint| endpoint.url.as_str()),
+        }),
+    );
+    provider_config.insert(
+        "access".to_string(),
+        serde_json::json!({"type": "api-key", "apiKey": secret}),
+    );
+    provider_config.insert(
+        "personalModelIds".to_string(),
+        serde_json::Value::Array(model_ids.clone()),
+    );
+    provider_config.insert(
+        "modelOrder".to_string(),
+        serde_json::Value::Array(model_ids),
+    );
+
+    let content = serialized_json(serde_json::json!({
+        "schemaVersion": 1,
+        "config": {
+            "providerConfigRules": {
+                "providerRules": [{
+                    "providerId": provider_id,
+                    "providerName": provider.display_name,
+                    "enabled": true,
+                    "config": serde_json::Value::Object(provider_config),
+                }],
+            },
+            "modelConfigRules": {
+                "providerModelRules": model_rules,
+                "manualProviderModelRules": [],
+            },
+        },
+    }))?;
+    Ok(ManagedProjectionOverlay {
+        relative_path: ".zcode/v2/provider_config.json".to_string(),
+        format: "json".to_string(),
+        content,
+        contains_secret_reference: true,
+    })
 }
 
 /// Cline CLI's provider store.
@@ -6038,6 +6212,110 @@ mod tests {
         );
     }
 
+    /// ZCode's backend registry reads the personal provider table, not the
+    /// legacy `config.json` provider map.
+    ///
+    /// Projecting only `config.json` made the ACP picker advertise the route
+    /// model while the first prompt failed with
+    /// `CONFIGURATION_ERROR Select a model before continuing`: the backend had
+    /// never learned the Provider. Both files therefore describe the same
+    /// binding.
+    #[test]
+    fn zcode_personal_provider_table_matches_the_registry_schema() {
+        let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::ZcodeJson);
+        provider.configured_models[0].capabilities.context_tokens = Some(1_000_000);
+        let model = binding.configured_models[0].clone();
+
+        let overlay = zcode_personal_provider_overlay(
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            Some(&model),
+            "VIBEX_FAKE_API_KEY",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&overlay.content).unwrap();
+        assert_eq!(overlay.relative_path, ".zcode/v2/provider_config.json");
+        assert!(overlay.contains_secret_reference);
+        assert_eq!(value["schemaVersion"], 1);
+
+        let rule = &value["config"]["providerConfigRules"]["providerRules"][0];
+        assert_eq!(rule["providerId"], "fake");
+        assert_eq!(rule["enabled"], true);
+        // A personal Provider groups under the personal family; the built-in
+        // groups own their own model lists and reject one that carries these.
+        assert_eq!(rule["config"]["group"], "standard-personal");
+        assert_eq!(
+            rule["config"]["api"]["baseUrl"],
+            "https://user:pass@example.invalid/v1?token=never-preview"
+        );
+        assert_eq!(rule["config"]["api"]["type"], "openai-chat-completions");
+        assert_eq!(rule["config"]["access"]["type"], "api-key");
+        assert_eq!(
+            rule["config"]["access"]["apiKey"],
+            overlay_secret_placeholder("VIBEX_FAKE_API_KEY")
+        );
+        assert_eq!(
+            rule["config"]["personalModelIds"],
+            serde_json::json!(["model-a"])
+        );
+        assert_eq!(rule["config"]["modelOrder"], serde_json::json!(["model-a"]));
+
+        let model_rule = &value["config"]["modelConfigRules"]["providerModelRules"][0];
+        assert_eq!(model_rule["providerId"], "fake");
+        assert_eq!(model_rule["modelId"], "model-a");
+        assert_eq!(model_rule["config"]["enabled"], true);
+        assert_eq!(
+            model_rule["config"]["properties"]["contextWindow"],
+            1_000_000
+        );
+        assert_eq!(
+            model_rule["config"]["optionSpecs"]["reasoningLevel"]["values"],
+            serde_json::json!(["low", "high", "max"])
+        );
+
+        // An anthropic Messages binding states that protocol so the backend
+        // speaks it, rather than sending an Anthropic body to a Chat endpoint.
+        let mut anthropic_model = model.clone();
+        anthropic_model.wire_protocol_id = vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string();
+        let overlay = zcode_personal_provider_overlay(
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            Some(&anthropic_model),
+            "VIBEX_FAKE_API_KEY",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&overlay.content).unwrap();
+        assert_eq!(
+            value["config"]["providerConfigRules"]["providerRules"][0]["config"]["api"]["type"],
+            "anthropic-messages"
+        );
+    }
+
+    /// A Model that cannot think must not project a reasoning vocabulary: the
+    /// backend would then offer levels whose requests the route rejects.
+    #[test]
+    fn zcode_personal_provider_table_omits_reasoning_for_non_reasoning_models() {
+        let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::ZcodeJson);
+        provider.configured_models[0].capabilities.reasoning = Some(false);
+        let model = binding.configured_models[0].clone();
+        let overlay = zcode_personal_provider_overlay(
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            Some(&model),
+            "VIBEX_FAKE_API_KEY",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&overlay.content).unwrap();
+        assert!(
+            value["config"]["modelConfigRules"]["providerModelRules"][0]["config"]
+                .get("optionSpecs")
+                .is_none()
+        );
+    }
+
     #[test]
     fn zcode_overlay_projects_concrete_reasoning_variants_over_heuristic_vocabulary() {
         // Always-thinking gateways (e.g. glm-5.3-flash endpoints) reject
@@ -7958,7 +8236,16 @@ mod tests {
             .into_iter()
             .find(|descriptor| descriptor.route.agent_id.as_str() == "antigravity")
             .unwrap();
-        let overlays = agent_specific_overlays(&descriptor);
+        let (provider, _, binding) = typed_projection_fixture(&descriptor);
+        let overlays = agent_specific_overlays(
+            &descriptor,
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            binding.configured_models.first(),
+            Some("GEMINI_API_KEY"),
+        )
+        .unwrap();
         let overlay = overlays
             .iter()
             .find(|overlay| overlay.relative_path == "antigravity-acp/settings.json")
@@ -7974,7 +8261,6 @@ mod tests {
         );
         // With no endpoint or Model there is nothing to allowlist, so no
         // gateway environment is projected.
-        let (provider, _, _) = typed_projection_fixture(&descriptor);
         assert!(antigravity_gateway_env(None, None, &descriptor, &provider).is_empty());
 
         // Every other Agent keeps exactly the overlays its provider control
@@ -7984,7 +8270,19 @@ mod tests {
             .into_iter()
             .find(|descriptor| descriptor.route.agent_id.as_str() == "kimi")
             .unwrap();
-        assert!(agent_specific_overlays(&kimi).is_empty());
+        let (kimi_provider, _, kimi_binding) = typed_projection_fixture(&kimi);
+        assert!(
+            agent_specific_overlays(
+                &kimi,
+                &kimi_provider,
+                &kimi_binding,
+                kimi_provider.endpoints.first(),
+                kimi_binding.configured_models.first(),
+                Some("KIMI_API_KEY"),
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]

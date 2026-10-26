@@ -447,9 +447,31 @@ impl SessionConfigPlanner {
         let Some(category) = option.category.as_deref() else {
             return Ok(id_key);
         };
-        let category_key = self.option_key(category)?;
+        // A depth category names the reasoning dimension itself and does not
+        // group unrelated controls the way `model` does. Kimi Code is the case
+        // that forced this: it publishes `thinking` (`off`/`on`) in the
+        // `thought_level` category and ships no Registry alias, so the planner
+        // read the dimension as generic while the probe — which already treats
+        // that category as reasoning effort — advertised `off`/`on` to the
+        // composer. A level the catalogue offered could then never be applied:
+        // the apply loop dropped the field, the durable selection kept it, and
+        // every dispatch failed with
+        // `message_submission_runtime_binding_mismatch`. A Boolean toggle
+        // cannot carry a level, so it stays generic.
+        let category_is_depth = option.kind != ProviderSessionConfigOptionKind::Boolean
+            && matches!(
+                normalize_identifier(category).as_str(),
+                "thought_level" | "thinking_level" | "reasoning"
+            );
+        let category_key = if category_is_depth {
+            CanonicalSessionConfigKey::parse(CANONICAL_REASONING_EFFORT)
+                .map_err(|_| CanonicalKeyError::Invalid(category.to_string()))?
+        } else {
+            self.option_key(category)?
+        };
         let id_is_semantic = self.is_registered_semantic_key(&id_key);
-        let category_is_semantic = self.is_registered_semantic_key(&category_key);
+        let category_is_semantic =
+            category_is_depth || self.is_registered_semantic_key(&category_key);
         if id_is_semantic && category_is_semantic && id_key != category_key {
             return Err(CanonicalKeyError::Ambiguous(
                 BTreeSet::from([id_key, category_key])
@@ -2737,6 +2759,59 @@ mod tests {
             resolve_canonical_option_key(CANONICAL_MODEL, &reserved_collision),
             Err(CanonicalKeyError::Ambiguous(_))
         ));
+    }
+
+    /// Kimi Code's `thinking` select is a depth control, not a generic toggle.
+    ///
+    /// It publishes `thinking` (`off`/`on`) in the `thought_level` category and
+    /// ships no Registry alias. The probe already read that category as
+    /// reasoning effort and offered both levels to the composer, while the
+    /// planner read the option as generic — so a level the catalogue offered
+    /// could never be applied. The apply loop dropped the field, the durable
+    /// selection kept it, and every dispatch was refused with
+    /// `message_submission_runtime_binding_mismatch`.
+    #[test]
+    fn a_depth_category_is_the_reasoning_dimension() {
+        let planner = SessionConfigPlanner::new(
+            "adapter=kimi@2.2.0",
+            1,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            vec![catalog_option(
+                "thinking",
+                Some("thought_level"),
+                ProviderSessionConfigOptionKind::Select,
+                "on",
+                &[("off", "Thinking Off"), ("on", "Thinking On")],
+            )],
+        );
+        let reasoning_key = CanonicalSessionConfigKey::parse(CANONICAL_REASONING_EFFORT).unwrap();
+        let option = planner.option_for_key(&reasoning_key).unwrap().unwrap();
+        assert_eq!(option.id, "thinking");
+        assert!(planner.advertises_reasoning_effort());
+        assert!(planner.reasoning_effort_value_is_advertised("on"));
+
+        // A Boolean switch cannot carry a level, so it stays generic: a
+        // `thinking` toggle must not become a depth dimension.
+        let toggle = catalog_option(
+            "thinking",
+            Some("thought_level"),
+            ProviderSessionConfigOptionKind::Boolean,
+            "true",
+            &[],
+        );
+        let planner = SessionConfigPlanner::new(
+            "adapter=kimi@2.2.0",
+            1,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            vec![toggle],
+        );
+        assert!(
+            planner.option_for_key(&reasoning_key).unwrap().is_none(),
+            "a Boolean toggle is not a reasoning depth"
+        );
+        assert!(!planner.advertises_reasoning_effort());
     }
 
     #[test]

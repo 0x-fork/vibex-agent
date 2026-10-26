@@ -526,6 +526,55 @@ runtime switch or a turn on an Agent that was otherwise healthy.
   counting it kept Kimi Code's selection carrying a level the Agent has no
   field for, and every dispatch was refused with
   `message_submission_runtime_binding_mismatch`.
+- **A depth *category* is the reasoning dimension, whatever the option id is.**
+  Kimi Code publishes `thinking` (`off`/`on`) in the `thought_level` category
+  and ships no Registry alias. `extract_probe_reasoning_efforts` already read
+  that category as reasoning effort and offered both levels to the composer,
+  while `SessionConfigPlanner::option_key_for_option` resolved the option to
+  its own id — so the level the catalogue offered could never be applied. The
+  apply loop dropped the field, the durable selection kept it, and every
+  dispatch was refused with `message_submission_runtime_binding_mismatch`.
+  `thought_level` / `thinking_level` / `reasoning` categories now resolve to
+  `reasoning_effort`, and a Boolean option stays generic because it cannot
+  carry a level.
+- **A wire name must be an identifier, not a label.** Antigravity validates
+  `mcpServers[].name` against `^[a-zA-Z0-9_-]+$` and refuses the whole
+  `session/new` with `-32602 Invalid params` when a display name such as
+  "Agent delegation" arrives; Gemini CLI turns the same value into its
+  `mcp_<server>_<tool>` function names, which its OpenAI-backed upstream then
+  rejects for the same reason. The descriptor therefore keeps the label and
+  puts a sanitized form on the wire, falling back to the stable id when the
+  label has nothing usable in it.
+- **A gateway projection has no ACP authentication method to select.**
+  Antigravity advertises only `oauth-*`, `gemini-api-key` and
+  `agent-platform`; calling `authenticate` on a gateway projection rewrites
+  `settings.json` back from `{"auth":{"type":"gateway"}}`, and its `model`
+  config option then answers `Model '<route id>' is not available for the
+  current authentication method` because the API-key catalogue holds only
+  Gemini ids. The launch skips the handshake when
+  `AGY_ACP_ENABLE_GATEWAY_AUTH=true` is projected.
+- **A protocol's tool-name charset is not shared.** Gemini allows `.` and `:`
+  in a function name (its MCP bridge rewrites only `[^a-zA-Z0-9_\-.:]`),
+  while OpenAI and Anthropic accept only `[a-zA-Z0-9_-]` and at most 64
+  characters. A Gemini client therefore sends
+  `mcp_com.browser-use_browser-use_browser_click`, and the upstream rejects the
+  whole request (`Invalid 'tools[36].function.name': string does not match
+  pattern`). The gateway rewrites the name into the target vocabulary and
+  remembers the mapping, because the reply has to name the tool the client can
+  actually call. The rewrite is deterministic (sorted, digest-suffixed on
+  truncation) so a resumed conversation replays the same names and a retry does
+  not miss the prompt cache; a passthrough is left alone because its reply is
+  never re-encoded.
+- **A backend registry is not the ACP picker's provider list.** ZCode's bridge
+  lists user-added Providers from the legacy `config.json` provider map, but
+  the backend registry a Model id is resolved against is built from the
+  personal table (`<home>/.zcode/v2/provider_config.json`); since 3.12 the
+  desktop writes it there and the legacy map stopped syncing. Projecting only
+  `config.json` made the picker advertise the route model while the first
+  prompt failed with `CONFIGURATION_ERROR Select a model before continuing` at
+  `turnPhase: model_creation` — with the ACP journal still recording a
+  successful `session/new`, because the session is created lazily. Both files
+  are projected from one binding.
 - **A vendor tool type the upstream cannot serve is dropped, not fatal.** A
   Responses client may offer built-ins (`web_search`, `web_search_preview`,
   `custom`, ...) that only OpenAI serves; forwarding one verbatim makes the
@@ -567,6 +616,12 @@ runtime switch or a turn on an Agent that was otherwise healthy.
 `a_vendor_tool_type_the_upstream_cannot_serve_is_dropped`,
 `dropping_every_tool_removes_the_key`,
 `a_probe_without_a_reasoning_dimension_reports_none`,
+`a_depth_category_is_the_reasoning_dimension`,
+`mcp_server_wire_names_are_identifiers`,
+`zcode_personal_provider_table_matches_the_registry_schema`,
+`a_dotted_name_is_rewritten_and_restored`,
+`a_tool_name_the_target_protocol_refuses_is_rewritten_and_restored`,
+`a_rewritten_tool_name_comes_back_as_the_clients_own`,
 `only_antigravity_gets_an_extra_overlay`,
 `a_refused_option_keeps_the_agents_own_words` and
 `a_field_refusal_reaches_the_operation_journal` for the detail path;
