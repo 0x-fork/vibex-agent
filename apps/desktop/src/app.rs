@@ -55731,16 +55731,18 @@ impl VibexWorkbench {
                             .children(tabs),
                     )
                     .child(
+                        // Matches the editor strip's "new tab" button: the same
+                        // ghost, compact presentation and leading gap, and no
+                        // divider or fixed width — the button is a tab-strip
+                        // action, not a separate cell of the header.
                         Button::new("new-composer-terminal")
                             .small()
                             .ghost()
                             .compact()
-                            .h_full()
-                            .w(px(38.0))
-                            .rounded_none()
-                            .border_l_1()
-                            .border_color(cx.theme().border)
+                            .ml_1()
+                            .flex_none()
                             .icon(IconName::Plus)
+                            .text_color(cx.theme().muted_foreground)
                             .tooltip(locale::text("New terminal", "新建终端", "新增終端機"))
                             .disabled(self.agent_action_pending || self.view_session_id.is_none())
                             .on_click(cx.listener(|this, _, window, cx| {
