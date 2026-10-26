@@ -1244,6 +1244,13 @@ pub struct ManagementCenter {
     /// so the icon routes to the settings page instead of flipping.
     computer_tools_ready: bool,
     selected_provider_profile_id: Option<String>,
+    /// Which route group the Agent's Provider card has selected.
+    ///
+    /// A route-group row answers the same question a Provider row does — which
+    /// model source this card is describing — so it takes the same selected
+    /// state instead of reporting itself only through a badge. The two ids are
+    /// kept apart because only one list may own the selection at a time.
+    selected_agent_route_id: Option<String>,
     agent_auth_scope: Option<(String, Option<String>)>,
     agent_auth_catalog: Option<AgentAuthCatalog>,
     agent_auth_context: Option<AgentAuthContext>,
@@ -2098,6 +2105,7 @@ impl ManagementCenter {
             agent_tools: vibex_core::AgentToolPreferences::default(),
             computer_tools_ready: false,
             selected_provider_profile_id: None,
+            selected_agent_route_id: None,
             agent_auth_scope: None,
             agent_auth_catalog: None,
             agent_auth_context: None,
@@ -2591,11 +2599,94 @@ impl ManagementCenter {
             return;
         }
         self.selected_provider_profile_id = Some(profile_id);
+        // One row is selected per card, and choosing a Provider answers the
+        // question a route group's row was answering.
+        self.selected_agent_route_id = None;
         self.selected_acp_profile_id = None;
         self.acp_config_draft = None;
         self.native_export_preview = None;
         self.sync_projection_editor();
         cx.notify();
+    }
+
+    /// Selects one route-group row on the Agent's Provider card.
+    ///
+    /// It clears the Provider selection for the same reason the Provider path
+    /// clears this one: the two lists sit under one heading and a second
+    /// highlighted row would say two rows are the card's subject.
+    fn select_agent_route_group(&mut self, route_id: String, cx: &mut Context<Self>) {
+        if self.selected_agent_route_id.as_deref() == Some(route_id.as_str()) {
+            return;
+        }
+        self.selected_agent_route_id = Some(route_id);
+        self.selected_provider_profile_id = None;
+        self.selected_acp_profile_id = None;
+        self.acp_config_draft = None;
+        self.native_export_preview = None;
+        self.sync_projection_editor();
+        cx.notify();
+    }
+
+    /// Makes a bound route group the one this Agent launches through.
+    ///
+    /// Binding does not choose among the Agent's groups; the default is a
+    /// separate flag on the binding. The row's check is that choice, so it
+    /// writes through the same command the Provider row's check writes the
+    /// default Profile with.
+    fn set_default_agent_route_group(
+        &mut self,
+        route_id: vibex_core::ModelRouteId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(agent_id) = self
+            .selected_agent_id
+            .clone()
+            .and_then(|agent_id| vibex_core::AgentId::parse(agent_id).ok())
+        else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let active_locale = locale::current_locale();
+        self.error = None;
+        self.mutation = Some(ManagementMutation::Gateway);
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .set_agent_default_model_route(vibex_backend::MutationRequest::new(
+                    vibex_core::AgentModelRouteDefaultRequest {
+                        agent_id,
+                        model_route_id: route_id,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(()) => {
+                        this.notice = Some(
+                            management_locale_text_for(
+                                active_locale,
+                                "Default route group updated",
+                                "默认路由组已更新",
+                                "預設路由組已更新",
+                            )
+                            .to_string(),
+                        );
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
     }
 
     fn current_agent_auth_scope(&self) -> Option<(String, Option<String>)> {
@@ -19656,9 +19747,9 @@ impl ManagementCenter {
                                     .font_medium()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(management_locale_text(
-                                        "Create a new Provider for this Agent",
-                                        "为这个 Agent 新建供应商",
-                                        "為這個 Agent 新增供應商",
+                                        "Create a new configuration for this Agent",
+                                        "为这个 Agent 新建配置",
+                                        "為這個 Agent 新增配置",
                                     )),
                             )
                             .child(create_rows),
@@ -21866,109 +21957,6 @@ impl ManagementCenter {
             .into_any_element()
     }
 
-    /// The gateway's state as the Provider card states it.
-    ///
-    /// The card used to say nothing about the gateway, and a separate routing
-    /// section said everything. Moving the gateway here means a reader sees the
-    /// address a route group would call and whether it can answer, without
-    /// leaving the page that lists the Providers it composes.
-    ///
-    /// The switch itself is not here. The gateway is one installation-wide
-    /// setting, so it lives on the Providers page and nowhere else; this block
-    /// only reports the resulting state for the Agent being edited.
-    fn render_agent_gateway_summary(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        self.schedule_gateway_cooldown_refresh(cx);
-        let snapshot = self.gateway.clone();
-        let status = &snapshot.runtime;
-        let address = status.base_url().unwrap_or_else(|| {
-            management_locale_text("not running", "未运行", "未執行").to_string()
-        });
-        let key_summary = gateway_overall_key_summary(&snapshot, locale::current_locale());
-        let enabled = snapshot.settings.policy.enabled;
-        let configurable = self
-            .selected_agent_id
-            .as_deref()
-            .and_then(|agent_id| vibex_core::AgentId::parse(agent_id.to_string()).ok())
-            .is_some_and(|agent_id| {
-                vibex_core::model_provider_configurable_agent_ids()
-                    .map(|ids| ids.contains(&agent_id))
-                    .unwrap_or(false)
-            });
-        v_flex()
-            .w_full()
-            .min_w_0()
-            .gap_1()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(if status.status.is_routable() && enabled {
-                cx.theme().border.opacity(0.7)
-            } else {
-                cx.theme().warning.opacity(0.7)
-            })
-            .px_2()
-            .py_1p5()
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .child(Icon::default().path("icons/vibex/server.svg").small())
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_sm()
-                            .font_medium()
-                            .child(snapshot.settings.display_name.clone()),
-                    )
-                    .child(gateway_status_badge(status, cx)),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .truncate()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!("{address} · {key_summary}")),
-            )
-            .when(!enabled || !status.status.is_routable(), |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(if !enabled {
-                            management_locale_text(
-                                "The gateway is off. Route groups need it, so turn it on from the Providers page.",
-                                "网关已关闭。路由组需要它，请在供应商页面打开。",
-                                "閘道已關閉。路由組需要它，請在供應商頁面開啟。",
-                            )
-                        } else {
-                            management_locale_text(
-                                "The gateway is not running. Turn it on from the Providers page.",
-                                "网关未运行，请在供应商页面打开。",
-                                "閘道未執行，請在供應商頁面開啟。",
-                            )
-                        }),
-                )
-            })
-            .when(configurable && enabled && status.status.is_routable(), |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(management_locale_text(
-                            "This Agent uses the gateway through the route groups it is bound to. Unbinding its last group leaves it with no route group to use.",
-                            "该 Agent 通过绑定的路由组使用网关。解绑最后一个路由组后，它将没有可用的路由组。",
-                            "該 Agent 透過綁定的路由組使用閘道。解綁最後一個路由組後，它將沒有可用的路由組。",
-                        )),
-                )
-            })
-            .into_any_element()
-    }
-
     /// Opens the route-group editor on an empty draft.
     ///
     /// `from_agent` decides only what happens after the save: on an Agent's
@@ -22379,6 +22367,12 @@ impl ManagementCenter {
     /// references and offers to add or drop a reference. Deleting the record
     /// itself belongs to the Providers page, where every Agent it affects is
     /// visible at once.
+    ///
+    /// The rows share the Provider row's frame — same height, radius, fill,
+    /// selection wash, hover reveal and action buttons — because the two lists
+    /// answer one question between them: which model source this Agent uses.
+    /// A group row differs only in what it says: a route mark instead of a
+    /// vendor brand, and the members it composes instead of one address.
     fn render_agent_route_groups(
         &mut self,
         _window: &mut Window,
@@ -22396,7 +22390,21 @@ impl ManagementCenter {
             })
             .map(|binding| binding.model_route_id.clone())
             .collect::<Vec<_>>();
-        let mut rows = v_flex().w_full().min_w_0().gap_2();
+        // The default flag lives on the binding, not on the group, so it is read
+        // here from the same list the rows came from.
+        let default_route_id = self
+            .agent_model_route_bindings
+            .iter()
+            .find(|binding| {
+                binding.agent_id.as_str() == agent_id
+                    && binding.deleted_at_ms.is_none()
+                    && binding.is_default
+            })
+            .map(|binding| binding.model_route_id.clone());
+        let mut rows = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap(px(MANAGEMENT_PROVIDER_ROW_GAP));
         let mut groups = self
             .model_routes
             .iter()
@@ -22410,8 +22418,11 @@ impl ManagementCenter {
                 .cmp(&right.display_name.to_lowercase())
         });
         let any = !groups.is_empty();
+        let selected_route_id = self.selected_agent_route_id.clone();
         for route in groups {
             let route_id = route.id.clone();
+            let hover_group: SharedString =
+                format!("route-group-row-hover-{}", route_id.as_str()).into();
             let models = vibex_core::provider_group_models(&route, &self.providers);
             let providers = route
                 .enabled_members()
@@ -22429,132 +22440,247 @@ impl ManagementCenter {
                     binding.model_route_id == route.id && binding.deleted_at_ms.is_none()
                 })
                 .count();
+            let is_default = default_route_id.as_ref() == Some(&route.id);
+            let active = selected_route_id.as_deref() == Some(route_id.as_str());
+            let select_id = route_id.as_str().to_string();
             let edit_id = route_id.clone();
             let remove_id = route_id.clone();
+            let default_id = route_id.clone();
+            let selectable = h_flex()
+                .id(SharedString::from(format!(
+                    "management-route-group-select-{}",
+                    route_id.as_str()
+                )))
+                .flex_1()
+                .min_w_0()
+                .min_h(px(72.0))
+                .items_center()
+                .gap_3()
+                .cursor_pointer()
+                .px_3()
+                .py(px(12.0))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_agent_route_group(select_id.clone(), cx);
+                }))
+                // The Provider row opens with a 36px grip gutter before its
+                // glyph. A group row has nothing to grab — its order is its
+                // members' order, set in the editor — but it keeps the gutter
+                // so both lists put their glyph in the same column.
+                .child(div().flex_none().w(px(36.0)).h(px(1.0)))
+                .child(management_route_group_glyph(is_default, cx))
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .child(route.display_name.clone()),
+                                )
+                                .when(is_default, |header| {
+                                    header.child(management_status_badge(
+                                        management_locale_text("Default", "默认", "預設")
+                                            .to_string(),
+                                        cx,
+                                    ))
+                                })
+                                .when(route.status != vibex_core::RouteStatus::Enabled, |header| {
+                                    header.child(Tag::secondary().xsmall().child(
+                                        management_locale_text("Disabled", "已停用", "已停用"),
+                                    ))
+                                })
+                                .when(users > 1, |header| {
+                                    // A group several Agents reference is not
+                                    // this Agent's to delete, so the row says so
+                                    // before the reader looks for a delete.
+                                    header.child(Tag::secondary().xsmall().child(
+                                        management_route_group_users_label(users),
+                                    ))
+                                }),
+                        )
+                        // Two lines, like the Provider row beside it: a
+                        // name and the thing the source serves. A Provider
+                        // row's second line is the address it calls; a
+                        // group's is the models it can answer with. Members,
+                        // count and strategy still describe the row, so they
+                        // go in its tooltip rather than adding a third line
+                        // that would put the two lists on different pitches.
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(if models.is_empty() {
+                                    cx.theme().warning
+                                } else {
+                                    cx.theme().muted_foreground
+                                })
+                                .child(if models.is_empty() {
+                                    management_locale_text(
+                                        "These Providers share no enabled model, so the group cannot answer.",
+                                        "这些供应商没有共同启用的模型，路由组无法工作。",
+                                        "這些供應商沒有共同啟用的模型，路由組無法運作。",
+                                    )
+                                    .to_string()
+                                } else {
+                                    models
+                                        .iter()
+                                        .map(|model| model.model_id.clone())
+                                        .collect::<Vec<_>>()
+                                        .join(" · ")
+                                }),
+                        ),
+                )
+                .tooltip({
+                    let detail = format!(
+                        "{} · {} · {}",
+                        if providers.is_empty() {
+                            management_locale_text(
+                                "no Provider left",
+                                "供应商已不存在",
+                                "供應商已不存在",
+                            )
+                            .to_string()
+                        } else {
+                            providers.join(" + ")
+                        },
+                        management_route_group_model_count(models.len()),
+                        management_route_strategy_label(route.strategy),
+                    );
+                    move |window, cx| Tooltip::new(detail.clone()).build(window, cx)
+                });
+            // The same visible-on-hover action rail a Provider row has. The
+            // check writes the default binding, the pencil opens the group and
+            // the close ends this Agent's reference; none of them delete the
+            // record, which only the Providers page may do.
+            let mut actions = h_flex()
+                .flex_none()
+                .items_center()
+                .justify_end()
+                .gap_1()
+                .pr_3()
+                .invisible()
+                .group_hover(&hover_group, |style| style.visible());
+            if !is_default {
+                actions = actions.child(button_with_aria_label(
+                    Button::new(SharedString::from(format!(
+                        "management-route-group-default-{}",
+                        default_id.as_str()
+                    )))
+                    .with_size(Size::Medium)
+                    .secondary()
+                    .compact()
+                    .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
+                    .icon(IconName::Check)
+                    .tooltip(management_locale_text(
+                        "Set as default route group",
+                        "设为默认路由组",
+                        "設為預設路由組",
+                    ))
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_default_agent_route_group(default_id.clone(), cx)
+                    })),
+                    management_locale_text(
+                        "Set as default route group",
+                        "设为默认路由组",
+                        "設為預設路由組",
+                    ),
+                ));
+            }
+            actions = actions
+                .child(button_with_aria_label(
+                    Button::new(SharedString::from(format!(
+                        "management-route-group-edit-{}",
+                        route_id.as_str()
+                    )))
+                    .with_size(Size::Medium)
+                    .secondary()
+                    .compact()
+                    .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
+                    .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                    .disabled(pending)
+                    .tooltip(management_locale_text(
+                        "Edit group",
+                        "编辑路由组",
+                        "編輯路由組",
+                    ))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.edit_route_group(edit_id.clone(), true, window, cx)
+                    })),
+                    management_locale_text("Edit route group", "编辑路由组", "編輯路由組"),
+                ))
+                .child(button_with_aria_label(
+                    Button::new(SharedString::from(format!(
+                        "management-route-group-remove-{}",
+                        route_id.as_str()
+                    )))
+                    .with_size(Size::Medium)
+                    .danger()
+                    .compact()
+                    .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
+                    .icon(IconName::Close)
+                    .disabled(pending)
+                    .tooltip(management_locale_text(
+                        "Stop using in this Agent",
+                        "在该 Agent 中停用",
+                        "在該 Agent 中停用",
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.unbind_route_group(remove_id.clone(), cx)
+                    })),
+                    management_locale_text(
+                        "Stop using this route group in this Agent",
+                        "在该 Agent 中停用此路由组",
+                        "在該 Agent 中停用此路由組",
+                    ),
+                ));
             rows = rows.child(
-                v_flex()
+                div()
                     .id(SharedString::from(format!(
                         "management-route-group-{}",
                         route_id.as_str()
                     )))
+                    .group(hover_group)
+                    .relative()
+                    .flex()
+                    .items_center()
                     .w_full()
                     .min_w_0()
-                    .gap_1()
+                    .min_h(px(MANAGEMENT_PROVIDER_ROW_HEIGHT))
+                    .overflow_hidden()
                     .rounded(px(8.0))
                     .border_1()
-                    .border_color(cx.theme().border.opacity(0.7))
-                    .p_2()
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Icon::default()
-                                    .path("icons/vibex/git-branch.svg")
-                                    .size(px(16.0)),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child(route.display_name.clone()),
-                            )
-                            .when(users > 1, |this| {
-                                // A group several Agents reference is not this
-                                // Agent's to delete, and the card has to say so
-                                // before the reader looks for a delete button.
-                                this.child(Tag::secondary().xsmall().child(
-                                    management_route_group_users_label(users),
-                                ))
-                            })
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "management-route-group-edit-{}",
-                                    route_id.as_str()
-                                )))
-                                .xsmall()
-                                .ghost()
-                                .compact()
-                                .icon(Icon::default().path("icons/vibex/pencil.svg"))
-                                .tooltip(management_locale_text(
-                                    "Edit group",
-                                    "编辑路由组",
-                                    "編輯路由組",
-                                ))
-                                .accessibility_label(management_locale_text(
-                                    "Edit route group",
-                                    "编辑路由组",
-                                    "編輯路由組",
-                                ))
-                                .disabled(pending)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.edit_route_group(edit_id.clone(), true, window, cx)
-                                })),
-                            )
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "management-route-group-remove-{}",
-                                    route_id.as_str()
-                                )))
-                                .xsmall()
-                                .ghost()
-                                .compact()
-                                .icon(IconName::Close)
-                                .tooltip(management_locale_text(
-                                    "Stop using in this Agent",
-                                    "在该 Agent 中停用",
-                                    "在該 Agent 中停用",
-                                ))
-                                .accessibility_label(management_locale_text(
-                                    "Stop using this route group in this Agent",
-                                    "在该 Agent 中停用此路由组",
-                                    "在該 Agent 中停用此路由組",
-                                ))
-                                .disabled(pending)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.unbind_route_group(remove_id.clone(), cx)
-                                })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{} · {} · {}",
-                                providers.join(" + "),
-                                management_route_group_model_count(models.len()),
-                                management_route_strategy_label(route.strategy)
-                            )),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if models.is_empty() {
-                                management_locale_text(
-                                    "These Providers share no enabled model, so the group cannot answer.",
-                                    "这些供应商没有共同启用的模型，路由组无法工作。",
-                                    "這些供應商沒有共同啟用的模型，路由組無法運作。",
-                                )
-                                .to_string()
-                            } else {
-                                models
-                                    .iter()
-                                    .map(|model| model.model_id.clone())
-                                    .collect::<Vec<_>>()
-                                    .join(" · ")
-                            }),
-                    ),
+                    .border_color(if active {
+                        // Matches the Provider row's selected surface: the wash
+                        // carries the selection, so both lists read alike.
+                        cx.theme().primary.opacity(0.0)
+                    } else {
+                        cx.theme().border.opacity(0.65)
+                    })
+                    .bg(if active {
+                        cx.theme().primary.opacity(0.08)
+                    } else {
+                        cx.theme().background.opacity(0.90)
+                    })
+                    .hover(|style| {
+                        style.bg(if active {
+                            cx.theme().primary.opacity(0.08)
+                        } else {
+                            cx.theme().accent
+                        })
+                    })
+                    .cursor_pointer()
+                    .child(selectable)
+                    .child(actions),
             );
         }
         if !any {
@@ -22576,6 +22702,8 @@ impl ManagementCenter {
             .gap_2()
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .text_xs()
                     .font_semibold()
                     .text_color(cx.theme().muted_foreground)
@@ -23515,153 +23643,122 @@ impl ManagementCenter {
         }
 
         let installation = self.render_agent_installation_card(&selected_agent, window, cx);
-        let provider_configuration = if profiles.is_empty() {
-            EmptyState::new()
-                .flex_none()
-                .min_h(px(180.0))
-                .gap_3()
-                .py_4()
-                .header(
-                    EmptyHeader::new()
-                        .max_w(px(420.0))
-                        .title(EmptyTitle::new().child(copy.no_profiles))
-                        .description(
-                            EmptyDescription::new()
-                                .text_xs()
-                                .child(copy.no_profiles_description),
-                        ),
-                )
-                .content(
-                    EmptyContent::new().child(
-                        h_flex()
-                            .flex_wrap()
-                            .items_center()
-                            .justify_center()
-                            .gap_2()
-                            .child(
-                                Button::new("provider-empty-add-configuration")
-                                    .small()
-                                    .primary()
-                                    .icon(IconName::Plus)
-                                    .label(copy.add_configuration)
-                                    .disabled(pending)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_profile_creator(window, cx);
-                                    })),
-                            )
-                            .children(native_import_supported.then(|| {
-                                Button::new("provider-empty-import-existing")
-                                    .small()
-                                    .secondary()
-                                    .icon(Icon::default().path("icons/vibex/import.svg"))
-                                    .label(copy.import_configuration)
-                                    .loading(native_importing)
-                                    .disabled(pending)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let agent_id = this.selected_agent_id.clone();
-                                        this.preview_native_import(true, agent_id, cx)
-                                    }))
+        // One toolbar owns every way this Agent gains a model source, and every
+        // row sits below it. The lists used to each carry their own controls,
+        // which put a group row above the Provider heading and the Add button
+        // between the two — so the reader could not tell which list the button
+        // added to, and rows appeared on both sides of it.
+        let add_rows = h_flex()
+            .w_full()
+            .min_w_0()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_source_count_for_agent(
+                        profiles.len(),
+                        self.selected_agent_id
+                            .as_deref()
+                            .map(|agent_id| {
+                                self.agent_model_route_bindings
+                                    .iter()
+                                    .filter(|binding| {
+                                        binding.agent_id.as_str() == agent_id
+                                            && binding.deleted_at_ms.is_none()
+                                    })
+                                    .count()
+                            })
+                            .unwrap_or(0),
+                    )),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .flex_wrap()
+                    .justify_end()
+                    .gap_2()
+                    .children(native_import_supported.then(|| {
+                        management_detail_icon_action(
+                            Button::new("provider-import-existing")
+                                .small()
+                                .secondary()
+                                .icon(Icon::default().path("icons/vibex/import.svg"))
+                                .loading(native_importing)
+                                .disabled(pending)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let agent_id = this.selected_agent_id.clone();
+                                    this.preview_native_import(true, agent_id, cx)
+                                })),
+                            copy.import_configuration,
+                        )
+                    }))
+                    .child(management_detail_icon_action(
+                        Button::new("provider-add-configuration")
+                            .small()
+                            .primary()
+                            .icon(IconName::Plus)
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_profile_creator(window, cx);
                             })),
-                    ),
-                )
-                .into_any_element()
-        } else {
+                        copy.add_configuration,
+                    )),
+            );
+        // Providers and route groups share one column under that toolbar. Both
+        // answer "which model will this Agent use", so the card states one list
+        // of sources rather than two surfaces that each looked complete.
+        let route_groups = self.render_agent_route_groups(window, cx);
+        let providers = if profiles.is_empty() {
+            // The empty card keeps the same shape as a populated one: the same
+            // heading, and the guidance where the rows will appear. Only the
+            // words change when the first Provider arrives.
             v_flex()
                 .w_full()
                 .min_w_0()
-                .gap_3()
+                .gap_1()
+                .py_2()
+                .child(div().text_sm().font_medium().child(copy.no_profiles))
                 .child(
-                    h_flex()
-                        .w_full()
-                        .min_w_0()
-                        .flex_wrap()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_route_count_for_agent(
-                                    self.selected_agent_id
-                                        .as_deref()
-                                        .map(|agent_id| {
-                                            self.agent_model_route_bindings
-                                                .iter()
-                                                .filter(|binding| {
-                                                    binding.agent_id.as_str() == agent_id
-                                                        && binding.deleted_at_ms.is_none()
-                                                })
-                                                .count()
-                                        })
-                                        .unwrap_or(0),
-                                )),
-                        )
-                        .child(
-                            h_flex()
-                                .flex_none()
-                                .flex_wrap()
-                                .justify_end()
-                                .gap_2()
-                                .children(native_import_supported.then(|| {
-                                    management_detail_icon_action(
-                                        Button::new("provider-import-existing")
-                                            .small()
-                                            .secondary()
-                                            .icon(Icon::default().path("icons/vibex/import.svg"))
-                                            .loading(native_importing)
-                                            .disabled(pending)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                let agent_id = this.selected_agent_id.clone();
-                                                this.preview_native_import(true, agent_id, cx)
-                                            })),
-                                        copy.import_configuration,
-                                    )
-                                }))
-                                .child(management_detail_icon_action(
-                                    Button::new("provider-add-configuration")
-                                        .small()
-                                        .primary()
-                                        .icon(IconName::Plus)
-                                        .disabled(pending)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.open_profile_creator(window, cx);
-                                        })),
-                                    copy.add_configuration,
-                                )),
-                        ),
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(copy.no_profiles_description),
                 )
-                .child(profile_rows)
                 .into_any_element()
+        } else {
+            profile_rows.into_any_element()
         };
-        // Route groups sit beside the Providers inside the same card: both
-        // answer "which model will this Agent use", and the gateway is what a
-        // group is served by. Keeping them together is what makes the
-        // relationship legible instead of a separate section that named routes
-        // while this one named Providers.
-        let route_groups = self.render_agent_route_groups(window, cx);
-        let gateway_summary = self.render_agent_gateway_summary(cx);
         let provider_configuration = v_flex()
             .w_full()
             .min_w_0()
             .gap_3()
-            .child(gateway_summary)
+            .child(add_rows)
             .child(route_groups)
             .child(
-                div()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text("Providers", "供应商", "供應商")),
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text("Providers", "供应商", "供應商")),
+                    )
+                    .child(providers),
             )
-            .child(provider_configuration)
             .into_any_element();
         let provider_configuration = management_card_with_icon(
             copy.provider_configuration,
             management_locale_text(
-                "Credentials, models, route groups, and the gateway they may use",
-                "凭证、模型、路由组，以及它们可能使用的网关",
-                "憑證、模型、路由組，以及它們可能使用的閘道",
+                "Credentials, models, and the route groups that compose them",
+                "凭证、模型，以及组合它们的路由组",
+                "憑證、模型，以及組合它們的路由組",
             ),
             "icons/vibex/database.svg",
             provider_configuration,
@@ -28705,6 +28802,44 @@ fn management_profile_glyph(
         .into_any_element()
 }
 
+/// The glyph that opens a route-group row.
+///
+/// It takes the frame a Provider row's brand tile takes — same size, radius,
+/// border and fill — so the two rows read as one list of model sources. Only
+/// the mark inside differs: a group composes Providers rather than speaking to
+/// one vendor, so it carries the route mark instead of a vendor brand.
+fn management_route_group_glyph(is_default: bool, cx: &App) -> AnyElement {
+    div()
+        .size(px(42.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(if is_default {
+            cx.theme().primary.opacity(0.25)
+        } else {
+            cx.theme().border.opacity(0.70)
+        })
+        .bg(if is_default {
+            cx.theme().primary.opacity(0.08)
+        } else {
+            cx.theme().muted.opacity(0.35)
+        })
+        .child(
+            Icon::default()
+                .path("icons/vibex/git-branch.svg")
+                .size(px(22.0))
+                .text_color(if is_default {
+                    cx.theme().primary
+                } else {
+                    cx.theme().foreground.opacity(0.78)
+                }),
+        )
+        .into_any_element()
+}
+
 fn management_status_badge(label: String, _cx: &App) -> AnyElement {
     Tag::secondary().xsmall().child(label).into_any_element()
 }
@@ -32216,15 +32351,18 @@ fn detail_empty_state(
 
 /// How many compositions one Agent holds.
 ///
-/// The Provider card used to count configurations, which answered "how many
-/// Providers does this Agent have". After routing, the question a reader has is
-/// "how many compositions", so the count moved with the meaning rather than
-/// showing the same number under a new label.
-fn management_route_count_for_agent(count: usize) -> String {
+/// What the Agent's card holds, counted the way the card lists it.
+///
+/// The count used to be routes alone, which read as a fact about a list that
+/// appeared under a heading of its own. The card now shows Providers and route
+/// groups in one column, so the line names both: a reader comparing two Agents
+/// has to be able to tell a card with three Providers from one with three
+/// groups.
+fn management_source_count_for_agent(providers: usize, route_groups: usize) -> String {
     match locale::current_locale() {
-        ResolvedLocale::En => format!("{count} route(s)"),
-        ResolvedLocale::ZhCn => format!("{count} 份路由"),
-        ResolvedLocale::ZhTw => format!("{count} 份路由"),
+        ResolvedLocale::En => format!("{providers} Provider(s) · {route_groups} route group(s)"),
+        ResolvedLocale::ZhCn => format!("{providers} 个供应商 · {route_groups} 个路由组"),
+        ResolvedLocale::ZhTw => format!("{providers} 個供應商 · {route_groups} 個路由組"),
     }
 }
 
@@ -36536,29 +36674,50 @@ mod tests {
         );
     }
 
+    /// The card has one toolbar, and every row sits below it.
+    ///
+    /// The empty state used to be a second surface with its own labelled Add
+    /// and Import buttons, while the populated list had a third copy of them in
+    /// its own header. One toolbar now owns both actions, so an empty card and
+    /// a populated one put the same control in the same place, and the rows
+    /// start under it instead of appearing on both sides.
     #[test]
-    fn model_provider_empty_state_centers_labeled_add_and_import_actions() {
+    fn model_provider_card_has_one_toolbar_above_every_row() {
         let source = include_str!("management.rs");
         let render = source
             .split_once("    fn render_providers(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp("))
             .map(|(body, _)| body)
             .expect("Provider renderer should remain inspectable");
-        let empty = render
-            .split_once("let provider_configuration = if profiles.is_empty()")
-            .and_then(|(_, tail)| tail.split_once("} else {"))
-            .map(|(body, _)| body)
-            .expect("Provider empty state should remain inspectable");
 
-        assert!(empty.contains(".items_center()"));
-        assert!(empty.contains(".justify_center()"));
-        assert!(empty.contains("provider-empty-add-configuration"));
-        assert!(empty.contains("provider-empty-import-existing"));
-        assert!(empty.contains(".label(copy.add_configuration)"));
-        assert!(empty.contains(".label(copy.import_configuration)"));
-        assert!(empty.contains("this.open_profile_creator(window, cx)"));
-        assert!(empty.contains("this.preview_native_import(true, agent_id, cx)"));
-        assert!(!empty.contains("compact_empty_state("));
+        let toolbar = render
+            .split_once("let add_rows = h_flex()")
+            .map(|(_, tail)| tail)
+            .expect("the toolbar should remain inspectable");
+        assert!(toolbar.contains("provider-import-existing"));
+        assert!(toolbar.contains("provider-add-configuration"));
+        assert!(toolbar.contains("this.open_profile_creator(window, cx)"));
+        assert!(toolbar.contains("this.preview_native_import(true, agent_id, cx)"));
+        assert!(
+            !render.contains("provider-empty-add-configuration"),
+            "the empty state must not own a second Add button"
+        );
+        assert!(
+            !render.contains("provider-empty-import-existing"),
+            "the empty state must not own a second Import button"
+        );
+        assert!(!render.contains("compact_empty_state("));
+        // The rows are assembled into the card after the toolbar, not before
+        // it, so nothing can appear above the Add button.
+        let toolbar_position = render.find("let add_rows = h_flex()").unwrap();
+        let route_position = render
+            .find("let route_groups = self.render_agent_route_groups(")
+            .unwrap();
+        let providers_position = render
+            .find("let providers = if profiles.is_empty()")
+            .unwrap();
+        assert!(toolbar_position < route_position);
+        assert!(toolbar_position < providers_position);
     }
 
     #[test]
@@ -36573,22 +36732,21 @@ mod tests {
         assert!(render.contains("vibex_core::supports_native_provider_import(&selected_agent.id)"));
         assert_eq!(
             render.matches("native_import_supported.then(||").count(),
-            2,
-            "both the empty state and the populated toolbar must gate the import action"
+            1,
+            "the one toolbar is the only place the import action appears"
         );
-        for button_id in ["provider-empty-import-existing", "provider-import-existing"] {
-            let button_position = render.find(button_id).expect(button_id);
-            let gate_position = render[..button_position]
-                .rfind("native_import_supported.then(||")
-                .expect("the import action must sit behind the support gate");
-            assert_eq!(
-                render[gate_position..button_position]
-                    .matches(".child(")
-                    .count(),
-                0,
-                "{button_id} must not be added through an ungated child"
-            );
-        }
+        let button_id = "provider-import-existing";
+        let button_position = render.find(button_id).expect(button_id);
+        let gate_position = render[..button_position]
+            .rfind("native_import_supported.then(||")
+            .expect("the import action must sit behind the support gate");
+        assert_eq!(
+            render[gate_position..button_position]
+                .matches(".child(")
+                .count(),
+            0,
+            "{button_id} must not be added through an ungated child"
+        );
     }
 
     #[test]
@@ -36790,14 +36948,12 @@ mod tests {
         }
         assert_eq!(
             render.matches(".label(").count(),
-            2,
-            "only empty-state Add and Import use text labels"
+            0,
+            "the card's Add and Import are icon actions with accessible names, not text buttons"
         );
-        assert!(render.contains(".label(copy.add_configuration)"));
-        assert!(render.contains(".label(copy.import_configuration)"));
         assert!(
             render.matches("management_detail_icon_action(").count() >= 2,
-            "populated Provider toolbar actions must use the accessible icon helper"
+            "the card toolbar's actions must use the accessible icon helper"
         );
         assert!(
             authentication
@@ -38786,6 +38942,73 @@ mod gateway_surface_tests {
         assert!(page.contains("render_route_group_page"));
     }
 
+    /// A route-group row is a Provider row with different contents.
+    ///
+    /// The two lists sit under one heading and answer one question, so a
+    /// difference in frame between them read as a difference in kind. This
+    /// pins the shared frame: the same height, radius, fill, selection wash,
+    /// hover reveal, and the same icon-rail action frame. The glyph differs by
+    /// design — a group composes Providers instead of speaking to a vendor —
+    /// but it sits in the same 42px tile, behind the same 36px gutter.
+    #[test]
+    fn route_group_rows_share_the_provider_row_frame() {
+        let source = include_str!("management.rs");
+        let card = source
+            .split_once("    fn render_agent_route_groups(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The route-group draft:"))
+            .map(|(body, _)| body)
+            .expect("the Agent's group rows should remain inspectable");
+
+        for shared in [
+            "MANAGEMENT_PROVIDER_ROW_HEIGHT",
+            "MANAGEMENT_PROVIDER_ROW_GAP",
+            "MANAGEMENT_PROVIDER_ROW_ACTION_SIZE",
+            "px(8.0)",
+            "px(MANAGEMENT_PROVIDER_ROW_HEIGHT)",
+            "cx.theme().background.opacity(0.90)",
+            "cx.theme().primary.opacity(0.08)",
+            "cx.theme().accent",
+            ".group(hover_group)",
+            ".invisible()",
+            ".group_hover(&hover_group, |style| style.visible())",
+            ".with_size(Size::Medium)",
+            "button_with_aria_label(",
+        ] {
+            assert!(
+                card.contains(shared),
+                "a route-group row must keep the Provider row's shared frame: {shared}"
+            );
+        }
+        // Selection and actions are what the two rows have in common; the old
+        // card used a padded column with inline ghost buttons, which is what
+        // made the two lists look like different kinds of record.
+        assert!(
+            !card.contains(".ghost()"),
+            "a route-group row must not fall back to inline ghost buttons"
+        );
+        assert!(
+            !card.contains(".p_2()"),
+            "a route-group row must use the Provider row's frame, not a padded card"
+        );
+        assert!(card.contains("select_agent_route_group("));
+        assert!(card.contains("set_default_agent_route_group("));
+
+        // The glyph takes the Provider brand tile's frame and the route mark.
+        let glyph = source
+            .split_once("fn management_route_group_glyph(")
+            .and_then(|(_, tail)| tail.split_once("\n/// The wash a"))
+            .or_else(|| {
+                source
+                    .split_once("fn management_route_group_glyph(")
+                    .map(|(_, tail)| (tail, ""))
+            })
+            .map(|(body, _)| body)
+            .expect("the route-group glyph should remain inspectable");
+        let glyph_body = glyph.split("\nfn ").next().unwrap_or(glyph);
+        assert!(glyph_body.contains(".size(px(42.0))"));
+        assert!(glyph_body.contains("icons/vibex/git-branch.svg"));
+    }
+
     /// The Provider card owns route groups, and the routing section is gone.
     #[test]
     fn the_provider_card_owns_route_groups() {
@@ -38796,7 +39019,10 @@ mod gateway_surface_tests {
             .map(|(body, _)| body)
             .expect("the provider page should remain inspectable");
         assert!(render.contains("render_agent_route_groups(window, cx)"));
-        assert!(render.contains("render_agent_gateway_summary(cx)"));
+        assert!(
+            !render.contains("render_agent_gateway_summary(cx)"),
+            "the gateway banner is gone: the card lists model sources, it does not announce the service"
+        );
         assert!(
             !render.contains(".child(route_graph)"),
             "the routing section must not come back"
