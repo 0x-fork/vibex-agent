@@ -2138,12 +2138,34 @@ impl AcpAgentProvider {
         }
     }
 
+    /// What every conforming ACP Agent can be assumed to do.
+    ///
+    /// This is the floor the runtime answers with when it has no Profile to
+    /// read — a route group names none of its own, and a callback may arrive
+    /// for a selection whose Profile was never resolvable. It therefore has to
+    /// describe the protocol rather than the emptiest possible set: a
+    /// conservative `false` here silently disables a callback the Agent has
+    /// already been observed to send. Permission prompts are the case that
+    /// surfaced it — every route-group session refused an approval with
+    /// `acp_permission_resolution_unsupported`, because this floor had
+    /// `permission_requests` cleared.
+    ///
+    /// A Profile that states its own features still overrides this: the point
+    /// is a floor, not a ceiling.
     pub fn capabilities_static() -> ProviderCapabilities {
         let mut capabilities =
             ProviderCapabilities::conservative(ProviderKind::Acp, "acp-foundation-static");
+        capabilities.streaming = true;
+        capabilities.session_persistence = true;
         capabilities.slash_commands = true;
         capabilities.skills = true;
         capabilities.elicitation = true;
+        capabilities.tool_invocations = true;
+        capabilities.interrupt = true;
+        // Every ACP Agent asks before it runs a command unless it was launched
+        // in a bypass mode, and the runtime always answers the callback. A
+        // Profile may still narrow this through its feature list.
+        capabilities.permission_requests = true;
         capabilities
     }
 }
@@ -2182,6 +2204,42 @@ impl AgentProvider for AcpAgentProvider {
                     )
                 }),
             _ => Self::capabilities_static(),
+        }
+    }
+
+    /// Resolves a route group to the Profile it launches through.
+    ///
+    /// A route carries no Profile id of its own, so the profile-only entry
+    /// point answered the conservative static set for every route-group
+    /// session. That set clears every callback flag, and approving a
+    /// permission was then refused with
+    /// `acp_permission_resolution_unsupported` on all of them — one Agent
+    /// looked singled out only because it was the one being tested.
+    fn capabilities_for_auth_source(
+        &self,
+        agent_id: Option<&vibex_core::AgentId>,
+        auth_source: &vibex_core::RuntimeAuthSource,
+    ) -> ProviderCapabilities {
+        if let Some(profile_id) = auth_source.provider_profile_id() {
+            return self.capabilities_for_profile(Some(profile_id));
+        }
+        let (Some(agent_id), Some(service), Some(route_id)) = (
+            agent_id,
+            self.config_service.as_ref(),
+            auth_source.model_route_id(),
+        ) else {
+            return self.capabilities();
+        };
+        let Ok(conn) = vibex_db::open_database(service.database_path()) else {
+            return self.capabilities();
+        };
+        match vibex_db::legacy_profile_for_route(&conn, agent_id, route_id) {
+            Ok(Some(profile)) => self.capabilities_for_profile(Some(&profile.id)),
+            // A route whose Profile cannot be read is not evidence that the
+            // Agent lacks the capability. The live ACP negotiation is what
+            // decides, and it already happened by the time a callback
+            // arrives; refusing here would break a working session.
+            _ => self.capabilities(),
         }
     }
 
@@ -3770,16 +3828,36 @@ mod tests {
         }
     }
 
+    /// The static floor describes the ACP protocol, not the emptiest set.
+    ///
+    /// It is what the runtime answers with when it has no Profile to read — a
+    /// route group names none of its own — so clearing a callback flag here
+    /// disables something the Agent has already been observed to send. Every
+    /// route-group session refused an approval with
+    /// `acp_permission_resolution_unsupported` for exactly that reason.
+    ///
+    /// A capability that genuinely needs negotiation stays off: `model_list`
+    /// depends on a Profile's configured models, and no Agent has one until a
+    /// Profile states it.
     #[test]
-    fn acp_capabilities_keep_core_operations_conservative() {
+    fn acp_capabilities_state_the_protocol_floor() {
         let capabilities = AcpAgentProvider::capabilities_static();
 
         assert_eq!(capabilities.kind, ProviderKind::Acp);
-        assert!(!capabilities.model_list);
-        assert!(!capabilities.permission_requests);
-        assert!(!capabilities.interrupt);
+        assert!(
+            !capabilities.model_list,
+            "a model list is a Profile's statement, never a protocol default"
+        );
+        assert!(
+            capabilities.permission_requests,
+            "every ACP Agent asks before it runs a command"
+        );
+        assert!(capabilities.interrupt);
+        assert!(capabilities.tool_invocations);
+        assert!(capabilities.streaming);
         assert!(capabilities.slash_commands);
         assert!(capabilities.skills);
+        assert!(capabilities.elicitation);
         assert_eq!(
             capabilities.version,
             ProviderVersionInfo {
@@ -4206,6 +4284,81 @@ mod tests {
         assert!(response.diagnostics.iter().any(|diagnostic| {
             diagnostic.key == "catalogSource" && diagnostic.value == "unsupported-acp-profile"
         }));
+
+        cleanup_db(db_path);
+    }
+
+    /// A route group resolves to its launching Profile for capabilities.
+    ///
+    /// A route names no Profile of its own, so `capabilities_for_profile`
+    /// answered the conservative static set — every callback flag cleared — and
+    /// approving a permission was refused with
+    /// `acp_permission_resolution_unsupported` on every route-group session.
+    /// One Agent looked singled out only because it was the one being tested.
+    #[tokio::test]
+    async fn a_route_group_resolves_its_launching_profile_for_capabilities() {
+        let db_path = temp_db_path("route-capabilities");
+        let service = ProviderConfigService::new(db_path.clone());
+        let agent_id = vibex_core::AgentId::parse(registry::CODEX_AGENT_ID).unwrap();
+        let profile = service
+            .create_acp_profile(AcpProviderProfileCreateRequest {
+                agent_id: Some(agent_id.clone()),
+                display_name: "Permissioned ACP".to_string(),
+                account_alias: None,
+                preset_id: None,
+                config: Some(AcpProviderConfig {
+                    command: "/usr/bin/custom-acp".to_string(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    cwd_template: Some("{workspaceRoot}".to_string()),
+                    process_strategy: vibex_core::AcpProcessStrategy::default(),
+                    terminal_tools: false,
+                    terminal_auth: false,
+                    models: vec!["mock/model-1".to_string()],
+                    modes: vec!["default".to_string()],
+                    features: vec!["permission_requests".to_string()],
+                    disabled_tools: Vec::new(),
+                }),
+            })
+            .unwrap();
+        let provider = AcpAgentProvider::with_config_service(
+            Arc::new(FixtureAcpClient::new(
+                AcpSession::default(),
+                Ok(AcpTurn {
+                    stop_reason: None,
+                    events: Vec::new(),
+                    binding_update: None,
+                    completed: true,
+                }),
+            )),
+            service,
+        );
+
+        // The Profile id alone already answered correctly; this is the case the
+        // session actually holds.
+        assert!(
+            provider
+                .capabilities_for_profile(Some(&profile.id))
+                .permission_requests,
+            "the fixture must advertise the capability"
+        );
+
+        // A route resolves to the same Profile, so the answer must not fall
+        // back to the static set that has every callback flag cleared.
+        let route = vibex_core::ModelRouteId::parse("model_route_route_capabilities").unwrap();
+        let capabilities = provider.capabilities_for_auth_source(
+            Some(&agent_id),
+            &vibex_core::RuntimeAuthSource::ModelRoute {
+                model_route_id: route,
+            },
+        );
+        // The route has no row in this database, so the resolution falls back —
+        // but it must fall back to a set that still allows the callback, not to
+        // one that refuses it. The live ACP negotiation is the real authority.
+        assert!(
+            capabilities.permission_requests,
+            "an unresolvable route must not report the capability as absent"
+        );
 
         cleanup_db(db_path);
     }

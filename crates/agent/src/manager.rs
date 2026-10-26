@@ -2786,7 +2786,8 @@ impl AgentManager {
         self.ensure_session_event_pump(&provider, &binding);
         let handle = ProviderSessionHandle {
             binding: binding.clone(),
-            capabilities: provider.capabilities_for_profile(selection.provider_profile_id()),
+            capabilities: provider
+                .capabilities_for_auth_source(Some(&selection.agent_id), &selection.auth_source),
         };
         let mut items = vec![self.append_goal_payload(
             &session.id,
@@ -4205,7 +4206,12 @@ impl AgentManager {
         let (selection, binding, _identity, route_key) =
             self.durable_session_execution(&conn, &session)?;
         let provider = self.runtime(&route_key)?;
-        let capabilities = provider.capabilities_for_profile(selection.provider_profile_id());
+        // The selection's auth source, not its Profile id: a route group
+        // launches through a resolved Profile but names none, so asking by
+        // Profile fell back to the conservative static set and refused every
+        // approval on every route-group session.
+        let capabilities = provider
+            .capabilities_for_auth_source(Some(&selection.agent_id), &selection.auth_source);
         if !capabilities.permission_requests {
             return Err(VibexError::capability(
                 "acp_permission_resolution_unsupported",
@@ -4308,7 +4314,8 @@ impl AgentManager {
         let (selection, binding, execution_identity, route_key) =
             self.durable_session_execution(&conn, &session)?;
         let provider = self.runtime(&route_key)?;
-        let capabilities = provider.capabilities_for_profile(selection.provider_profile_id());
+        let capabilities = provider
+            .capabilities_for_auth_source(Some(&selection.agent_id), &selection.auth_source);
         if !capabilities.elicitation {
             return Err(VibexError::capability(
                 "acp_elicitation_resolution_unsupported",
@@ -4536,7 +4543,8 @@ impl AgentManager {
             Err(error) => return Err(error),
         };
         let provider = self.runtime(&route_key)?;
-        let capabilities = provider.capabilities_for_profile(selection.provider_profile_id());
+        let capabilities = provider
+            .capabilities_for_auth_source(Some(&selection.agent_id), &selection.auth_source);
         if !capabilities.interrupt {
             return Err(VibexError::capability(
                 "acp_interrupt_unsupported",
@@ -4615,7 +4623,8 @@ impl AgentManager {
                 "this provider profile does not support native steering",
             ));
         }
-        let capabilities = provider.capabilities_for_profile(selection.provider_profile_id());
+        let capabilities = provider
+            .capabilities_for_auth_source(Some(&selection.agent_id), &selection.auth_source);
         let outcome = provider
             .steer_turn(
                 ProviderSessionHandle {
@@ -5353,8 +5362,10 @@ impl AgentManager {
         required_runtime: &SessionRuntimeSelection,
         correlation_id: Option<&vibex_core::CorrelationId>,
     ) -> VibexResult<Vec<TimelineItem>> {
-        let capabilities =
-            provider.capabilities_for_profile(required_runtime.provider_profile_id());
+        let capabilities = provider.capabilities_for_auth_source(
+            Some(&required_runtime.agent_id),
+            &required_runtime.auth_source,
+        );
         let resource_summary = turn_resource_summary(
             conn,
             &required_runtime.agent_id,

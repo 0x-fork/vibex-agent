@@ -508,6 +508,25 @@ pub trait AgentProvider: Send + Sync {
         self.capabilities()
     }
 
+    /// Capabilities for the source a session actually runs on.
+    ///
+    /// `capabilities_for_profile` cannot answer this alone: a route group
+    /// launches through a resolved Profile but carries no Profile id of its
+    /// own, so a caller that only has the selection's auth source falls back
+    /// to the conservative static set. That set has every callback flag
+    /// cleared, which is why approving a permission on any route-group session
+    /// — not just one Agent — was refused with
+    /// `acp_permission_resolution_unsupported`. Adapters that can resolve a
+    /// route to its launching Profile override this; the default keeps the
+    /// profile-only contract.
+    fn capabilities_for_auth_source(
+        &self,
+        _agent_id: Option<&AgentId>,
+        auth_source: &vibex_core::RuntimeAuthSource,
+    ) -> ProviderCapabilities {
+        self.capabilities_for_profile(auth_source.provider_profile_id())
+    }
+
     async fn list_auth_methods(
         &self,
         _agent_id: &AgentId,

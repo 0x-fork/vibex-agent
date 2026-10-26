@@ -62,13 +62,14 @@ fn parts(value: Option<&Value>) -> GatewayResult<Vec<ContentPart>> {
             continue;
         }
         if let Some(call) = item.get("functionCall") {
+            // Gemini issues no id for a function call, so one is derived from
+            // the name. `assign_call_ordinals` makes it unique afterwards: an
+            // upstream rejects a turn that calls one tool twice, because both
+            // syntheses produced the same `tool_call_id`.
+            let name = string_field(call, "name").unwrap_or_default().to_string();
             parts.push(ContentPart::ToolCall {
-                // Gemini does not issue ids for function calls. A deterministic
-                // id keeps a later `functionResponse` paired with its call;
-                // the name is unique within one reply because Gemini rejects a
-                // duplicate tool set.
-                id: format!("call_{}", string_field(call, "name").unwrap_or("tool")),
-                name: string_field(call, "name").unwrap_or_default().to_string(),
+                id: format!("{GEMINI_CALL_ID_PREFIX}{name}"),
+                name,
                 arguments: call
                     .get("args")
                     .cloned()
@@ -77,8 +78,12 @@ fn parts(value: Option<&Value>) -> GatewayResult<Vec<ContentPart>> {
             continue;
         }
         if let Some(response) = item.get("functionResponse") {
+            // Gemini pairs a response to its call by name, so the id is the
+            // name. `assign_call_ordinals` numbers repeated names on both
+            // sides in the same order, which is how Gemini emits them.
+            let name = string_field(response, "name").unwrap_or("tool").to_string();
             parts.push(ContentPart::ToolResult {
-                call_id: format!("call_{}", string_field(response, "name").unwrap_or("tool")),
+                call_id: format!("{GEMINI_CALL_ID_PREFIX}{name}"),
                 content: vec![ContentPart::Text(
                     serde_json::to_string(response.get("response").unwrap_or(&Value::Null))
                         .unwrap_or_default(),
@@ -91,6 +96,63 @@ fn parts(value: Option<&Value>) -> GatewayResult<Vec<ContentPart>> {
         // Gemini adds part kinds over time and none of them affect routing.
     }
     Ok(parts)
+}
+
+/// Marks a canonical id this codec synthesized from a Gemini tool name.
+pub const GEMINI_CALL_ID_PREFIX: &str = "call_";
+
+/// The Gemini tool name a canonical call id was synthesised from.
+///
+/// The ordinal `assign_call_ordinals` added is a gateway-internal detail: Gemini
+/// pairs a call and its response by name, and sending `read__2` would name a
+/// function the client never declared.
+fn gemini_call_name(call_id: &str) -> &str {
+    let name = call_id
+        .strip_prefix(GEMINI_CALL_ID_PREFIX)
+        .unwrap_or(call_id);
+    name.split_once("__").map_or(name, |(name, _)| name)
+}
+
+/// Numbers repeated tool names so the canonical ids stay unique.
+///
+/// Gemini identifies a call by name alone, so a turn that runs the same tool
+/// twice produces two identical synthesised ids. Every other protocol requires
+/// per-call identity, and the upstream refuses the whole request when two calls
+/// share one (`Duplicate value for 'tool_call_id' of call_read_file`). The
+/// first occurrence keeps the plain name — that is what a later
+/// `functionResponse` was paired with — and each repeat gains a position
+/// suffix. Calls and their responses are numbered independently per name in
+/// the order they appear, which is how Gemini emits them.
+fn assign_call_ordinals(messages: &mut [CanonicalMessage]) {
+    let mut seen_calls: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut seen_results: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for message in messages {
+        for part in &mut message.parts {
+            match part {
+                ContentPart::ToolCall { id, name, .. } => {
+                    let count = seen_calls.entry(name.clone()).or_insert(0);
+                    *count += 1;
+                    if *count > 1 {
+                        *id = format!("{id}__{count}");
+                    }
+                }
+                ContentPart::ToolResult { call_id, .. } => {
+                    let name = call_id
+                        .strip_prefix(GEMINI_CALL_ID_PREFIX)
+                        .unwrap_or(call_id)
+                        .to_string();
+                    let count = seen_results.entry(name).or_insert(0);
+                    *count += 1;
+                    if *count > 1 {
+                        *call_id = format!("{call_id}__{count}");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 pub fn parse_request(value: &Value) -> GatewayResult<CanonicalRequest> {
@@ -110,6 +172,7 @@ pub fn parse_request(value: &Value) -> GatewayResult<CanonicalRequest> {
             });
         }
     }
+    assign_call_ordinals(&mut messages);
 
     let mut tools = Vec::new();
     if let Some(declarations) = value
@@ -304,7 +367,9 @@ fn part_value(part: &ContentPart) -> GatewayResult<Option<Value>> {
         ContentPart::ToolResult {
             call_id, content, ..
         } => {
-            let name = call_id.strip_prefix("call_").unwrap_or(call_id);
+            // `assign_call_ordinals` suffixes a repeated name; Gemini knows the
+            // call by name, so the suffix is stripped again here.
+            let name = gemini_call_name(call_id);
             let text = content
                 .iter()
                 .filter_map(|part| match part {
@@ -962,6 +1027,72 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, CanonicalEvent::Stop(StopReason::ToolUse)))
         );
+    }
+
+    /// A turn that calls one tool twice keeps two distinct call ids.
+    ///
+    /// Gemini names a call but issues no id, so both calls synthesised
+    /// `call_read_file`. Chat and Responses require per-call identity and the
+    /// upstream refused the whole translated request with `Duplicate value for
+    /// 'tool_call_id' of call_read_file in message[2]` — the turn died after
+    /// the tools had already run.
+    #[test]
+    fn repeated_tool_names_get_distinct_call_ids() {
+        let request = parse_request(&json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "read both"}]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "read_file", "args": {"path": "a"}}},
+                    {"functionCall": {"name": "read_file", "args": {"path": "b"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "read_file", "response": {"content": "A"}}},
+                    {"functionResponse": {"name": "read_file", "response": {"content": "B"}}}
+                ]}
+            ]
+        }))
+        .unwrap();
+
+        let mut ids = Vec::new();
+        for message in &request.messages {
+            for part in &message.parts {
+                if let ContentPart::ToolCall { id, .. } = part {
+                    ids.push(id.clone());
+                }
+            }
+        }
+        assert_eq!(ids.len(), 2);
+        assert_ne!(
+            ids[0], ids[1],
+            "two calls must not share one canonical id: {ids:?}"
+        );
+
+        let mut result_ids = Vec::new();
+        for message in &request.messages {
+            for part in &message.parts {
+                if let ContentPart::ToolResult { call_id, .. } = part {
+                    result_ids.push(call_id.clone());
+                }
+            }
+        }
+        assert_ne!(result_ids[0], result_ids[1], "{result_ids:?}");
+
+        // Sending the turn back to Gemini must name the function the client
+        // declared: neither the prefix nor the ordinal is part of its name.
+        let body = build_request(&request, "gemini-3-pro").unwrap();
+        let names = body["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|content| content["parts"].as_array().cloned().unwrap_or_default())
+            .filter_map(|part| {
+                part.get("functionResponse")
+                    .or_else(|| part.get("functionCall"))
+                    .and_then(|entry| entry["name"].as_str())
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["read_file"; 4], "{body}");
     }
 
     #[test]

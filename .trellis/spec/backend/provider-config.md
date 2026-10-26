@@ -521,6 +521,34 @@ runtime switch or a turn on an Agent that was otherwise healthy.
   request with `Invalid params` plus a structured `data` body
   (`{"<field>": {"_errors": [...]}}`). Reading only `data.details` (a string)
   left the journal at "Invalid params", which is unactionable.
+- **A route group names no Profile, so capabilities cannot be read by Profile.**
+  `SessionRuntimeSelection::provider_profile_id()` is `None` for
+  `RuntimeAuthSource::ModelRoute`, which sent every route-group session to the
+  conservative static set. That set had `permission_requests` cleared, so
+  approving any prompt on any route-group session was refused with
+  `acp_permission_resolution_unsupported` — one Agent looked singled out only
+  because it was the one being tested. Two changes fix it: the ACP provider
+  resolves a route to its launching Profile
+  (`legacy_profile_for_route`) through `capabilities_for_auth_source`, and the
+  static floor describes the protocol (streaming, persistence, tool calls,
+  interrupt, permissions, elicitation) rather than the emptiest possible set.
+  Clearing a callback flag there disables something the Agent has already been
+  observed to send.
+- **A reasoning depth in a model id is not a second model.** Antigravity's
+  picker publishes one model per depth, so it asks the gateway for
+  `group/<id>/<model>-high` while the group holds the base model. Treating the
+  suffix as part of the model answered `404 No configured Provider serves the
+  model 'group/.../deepseek-v4.1-flash-high'` on every turn. The gateway strips
+  `-high`/`-medium`/`-low` when the group does not declare the suffixed id, and
+  the level still reaches the upstream through the request's reasoning.
+- **A protocol that issues no call ids still needs unique ones.** Gemini names
+  a function call but gives it no id, and it pairs a `functionResponse` back by
+  name. Synthesizing `call_<name>` for both made two calls to one tool share an
+  id, and Chat/Responses refused the translated turn with `Duplicate value for
+  'tool_call_id' of call_read_file in message[2]`. Repeated names now gain a
+  position suffix on both the call and its result, and the codec strips both
+  the prefix and the suffix when it renders back into Gemini, because Gemini
+  knows the call by name alone.
 - **A Boolean `thinking` toggle is not a reasoning dimension.** It cannot carry
   `off`/`low`/`high`, so it must not make an Agent look depth-capable;
   counting it kept Kimi Code's selection carrying a level the Agent has no
@@ -617,6 +645,10 @@ runtime switch or a turn on an Agent that was otherwise healthy.
 `dropping_every_tool_removes_the_key`,
 `a_probe_without_a_reasoning_dimension_reports_none`,
 `a_depth_category_is_the_reasoning_dimension`,
+`acp_capabilities_state_the_protocol_floor`,
+`a_route_group_resolves_its_launching_profile_for_capabilities`,
+`a_reasoning_depth_suffix_resolves_to_the_base_model`,
+`repeated_tool_names_get_distinct_call_ids`,
 `kimi_depth_category_is_read_as_reasoning_by_probe_and_planner`,
 `mcp_server_wire_names_are_identifiers`,
 `zcode_personal_provider_table_matches_the_registry_schema`,

@@ -3106,6 +3106,60 @@ async fn a_vendor_tool_type_the_upstream_cannot_serve_is_dropped() {
     cleanup(path);
 }
 
+/// A reasoning-depth model id resolves to the group's base model.
+///
+/// Antigravity's picker publishes one model per depth, so it asks the gateway
+/// for `group/<id>/<model>-high`. The group holds the base model — a depth is a
+/// property of one model rather than a second model — and the upstream has
+/// never heard of the suffixed id. Treating the suffix as part of the model
+/// answered `404 No configured Provider serves the model
+/// 'group/.../deepseek-v4.1-flash-high'` on every turn of that session.
+#[tokio::test]
+async fn a_reasoning_depth_suffix_resolves_to_the_base_model() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-v4.1-flash"],
+        "sk-test",
+    );
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": format!("{}-high", group_model(&group, "deepseek-v4.1-flash")),
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "a depth suffix must reach the base model, not be refused: {body}"
+    );
+
+    let recorded = recorder.lock().await;
+    let sent = recorded.body.as_ref().unwrap();
+    assert_eq!(
+        sent["model"], "deepseek-v4.1-flash",
+        "the upstream is asked for the model it declares: {sent}"
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
 /// A Gemini tool name that the OpenAI protocols refuse is rewritten, and the
 /// reply is translated back to the client's own name.
 ///

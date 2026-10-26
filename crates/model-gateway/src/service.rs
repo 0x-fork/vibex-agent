@@ -190,11 +190,26 @@ impl GatewaySnapshot {
     ) -> Option<(&'a GatewayProviderGroup, &'a str)> {
         let parsed = vibex_core::provider_group_model_ref(requested)?;
         let group = self.groups.get(parsed.group_id)?;
+        if let Some(model) = group
+            .models
+            .iter()
+            .find(|model| model.model == parsed.model_id)
+        {
+            return Some((group, model.model.as_str()));
+        }
+        // An Agent that states its reasoning depth as part of the model id
+        // asks for `group/<id>/<model>-<level>` (Antigravity's picker works
+        // that way). The group holds the base model, because a depth is a
+        // property of one model rather than a second model, so the suffix is
+        // resolved here instead of making every member declare each level.
+        // The level still reaches the upstream: `build_member_body` copies the
+        // request's reasoning through.
+        let base = reasoning_variant_base(parsed.model_id)?;
         group
             .models
             .iter()
-            .any(|model| model.model == parsed.model_id)
-            .then_some((group, parsed.model_id))
+            .find(|model| model.model == base)
+            .map(|model| (group, model.model.as_str()))
     }
 
     pub fn upstream(&self, profile: &ModelProviderProfileId) -> Option<&GatewayUpstream> {
@@ -2517,6 +2532,20 @@ struct ResolvedMember {
     /// It is the group's own choice, not a gateway-wide default: two groups
     /// over the same Provider may want one held Key and one rotating pool.
     key_strategy: GatewayRoutingStrategy,
+}
+
+/// The base model of a reasoning-depth model id.
+///
+/// An Agent may publish one selectable model per depth (`<model>-high`,
+/// `<model>-medium`, ...) rather than a separate depth control. Such an id
+/// names the *base* model plus a depth, so a group that holds the base model
+/// can still serve it. Only the levels those pickers use are stripped, and the
+/// result must be non-empty, so an ordinary model called `plan-high` keeps its
+/// own name when the group declares it.
+pub(crate) fn reasoning_variant_base(model: &str) -> Option<&str> {
+    ["-high", "-medium", "-low"]
+        .into_iter()
+        .find_map(|suffix| model.strip_suffix(suffix).filter(|base| !base.is_empty()))
 }
 
 /// The group a request's model id names, when it names one.
