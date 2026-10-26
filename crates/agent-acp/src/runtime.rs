@@ -16742,7 +16742,25 @@ fn runtime_config_value_is_advertised(
             .map(|option| match option.kind {
                 ProviderSessionConfigOptionKind::Boolean => matches!(value, "true" | "false"),
                 ProviderSessionConfigOptionKind::Select => {
-                    option.values.is_empty() || option.values.iter().any(|item| item.value == value)
+                    // `values` is only the set the Agent lets a client choose
+                    // from. An option can still report a `currentValue` (or a
+                    // `defaultValue`) it does not list there — Cline does
+                    // exactly that when a gateway Profile pins its provider
+                    // through `CLINE_PROVIDER`, so `openai-compatible` is the
+                    // current value but never appears as a picker row. A
+                    // selection repeating a value already in effect needs no
+                    // wire write, and rejecting it here failed the whole
+                    // session before the no-op check could run.
+                    option.values.is_empty()
+                        || option.values.iter().any(|item| item.value == value)
+                        || option
+                            .current_value
+                            .as_ref()
+                            .is_some_and(|item| item.value == value)
+                        || option
+                            .default_value
+                            .as_ref()
+                            .is_some_and(|item| item.value == value)
                 }
                 ProviderSessionConfigOptionKind::String => {
                     !value.trim().is_empty() && value.len() <= 256
@@ -34218,6 +34236,127 @@ for line in sys.stdin:
                 .unwrap()
                 .contains_key(&binding_id)
         );
+        fixture.cleanup();
+    }
+
+    /// A select option may report a value it does not list among its rows.
+    ///
+    /// Cline does exactly that when a gateway Profile pins its provider through
+    /// `CLINE_PROVIDER`: `provider` carries `openai-compatible` as its
+    /// `currentValue` while its rows stay the account providers. The composer
+    /// persists that current value with the selection, so judging it against
+    /// the rows alone failed a new Cline session with
+    /// `runtime_switch_configuration_unavailable`
+    /// (`acp_session_config_value_unavailable`) before any wire request. The
+    /// value is already in effect, so it is a no-op, not a rejection — writing
+    /// it back is refused as well ("Cannot change provider: CLINE_PROVIDER
+    /// environment variable is set").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_runtime_config_accepts_a_selects_current_value_as_a_no_op() {
+        let Some(fixture) = MockAcpFixture::create("runtime-config-current-value") else {
+            return;
+        };
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let attachment = client.current_attachment(&session_id).unwrap();
+        attachment.payload().replace_config_options(&json!({
+            "configOptions": [
+                {
+                    "id": "provider",
+                    "label": "Provider",
+                    "type": "select",
+                    "currentValue": "openai-compatible",
+                    "options": [
+                        { "value": "cline", "label": "Cline Usage-Billing" },
+                        { "value": "cline-pass", "label": "ClinePass" },
+                        {
+                            "value": "openai-codex",
+                            "label": "OpenAI ChatGPT Subscription"
+                        }
+                    ]
+                },
+                {
+                    "id": "model",
+                    "category": "model",
+                    "label": "Model",
+                    "type": "select",
+                    "currentValue": "group/model_route_x/deepseek-v4.1-flash",
+                    "options": [{
+                        "value": "group/model_route_x/deepseek-v4.1-flash",
+                        "label": "DeepSeek V4.1 Flash"
+                    }]
+                }
+            ]
+        }));
+        let provider_key =
+            crate::session_config::CanonicalSessionConfigKey::parse("provider").unwrap();
+        assert!(
+            attachment
+                .payload()
+                .session_config_planner()
+                .unwrap()
+                .option_for_key(&provider_key)
+                .unwrap()
+                .is_some(),
+            "the current value must be plannable even when it is not a picker row"
+        );
+
+        let state = attachment.payload().runtime_config_state();
+        let result = client
+            .update_session_runtime_config(SessionRuntimeConfigMutationRequest {
+                session_id: session_id.clone(),
+                expected_revision: state.state_revision,
+                expected_binding_id: attachment.binding_id().clone(),
+                expected_activation_generation: attachment.fence().activation_generation as i64,
+                patch: SessionRuntimeConfigPatch {
+                    config_values: BTreeMap::from([(
+                        "provider".to_string(),
+                        "openai-compatible".to_string(),
+                    )]),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.outcomes.len(), 1, "{result:#?}");
+        assert_eq!(
+            result.outcomes[0].status,
+            SessionRuntimeConfigApplyStatus::NoOp,
+            "{result:#?}"
+        );
+        assert!(
+            result
+                .state
+                .config_values
+                .get("provider")
+                .is_some_and(|value| {
+                    value
+                        .effective
+                        .as_ref()
+                        .is_some_and(|effective| effective.value == "openai-compatible")
+                }),
+            "{result:#?}"
+        );
+        assert!(
+            !fixture.request_log().iter().any(|request| {
+                request["method"] == "session/set_config_option"
+                    && request["params"]["configId"] == "provider"
+            }),
+            "a value already in effect must not be written back"
+        );
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
         fixture.cleanup();
     }
 
