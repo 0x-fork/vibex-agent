@@ -3551,18 +3551,34 @@ fn cline_overlay(
     // selected Model whose protocol Cline cannot point at a caller-supplied
     // endpoint must fail rather than silently store a different provider; the
     // first enabled Model is only a fallback for a binding with no selection.
+    //
+    // A binding with no enabled Model at all is not a mismatch, so it must not
+    // fail here. Vibex seeds an internal ACP Profile for every enabled Agent
+    // (so "enable and chat" works before a Provider exists) and that row
+    // carries no Models; it is not even listed in the Config Center. Refusing
+    // to plan it made the whole management snapshot fail, so every unrelated
+    // Config Center action reported this error. Such a binding has no Model
+    // protocol to derive an id from, so it takes the same Chat-Completions
+    // default the environment projection uses and leaves `model` out of the
+    // store entry: the launch carries no `CLINE_MODEL` either, and Cline keeps
+    // its own catalogue default instead of being told to run an id nobody
+    // selected.
+    let enabled_models = binding
+        .configured_models
+        .iter()
+        .filter(|configured| configured.enabled)
+        .collect::<Vec<_>>();
     let provider_id = match model {
         Some(selected) => cline_provider_id(Some(selected)),
-        None => binding
-            .configured_models
-            .iter()
-            .filter(|configured| configured.enabled)
+        None if enabled_models.is_empty() => cline_provider_id(None),
+        None => enabled_models
+            .into_iter()
             .find_map(|configured| cline_provider_id(Some(configured))),
     }
     .ok_or_else(|| {
         VibexError::validation(
             "agent_projection_cline_provider_unsupported",
-            "no enabled Model selects a Cline provider that accepts a custom base URL",
+            "the selected Model has no Cline provider that accepts a custom base URL",
         )
     })?;
 
@@ -9162,6 +9178,82 @@ mod tests {
         let mut anthropic = base.clone();
         anthropic.wire_protocol_id = WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string();
         assert!(cline_provider_id(Some(&anthropic)).is_none());
+    }
+
+    /// A binding with no Model is a scaffold, not a mistake.
+    ///
+    /// Enabling a catalog Agent seeds an internal ACP Profile so a session can
+    /// start before any Provider is configured. That row carries no Models, and
+    /// the Config Center does not list it — but the version refresh reconciles
+    /// it on every snapshot, so planning it used to fail with
+    /// `agent_projection_cline_provider_unsupported` and took the whole
+    /// management snapshot down with it. Every unrelated Config Center action
+    /// then reported the error, which is what made a Prompt save look broken.
+    #[test]
+    fn cline_projection_accepts_a_binding_with_no_model() {
+        let descriptor = provider_descriptor("cline");
+        let (provider, runtime, binding) = typed_projection_fixture(&descriptor);
+        let mut empty = binding.clone();
+        empty.configured_models.clear();
+
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &empty,
+            &descriptor,
+            "cline-seeded-profile",
+        )
+        .expect("a Model-less binding is projected, not refused");
+
+        // The store still carries the provider id and the endpoint, so a launch
+        // from this scaffold is not left pointing at Cline's OpenAI default.
+        assert_eq!(plan.overlay_files.len(), 1);
+        let stored: serde_json::Value =
+            serde_json::from_str(&plan.overlay_files[0].content).unwrap();
+        assert_eq!(stored["lastUsedProvider"], "openai-compatible");
+        let settings = &stored["providers"]["openai-compatible"]["settings"];
+        assert_eq!(settings["baseUrl"], "https://provider.example.invalid/v1/");
+        assert_eq!(
+            settings["apiKey"],
+            overlay_secret_placeholder("CLINE_API_KEY")
+        );
+        // No Model was selected, so none is invented.
+        assert!(settings.get("model").is_none(), "{settings:?}");
+        assert!(!plan.non_secret_env.contains_key("CLINE_MODEL"));
+    }
+
+    /// A Model Cline cannot express through a provider id is still a real
+    /// mismatch. A stored binding can hold one — the descriptor's interface
+    /// list only gates binding *validation*, not a row written before a
+    /// protocol was removed — so the overlay must keep refusing it instead of
+    /// silently storing a different provider.
+    #[test]
+    fn cline_projection_still_refuses_a_model_without_a_provider_id() {
+        use vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES;
+
+        let descriptor = provider_descriptor("cline");
+        let (provider, _, binding) = typed_projection_fixture(&descriptor);
+        let mut anthropic = binding.configured_models[0].clone();
+        anthropic.wire_protocol_id = WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string();
+
+        // The selected Model is the one Cline cannot express, so the plan fails
+        // rather than falling back to a Model the session would not select.
+        let error = cline_overlay(
+            &binding,
+            provider.endpoints.first(),
+            Some(&anthropic),
+            "CLINE_API_KEY",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "agent_projection_cline_provider_unsupported");
+
+        // The same holds when the Model is only in the binding: no selection
+        // falls back to the first *enabled* Model, which is this one.
+        let mut stored = binding.clone();
+        stored.configured_models = vec![anthropic];
+        let error =
+            cline_overlay(&stored, provider.endpoints.first(), None, "CLINE_API_KEY").unwrap_err();
+        assert_eq!(error.code, "agent_projection_cline_provider_unsupported");
     }
 
     fn provider_descriptor(agent_id: &str) -> AgentProviderProjectionDescriptor {

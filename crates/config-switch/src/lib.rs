@@ -607,7 +607,17 @@ impl ProviderConfigService {
                 .collect::<Vec<_>>();
         let mut projection_changed = false;
         for profile in &legacy_profiles {
-            projection_changed |= self.sync_legacy_projection(&conn, profile)?;
+            match self.sync_legacy_projection(&conn, profile) {
+                Ok(changed) => projection_changed |= changed,
+                // One row's projection failed, but the detected version is
+                // still the fact the caller asked to record: the returned
+                // snapshot uses it, and the binding keeps its previous
+                // projection state until a later edit or launch retries it.
+                // Propagating here made a single unprojectable binding fail the
+                // whole Config Center snapshot, which the desktop reports as an
+                // error for every unrelated action that refreshes it.
+                Err(_) => continue,
+            }
         }
         let mut agent =
             AgentSnapshotEntry::from_definition(&definition, config.as_ref(), Some(&discovery));
@@ -10975,6 +10985,90 @@ mod tests {
                 .iter()
                 .any(|entry| entry.value == "removed agents are not probed")
         );
+    }
+
+    /// A seeded ACP Profile must not decide whether a refresh succeeds.
+    ///
+    /// Enabling a catalog Agent writes an internal launch Profile with no
+    /// Models. The version refresh reconciles every ACP Profile of that Agent,
+    /// so projecting that scaffold used to fail the whole call — and with it
+    /// `assemble_management_snapshot`, which the Config Center surfaces as one
+    /// error for whatever the reader was actually doing (a Prompt save, an
+    /// Agent toggle, a plain refresh).
+    #[test]
+    fn version_refresh_tolerates_an_unprojectable_seeded_profile() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let agent_id = AgentId::parse("cline").unwrap();
+        service
+            .update_agent_config(AgentUpdateConfigRequest {
+                agent_id: agent_id.clone(),
+                added: Some(true),
+                enabled: Some(true),
+                label_override: None,
+                description_override: None,
+                order_index: None,
+                command: None,
+                env: None,
+                params: None,
+            })
+            .unwrap();
+
+        let seeded = service
+            .list_runtime_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.agent_id == agent_id)
+            .expect("enabling Cline should seed an internal launch profile");
+        assert!(
+            seeded.configured_models.is_empty(),
+            "the seeded profile carries no Models"
+        );
+
+        // Put the seeded binding into a state the projector used to refuse:
+        // Cline's Model-less scaffold made `cline_overlay` return
+        // `agent_projection_cline_provider_unsupported`.
+        let conn = service.open_connection().unwrap();
+        let binding =
+            vibex_db::AgentModelProviderBindingRepository::get_by_legacy_profile(&conn, &seeded.id)
+                .unwrap()
+                .expect("the seeded profile has a projection binding");
+        let mut broken = binding.clone();
+        broken.configured_models = vec![vibex_core::AgentConfiguredModelBinding {
+            id: vibex_core::AgentConfiguredModelBindingId::new(),
+            provider_model_id: "unsupported-model".to_string(),
+            agent_model_id: "unsupported-model".to_string(),
+            wire_protocol_id: vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
+            sdk_adapter_id: None,
+            deployment: None,
+            enabled: true,
+            process_scoped: false,
+        }];
+        // The repository owns the single-step revision contract.
+        broken.revision = binding.revision.saturating_add(1);
+        broken.updated_at_ms = binding.updated_at_ms.saturating_add(1);
+        vibex_db::AgentModelProviderBindingRepository::update(&conn, &broken, binding.revision)
+            .unwrap();
+        drop(conn);
+
+        // The refresh records the detected identity even though that binding
+        // cannot be projected; it must not return an error.
+        service
+            .refresh_agent_snapshot(AgentRefreshSnapshotRequest {
+                agent_id: agent_id.clone(),
+                cwd_scope: None,
+            })
+            .expect("one unprojectable binding must not fail the refresh");
+
+        // A second pass over an unchanged tree still succeeds, which is what
+        // the Config Center does on every load while the Agent's version cache
+        // is stale.
+        service
+            .refresh_agent_snapshot(AgentRefreshSnapshotRequest {
+                agent_id,
+                cwd_scope: None,
+            })
+            .expect("repeated refresh stays successful");
     }
 
     #[test]
