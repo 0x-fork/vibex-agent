@@ -30141,7 +30141,7 @@ impl VibexWorkbench {
                 format!(
                     "{} / {} / {}",
                     selection.agent_id.as_str(),
-                    selection.auth_source.id(),
+                    runtime_auth_source_placeholder_label(&selection.auth_source),
                     runtime_model_selection_label(&selection.model)
                 )
             })
@@ -54621,7 +54621,7 @@ impl VibexWorkbench {
                     format!(
                         "{} / {} / {}",
                         selection.agent_id,
-                        selection.auth_source.id(),
+                        runtime_auth_source_placeholder_label(&selection.auth_source),
                         runtime_model_selection_label(&selection.model)
                     )
                 })
@@ -73442,17 +73442,44 @@ fn runtime_provider_model_label(
             )
         })
         .unwrap_or_else(|| {
+            // The catalogue normally carries this selection, so this is the
+            // window between a switch being requested and the new catalogue
+            // arriving. A route's auth-source id is `model_route_<hex>` and its
+            // model id is the gateway address `group/<id>/<model>`; neither is
+            // a name the reader chose, so the route's own label and the model
+            // part are shown instead of the addresses.
             format!(
                 "{} / {}",
-                selection.auth_source.id(),
+                runtime_auth_source_placeholder_label(&selection.auth_source),
                 runtime_model_selection_label(&selection.model)
             )
         })
 }
 
+/// A name for an auth source that the catalogue has not described yet.
+fn runtime_auth_source_placeholder_label(auth_source: &RuntimeAuthSource) -> String {
+    match auth_source {
+        RuntimeAuthSource::AgentAccount { .. } => {
+            locale::text("Agent account", "Agent 账户", "Agent 帳戶").to_string()
+        }
+        RuntimeAuthSource::ProviderProfile {
+            provider_profile_id,
+        } => provider_profile_id.as_str().to_string(),
+        RuntimeAuthSource::ModelRoute { .. } => {
+            locale::text("Route group", "路由组", "路由組").to_string()
+        }
+    }
+}
+
 fn runtime_model_selection_label(model: &RuntimeModelSelection) -> String {
     match model {
-        RuntimeModelSelection::Explicit { model_id } => model_id.clone(),
+        RuntimeModelSelection::Explicit { model_id } => {
+            // A route model is addressed as `group/<id>/<model>`; only the
+            // model part is a name.
+            vibex_core::provider_group_model_ref(model_id)
+                .map(|parsed| parsed.model_id.to_string())
+                .unwrap_or_else(|| model_id.clone())
+        }
         RuntimeModelSelection::AgentDefault => locale::text(
             "Selected automatically by Agent",
             "由 Agent 自动选择",

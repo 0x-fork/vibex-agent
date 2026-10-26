@@ -5929,8 +5929,14 @@ impl AgentManager {
                 let label = vibex_db::ModelRouteRepository::get(&conn, model_route_id)?
                     .map(|route| route.display_name)
                     .unwrap_or_else(|| model_route_id.as_str().to_string());
+                // The model is named the way the Provider that serves it names
+                // it, because that is the name the reader picked from. A route
+                // model's effective id is `group/<id>/<model>` — an address the
+                // gateway resolves, not a name anybody chose — and printing it
+                // here put that address under every turn while the picker above
+                // showed the model's own name.
                 let model_label = effective_model_id
-                    .map(str::to_string)
+                    .map(|model_id| route_model_display_label(&conn, model_route_id, model_id))
                     .unwrap_or_else(|| "Agent default".to_string());
                 (label, model_label)
             }
@@ -5954,6 +5960,61 @@ impl AgentManager {
             )
         })
     }
+}
+
+/// The name a route model is shown by, matching the Provider's own catalogue.
+///
+/// A route model's effective id is the gateway address
+/// `group/<id>/<model>`, and the Provider entry behind it may carry a display
+/// name of its own. Attribution and the composer both have to use the same
+/// name, or the turn reads as a different model than the one the reader
+/// selected. An id that carries no route — a direct Provider model — is
+/// already the name the Provider used.
+fn route_model_display_label(
+    conn: &DbConnection,
+    model_route_id: &vibex_core::ModelRouteId,
+    model_id: &str,
+) -> String {
+    let Some(parsed) = vibex_core::provider_group_model_ref(model_id) else {
+        return model_id.to_string();
+    };
+    // The route the selection names decides whose catalogue to ask. An id that
+    // names a different group than the selection does would be resolved against
+    // the wrong Providers, so its own model name is the honest answer.
+    let base = parsed.model_id;
+    if parsed.group_id != model_route_id.as_str() {
+        return base.to_string();
+    }
+    let Ok(Some(route)) = vibex_db::ModelRouteRepository::get(conn, model_route_id) else {
+        return base.to_string();
+    };
+    let Ok(profiles) = vibex_db::ModelProviderProfileRepository::list(conn) else {
+        return base.to_string();
+    };
+    for member in route.enabled_members() {
+        let Some(profile) = profiles
+            .iter()
+            .find(|profile| profile.id == member.model_provider_profile_id)
+        else {
+            continue;
+        };
+        let Some(entry) = profile
+            .configured_models
+            .iter()
+            .find(|entry| entry.id == base)
+        else {
+            continue;
+        };
+        if let Some(label) = entry
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+        {
+            return label.to_string();
+        }
+    }
+    base.to_string()
 }
 
 fn usage_counter_origin_for_switch_method(
@@ -6803,6 +6864,106 @@ fn filter_and_limit_command_entries(
 
 #[cfg(test)]
 mod tests {
+    /// Attribution names a route model the way the Provider names it.
+    ///
+    /// A route model's effective id is the gateway address
+    /// `group/<id>/<model>`. Printing that under the turn put an address where
+    /// the composer showed the model's own name, so the same selection read as
+    /// two different models on one screen.
+    #[test]
+    fn a_route_model_is_named_by_its_provider_catalogue() {
+        use vibex_core::{
+            ModelProviderCatalogEntry, ModelProviderProfile, ModelProviderProfileStatus,
+            ModelRoute, ModelRouteMember, RouteKind, RouteStatus, RouteStrategy,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-route-label-{}.db",
+            vibex_core::RequestId::new().as_str()
+        ));
+        let manager = AgentManager::new(&dir).unwrap();
+        let conn = manager.open_migrated().unwrap();
+
+        // A Provider whose catalogue gives the model a name of its own, which is
+        // what the composer shows.
+        let provider = ModelProviderProfile {
+            id: vibex_core::ModelProviderProfileId::new(),
+            display_name: "Gateway Upstream".to_string(),
+            status: ModelProviderProfileStatus::Enabled,
+            configured_models: vec![ModelProviderCatalogEntry {
+                id: "deepseek-v4.1-flash".to_string(),
+                display_name: Some("DeepSeek V4.1 Flash".to_string()),
+                enabled: true,
+                metadata: Vec::new(),
+                capabilities: Default::default(),
+            }],
+            default_model_id: Some("deepseek-v4.1-flash".to_string()),
+            revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            ..Default::default()
+        };
+        vibex_db::ModelProviderProfileRepository::insert(&conn, &provider).unwrap();
+
+        let route_id = vibex_core::ModelRouteId::parse("model_route_label_fixture").unwrap();
+        vibex_db::ModelRouteRepository::insert(
+            &conn,
+            &ModelRoute {
+                id: route_id.clone(),
+                display_name: "route group".to_string(),
+                description: None,
+                kind: RouteKind::ProviderGroup,
+                // A provider group names Providers, not models: its models are
+                // the intersection of their catalogues.
+                members: vec![ModelRouteMember::new(provider.id.clone(), "", 0)],
+                strategy: RouteStrategy::Ordered,
+                first_token_timeout_ms: None,
+                context_tokens: None,
+                pin: Default::default(),
+                failover: Default::default(),
+                token_limit: None,
+                status: RouteStatus::Enabled,
+                revision: 1,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                deleted_at_ms: None,
+            },
+        )
+        .unwrap();
+
+        let addressed = format!("group/{}/deepseek-v4.1-flash", route_id.as_str());
+        assert_eq!(
+            route_model_display_label(&conn, &route_id, &addressed),
+            "DeepSeek V4.1 Flash",
+            "the Provider's own name is what the picker showed"
+        );
+
+        // A model id that names no route is already the name its Provider used.
+        assert_eq!(
+            route_model_display_label(&conn, &route_id, "some-direct-model"),
+            "some-direct-model",
+            "an id that names no route is already a model name"
+        );
+
+        // An address belonging to another group must not be resolved against
+        // this group's Providers, but it still shows its model name rather than
+        // the gateway address.
+        assert_eq!(
+            route_model_display_label(
+                &conn,
+                &route_id,
+                "group/model_route_somewhere_else/deepseek-v4.1-flash"
+            ),
+            "deepseek-v4.1-flash",
+            "another group's address still shows its model name"
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(dir.with_extension("db-wal"));
+        let _ = std::fs::remove_file(dir.with_extension("db-shm"));
+    }
+
     mod delegation_recovery_tests {
         include!("manager/delegation_recovery_tests.rs");
     }

@@ -534,6 +534,15 @@ runtime switch or a turn on an Agent that was otherwise healthy.
   interrupt, permissions, elicitation) rather than the emptiest possible set.
   Clearing a callback flag there disables something the Agent has already been
   observed to send.
+- **A route model is shown by the Provider's name, not its gateway address.**
+  The effective model of a route session is `group/<id>/<model>` — an address
+  the gateway resolves. Attribution wrote that id straight into `model_label`,
+  so the turn header and the answer footer printed the address while the
+  composer showed the model name the Provider's catalogue carries. The same
+  selection then read as two different models on one screen. `model_label`
+  resolves through the route's members to the first `display_name` their
+  catalogues give that model, and the client's own fallback strips the group
+  prefix instead of printing `model_route_<hex>`/`group/<id>/<model>`.
 - **A tool result is a tool turn, whatever role wraps it.** Gemini pairs a
   `functionResponse` back to its `functionCall` by name, and Antigravity sends
   both under `model`. Reading that role literally put the result inside an
@@ -662,6 +671,7 @@ runtime switch or a turn on an Agent that was otherwise healthy.
 `repeated_tool_names_get_distinct_call_ids`,
 `a_function_response_under_the_model_role_is_a_tool_turn`,
 `antigravity_style_history_pairs_every_call_with_its_result`,
+`a_route_model_is_named_by_its_provider_catalogue`,
 `a_gemini_tool_result_under_the_model_role_answers_its_call`,
 `kimi_depth_category_is_read_as_reasoning_by_probe_and_planner`,
 `mcp_server_wire_names_are_identifiers`,
