@@ -10201,6 +10201,8 @@ fn the_session_list_draws_the_arrangement_the_desktop_published() {
         worktree_titles: std::collections::BTreeMap::new(),
         worktree_lifecycle: std::collections::BTreeMap::new(),
         project_new_session_locations: std::collections::BTreeMap::new(),
+        auto_continue_default_enabled: false,
+        auto_continue_disabled_project_ids: Vec::new(),
         auto_continue_project_ids: Vec::new(),
         auto_continue_session_overrides: std::collections::BTreeMap::new(),
         auto_continue_session_ids: Vec::new(),
@@ -10287,6 +10289,8 @@ fn the_session_list_marks_state_and_auto_continue_without_words() {
     // The authority has auto-continue on for the idle session, and its last
     // turn stopped without an answer.
     app.auto_continue.apply_authority(
+        false,
+        &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeMap::new(),
         &std::collections::BTreeSet::from([idle.id.as_str().to_string()]),
@@ -10848,6 +10852,8 @@ fn the_session_view_shows_the_continuation_countdown() {
     app.agent.state.selected_session_id = Some(idle.id.clone());
     app.navigate_to(Page::Agent);
     app.auto_continue.apply_authority(
+        false,
+        &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeMap::new(),
         &std::collections::BTreeSet::from([idle.id.as_str().to_string()]),
@@ -11211,6 +11217,8 @@ fn a_delegated_row_under_a_folder_nested_session_hangs_from_its_elbow() {
         worktree_titles: std::collections::BTreeMap::new(),
         worktree_lifecycle: std::collections::BTreeMap::new(),
         project_new_session_locations: std::collections::BTreeMap::new(),
+        auto_continue_default_enabled: false,
+        auto_continue_disabled_project_ids: Vec::new(),
         auto_continue_project_ids: Vec::new(),
         auto_continue_session_overrides: std::collections::BTreeMap::new(),
         auto_continue_session_ids: Vec::new(),
@@ -11676,6 +11684,8 @@ fn a_folder_rows_action_button_offers_what_a_folder_can_do() {
         worktree_titles: std::collections::BTreeMap::new(),
         worktree_lifecycle: std::collections::BTreeMap::new(),
         project_new_session_locations: std::collections::BTreeMap::new(),
+        auto_continue_default_enabled: false,
+        auto_continue_disabled_project_ids: Vec::new(),
         auto_continue_project_ids: Vec::new(),
         auto_continue_session_overrides: std::collections::BTreeMap::new(),
         auto_continue_session_ids: Vec::new(),

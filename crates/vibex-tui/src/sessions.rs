@@ -1098,6 +1098,8 @@ mod tests {
             worktree_titles: BTreeMap::new(),
             worktree_lifecycle: BTreeMap::new(),
             project_location_preferences: BTreeMap::new(),
+            auto_continue_enabled_by_default: false,
+            auto_continue_disabled_project_ids: BTreeSet::new(),
             auto_continue_project_ids: BTreeSet::new(),
             auto_continue_session_overrides: BTreeMap::new(),
             auto_continue_session_ids: BTreeSet::new(),

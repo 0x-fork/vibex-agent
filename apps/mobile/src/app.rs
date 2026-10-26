@@ -8916,10 +8916,10 @@ impl MobileApp {
                     title: session.title.clone(),
                     agent_identity,
                     display_state,
-                    auto_continue: self
-                        .sidebar_view
-                        .auto_continue_session_ids
-                        .contains(member_id.as_str()),
+                    auto_continue: self.sidebar_view.auto_continue_session_enabled(
+                        member_id.as_str(),
+                        session.project_id.as_str(),
+                    ),
                     // Unread means "finished while you were looking elsewhere",
                     // so the selection clears it exactly as it does for the row.
                     has_unread_completion: self
@@ -9681,6 +9681,10 @@ impl MobileApp {
             let child_depth = row.depth + 1;
             let project_id = row.project_id.clone();
             let workspace_id = row.workspace_id.clone();
+            // A delegated child carries the parent's project scope, but its own
+            // snapshot is what names that project; the row's copy can be empty
+            // for a parent the tree page did not place in a project.
+            let child_project_id = row.project_id.clone().unwrap_or_default();
             expanded.push(row);
             for child in children {
                 let Some(child_id) = child.session_ref.session_id() else {
@@ -9713,10 +9717,10 @@ impl MobileApp {
                     // child, which the sidebar view carries for every session.
                     state: None,
                     unread: false,
-                    auto_continue: self
-                        .sidebar_view
-                        .auto_continue_session_ids
-                        .contains(child_id.as_str()),
+                    auto_continue: self.sidebar_view.auto_continue_session_enabled(
+                        child_id.as_str(),
+                        child_project_id.as_str(),
+                    ),
                     auto_continue_paused: self
                         .sidebar_view
                         .auto_continue_paused_session_ids
@@ -20149,23 +20153,19 @@ impl MobileApp {
             .controller
             .as_ref()
             .and_then(|controller| controller.state.selected_session_id.clone());
-        let session_state = selected_session
-            .as_ref()
-            .and_then(|selected| {
-                self.sessions()
-                    .iter()
-                    .find(|session| session.id.as_str() == selected.as_str())
-            })
-            .map(|session| session.state)
-            .or(state);
+        let selected_row_session = selected_session.as_ref().and_then(|selected| {
+            self.sessions()
+                .iter()
+                .find(|session| session.id.as_str() == selected.as_str())
+        });
+        let session_state = selected_row_session.map(|session| session.state).or(state);
         let header_column = session_state.map(|session_state| {
             let awaiting_user = selected_session.as_ref().is_some_and(|selected| {
                 self.session_awaits_user_input(selected.as_str(), session_state)
             });
-            let auto_continue = selected_session.as_ref().is_some_and(|selected| {
+            let auto_continue = selected_row_session.is_some_and(|session| {
                 self.sidebar_view
-                    .auto_continue_session_ids
-                    .contains(selected.as_str())
+                    .auto_continue_session_enabled(session.id.as_str(), session.project_id.as_str())
             });
             let scheduled = selected_session.as_ref().is_some_and(|selected| {
                 self.scheduled_send_at(selected.as_str(), session_state)

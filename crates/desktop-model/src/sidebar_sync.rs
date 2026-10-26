@@ -44,6 +44,8 @@ pub struct SidebarOrganizationView {
     /// same states from here.
     pub worktree_lifecycle: BTreeMap<String, crate::WorktreeLifecycleDisplayState>,
     pub project_location_preferences: BTreeMap<String, NewSessionLocation>,
+    pub auto_continue_enabled_by_default: bool,
+    pub auto_continue_disabled_project_ids: BTreeSet<String>,
     pub auto_continue_project_ids: BTreeSet<String>,
     pub auto_continue_session_overrides: BTreeMap<String, bool>,
     pub auto_continue_session_ids: BTreeSet<String>,
@@ -431,6 +433,12 @@ impl SidebarOrganizationView {
                     )
                 })
                 .collect(),
+            auto_continue_default_enabled: self.auto_continue_enabled_by_default,
+            auto_continue_disabled_project_ids: self
+                .auto_continue_disabled_project_ids
+                .iter()
+                .cloned()
+                .collect(),
             auto_continue_project_ids: self.auto_continue_project_ids.iter().cloned().collect(),
             auto_continue_session_overrides: self.auto_continue_session_overrides.clone(),
             auto_continue_session_ids: self.auto_continue_session_ids.iter().cloned().collect(),
@@ -572,6 +580,12 @@ impl SidebarOrganizationView {
                     )
                 })
                 .collect(),
+            auto_continue_enabled_by_default: snapshot.auto_continue_default_enabled,
+            auto_continue_disabled_project_ids: snapshot
+                .auto_continue_disabled_project_ids
+                .iter()
+                .cloned()
+                .collect(),
             auto_continue_project_ids: snapshot.auto_continue_project_ids.iter().cloned().collect(),
             auto_continue_session_overrides: snapshot.auto_continue_session_overrides.clone(),
             auto_continue_session_ids: snapshot.auto_continue_session_ids.iter().cloned().collect(),
@@ -643,6 +657,11 @@ impl SidebarOrganizationView {
             // own git layer answers.
             worktree_lifecycle: BTreeMap::new(),
             project_location_preferences: sidebar.project_location_preferences.clone(),
+            auto_continue_enabled_by_default: state.session.auto_continue_enabled_by_default,
+            auto_continue_disabled_project_ids: state
+                .session
+                .auto_continue_disabled_project_ids
+                .clone(),
             auto_continue_project_ids: state.session.auto_continue_project_ids.clone(),
             auto_continue_session_overrides: state.session.auto_continue_session_overrides.clone(),
             // The effective set is derived, not persisted: the Desktop
@@ -732,6 +751,9 @@ impl SidebarOrganizationView {
         sidebar.worktree_titles = self.worktree_titles.clone();
         sidebar.project_location_preferences = self.project_location_preferences.clone();
         sidebar.project_appearances = self.project_appearances.clone();
+        state.session.auto_continue_enabled_by_default = self.auto_continue_enabled_by_default;
+        state.session.auto_continue_disabled_project_ids =
+            self.auto_continue_disabled_project_ids.clone();
         state.session.auto_continue_project_ids = self.auto_continue_project_ids.clone();
         state.session.auto_continue_session_overrides =
             self.auto_continue_session_overrides.clone();
@@ -792,6 +814,50 @@ impl SidebarOrganizationView {
             || !self.project_order.is_empty()
             || !self.workspace_order.is_empty()
             || !self.organization.collapsed_folder_ids.is_empty()
+    }
+
+    /// Whether a session of `project_id` starts with auto-continue on.
+    ///
+    /// The shell-wide default covers every project, including projects the
+    /// reader creates later; a project's own explicit choice is the stronger
+    /// statement and wins over it.
+    pub fn auto_continue_project_default(&self, project_id: &str) -> bool {
+        if self.auto_continue_project_ids.contains(project_id) {
+            return true;
+        }
+        if self.auto_continue_disabled_project_ids.contains(project_id) {
+            return false;
+        }
+        self.auto_continue_enabled_by_default
+    }
+
+    /// Whether a session keeps its pane's group continuing it.
+    ///
+    /// A group's own choice is the narrowest one it has; without one it follows
+    /// the project, which is what lets the shell-wide default reach a group the
+    /// reader never touched.
+    pub fn auto_continue_group_enabled(
+        &self,
+        group_choice: Option<bool>,
+        project_id: &str,
+    ) -> bool {
+        group_choice.unwrap_or_else(|| self.auto_continue_project_default(project_id))
+    }
+
+    /// Whether the authority holds auto-continue on for one session.
+    ///
+    /// A session override is the reader's last word on that row; without one
+    /// the session follows its project's default. The effective set the holder
+    /// publishes comes next, so a client that was only told the ids still
+    /// paints the same marks.
+    pub fn auto_continue_session_enabled(&self, session_id: &str, project_id: &str) -> bool {
+        if let Some(enabled) = self.auto_continue_session_overrides.get(session_id) {
+            return *enabled;
+        }
+        // The holder's effective set already folded the defaults into the ids,
+        // so it is the next best answer for a row this view has no project for.
+        self.auto_continue_session_ids.contains(session_id)
+            || self.auto_continue_project_default(project_id)
     }
 
     /// Move, or take away, the hour one published send waits for.
@@ -1994,6 +2060,7 @@ mod tests {
         );
         assert!(!view.auto_continue_session_ids.contains("session-b"));
         assert!(view.auto_continue_paused_session_ids.contains("session-a"));
+        assert!(!view.auto_continue_enabled_by_default);
         // And writing it back is the same translation in reverse, so a shell
         // that owns the runtime persists a tree the next read reconstructs
         // exactly — the revision included.
@@ -2007,6 +2074,52 @@ mod tests {
         assert!(
             !SidebarOrganizationView::from_desktop_ui_state(&other).arranges_anything(),
             "an arrangement nobody made claimed to arrange something"
+        );
+    }
+
+    #[test]
+    fn a_shell_wide_default_covers_every_project_including_new_ones() {
+        let mut state = crate::DesktopUiStateV1::default();
+        state.session.auto_continue_enabled_by_default = true;
+        // One project opted out while the default was on; another carried an
+        // explicit opt-in from before the switch existed.
+        state
+            .session
+            .auto_continue_disabled_project_ids
+            .insert("project-off".to_string());
+        state
+            .session
+            .auto_continue_project_ids
+            .insert("project-on".to_string());
+
+        let view = SidebarOrganizationView::from_desktop_ui_state(&state);
+        assert!(view.auto_continue_project_default("project-new"));
+        assert!(view.auto_continue_project_default("project-on"));
+        assert!(!view.auto_continue_project_default("project-off"));
+
+        // A session without an override follows its project; an override is
+        // the reader's last word on that one row.
+        assert!(view.auto_continue_session_enabled("session-new", "project-new"));
+        assert!(!view.auto_continue_session_enabled("session-off", "project-off"));
+        state
+            .session
+            .auto_continue_session_overrides
+            .insert("session-new".to_string(), false);
+        let view = SidebarOrganizationView::from_desktop_ui_state(&state);
+        assert!(!view.auto_continue_session_enabled("session-new", "project-new"));
+
+        // The default rides the wire both ways, so a compact client applies the
+        // same rule without inventing a project it has not seen.
+        let remote = view.to_remote();
+        assert!(remote.auto_continue_default_enabled);
+        assert_eq!(
+            remote.auto_continue_disabled_project_ids,
+            vec!["project-off".to_string()]
+        );
+        assert_eq!(
+            SidebarOrganizationView::from_remote(&remote),
+            view,
+            "the default did not survive the wire"
         );
     }
 

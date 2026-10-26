@@ -829,9 +829,12 @@ is never a column count.
   interleaving two turns. The countdown is drawn wherever the reader is: the
   row's `↻N` on the list, and the composer's info line inside the session, which
   is where the Desktop puts the same seconds. The preference rides the sidebar arrangement's
-  auto-continue fields, so it is the same preference on every surface; a
-  suspension this client makes is local, because the protocol has no pause
-  change — only the enable/disable that clears one.
+  auto-continue fields, so it is the same preference on every surface; the
+  shell-wide default (`autoContinueDefaultEnabled`) turns a project on before
+  any per-project or per-session decision is consulted, so a project created
+  after the switch was flipped continues its sessions here too. A suspension
+  this client makes is local, because the protocol has no pause change — only
+  the enable/disable that clears one.
 * **The list draws the authority's arrangement, and edits it there.** Folders,
   the order of projects and sessions, the pinned band, collapsed headings and
   unread marks are the Desktop's: `SidebarBackend` reads them as a

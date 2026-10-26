@@ -99,11 +99,17 @@ impl AutoContinue {
     ///
     /// `sessions` hydrates a project default the way the Desktop does at
     /// startup: a project with auto-continue on continues its sessions, whether
-    /// or not each one carries its own override. A suspension survives, and so
-    /// does a local toggle that the authority has not echoed yet.
+    /// or not each one carries its own override. `default_enabled` is the
+    /// shell-wide default behind those project ids, so it covers a project the
+    /// reader has not listed — including one created after the switch was
+    /// turned on. A suspension survives, and so does a local toggle that the
+    /// authority has not echoed yet.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_authority(
         &mut self,
+        default_enabled: bool,
         project_ids: &BTreeSet<String>,
+        disabled_project_ids: &BTreeSet<String>,
         overrides: &BTreeMap<String, bool>,
         enabled: &BTreeSet<String>,
         paused: &BTreeSet<String>,
@@ -116,7 +122,10 @@ impl AutoContinue {
         // session off under a project that is on is exactly what an override is
         // for, so it has the last word.
         for session in sessions {
-            if project_ids.contains(session.project_id.as_str()) {
+            let project_id = session.project_id.as_str();
+            let project_on = !disabled_project_ids.contains(project_id)
+                && (default_enabled || project_ids.contains(project_id));
+            if project_on {
                 effective.insert(session.id.as_str().to_string());
             }
         }
@@ -442,6 +451,8 @@ mod tests {
     fn machine() -> AutoContinue {
         let mut machine = AutoContinue::default();
         machine.apply_authority(
+            false,
+            &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeMap::new(),
             &enabled(&["session_a"]),
@@ -601,7 +612,9 @@ mod tests {
         ];
         let mut machine = AutoContinue::default();
         machine.apply_authority(
+            false,
             &enabled(&["project_p"]),
+            &BTreeSet::new(),
             &BTreeMap::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
@@ -612,11 +625,36 @@ mod tests {
     }
 
     #[test]
+    fn the_shell_wide_default_turns_a_new_project_on() {
+        let sessions = vec![
+            session("session_new", "created_later", AgentSessionState::Idle, 10),
+            session("session_off", "opted_out", AgentSessionState::Idle, 10),
+        ];
+        let mut machine = AutoContinue::default();
+        machine.apply_authority(
+            true,
+            &BTreeSet::new(),
+            &enabled(&["project_opted_out"]),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &sessions,
+        );
+        // The project did not exist when the switch was flipped; the default
+        // still covers it. A project the reader turned off keeps following that
+        // decision.
+        assert!(machine.is_enabled(&session_id("session_new")));
+        assert!(!machine.is_enabled(&session_id("session_off")));
+    }
+
+    #[test]
     fn an_authority_suspension_survives_and_a_session_off_beats_a_project_on() {
         let sessions = vec![session("session_a", "p", AgentSessionState::Idle, 10)];
         let mut machine = AutoContinue::default();
         machine.apply_authority(
+            false,
             &enabled(&["project_p"]),
+            &BTreeSet::new(),
             &BTreeMap::from([("session_a".to_string(), false)]),
             &BTreeSet::new(),
             &enabled(&["session_b"]),

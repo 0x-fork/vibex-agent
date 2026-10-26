@@ -3348,7 +3348,13 @@ impl App {
             .as_deref()
             .unwrap_or_default();
         self.auto_continue.apply_authority(
+            snapshot.auto_continue_default_enabled,
             &snapshot.auto_continue_project_ids.iter().cloned().collect(),
+            &snapshot
+                .auto_continue_disabled_project_ids
+                .iter()
+                .cloned()
+                .collect(),
             &snapshot.auto_continue_session_overrides.clone(),
             &snapshot.auto_continue_session_ids.iter().cloned().collect(),
             &snapshot

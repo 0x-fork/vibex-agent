@@ -4894,6 +4894,15 @@ pub struct RemoteSidebarOrganizationSnapshot {
     #[serde(default)]
     pub project_new_session_locations:
         std::collections::BTreeMap<String, RemoteSidebarNewSessionLocation>,
+    /// Whether auto-continue is the default for every project, including
+    /// projects created later. Per-project ids and session overrides layer on
+    /// top of it, so a client that only reads this flag still knows the
+    /// default a session created there will start with.
+    #[serde(default)]
+    pub auto_continue_default_enabled: bool,
+    /// Projects explicitly opted out while the global default is on.
+    #[serde(default)]
+    pub auto_continue_disabled_project_ids: Vec<String>,
     #[serde(default)]
     pub auto_continue_project_ids: Vec<String>,
     #[serde(default)]

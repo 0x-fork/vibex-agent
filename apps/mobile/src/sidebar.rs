@@ -960,7 +960,9 @@ fn push_group_rows(
                 .iter()
                 .any(|session| session.id.as_str() == session_id)
         }),
-        auto_continue: group.auto_continue.unwrap_or(false),
+        auto_continue: input
+            .view
+            .auto_continue_group_enabled(group.auto_continue, project_id),
         auto_continue_paused: false,
         delegated_child: false,
     });
@@ -1072,8 +1074,7 @@ fn session_row(
         unread: input.view.unread_session_ids.contains(session_id.as_str()),
         auto_continue: input
             .view
-            .auto_continue_session_ids
-            .contains(session_id.as_str()),
+            .auto_continue_session_enabled(session_id.as_str(), project_id),
         auto_continue_paused: input
             .view
             .auto_continue_paused_session_ids

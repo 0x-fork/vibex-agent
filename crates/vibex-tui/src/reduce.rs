@@ -11206,6 +11206,8 @@ mod tests {
             worktree_titles: std::collections::BTreeMap::new(),
             worktree_lifecycle: std::collections::BTreeMap::new(),
             project_new_session_locations: std::collections::BTreeMap::new(),
+            auto_continue_default_enabled: false,
+            auto_continue_disabled_project_ids: Vec::new(),
             auto_continue_project_ids: Vec::new(),
             auto_continue_session_overrides: std::collections::BTreeMap::new(),
             auto_continue_session_ids: Vec::new(),

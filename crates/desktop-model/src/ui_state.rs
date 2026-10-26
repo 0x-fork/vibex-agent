@@ -1357,6 +1357,18 @@ pub struct SessionUiState {
     pub enhanced_command_execution_display: bool,
     #[serde(default = "default_enhanced_file_operation_display")]
     pub enhanced_file_operation_display: bool,
+    /// Whether automatic continuation is the default for every project.
+    ///
+    /// The settings switch writes this one flag, so turning it on covers the
+    /// projects that exist now and every project created later — including the
+    /// sessions the reader has not created yet. Per-project defaults and
+    /// per-session overrides still layer on top of it.
+    #[serde(default)]
+    pub auto_continue_enabled_by_default: bool,
+    /// Projects explicitly opted out while the global default is on. A project
+    /// override is the stronger statement, so it wins over this set.
+    #[serde(default)]
+    pub auto_continue_disabled_project_ids: BTreeSet<String>,
     #[serde(default)]
     pub auto_continue_project_ids: BTreeSet<String>,
     #[serde(default)]
@@ -1393,6 +1405,8 @@ impl Default for SessionUiState {
             show_agent_generation_status: true,
             enhanced_command_execution_display: false,
             enhanced_file_operation_display: true,
+            auto_continue_enabled_by_default: false,
+            auto_continue_disabled_project_ids: BTreeSet::new(),
             auto_continue_project_ids: BTreeSet::new(),
             auto_continue_session_overrides: BTreeMap::new(),
             auto_continue_paused_session_ids: BTreeSet::new(),
@@ -1737,6 +1751,7 @@ impl DesktopUiStateV1 {
             .take(KEYBOARD_SHORTCUT_OVERRIDE_LIMIT)
             .collect();
         normalize_set(&mut self.session.auto_continue_project_ids, 1_000);
+        normalize_set(&mut self.session.auto_continue_disabled_project_ids, 1_000);
         normalize_set(&mut self.session.auto_continue_paused_session_ids, 1_000);
         self.session.auto_continue_session_overrides =
             std::mem::take(&mut self.session.auto_continue_session_overrides)
@@ -1811,6 +1826,9 @@ impl DesktopUiStateV1 {
             .cleanup_references(&references.project_ids, &references.session_ids);
         self.session
             .auto_continue_project_ids
+            .retain(|id| references.project_ids.contains(id));
+        self.session
+            .auto_continue_disabled_project_ids
             .retain(|id| references.project_ids.contains(id));
         self.session
             .auto_continue_session_overrides
@@ -3380,6 +3398,14 @@ mod tests {
             ReasoningExpansionMode::Window
         );
         assert_eq!(SessionUiState::default().auto_archive_after_days, None);
+        // Auto-continue stays opt-in until the reader turns the shell-wide
+        // default on; an older file without the field reads as off.
+        assert!(!SessionUiState::default().auto_continue_enabled_by_default);
+        assert!(
+            SessionUiState::default()
+                .auto_continue_disabled_project_ids
+                .is_empty()
+        );
 
         let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
         let session = value
@@ -3411,6 +3437,13 @@ mod tests {
         assert_eq!(
             decoded.session.reasoning_expansion_mode,
             ReasoningExpansionMode::Window
+        );
+        assert!(!decoded.session.auto_continue_enabled_by_default);
+        assert!(
+            decoded
+                .session
+                .auto_continue_disabled_project_ids
+                .is_empty()
         );
         assert!(decoded.session.auto_continue_project_ids.is_empty());
         assert!(decoded.session.auto_continue_session_overrides.is_empty());
@@ -3715,6 +3748,15 @@ mod tests {
             .session
             .auto_continue_project_ids
             .insert("project_stale".into());
+        state.session.auto_continue_enabled_by_default = true;
+        state
+            .session
+            .auto_continue_disabled_project_ids
+            .insert(" project_opted_out ".into());
+        state
+            .session
+            .auto_continue_disabled_project_ids
+            .insert("project_stale".into());
         state
             .session
             .auto_continue_session_overrides
@@ -3743,6 +3785,11 @@ mod tests {
                 .auto_continue_project_ids
                 .contains("project_kept")
         );
+        assert!(state.session.auto_continue_enabled_by_default);
+        assert_eq!(
+            state.session.auto_continue_disabled_project_ids,
+            BTreeSet::from(["project_opted_out".to_string(), "project_stale".to_string()])
+        );
         assert_eq!(
             state
                 .session
@@ -3765,7 +3812,7 @@ mod tests {
         );
 
         state.cleanup_stale_ids(&UiStateReferences {
-            project_ids: BTreeSet::from(["project_kept".into()]),
+            project_ids: BTreeSet::from(["project_kept".into(), "project_opted_out".into()]),
             session_ids: BTreeSet::from([
                 "session_enabled".into(),
                 "session_disabled".into(),
@@ -3776,6 +3823,10 @@ mod tests {
         assert_eq!(
             state.session.auto_continue_project_ids,
             BTreeSet::from(["project_kept".into()])
+        );
+        assert_eq!(
+            state.session.auto_continue_disabled_project_ids,
+            BTreeSet::from(["project_opted_out".into()])
         );
         assert_eq!(
             state.session.auto_continue_session_overrides,

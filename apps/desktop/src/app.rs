@@ -9766,7 +9766,9 @@ pub struct VibexWorkbench {
     /// dedups the second copy, but the notification path runs before that, so
     /// without this watermark a single completion raises two identical hints.
     notified_timeline_sequences: BTreeMap<String, i64>,
+    auto_continue_enabled_by_default: bool,
     auto_continue_default_project_ids: BTreeSet<String>,
+    auto_continue_disabled_project_ids: BTreeSet<String>,
     auto_continue_session_ids: BTreeSet<String>,
     auto_continue_paused_session_ids: BTreeSet<String>,
     auto_continue_paused_turn_session_ids: BTreeSet<String>,
@@ -10363,7 +10365,10 @@ impl VibexWorkbench {
         }
         let restored_collapsed_delegated_ids =
             ui_state.sidebar.collapsed_delegated_session_ids.clone();
+        let auto_continue_enabled_by_default = ui_state.session.auto_continue_enabled_by_default;
         let auto_continue_default_project_ids = ui_state.session.auto_continue_project_ids.clone();
+        let auto_continue_disabled_project_ids =
+            ui_state.session.auto_continue_disabled_project_ids.clone();
         let auto_continue_session_ids = restored_auto_continue_session_ids(&ui_state.session);
         let auto_continue_paused_session_ids =
             ui_state.session.auto_continue_paused_session_ids.clone();
@@ -11211,7 +11216,9 @@ impl VibexWorkbench {
             pending_user_request_ids: BTreeMap::new(),
             notification_suppressed_session_ids: BTreeSet::new(),
             notified_timeline_sequences: BTreeMap::new(),
+            auto_continue_enabled_by_default,
             auto_continue_default_project_ids,
+            auto_continue_disabled_project_ids,
             auto_continue_session_ids,
             auto_continue_paused_session_ids,
             auto_continue_paused_turn_session_ids: BTreeSet::new(),
@@ -12541,6 +12548,8 @@ impl VibexWorkbench {
                 .sidebar
                 .project_location_preferences
                 .clone(),
+            auto_continue_enabled_by_default: self.auto_continue_enabled_by_default,
+            auto_continue_disabled_project_ids: self.auto_continue_disabled_project_ids.clone(),
             auto_continue_project_ids: self.auto_continue_default_project_ids.clone(),
             auto_continue_session_overrides: self
                 .ui_state
@@ -12730,6 +12739,14 @@ impl VibexWorkbench {
                             self.ui_state.sidebar.worktree_titles = view.worktree_titles.clone();
                             self.ui_state.session.auto_continue_session_overrides =
                                 view.auto_continue_session_overrides.clone();
+                            self.auto_continue_enabled_by_default =
+                                view.auto_continue_enabled_by_default;
+                            self.ui_state.session.auto_continue_enabled_by_default =
+                                view.auto_continue_enabled_by_default;
+                            self.auto_continue_disabled_project_ids =
+                                view.auto_continue_disabled_project_ids.clone();
+                            self.ui_state.session.auto_continue_disabled_project_ids =
+                                view.auto_continue_disabled_project_ids.clone();
                             self.auto_continue_session_ids = view.auto_continue_session_ids.clone();
                             self.auto_continue_paused_session_ids =
                                 view.auto_continue_paused_session_ids.clone();
@@ -13100,7 +13117,10 @@ impl VibexWorkbench {
                 state.network_proxy = NetworkProxyUiState::default();
             }
         }
+        let auto_continue_enabled_by_default = state.session.auto_continue_enabled_by_default;
         let auto_continue_default_project_ids = state.session.auto_continue_project_ids.clone();
+        let auto_continue_disabled_project_ids =
+            state.session.auto_continue_disabled_project_ids.clone();
         let auto_continue_session_ids = restored_auto_continue_session_ids(&state.session);
         let auto_continue_paused_session_ids =
             state.session.auto_continue_paused_session_ids.clone();
@@ -13149,7 +13169,9 @@ impl VibexWorkbench {
             self.ui_state.desktop_behavior.launch_at_login =
                 launch_at_login_enabled(&config.application_id);
         }
+        self.auto_continue_enabled_by_default = auto_continue_enabled_by_default;
         self.auto_continue_default_project_ids = auto_continue_default_project_ids;
+        self.auto_continue_disabled_project_ids = auto_continue_disabled_project_ids;
         self.auto_continue_session_ids = auto_continue_session_ids;
         self.auto_continue_paused_session_ids = auto_continue_paused_session_ids;
         self.sidebar_state.row_order = self.ui_state.sidebar.session_order.clone();
@@ -16651,8 +16673,91 @@ impl VibexWorkbench {
     }
 
     fn project_auto_continue_enabled(&self, project_id: &ProjectId) -> bool {
-        self.auto_continue_default_project_ids
-            .contains(project_id.as_str())
+        self.project_auto_continue_enabled_for(project_id.as_str())
+    }
+
+    fn project_auto_continue_enabled_for(&self, project_id: &str) -> bool {
+        if self.auto_continue_default_project_ids.contains(project_id) {
+            return true;
+        }
+        if self.auto_continue_disabled_project_ids.contains(project_id) {
+            return false;
+        }
+        self.auto_continue_enabled_by_default
+    }
+
+    /// Whether automatic continuation is on for every project by default.
+    fn auto_continue_default_enabled(&self) -> bool {
+        self.auto_continue_enabled_by_default
+    }
+
+    /// The settings switch: auto-continue becomes the default for every
+    /// project, including the ones created from now on.
+    ///
+    /// The switch changes the default, not the rows: turning it on means
+    /// every project, so the per-project opt-outs and opt-ins are cleared and
+    /// every session that has no override of its own is turned on. Turning it
+    /// off only removes the fallback, so a project or session the reader
+    /// explicitly chose keeps that choice. An explicit session override is the
+    /// reader's own decision about that row and survives either way, so
+    /// flipping the switch never destroys a per-session choice.
+    fn set_auto_continue_default_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.auto_continue_enabled_by_default == enabled {
+            return;
+        }
+        self.auto_continue_enabled_by_default = enabled;
+        self.ui_state.session.auto_continue_enabled_by_default = enabled;
+        if enabled {
+            // "On for every project" has to mean what it says, so an earlier
+            // per-project opt-out is gone: there is no default left for it to
+            // opt out of. The opt-in list is dropped for the same reason —
+            // those projects are now covered by the default.
+            self.auto_continue_disabled_project_ids.clear();
+            self.ui_state
+                .session
+                .auto_continue_disabled_project_ids
+                .clear();
+            self.auto_continue_default_project_ids.clear();
+            self.ui_state.session.auto_continue_project_ids.clear();
+        }
+        let session_ids = self
+            .sessions
+            .iter()
+            .chain(self.delegated_sessions.values())
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        for session_id in session_ids {
+            self.reconcile_auto_continue_for_session(&session_id, cx);
+        }
+        self.queue_ui_state();
+        self.publish_sidebar_invalidation();
+        cx.notify();
+    }
+
+    /// Re-derives one session's effective auto-continue from the defaults on
+    /// hand, leaving an explicit session override alone.
+    ///
+    /// A session nobody overrode follows its project, which is what makes a
+    /// project or shell-wide default reach the rows that were already open.
+    fn reconcile_auto_continue_for_session(
+        &mut self,
+        session_id: &VibexSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_id) = self
+            .registered_session(session_id.as_str())
+            .map(|session| session.project_id.clone())
+        else {
+            return;
+        };
+        let enabled = self
+            .ui_state
+            .session
+            .auto_continue_session_overrides
+            .get(session_id.as_str())
+            .copied()
+            .unwrap_or_else(|| self.project_auto_continue_enabled(&project_id));
+        self.apply_auto_continue_enabled(session_id, enabled, cx);
     }
 
     fn set_project_auto_continue_enabled(
@@ -16664,21 +16769,32 @@ impl VibexWorkbench {
         if enabled {
             self.auto_continue_default_project_ids
                 .insert(project_id.as_str().to_string());
-            let session_ids = self
-                .sessions
-                .iter()
-                .filter(|session| session.project_id.as_str() == project_id.as_str())
-                .map(|session| session.id.clone())
-                .collect::<Vec<_>>();
-            for session_id in session_ids {
-                self.set_auto_continue_enabled(session_id, true, cx);
-            }
+            self.auto_continue_disabled_project_ids
+                .remove(project_id.as_str());
         } else {
             self.auto_continue_default_project_ids
                 .remove(project_id.as_str());
+            // The shell-wide default still says "on", so the project has to
+            // record the reader's own decision rather than rely on the
+            // absence of an opt-in.
+            if self.auto_continue_enabled_by_default {
+                self.auto_continue_disabled_project_ids
+                    .insert(project_id.as_str().to_string());
+            }
         }
         self.ui_state.session.auto_continue_project_ids =
             self.auto_continue_default_project_ids.clone();
+        self.ui_state.session.auto_continue_disabled_project_ids =
+            self.auto_continue_disabled_project_ids.clone();
+        let session_ids = self
+            .sessions
+            .iter()
+            .filter(|session| session.project_id.as_str() == project_id.as_str())
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        for session_id in session_ids {
+            self.reconcile_auto_continue_for_session(&session_id, cx);
+        }
         self.queue_ui_state();
         self.publish_sidebar_invalidation();
         cx.notify();
@@ -17092,30 +17208,15 @@ impl VibexWorkbench {
         );
     }
 
+    /// The reader's own switch on one row: it writes a session override, which
+    /// is what keeps this row where the reader put it under any default.
     fn set_auto_continue_enabled(
         &mut self,
         session_id: VibexSessionId,
         enabled: bool,
         cx: &mut Context<Self>,
     ) {
-        if enabled {
-            self.auto_continue_session_ids
-                .insert(session_id.as_str().to_string());
-            self.auto_continue_paused_turn_session_ids
-                .remove(session_id.as_str());
-            self.auto_continue_handled_turns.remove(session_id.as_str());
-            self.auto_continue_paused_session_ids
-                .remove(session_id.as_str());
-            self.sync_auto_continue_for_session(&session_id, cx);
-        } else {
-            self.auto_continue_session_ids.remove(session_id.as_str());
-            self.auto_continue_paused_turn_session_ids
-                .remove(session_id.as_str());
-            self.auto_continue_handled_turns.remove(session_id.as_str());
-            self.auto_continue_paused_session_ids
-                .remove(session_id.as_str());
-            self.cancel_auto_continue_countdown(&session_id);
-        }
+        self.apply_auto_continue_enabled(&session_id, enabled, cx);
         self.ui_state
             .session
             .auto_continue_session_overrides
@@ -17127,6 +17228,40 @@ impl VibexWorkbench {
         self.queue_ui_state();
         self.publish_sidebar_invalidation();
         cx.notify();
+    }
+
+    /// Switches one session's effective state without writing an override.
+    ///
+    /// The callers that resolve a default use this: persisting a row as if the
+    /// reader had clicked it would turn the default into thousands of
+    /// overrides and make the switch impossible to turn back off.
+    fn apply_auto_continue_enabled(
+        &mut self,
+        session_id: &VibexSessionId,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if enabled {
+            let newly_enabled = self
+                .auto_continue_session_ids
+                .insert(session_id.as_str().to_string());
+            self.auto_continue_paused_turn_session_ids
+                .remove(session_id.as_str());
+            self.auto_continue_handled_turns.remove(session_id.as_str());
+            self.auto_continue_paused_session_ids
+                .remove(session_id.as_str());
+            if newly_enabled {
+                self.sync_auto_continue_for_session(session_id, cx);
+            }
+        } else {
+            self.auto_continue_session_ids.remove(session_id.as_str());
+            self.auto_continue_paused_turn_session_ids
+                .remove(session_id.as_str());
+            self.auto_continue_handled_turns.remove(session_id.as_str());
+            self.auto_continue_paused_session_ids
+                .remove(session_id.as_str());
+            self.cancel_auto_continue_countdown(session_id);
+        }
     }
 
     /// Applies one auto-continue setting to every session of a menu selection.
@@ -34402,6 +34537,20 @@ impl VibexWorkbench {
         // it off the sidebar until the next authoritative list read.
         self.delegated_sessions.remove(session_id.as_str());
         self.upsert_session_snapshot(session);
+        // A session created under the shell-wide default starts out already
+        // continuing itself. `upsert_session_snapshot` reads the project
+        // default, so a session created before its project row exists would
+        // otherwise start off and only turn on at the next session-list read.
+        if self.auto_continue_enabled_by_default
+            && !self
+                .ui_state
+                .session
+                .auto_continue_session_overrides
+                .contains_key(session_id.as_str())
+        {
+            self.auto_continue_session_ids
+                .insert(session_id.as_str().to_string());
+        }
         self.file_new_session_in_folder(&session_id);
         self.reconcile_sidebar_state();
         self.publish_sidebar_invalidation();
@@ -42379,7 +42528,14 @@ impl VibexWorkbench {
     }
 
     fn clear_auto_continue_preference_state(&mut self) {
+        self.auto_continue_enabled_by_default = false;
+        self.ui_state.session.auto_continue_enabled_by_default = false;
         self.auto_continue_default_project_ids.clear();
+        self.auto_continue_disabled_project_ids.clear();
+        self.ui_state
+            .session
+            .auto_continue_disabled_project_ids
+            .clear();
         self.auto_continue_session_ids.clear();
         self.auto_continue_paused_session_ids.clear();
         self.auto_continue_paused_turn_session_ids.clear();
@@ -42446,7 +42602,10 @@ impl VibexWorkbench {
             );
         }
 
+        let auto_continue_enabled_by_default = snapshot.session.auto_continue_enabled_by_default;
         let auto_continue_default_project_ids = snapshot.session.auto_continue_project_ids.clone();
+        let auto_continue_disabled_project_ids =
+            snapshot.session.auto_continue_disabled_project_ids.clone();
         let auto_continue_session_ids = restored_auto_continue_session_ids(&snapshot.session);
         let auto_continue_paused_session_ids =
             snapshot.session.auto_continue_paused_session_ids.clone();
@@ -42495,7 +42654,9 @@ impl VibexWorkbench {
 
         self.ui_state = snapshot;
         self.ui_state.network_proxy = restored_proxy;
+        self.auto_continue_enabled_by_default = auto_continue_enabled_by_default;
         self.auto_continue_default_project_ids = auto_continue_default_project_ids;
+        self.auto_continue_disabled_project_ids = auto_continue_disabled_project_ids;
         self.auto_continue_session_ids = auto_continue_session_ids;
         self.auto_continue_paused_session_ids = auto_continue_paused_session_ids;
         self.sidebar_state.row_order = self.ui_state.sidebar.session_order.clone();
@@ -46715,7 +46876,12 @@ impl VibexWorkbench {
             .then(|| self.session_group_status(&group))
             .flatten();
         let pinned = group.pinned;
-        let auto_continue = group.auto_continue;
+        // A group that never made its own choice follows its project, which is
+        // what makes the shell-wide default reach a group the reader did not
+        // touch.
+        let auto_continue = group
+            .auto_continue
+            .unwrap_or_else(|| self.project_auto_continue_enabled_for(&group.project_id));
         let avatars = self.session_group_avatars(&group, cx);
         let hover_group: SharedString = format!("sidebar-group-{group_id}").into();
         let click_group_id = group_id.clone();
@@ -46886,7 +47052,7 @@ impl VibexWorkbench {
                     menu,
                     menu_group_id.clone(),
                     menu_group_name.clone(),
-                    auto_continue.unwrap_or(false),
+                    auto_continue,
                     context_entity.clone(),
                     window,
                     cx,
@@ -46955,7 +47121,7 @@ impl VibexWorkbench {
                             .when_some(collapsed_status, |this, status| {
                                 this.child(sidebar_aggregate_status_indicator(
                                     status,
-                                    auto_continue == Some(true),
+                                    auto_continue,
                                     cx,
                                 ))
                             })
@@ -76096,11 +76262,19 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
             SettingsSection::Session,
             locale::text("Auto-continue", "自动继续", "自動繼續"),
             locale::text(
-                "Apply auto-continue to the selected session.",
-                "为当前选中的会话启用自动继续。",
-                "為目前選取的會話啟用自動繼續。",
+                "Keep automatic continuation on for every project, including new sessions.",
+                "为所有项目默认开启自动继续，新建会话同样自动继续。",
+                "為所有專案預設開啟自動繼續，新建會話同樣自動繼續。",
             ),
-            &["auto continue", "continue", "自动继续", "自動繼續"],
+            &[
+                "auto continue",
+                "continue",
+                "default",
+                "project",
+                "自动继续",
+                "自動繼續",
+                "默认",
+            ],
         ),
         settings_search_candidate(
             SettingsSection::Session,
@@ -76153,9 +76327,9 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
             SettingsSection::Session,
             locale::text("Auto-continue defaults", "自动继续默认项", "自動繼續預設項"),
             locale::text(
-                "Clear project and session auto-continue overrides.",
-                "清除项目和会话的自动继续覆盖项。",
-                "清除專案與會話的自動繼續覆寫項。",
+                "Clear the global default and the project and session auto-continue overrides.",
+                "清除全局默认，以及项目和会话的自动继续覆盖项。",
+                "清除全域預設，以及專案與會話的自動繼續覆寫項。",
             ),
             &["auto continue", "defaults", "overrides", "默认", "預設"],
         ),
@@ -79777,26 +79951,12 @@ impl FoundationSettings {
         cx.notify();
     }
 
-    fn toggle_current_auto_continue(&mut self, cx: &mut Context<Self>) {
+    /// The settings switch writes the shell-wide default rather than the
+    /// selected session's row: the reader asked for auto-continue everywhere,
+    /// not for the session that happened to be open.
+    fn set_auto_continue_default_for_all(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
-            if let Some(session) = this.selected_session().cloned() {
-                let enabled = this.auto_continue_enabled(&session.id);
-                this.set_auto_continue_enabled(session.id, !enabled, cx);
-            } else if let Some(project_id) = this
-                .ui_state
-                .workbench
-                .selected_workspace_id
-                .as_deref()
-                .and_then(|workspace_id| {
-                    this.workspaces
-                        .iter()
-                        .find(|(_, workspace)| workspace.id.as_str() == workspace_id)
-                        .map(|(project, _)| project.id.clone())
-                })
-            {
-                let enabled = this.project_auto_continue_enabled(&project_id);
-                this.set_project_auto_continue_enabled(project_id, !enabled, cx);
-            }
+            this.set_auto_continue_default_enabled(enabled, cx);
         });
         cx.notify();
     }
@@ -80967,10 +81127,7 @@ impl FoundationSettings {
         );
         let auto_continue = self
             .workbench
-            .read_with(cx, |this, _| {
-                this.selected_session()
-                    .is_some_and(|session| this.auto_continue_enabled(&session.id))
-            })
+            .read_with(cx, |this, _| this.auto_continue_default_enabled())
             .unwrap_or(false);
         let (runtime_preferences, auto_continue_preferences) = self
             .workbench
@@ -80987,7 +81144,13 @@ impl FoundationSettings {
                             .runtime_selections_by_model
                             .is_empty()
                         || this.ui_state.composer.default_runtime_selection.is_some(),
-                    !this.ui_state.session.auto_continue_project_ids.is_empty()
+                    this.ui_state.session.auto_continue_enabled_by_default
+                        || !this.ui_state.session.auto_continue_project_ids.is_empty()
+                        || !this
+                            .ui_state
+                            .session
+                            .auto_continue_disabled_project_ids
+                            .is_empty()
                         || !this
                             .ui_state
                             .session
@@ -81129,15 +81292,15 @@ impl FoundationSettings {
                         setting_row(
                             locale::text("Auto-continue", "自动继续", "自動繼續"),
                             locale::text(
-                                "Apply auto-continue to the selected session.",
-                                "为当前选中的会话启用自动继续。",
-                                "為目前選取的會話啟用自動繼續。",
+                                "Keep automatic continuation on for every project, including new sessions.",
+                                "为所有项目默认开启自动继续，新建会话同样自动继续。",
+                                "為所有專案預設開啟自動繼續，新建會話同樣自動繼續。",
                             ),
                             Switch::new("auto-continue")
                                 .small()
                                 .checked(auto_continue)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.toggle_current_auto_continue(cx)
+                                .on_click(cx.listener(|this, enabled, _, cx| {
+                                    this.set_auto_continue_default_for_all(*enabled, cx)
                                 })),
                             stacked,
                             cx,
@@ -81149,9 +81312,9 @@ impl FoundationSettings {
                                 "自動繼續預設項",
                             ),
                             locale::text(
-                                "Clear project and session auto-continue overrides.",
-                                "清除项目和会话的自动继续覆盖项。",
-                                "清除專案與會話的自動繼續覆寫項。",
+                                "Clear the global default and the project and session auto-continue overrides.",
+                                "清除全局默认，以及项目和会话的自动继续覆盖项。",
+                                "清除全域預設，以及專案與會話的自動繼續覆寫項。",
                             ),
                             Button::new("clear-auto-continue-preferences")
                                 .small()
@@ -98893,6 +99056,53 @@ mod tests {
     }
 
     #[test]
+    fn the_settings_switch_turns_auto_continue_on_everywhere() {
+        let source = include_str!("app.rs");
+        let settings = source
+            .split_once("    fn render_session_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_archived_page("))
+            .map(|(body, _)| body)
+            .expect("session settings should remain inspectable");
+        // The switch speaks for every project, not for whichever session the
+        // reader happened to have open.
+        assert!(settings.contains("this.auto_continue_default_enabled()"));
+        assert!(settings.contains("this.set_auto_continue_default_for_all(*enabled, cx)"));
+        assert!(!settings.contains("toggle_current_auto_continue"));
+        assert!(!settings.contains("selected_session()\n                    .is_some_and"));
+        assert!(settings.contains("including new sessions"));
+        assert!(settings.contains("新建会话同样自动继续"));
+
+        let toggle = source
+            .split_once("    fn set_auto_continue_default_enabled(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_project_auto_continue_enabled("))
+            .map(|(body, _)| body)
+            .expect("the global auto-continue switch should remain inspectable");
+        assert!(toggle.contains("self.auto_continue_enabled_by_default = enabled"));
+        assert!(toggle.contains("self.ui_state.session.auto_continue_enabled_by_default"));
+        assert!(toggle.contains("auto_continue_disabled_project_ids.clear()"));
+        // Flipping the default must not write the rows as if the reader had
+        // clicked each one; the override writer is the only place that does.
+        assert!(toggle.contains("self.reconcile_auto_continue_for_session(&session_id, cx)"));
+        assert!(!toggle.contains("set_auto_continue_enabled("));
+
+        let project = source
+            .split_once("    fn project_auto_continue_enabled(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn auto_continue_default_enabled("))
+            .map(|(body, _)| body)
+            .expect("the project default should remain inspectable");
+        assert!(project.contains("self.auto_continue_enabled_by_default"));
+        assert!(project.contains("auto_continue_disabled_project_ids"));
+
+        let create = source
+            .split_once("    fn open_pending_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn update_pending_new_session_workspace("))
+            .map(|(body, _)| body)
+            .expect("session creation should remain inspectable");
+        assert!(create.contains("self.auto_continue_enabled_by_default"));
+        assert!(create.contains("self.auto_continue_session_ids"));
+    }
+
+    #[test]
     fn auto_continue_ui_supports_session_scoping_countdown_and_pause() {
         let source = include_str!("app.rs");
         assert!(source.contains("auto_continue_default_project_ids"));
@@ -99001,7 +99211,9 @@ mod tests {
             .map(|(body, _)| body)
             .expect("project auto-continue toggle should remain inspectable");
         assert!(project_toggle.contains("session.project_id.as_str() == project_id.as_str()"));
-        assert!(project_toggle.contains("self.set_auto_continue_enabled(session_id, true, cx)"));
+        assert!(
+            project_toggle.contains("self.reconcile_auto_continue_for_session(&session_id, cx)")
+        );
         assert!(project_toggle.contains("self.ui_state.session.auto_continue_project_ids"));
         assert!(project_toggle.contains("self.queue_ui_state()"));
 
@@ -108035,8 +108247,11 @@ mod tests {
         assert!(group_row.contains(".when(collapsed_status.is_none(), |this| {"));
         // The group's auto-continue rides the ring's color instead of a second
         // glyph in the trailing column, which keeps the column holding one mark
-        // at a time.
-        assert!(group_row.contains("auto_continue == Some(true)"));
+        // at a time. A group that never chose follows its project default, so
+        // the row resolves the effective answer once and both the ring and the
+        // menu read it.
+        assert!(group_row.contains(".unwrap_or_else(|| self.project_auto_continue_enabled_for("));
+        assert!(group_row.contains("auto_continue,"));
         assert!(!group_row.contains("rotate-ccw.svg"));
 
         assert_eq!(
