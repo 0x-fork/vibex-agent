@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use crate::theme;
 use crate::typography::code_font_weight;
 use gpui::{
     AnyElement, App, BackgroundExecutor, BorderStyle, Bounds, ClipboardItem, Context,
@@ -1647,15 +1648,15 @@ impl TerminalSurface {
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let active = self.active_tab;
-        // The folder bar draws the plates and the selected tab's shape; the wash
-        // behind it is what the shape rises out of, since the framework maps a
-        // bar and an active tab to the same color.
+        // The folder bar draws the selected tab's shape; the plate behind it is
+        // what the shape rises out of. Every tab strip in the app takes the same
+        // plate, so the editor and the terminal read as one kind of strip.
         h_flex()
             .id("terminal-tab-strip")
             .h(px(36.0))
             .flex_none()
             .min_w_0()
-            .bg(cx.theme().muted.opacity(0.24))
+            .bg(theme::tab_strip_plate(cx.theme()))
             .border_b_1()
             .border_color(cx.theme().border)
             .child(

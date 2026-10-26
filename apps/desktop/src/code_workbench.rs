@@ -110,6 +110,7 @@ use crate::resize_seam;
 use crate::skeleton;
 use crate::spinner::Spinner;
 use crate::terminal_surface::TerminalSurface;
+use crate::theme;
 
 const FILE_ROW_HEIGHT: f32 = 28.0;
 const FILE_TREE_INDENT: f32 = 20.0;
@@ -8404,12 +8405,13 @@ impl CodeWorkbench {
                 .is_some_and(|target| {
                     target.pane_id == pane_id && target.region == PreviewPaneDropRegion::TabGroup
                 });
-        // The bar paints its own plate; the strip behind it carries the panes'
-        // drop wash, so a drag over the tab group lights the whole strip.
+        // The strip paints the plate the folder tabs are read against; a drag
+        // over the tab group replaces it with the drop wash so the whole strip
+        // lights up as one target.
         let tab_strip_tone = if tab_group_drop_active {
             cx.theme().primary.opacity(0.10)
         } else {
-            cx.theme().muted.opacity(0.30)
+            theme::tab_strip_plate(cx.theme())
         };
         let content_drop_region = cx
             .has_active_drag()
@@ -8533,12 +8535,16 @@ impl CodeWorkbench {
                     ))
                     .child(
                         // The bar paints no plate of its own here: the strip's
-                        // wash shows between tabs, and the selected tab takes
+                        // plate shows between tabs, and the selected tab takes
                         // the page color so it joins the content below.
+                        //
+                        // It takes its content's width and only shrinks when
+                        // the tabs outgrow the strip, so the "new tab" button
+                        // sits right after the last tab while they fit and
+                        // falls back to the strip's end once they scroll.
                         TabBar::new(format!("preview-tab-bar:{pane_id}"))
                             .folder()
                             .h_full()
-                            .flex_1()
                             .min_w_0()
                             .bg(cx.theme().transparent)
                             .track_scroll(&tab_scroll)
@@ -8626,6 +8632,9 @@ impl CodeWorkbench {
                                     )
                             }),
                     )
+                    // The strip's own actions stay pinned to its end, so the
+                    // "new tab" button can sit with the tabs and these do not.
+                    .child(div().flex_1())
                     .child(
                         Button::new(format!("preview-pane-tabs-menu:{pane_id}"))
                             .small()

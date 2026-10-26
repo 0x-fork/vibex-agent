@@ -255,6 +255,31 @@ pub fn active_wash(is_dark: bool) -> Hsla {
     state_wash(is_dark, 0.16)
 }
 
+/// How far the tab-strip plate leans from the page toward `muted`.
+///
+/// Enough that the selected folder tab — filled with the page color — lifts off
+/// the strip, and that the unselected tabs' muted ink still reads on it.
+const TAB_STRIP_PLATE_MIX: f32 = 0.60;
+
+/// The plate a tab strip paints behind its tabs.
+///
+/// A folder tab fills its selected shape with the page color and leaves its
+/// unselected siblings transparent, so the strip under them is what the tabs
+/// are read against: it has to differ from the page, or the selected tab and
+/// the strip become one surface.
+///
+/// `muted` is opaque and one step above the page in every bundled theme, but at
+/// full strength it is the button plate. Mixed onto the page instead, the strip
+/// lands between the two, and it is mixed here rather than painted as a
+/// translucent wash so the tone does not depend on what happens to sit behind
+/// the strip (the page, a card, or a wallpaper). Every strip takes this one
+/// value, so the editor, session-group, Composer and terminal strips match.
+pub fn tab_strip_plate(theme: &Theme) -> Hsla {
+    theme
+        .background
+        .blend(theme.muted.opacity(TAB_STRIP_PLATE_MIX))
+}
+
 pub fn apply_appearance(
     appearance: &AppearanceUiState,
     backdrop: Backdrop,
@@ -789,6 +814,35 @@ mod tests {
             let active = active_wash(is_dark);
             assert_eq!(active.l, wash_channel);
             assert!((active.a - 0.16).abs() < 1e-6);
+        }
+    }
+
+    /// A folder tab is filled with the page color, so a strip plate that lands
+    /// on the page would leave the selected tab indistinguishable from the
+    /// strip it sits on. Every bundled theme has to separate the two, and the
+    /// plate has to stay opaque so it reads the same over a card or over a
+    /// wallpaper — which is why it is mixed from opaque roles rather than
+    /// painted as a translucent wash.
+    #[test]
+    fn every_theme_separates_the_tab_strip_plate_from_the_page() {
+        for theme in vibex_ui::themes_for(GpuiThemeMode::Light)
+            .chain(vibex_ui::themes_for(GpuiThemeMode::Dark))
+        {
+            let page = semantic_color_for(theme, "background");
+            let muted = semantic_color_for(theme, "muted");
+            let plate = page.blend(muted.opacity(TAB_STRIP_PLATE_MIX));
+            assert!(
+                plate.a >= 1.0 - 1e-6,
+                "{}: the tab strip plate is translucent",
+                theme.name
+            );
+            assert!(
+                (plate.l - page.l).abs() > 0.02,
+                "{}: the tab strip plate sits on the page ({} vs {})",
+                theme.name,
+                plate.l,
+                page.l
+            );
         }
     }
 

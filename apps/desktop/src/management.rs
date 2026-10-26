@@ -38968,6 +38968,7 @@ mod gateway_surface_tests {
                 )],
                 skipped_members: Vec::new(),
                 error_code: None,
+                error_message: None,
             }),
         );
 
@@ -38999,6 +39000,7 @@ mod gateway_surface_tests {
                 failed_attempts: Vec::new(),
                 skipped_members: Vec::new(),
                 error_code: None,
+                error_message: None,
             }),
         );
         let lines = gateway_route_lines(&over_limit, ResolvedLocale::ZhCn);
@@ -39029,6 +39031,7 @@ mod gateway_surface_tests {
                 ],
                 skipped_members: Vec::new(),
                 error_code: None,
+                error_message: None,
             }),
         );
         let lines = gateway_route_lines(&two_dead, ResolvedLocale::En);
@@ -39111,6 +39114,7 @@ mod gateway_surface_tests {
                 failed_attempts: Vec::new(),
                 skipped_members: Vec::new(),
                 error_code: Some("model_gateway_translation_failed".to_string()),
+                error_message: None,
             }),
         );
         failed.outcome = vibex_core::GatewayRequestOutcome::Failed;

@@ -45605,7 +45605,7 @@ impl VibexWorkbench {
             .bg(if tab_group_drop_active {
                 cx.theme().primary.opacity(0.10)
             } else {
-                cx.theme().muted.opacity(0.30)
+                theme::tab_strip_plate(cx.theme())
             })
             .on_drag_move(cx.listener(
                 move |this, event: &DragMoveEvent<SessionGroupTabDrag>, _, cx| {
@@ -55705,18 +55705,21 @@ impl VibexWorkbench {
                     .h(px(36.0))
                     .flex_none()
                     .min_w_0()
-                    .bg(cx.theme().muted.opacity(0.24))
+                    .bg(theme::tab_strip_plate(cx.theme()))
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
                         // The folder bar scrolls itself, wheel included, and
                         // keeps a clicked tab in view; the card only supplies
                         // the strip's height and the button beside it.
+                        // Content width, shrinking only when the tabs outgrow
+                        // the card, so "new terminal" follows the last tab while
+                        // they fit and returns to the card's edge once they
+                        // scroll.
                         TabBar::new("composer-terminal-tabs")
                             .folder()
                             .h_full()
                             .min_w_0()
-                            .flex_1()
                             .max_width(px(220.0))
                             .bg(cx.theme().transparent)
                             .when_some(
