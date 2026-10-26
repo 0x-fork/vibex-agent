@@ -1852,6 +1852,7 @@ impl ModelGatewayService {
             failed_attempts: failed_attempts.clone(),
             skipped_members: skipped_members.clone(),
             error_code: Some(error.code().to_string()),
+            error_message: Some(vibex_core::gateway_diagnostic_text(&error.message())),
         };
         self.record(prepared, &outcome);
         Err(error)
@@ -2306,6 +2307,7 @@ impl ModelGatewayService {
                 failed_attempts: outcome.failed_attempts.clone(),
                 skipped_members: outcome.skipped_members.clone(),
                 error_code: outcome.error_code.clone(),
+                error_message: outcome.error_message.clone(),
                 ..GatewayRouteTrace::new(outcome.skipped_cooling, outcome.skipped_over_limit)
             }),
             created_at_ms: now,
@@ -2688,6 +2690,8 @@ pub(crate) struct RequestOutcome {
     /// says only "failed", with nothing linking it to the message the Agent
     /// showed.
     pub error_code: Option<String>,
+    /// What the upstream said when it refused, when it said anything.
+    pub error_message: Option<String>,
 }
 
 /// The credential a request authenticates with.
@@ -3271,6 +3275,7 @@ pub(crate) async fn forward(
             served: None,
             failed_attempts,
             skipped_members,
+            error_message: None,
             error_code: failed.then_some("model_gateway_upstream_failed".to_string()),
         },
     );
@@ -3319,6 +3324,7 @@ pub(crate) async fn gather(
                     failed_attempts,
                     skipped_members,
                     error_code: Some("model_gateway_upstream_failed".to_string()),
+                    error_message: None,
                 },
             );
             return Err(GatewayError::Upstream {
@@ -3395,6 +3401,7 @@ pub(crate) async fn gather(
             served: (!response.model.is_empty()).then(|| response.model.clone()),
             failed_attempts,
             skipped_members,
+            error_message: None,
             error_code: None,
         },
     );

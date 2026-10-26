@@ -3150,6 +3150,90 @@ async fn dropping_every_tool_removes_the_key() {
     cleanup(path);
 }
 
+/// A vendor's 400 body reaches the ledger.
+///
+/// The body names the field the vendor refused — "Invalid schema for function
+/// 'read_file': ..." — and the Agent shows only its own generic wrapper. Without
+/// this the ledger had a bare status and the reason existed nowhere the user
+/// could look.
+#[tokio::test]
+async fn a_refused_upstream_body_is_recorded_with_its_message() {
+    let path = database_path();
+    let (upstream_url, upstream_task) = mock_schema_refusing_upstream().await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::GeminiGenerateContent,
+        &["gemini-2.5-pro"],
+        "sk-test",
+    );
+    let group = point_gateway_at(&path, upstream, GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let model = group_model(&group, "gemini-2.5-pro");
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/v1beta/models/{model}:generateContent"
+        ))
+        .header(header::HOST, "127.0.0.1")
+        .header("x-goog-api-key", "vibex-local-gateway")
+        .json(&json!({
+            "contents": [{"role": "user", "parts": [{"text": "read it"}]}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let _ = response.text().await.unwrap();
+
+    let connection = open_database(&path).unwrap();
+    let rows = ModelGatewayRequestLogRepository::recent(&connection, 5).unwrap();
+    let row = rows.first().expect("the failure must be recorded");
+    let route = row.route.as_ref().expect("the row carries a route trace");
+    assert_eq!(
+        route.error_code.as_deref(),
+        Some("model_gateway_upstream_failed")
+    );
+    let message = route
+        .error_message
+        .as_deref()
+        .unwrap_or_else(|| panic!("the vendor's own words must be kept: {route:#?}"));
+    assert!(
+        message.contains("STRING") && message.contains("anyOf"),
+        "the message must be the vendor's refusal: {message}"
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+async fn mock_schema_refusing_upstream() -> (String, tokio::task::JoinHandle<()>) {
+    let router = Router::new().route(
+        "/{*path}",
+        post(move |_body: axum::body::Bytes| async move {
+            let mut response = Response::new(Body::from(
+                json!({"error": {"message":
+                    "Invalid schema for function 'read_file': \"STRING\" is not valid under any of the schemas listed in the 'anyOf' key"
+                }})
+                .to_string(),
+            ));
+            *response.status_mut() = axum::http::StatusCode::BAD_REQUEST;
+            response
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (format!("http://{address}"), task)
+}
+
 /// A refusal that never reached an upstream still lands in the ledger.
 ///
 /// Without the row the ledger is empty at the moment the Agent shows an error,

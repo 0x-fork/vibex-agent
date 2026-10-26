@@ -855,6 +855,15 @@ pub struct GatewayRouteTrace {
     /// investigation starts from the ledger instead of a session transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    /// What the upstream said when it refused the request.
+    ///
+    /// A `400` from a vendor is a description of the field it objected to
+    /// ("Invalid schema for function 'read_file': ..."), and it is the only
+    /// place that description exists: the Agent shows its own generic wrapper
+    /// and the ledger used to keep the status alone. Redacted and bounded the
+    /// same way every other diagnostic is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 /// One route member that did not answer, and why.
@@ -878,6 +887,7 @@ impl GatewayRouteTrace {
             failed_attempts: Vec::new(),
             skipped_members: Vec::new(),
             error_code: None,
+            error_message: None,
         }
     }
 
@@ -887,6 +897,7 @@ impl GatewayRouteTrace {
     /// nothing: the error code is the whole reason the row exists.
     pub fn is_unremarkable(&self) -> bool {
         self.error_code.is_none()
+            && self.error_message.is_none()
             && self.skipped_cooling == 0
             && self.skipped_over_limit == 0
             && self.failed_attempts.is_empty()
@@ -897,6 +908,37 @@ impl GatewayRouteTrace {
     pub fn is_current(&self) -> bool {
         self.schema_version == GATEWAY_ROUTE_TRACE_SCHEMA_VERSION
     }
+}
+
+/// Redacts and bounds a vendor message for the ledger.
+///
+/// An upstream refusal is the only description of which field it objected to,
+/// so it is worth keeping — but it is vendor text that may quote a request
+/// header or a path. Both are already the gateway's own diagnostics contract:
+/// a bounded length and the shared sensitive-value check.
+pub fn gateway_diagnostic_text(message: &str) -> String {
+    const MAX: usize = 512;
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let sensitive = lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("authorization")
+        || lower.contains("bearer ")
+        || lower.contains("password")
+        || lower.contains("secret")
+        || lower.starts_with("sk-");
+    if sensitive {
+        return "[redacted-sensitive-output]".to_string();
+    }
+    if trimmed.chars().count() <= MAX {
+        return trimmed.to_string();
+    }
+    let mut bounded = trimmed.chars().take(MAX).collect::<String>();
+    bounded.push('…');
+    bounded
 }
 
 /// How a gateway request ended.
@@ -1247,6 +1289,7 @@ impl GatewayRequestSummary {
                     })
                     .collect(),
                 error_code: trace.error_code,
+                error_message: trace.error_message,
             });
         Self {
             model_provider_profile_id: profile
@@ -1388,6 +1431,9 @@ pub struct GatewayRouteSummary {
     /// The gateway's own error code, when the request never produced a reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    /// What the upstream said it refused, when it refused one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 /// One skipped route member, named for display.
