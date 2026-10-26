@@ -82,6 +82,7 @@ mod market;
 pub mod mcp_delivery;
 mod model_gateway;
 mod model_route;
+mod model_source;
 mod native_export;
 mod native_import;
 mod native_surface;

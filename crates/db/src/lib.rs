@@ -81,6 +81,8 @@ mod model_gateway;
 pub use model_gateway::*;
 mod model_route;
 pub use model_route::*;
+mod model_source;
+pub use model_source::*;
 
 pub type DbConnection = Connection;
 
@@ -95,7 +97,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 80;
+pub const CURRENT_SCHEMA_VERSION: i64 = 82;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1558,6 +1560,7 @@ const MIGRATIONS: &[Migration] = &[
                 configured_models_json TEXT NOT NULL,
                 default_model_id TEXT NULL,
                 headers_json TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL,
                 revision INTEGER NOT NULL CHECK(revision > 0),
                 created_at_ms INTEGER NOT NULL,
@@ -4911,6 +4914,32 @@ impl AgentDefaultModelProviderProfileRepository {
             provider_profile_id: Some(provider_profile_id),
             updated_at_ms: Some(now),
         })
+    }
+
+    /// Removes the scoped Provider default.
+    ///
+    /// Setting a route as the unified default calls this so the two legacy
+    /// stores cannot both claim to decide the Agent's start.
+    pub fn clear(
+        conn: &Connection,
+        scope: ProviderProfileDefaultScope,
+        agent_id: AgentId,
+    ) -> VibexResult<bool> {
+        let scope_kind = enum_to_db(&scope.kind)?;
+        let scope_id = scope.storage_key();
+        let changed = conn
+            .execute(
+                "
+                DELETE FROM agent_default_model_provider_profiles
+                WHERE scope_kind = ?1 AND scope_id = ?2 AND agent_id = ?3
+                ",
+                params![scope_kind, scope_id, agent_id.as_str()],
+            )
+            .map_err(storage_err(
+                "agent_model_provider_default_clear_failed",
+                "failed to clear agent model provider default profile",
+            ))?;
+        Ok(changed > 0)
     }
 }
 
@@ -12464,6 +12493,11 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // Describes each Agent's direct Provider as a single-member route, so the
     // route graph can show direct connections beside gateway ones.
     model_route::backfill_direct_routes(conn)?;
+    // The unified default reads the bindings the compatibility backfill above
+    // creates, so it runs after them rather than in the middle of the recorded
+    // migration list.
+    apply_agent_model_source_defaults(conn, &mut applied)?;
+    provider_projection::migrate_provider_metadata(conn, &mut applied)?;
     Ok(applied)
 }
 
@@ -18732,6 +18766,8 @@ mod tests {
                 "78:gateway_profile_kind_repair",
                 "79:model_gateway_endpoint_protocol",
                 "80:route_failover",
+                "81:agent_model_source_defaults",
+                "82:model_provider_metadata",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -18896,6 +18932,8 @@ mod tests {
                 "78:gateway_profile_kind_repair",
                 "79:model_gateway_endpoint_protocol",
                 "80:route_failover",
+                "81:agent_model_source_defaults",
+                "82:model_provider_metadata",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -19041,6 +19079,8 @@ mod tests {
                 "78:gateway_profile_kind_repair",
                 "79:model_gateway_endpoint_protocol",
                 "80:route_failover",
+                "81:agent_model_source_defaults",
+                "82:model_provider_metadata",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -19224,6 +19264,8 @@ mod tests {
                 "78:gateway_profile_kind_repair",
                 "79:model_gateway_endpoint_protocol",
                 "80:route_failover",
+                "81:agent_model_source_defaults",
+                "82:model_provider_metadata",
             ]
         );
         assert_eq!(
@@ -20667,6 +20709,8 @@ mod tests {
                 "78:gateway_profile_kind_repair",
                 "79:model_gateway_endpoint_protocol",
                 "80:route_failover",
+                "81:agent_model_source_defaults",
+                "82:model_provider_metadata",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

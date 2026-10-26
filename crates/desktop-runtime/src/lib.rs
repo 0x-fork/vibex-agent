@@ -1135,6 +1135,7 @@ pub async fn assemble_management_snapshot(
     // use, and one query is cheaper than one per Agent.
     let model_routes = provider.list_model_routes()?;
     let agent_model_route_bindings = provider.list_all_agent_model_route_bindings()?;
+    let agent_model_source_defaults = provider.list_agent_model_source_defaults()?;
     let native_import_preview = provider
         .preview_native_import(vibex_core::ProviderNativeImportPreviewRequest {
             sources: vec![
@@ -1324,6 +1325,7 @@ pub async fn assemble_management_snapshot(
         agent_model_provider_bindings,
         model_routes,
         agent_model_route_bindings,
+        agent_model_source_defaults,
         native_import_preview,
         acp_configs,
         agent_details,

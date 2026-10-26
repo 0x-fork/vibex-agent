@@ -7,19 +7,68 @@ use vibex_core::{ModelCapabilitySource, ProviderModelCapabilities, ProviderModel
 /// One model's catalogue entry.
 ///
 /// Prices are absent by design: the product reports tokens, and a price from a
-/// catalogue would be an estimate presented as a fact.
+/// catalogue would be an estimate presented as a fact. The catalogue's `cost`
+/// object is not even parsed, so a stored entry cannot acquire one.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogModel {
     pub id: String,
     pub display_name: Option<String>,
+    /// The vendor's model family, such as `claude` or `gpt`.
+    pub family: Option<String>,
+    /// When the vendor published the model, as the catalogue spells it.
+    pub release_date: Option<String>,
     pub context_tokens: Option<u32>,
+    /// Prompt tokens accepted at once, when the catalogue publishes it apart
+    /// from the context window.
+    pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
     pub reasoning: Option<bool>,
+    /// The reasoning controls the model offers, kept in the catalogue's own
+    /// vocabulary rather than translated into Agent levels.
+    pub reasoning_options: Option<Vec<CatalogReasoningOption>>,
     pub image_input: Option<bool>,
     pub pdf_input: Option<bool>,
+    /// The raw modality lists, so a surface can show every modality rather
+    /// than only the two capabilities this crate projects.
+    pub modalities: Option<CatalogModalities>,
     pub temperature: Option<bool>,
+    pub tool_call: Option<bool>,
+    pub structured_output: Option<bool>,
+    /// The vendor-independent id the catalogue maps a resold or aliased model
+    /// to.
+    pub canonical_model_id: Option<String>,
+    /// The vendor's lifecycle status, such as `beta` or `deprecated`.
+    pub status: Option<String>,
     pub reasoning_efforts: Option<ProviderModelReasoningEfforts>,
+}
+
+/// The modality lists a catalogue model advertises.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CatalogModalities {
+    #[serde(default)]
+    pub input: Vec<String>,
+    #[serde(default)]
+    pub output: Vec<String>,
+}
+
+/// One reasoning control a model advertises.
+///
+/// The shapes mirror the catalogue's own tagged objects: `{"type":"toggle"}`,
+/// `{"type":"effort","values":[...]}`, and
+/// `{"type":"budget_tokens","min":N}`. They are not Agent effort levels; the
+/// catalogue does not publish the Agent's vocabulary, so nothing is mapped.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CatalogReasoningOption {
+    Toggle,
+    Effort {
+        values: Vec<String>,
+    },
+    BudgetTokens {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<u32>,
+    },
 }
 
 /// One provider's entries.
@@ -28,6 +77,15 @@ pub struct CatalogModel {
 pub struct CatalogProvider {
     pub id: String,
     pub display_name: String,
+    /// The provider's OpenAI-compatible base URL, when the catalogue lists one.
+    pub api: Option<String>,
+    /// The provider's documentation URL.
+    pub doc: Option<String>,
+    /// Environment variables the provider's SDK reads.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// The npm package the vendor's own SDK ships as.
+    pub npm: Option<String>,
     pub models: BTreeMap<String, CatalogModel>,
 }
 
@@ -280,5 +338,52 @@ mod tests {
                 .any(|(field, _)| *field == "reasoningEfforts")
         );
         assert!(suggestion.adopt_all().reasoning_efforts.is_none());
+    }
+
+    #[test]
+    fn catalog_reasoning_options_are_not_agent_effort_levels() {
+        let catalog = parse_catalog(
+            r#"{"p":{"models":{"m":{
+                "reasoning_options":[
+                    {"type":"toggle"},
+                    {"type":"effort","values":["low","high"]},
+                    {"type":"budget_tokens","min":1024}
+                ]
+            }}}}"#,
+        )
+        .unwrap();
+        let suggestion = catalog.suggestion("p", "m").unwrap();
+        assert_eq!(
+            suggestion.model.reasoning_options.as_ref().unwrap().len(),
+            3
+        );
+        // The catalogue's controls stay catalogue data; they never become the
+        // Agent's declared level table.
+        assert!(suggestion.model.reasoning_efforts.is_none());
+        assert!(suggestion.adopt_all().reasoning_efforts.is_none());
+    }
+
+    #[test]
+    fn new_catalog_metadata_does_not_widen_the_adopted_capabilities() {
+        let catalog = parse_catalog(
+            r#"{"p":{"models":{"m":{
+                "family":"p","release_date":"2025-01-01","limit":{"input":1000},
+                "tool_call":true,"structured_output":true,
+                "status":"beta","canonical_model_id":"p/m",
+                "modalities":{"input":["text","image"],"output":["text"]}
+            }}}}"#,
+        )
+        .unwrap();
+        let suggestion = catalog.suggestion("p", "m").unwrap();
+        let capabilities = suggestion.adopt_all();
+        // Only the declared capability fields are adopted.
+        assert_eq!(capabilities.reasoning, None);
+        assert_eq!(capabilities.image_input, Some(true));
+        assert_eq!(capabilities.pdf_input, Some(false));
+        assert_eq!(capabilities.context_tokens, None);
+        assert_eq!(
+            capabilities.adopted_from_catalog().collect::<Vec<_>>(),
+            vec!["imageInput", "pdfInput"]
+        );
     }
 }

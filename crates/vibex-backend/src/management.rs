@@ -193,6 +193,25 @@ pub trait ManagementBackend: BackendBound {
         request: MutationRequest<vibex_core::AgentModelRouteDefaultRequest>,
     ) -> BackendFuture<'_, ()>;
 
+    /// The Agent's resolved default model source for one scope.
+    fn get_agent_model_source_default(
+        &self,
+        request: vibex_core::AgentModelSourceDefaultRequest,
+    ) -> BackendFuture<'_, vibex_core::AgentModelSourceDefault>;
+
+    /// Sets the Agent's default model source, clearing the conflicting legacy
+    /// default in the same transaction.
+    fn set_agent_model_source_default(
+        &self,
+        request: MutationRequest<vibex_core::SetAgentModelSourceDefaultRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentModelSourceDefault>;
+
+    /// Removes the explicit unified default; the legacy fallbacks remain.
+    fn clear_agent_model_source_default(
+        &self,
+        request: MutationRequest<vibex_core::ClearAgentModelSourceDefaultRequest>,
+    ) -> BackendFuture<'_, bool>;
+
     /// The catalogue's suggestion for one model, when a catalogue is cached.
     ///
     /// This never blocks on the network: a missing or stale catalogue answers

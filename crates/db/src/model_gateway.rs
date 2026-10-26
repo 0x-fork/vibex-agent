@@ -1187,6 +1187,7 @@ mod tests {
             configured_models: Vec::new(),
             default_model_id: None,
             headers: Vec::new(),
+            metadata: Default::default(),
             status: vibex_core::ModelProviderProfileStatus::Enabled,
             revision: 1,
             created_at_ms: 1,
@@ -1492,6 +1493,7 @@ mod tests {
                 }],
                 skipped_members: Vec::new(),
                 error_code: None,
+                error_message: None,
             }),
             created_at_ms: now,
         };

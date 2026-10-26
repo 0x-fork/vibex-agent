@@ -79,6 +79,13 @@ impl ProviderPresetCaveat {
 pub struct ProviderPreset {
     pub id: String,
     pub display_name: String,
+    /// The matching provider id in the models.dev catalogue, when the vendor is
+    /// listed there.
+    ///
+    /// The two ids differ for some vendors (`google-gemini` is `google` in the
+    /// catalogue), so the mapping is explicit rather than derived from `id`.
+    /// `None` means the catalogue has nothing to suggest for this Provider.
+    pub catalog_id: Option<String>,
     /// Endpoint per wire protocol. One preset may serve several protocols
     /// through different addresses.
     pub endpoints: BTreeMap<String, String>,
@@ -214,6 +221,12 @@ impl ProviderPreset {
                 value: wire_api.wire_protocol_id().to_string(),
             });
         }
+        if let Some(catalog_id) = self.catalog_id.as_deref() {
+            options.entries.push(crate::ProviderBindingMetadata {
+                key: "catalogId".to_string(),
+                value: catalog_id.to_string(),
+            });
+        }
         for (protocol, url) in &self.endpoints {
             if let Some(wire_api) = crate::ProviderModelWireApi::from_wire_protocol_id(protocol) {
                 options.entries.push(crate::ProviderBindingMetadata {
@@ -241,6 +254,10 @@ pub const PROVIDER_PRESET_DEEPSEEK: &str = "deepseek";
 pub const PROVIDER_PRESET_MOONSHOT_KIMI: &str = "moonshot-kimi";
 pub const PROVIDER_PRESET_ZHIPU_GLM: &str = "zhipu-glm";
 pub const PROVIDER_PRESET_OPENROUTER: &str = "openrouter";
+pub const PROVIDER_PRESET_XAI: &str = "xai";
+pub const PROVIDER_PRESET_MISTRAL: &str = "mistral";
+pub const PROVIDER_PRESET_GROQ: &str = "groq";
+pub const PROVIDER_PRESET_SILICONFLOW: &str = "siliconflow";
 pub const PROVIDER_PRESET_OLLAMA: &str = "ollama";
 
 /// Third-party plans that resell open coding models.
@@ -264,6 +281,7 @@ fn preset(
     ProviderPreset {
         id: id.to_string(),
         display_name: display_name.to_string(),
+        catalog_id: None,
         endpoints: endpoints(endpoint_entries),
         website: None,
         keys_url: None,
@@ -291,6 +309,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
 
     let mut presets = vec![
         ProviderPreset {
+            catalog_id: Some("anthropic".to_string()),
             website: Some("https://www.anthropic.com".to_string()),
             keys_url: Some("https://console.anthropic.com/settings/keys".to_string()),
             key_hint: Some("starts with sk-ant-".to_string()),
@@ -303,6 +322,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             )
         },
         ProviderPreset {
+            catalog_id: Some("openai".to_string()),
             website: Some("https://openai.com".to_string()),
             keys_url: Some("https://platform.openai.com/api-keys".to_string()),
             key_hint: Some("starts with sk-".to_string()),
@@ -317,6 +337,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             )
         },
         ProviderPreset {
+            catalog_id: Some("google".to_string()),
             website: Some("https://ai.google.dev".to_string()),
             keys_url: Some("https://aistudio.google.com/apikey".to_string()),
             ..preset(
@@ -327,6 +348,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             )
         },
         ProviderPreset {
+            catalog_id: Some("deepseek".to_string()),
             website: Some("https://www.deepseek.com".to_string()),
             keys_url: Some("https://platform.deepseek.com/api_keys".to_string()),
             key_hint: Some("starts with sk-".to_string()),
@@ -341,6 +363,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             )
         },
         ProviderPreset {
+            catalog_id: Some("moonshotai".to_string()),
             website: Some("https://platform.moonshot.cn".to_string()),
             keys_url: Some("https://platform.moonshot.cn/console/api-keys".to_string()),
             ..preset(
@@ -354,6 +377,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             )
         },
         ProviderPreset {
+            catalog_id: Some("zhipuai".to_string()),
             website: Some("https://open.bigmodel.cn".to_string()),
             keys_url: Some("https://open.bigmodel.cn/usercenter/apikeys".to_string()),
             regions: vec![ProviderPresetRegion {
@@ -369,6 +393,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             )
         },
         ProviderPreset {
+            catalog_id: Some("openrouter".to_string()),
             website: Some("https://openrouter.ai".to_string()),
             keys_url: Some("https://openrouter.ai/keys".to_string()),
             ..preset(
@@ -383,6 +408,65 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                     "deepseek/deepseek-chat",
                     "anthropic/claude-sonnet-4.5",
                     "openai/gpt-5",
+                ],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("xai".to_string()),
+            website: Some("https://x.ai".to_string()),
+            keys_url: Some("https://console.x.ai".to_string()),
+            key_hint: Some("starts with xai-".to_string()),
+            ..preset(
+                PROVIDER_PRESET_XAI,
+                "xAI",
+                &[(chat, "https://api.x.ai/v1")],
+                &["grok-4.7", "grok-4.6", "grok-4.5"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("mistral".to_string()),
+            website: Some("https://mistral.ai".to_string()),
+            keys_url: Some("https://console.mistral.ai/api-keys".to_string()),
+            ..preset(
+                PROVIDER_PRESET_MISTRAL,
+                "Mistral",
+                &[(chat, "https://api.mistral.ai/v1")],
+                &[
+                    "mistral-large-latest",
+                    "mistral-small-latest",
+                    "codestral-latest",
+                ],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("groq".to_string()),
+            website: Some("https://groq.com".to_string()),
+            keys_url: Some("https://console.groq.com/keys".to_string()),
+            key_hint: Some("starts with gsk_".to_string()),
+            ..preset(
+                PROVIDER_PRESET_GROQ,
+                "Groq",
+                &[(chat, "https://api.groq.com/openai/v1")],
+                &["llama-3.3-70b-versatile", "openai/gpt-oss-120b"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("siliconflow".to_string()),
+            website: Some("https://cloud.siliconflow.cn".to_string()),
+            keys_url: Some("https://cloud.siliconflow.cn/account/ak".to_string()),
+            regions: vec![ProviderPresetRegion {
+                id: "global".to_string(),
+                display_name: "International".to_string(),
+                endpoints: endpoints(&[(chat, "https://api.siliconflow.com/v1")]),
+            }],
+            ..preset(
+                PROVIDER_PRESET_SILICONFLOW,
+                "SiliconFlow",
+                &[(chat, "https://api.siliconflow.cn/v1")],
+                &[
+                    "deepseek-ai/DeepSeek-V3",
+                    "Qwen/Qwen3-32B",
+                    "Qwen/Qwen3-Coder-480B-A35B-Instruct",
                 ],
             )
         },
@@ -405,6 +489,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
         // they decide whether the model list can be trusted at all — the one
         // thing an address and a protocol cannot express.
         ProviderPreset {
+            catalog_id: Some("opencode-go".to_string()),
             plan_note: Some("$10/month".to_string()),
             website: Some("https://opencode.ai/docs/go".to_string()),
             keys_url: Some("https://opencode.ai/auth".to_string()),
@@ -451,6 +536,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             )
         },
         ProviderPreset {
+            catalog_id: Some("commandcode".to_string()),
             website: Some("https://commandcode.ai/docs/provider".to_string()),
             keys_url: Some("https://commandcode.ai/settings/keys".to_string()),
             // One account, two protocol families: the Claude models answer the
@@ -507,6 +593,145 @@ mod tests {
                 preset.id
             );
         }
+    }
+
+    #[test]
+    fn catalog_ids_follow_the_catalogue_aliases() {
+        for (preset_id, catalog_id) in [
+            (PROVIDER_PRESET_ANTHROPIC, "anthropic"),
+            (PROVIDER_PRESET_OPENAI, "openai"),
+            // The preset id keeps the product name; the catalogue uses the
+            // vendor name.
+            (PROVIDER_PRESET_GOOGLE_GEMINI, "google"),
+            (PROVIDER_PRESET_DEEPSEEK, "deepseek"),
+            (PROVIDER_PRESET_MOONSHOT_KIMI, "moonshotai"),
+            (PROVIDER_PRESET_ZHIPU_GLM, "zhipuai"),
+            (PROVIDER_PRESET_OPENROUTER, "openrouter"),
+            (PROVIDER_PRESET_XAI, "xai"),
+            (PROVIDER_PRESET_MISTRAL, "mistral"),
+            (PROVIDER_PRESET_GROQ, "groq"),
+            (PROVIDER_PRESET_SILICONFLOW, "siliconflow"),
+            (PROVIDER_PRESET_COMMANDCODE, "commandcode"),
+            (PROVIDER_PRESET_OPENCODE_GO, "opencode-go"),
+        ] {
+            assert_eq!(
+                provider_preset(preset_id).unwrap().catalog_id.as_deref(),
+                Some(catalog_id),
+                "{preset_id} must point at its models.dev provider"
+            );
+        }
+        // These two are not listed by models.dev, so a suggestion must never
+        // be attempted for them.
+        for preset_id in [PROVIDER_PRESET_OLLAMA, PROVIDER_PRESET_CLINEPASS] {
+            assert!(
+                provider_preset(preset_id).unwrap().catalog_id.is_none(),
+                "{preset_id} has no models.dev provider"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_ids_are_unique_and_slug_shaped() {
+        let catalog_ids = provider_presets()
+            .into_iter()
+            .filter_map(|preset| preset.catalog_id)
+            .collect::<Vec<_>>();
+        assert!(catalog_ids.len() >= 10);
+        let mut unique = catalog_ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            catalog_ids.len(),
+            "two presets must not share a catalogue id"
+        );
+        for catalog_id in catalog_ids {
+            assert!(!catalog_id.trim().is_empty());
+            assert_eq!(
+                catalog_id.to_ascii_lowercase(),
+                catalog_id,
+                "a catalogue id is a lowercase slug"
+            );
+            assert!(
+                !catalog_id.chars().any(char::is_whitespace),
+                "a catalogue id must not contain whitespace"
+            );
+        }
+    }
+
+    #[test]
+    fn the_common_vendors_ship_with_their_official_endpoints() {
+        let xai = provider_preset(PROVIDER_PRESET_XAI).unwrap();
+        assert_eq!(xai.display_name, "xAI");
+        assert_eq!(
+            xai.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions),
+            Some("https://api.x.ai/v1")
+        );
+        assert!(xai.models.iter().all(|model| model.starts_with("grok-")));
+
+        let mistral = provider_preset(PROVIDER_PRESET_MISTRAL).unwrap();
+        assert_eq!(
+            mistral.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions),
+            Some("https://api.mistral.ai/v1")
+        );
+        assert!(
+            mistral
+                .models
+                .iter()
+                .any(|model| model == "mistral-large-latest")
+        );
+
+        let groq = provider_preset(PROVIDER_PRESET_GROQ).unwrap();
+        assert_eq!(
+            groq.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions),
+            Some("https://api.groq.com/openai/v1")
+        );
+        assert!(
+            groq.models
+                .iter()
+                .any(|model| model == "llama-3.3-70b-versatile")
+        );
+
+        let siliconflow = provider_preset(PROVIDER_PRESET_SILICONFLOW).unwrap();
+        assert_eq!(
+            siliconflow.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions),
+            Some("https://api.siliconflow.cn/v1")
+        );
+        let global = siliconflow.with_region(Some("global"));
+        assert_eq!(
+            global.endpoint_for(ProviderModelWireApi::OpenaiChatCompletions),
+            Some("https://api.siliconflow.com/v1")
+        );
+        // The vendor serves an OpenAI-compatible surface on both regions.
+        for preset in [xai, mistral, groq, siliconflow] {
+            assert!(!preset.no_key);
+            assert!(!preset.models.is_empty());
+            assert!(preset.keys_url.is_some());
+        }
+    }
+
+    #[test]
+    fn a_preset_draft_carries_its_catalog_id() {
+        let agent_id = crate::AgentId::parse("codex").unwrap();
+        let deepseek = provider_preset(PROVIDER_PRESET_DEEPSEEK).unwrap();
+        let draft = deepseek.draft_profile(&agent_id);
+        assert!(
+            draft
+                .provider_options
+                .entries
+                .iter()
+                .any(|entry| { entry.key == "catalogId" && entry.value == "deepseek" })
+        );
+        let ollama = provider_preset(PROVIDER_PRESET_OLLAMA).unwrap();
+        let draft = ollama.draft_profile(&agent_id);
+        assert!(
+            !draft
+                .provider_options
+                .entries
+                .iter()
+                .any(|entry| entry.key == "catalogId"),
+            "a preset without a catalogue id writes no option"
+        );
     }
 
     #[test]

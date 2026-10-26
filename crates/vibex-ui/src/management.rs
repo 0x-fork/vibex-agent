@@ -1392,6 +1392,27 @@ mod tests {
             error_future()
         }
 
+        fn get_agent_model_source_default(
+            &self,
+            _request: vibex_core::AgentModelSourceDefaultRequest,
+        ) -> BackendFuture<'_, vibex_core::AgentModelSourceDefault> {
+            error_future()
+        }
+
+        fn set_agent_model_source_default(
+            &self,
+            _request: MutationRequest<vibex_core::SetAgentModelSourceDefaultRequest>,
+        ) -> BackendFuture<'_, vibex_core::AgentModelSourceDefault> {
+            error_future()
+        }
+
+        fn clear_agent_model_source_default(
+            &self,
+            _request: MutationRequest<vibex_core::ClearAgentModelSourceDefaultRequest>,
+        ) -> BackendFuture<'_, bool> {
+            error_future()
+        }
+
         fn model_gateway_inflight(&self) -> BackendFuture<'_, Vec<vibex_core::GatewayInflight>> {
             error_future()
         }

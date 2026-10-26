@@ -7,6 +7,7 @@ mod acp_catalog;
 pub mod agent;
 pub mod agent_auth;
 pub mod agent_config;
+pub mod agent_model_source;
 pub mod agent_provider_runtime;
 pub mod automation_graph;
 pub mod browser;
@@ -94,6 +95,10 @@ pub use agent_config::{
     CustomAgentDeleteRequest, USER_VISIBLE_AGENT_IDS, acp_registry_agent_id,
     agent_id_for_provider_kind, agent_install_url, builtin_agent_definitions,
     custom_agent_definition, is_user_visible_agent, supports_native_provider_import,
+};
+pub use agent_model_source::{
+    AgentModelSourceDefault, AgentModelSourceDefaultRequest, AgentModelSourceRef,
+    ClearAgentModelSourceDefaultRequest, SetAgentModelSourceDefaultRequest,
 };
 pub use agent_provider_runtime::*;
 pub use automation_graph::{

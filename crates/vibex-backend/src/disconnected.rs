@@ -865,6 +865,27 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn get_agent_model_source_default(
+        &self,
+        _request: vibex_core::AgentModelSourceDefaultRequest,
+    ) -> BackendFuture<'_, vibex_core::AgentModelSourceDefault> {
+        disconnected_future!()
+    }
+
+    fn set_agent_model_source_default(
+        &self,
+        _request: MutationRequest<vibex_core::SetAgentModelSourceDefaultRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentModelSourceDefault> {
+        disconnected_future!()
+    }
+
+    fn clear_agent_model_source_default(
+        &self,
+        _request: MutationRequest<vibex_core::ClearAgentModelSourceDefaultRequest>,
+    ) -> BackendFuture<'_, bool> {
+        disconnected_future!()
+    }
+
     fn model_capability_suggestion(
         &self,
         _request: vibex_core::ModelCapabilitySuggestionRequest,

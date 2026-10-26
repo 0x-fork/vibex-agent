@@ -4399,6 +4399,13 @@ pub struct RemoteProviderManagementSnapshot {
     /// Which routes each Agent may use, default first.
     #[serde(default)]
     pub agent_model_route_bindings: Vec<crate::AgentModelRouteBinding>,
+    /// The explicit unified default source rows, one per Agent and scope.
+    ///
+    /// Only stored rows are carried, not resolved fallbacks: a pre-migration
+    /// authority still answers from the legacy defaults on its own read path,
+    /// and the client must not invent a row the authority did not write.
+    #[serde(default)]
+    pub agent_model_source_defaults: Vec<crate::AgentModelSourceDefault>,
     pub native_import_preview: Option<ProviderNativeImportPreview>,
     pub acp_configs: Vec<RemoteAcpProfileConfigEntry>,
     pub agent_details: Vec<RemoteManagementAgentDetail>,

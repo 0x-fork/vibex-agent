@@ -22,13 +22,19 @@ mod suggest;
 
 pub use cache::{CatalogCache, CatalogState};
 pub use fetch::{CatalogFetchError, catalog_url, parse_catalog};
-pub use suggest::{CapabilitySuggestion, Catalog, CatalogModel, SuggestSource};
+pub use suggest::{
+    CapabilitySuggestion, Catalog, CatalogModalities, CatalogModel, CatalogProvider,
+    CatalogReasoningOption, SuggestSource,
+};
 
 /// How long a fetched catalogue is trusted before it is refreshed.
 pub const CATALOG_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// The catalogue's own schema version, so a stored cache can be invalidated.
-pub const CATALOG_SCHEMA_VERSION: u32 = 1;
+///
+/// Bumped when the stored shape gains fields a reader expects, so an older
+/// cache is discarded and refetched rather than served without them.
+pub const CATALOG_SCHEMA_VERSION: u32 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -44,12 +50,24 @@ mod tests {
         let model = CatalogModel {
             id: "deepseek-chat".to_string(),
             display_name: Some("DeepSeek Chat".to_string()),
+            family: Some("deepseek".to_string()),
+            release_date: Some("2024-12-26".to_string()),
             context_tokens: Some(128_000),
+            input_tokens: Some(64_000),
             output_tokens: Some(8_192),
             reasoning: Some(true),
+            reasoning_options: Some(vec![CatalogReasoningOption::Toggle]),
             image_input: Some(false),
             pdf_input: Some(false),
+            modalities: Some(CatalogModalities {
+                input: vec!["text".to_string()],
+                output: vec!["text".to_string()],
+            }),
             temperature: Some(true),
+            tool_call: Some(true),
+            structured_output: Some(true),
+            canonical_model_id: Some("deepseek/deepseek-chat".to_string()),
+            status: Some("beta".to_string()),
             reasoning_efforts: None,
         };
         let encoded = serde_json::to_string(&model).unwrap().to_lowercase();
@@ -57,6 +75,23 @@ mod tests {
             assert!(
                 !encoded.contains(forbidden),
                 "a catalog model must not carry `{forbidden}`: {encoded}"
+            );
+        }
+    }
+
+    /// A `cost` object in the upstream document is not read into the catalog,
+    /// so serialising the parsed catalog cannot leak money either.
+    #[test]
+    fn a_parsed_catalog_never_carries_money() {
+        let catalog = parse_catalog(
+            r#"{"p":{"models":{"m":{"cost":{"input":0.27,"output":1.1},"limit":{"context":1000}}}}}"#,
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&catalog).unwrap().to_lowercase();
+        for forbidden in ["cost", "price", "currency", "amount", "usd", "micros"] {
+            assert!(
+                !encoded.contains(forbidden),
+                "a parsed catalog must not carry `{forbidden}`: {encoded}"
             );
         }
     }

@@ -2958,6 +2958,56 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn get_agent_model_source_default(
+        &self,
+        request: vibex_core::AgentModelSourceDefaultRequest,
+    ) -> BackendFuture<'_, vibex_core::AgentModelSourceDefault> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .get_agent_model_source_default(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_agent_model_source_default(
+        &self,
+        request: MutationRequest<vibex_core::SetAgentModelSourceDefaultRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentModelSourceDefault> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .set_agent_model_source_default(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn clear_agent_model_source_default(
+        &self,
+        request: MutationRequest<vibex_core::ClearAgentModelSourceDefaultRequest>,
+    ) -> BackendFuture<'_, bool> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .clear_agent_model_source_default(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
     fn model_capability_suggestion(
         &self,
         request: ModelCapabilitySuggestionRequest,

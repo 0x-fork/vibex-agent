@@ -582,6 +582,8 @@ struct ManagementSnapshot {
     model_routes: Vec<vibex_core::ModelRoute>,
     /// Which routes each Agent may use, default first.
     agent_model_route_bindings: Vec<vibex_core::AgentModelRouteBinding>,
+    /// Explicit unified default-source rows, before legacy fallback.
+    agent_model_source_defaults: Vec<vibex_core::AgentModelSourceDefault>,
     model_provider_agent_ids: BTreeSet<String>,
     acp_configs: Vec<(String, vibex_core::AcpProviderConfig)>,
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
@@ -988,8 +990,13 @@ pub struct ManagementCenter {
     model_routes: Vec<vibex_core::ModelRoute>,
     /// Which routes each Agent may use.
     agent_model_route_bindings: Vec<vibex_core::AgentModelRouteBinding>,
+    /// Explicit unified default-source rows, before legacy fallback.
+    agent_model_source_defaults: Vec<vibex_core::AgentModelSourceDefault>,
     /// Which shared Provider the global Providers page has selected.
     selected_global_provider_id: Option<String>,
+    /// The global Providers list filter. Matches name, address, model and Key
+    /// name, the four things a user remembers about a Provider.
+    provider_search: Entity<InputState>,
     /// Which half of the Providers page the left column is showing.
     ///
     /// Providers and route groups are two kinds of record the same page owns,
@@ -1051,6 +1058,20 @@ pub struct ManagementCenter {
     shared_provider_name_target: Option<String>,
     shared_provider_name_input: Option<Entity<InputState>>,
     shared_provider_name_error: Option<String>,
+    /// The shared Provider whose core fields are open in the inline editor.
+    shared_provider_edit_target: Option<vibex_core::ModelProviderProfileId>,
+    shared_provider_edit_name: Entity<InputState>,
+    shared_provider_edit_base_url: Entity<InputState>,
+    shared_provider_edit_models: Entity<InputState>,
+    shared_provider_edit_default_model: Entity<InputState>,
+    shared_provider_edit_models_url: Entity<InputState>,
+    shared_provider_edit_catalog_id: Entity<InputState>,
+    shared_provider_edit_icon: Entity<InputState>,
+    shared_provider_edit_category: Option<String>,
+    shared_provider_edit_proxy_url: Entity<InputState>,
+    shared_provider_edit_proxy_disabled: bool,
+    shared_provider_edit_only_through_groups: bool,
+    shared_provider_edit_error: Option<String>,
     /// The preset the editor's draft started from, until it is saved.
     ///
     /// It is kept beside the draft rather than inside it because a preset is a
@@ -1109,6 +1130,18 @@ pub struct ManagementCenter {
     /// Whether the draft route switches members silently when the pinned one
     /// fails. False means it asks first.
     route_group_auto_failover: bool,
+    /// The draft group's first-token timeout, in seconds. Empty waits forever.
+    route_group_first_token_timeout: Entity<InputState>,
+    /// The draft group's context window, in tokens. Empty derives it from the
+    /// smallest member.
+    route_group_context_tokens: Entity<InputState>,
+    /// The draft group's local token ceiling, in tokens. Empty is no ceiling.
+    route_group_token_limit: Entity<InputState>,
+    /// The window the local token ceiling is measured over.
+    route_group_token_limit_window: vibex_core::GatewayTokenWindow,
+    /// Per-member fixed reasoning effort, keyed by Provider id. Empty inherits
+    /// what the Agent asked for.
+    route_group_member_efforts: BTreeMap<String, String>,
     /// The catalogue's suggestion for the Model currently being edited.
     ///
     /// It is only ever a suggestion: nothing here is applied until the user
@@ -1545,11 +1578,91 @@ impl ManagementCenter {
                 "搜尋廠商",
             ))
         });
+        let provider_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Search Providers",
+                "搜索供应商",
+                "搜尋供應商",
+            ))
+        });
+        let shared_provider_edit_name = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Provider name",
+                "供应商名称",
+                "供應商名稱",
+            ))
+        });
+        let shared_provider_edit_base_url = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "https://api.example.com/v1",
+                "https://api.example.com/v1",
+                "https://api.example.com/v1",
+            ))
+        });
+        let shared_provider_edit_models = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "model-a, model-b",
+                "模型 A, 模型 B",
+                "模型 A, 模型 B",
+            ))
+        });
+        let shared_provider_edit_default_model = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "default model",
+                "默认模型",
+                "預設模型",
+            ))
+        });
+        let shared_provider_edit_models_url = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "models endpoint",
+                "模型列表地址",
+                "模型清單位址",
+            ))
+        });
+        let shared_provider_edit_catalog_id = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "models.dev id",
+                "models.dev ID",
+                "models.dev ID",
+            ))
+        });
+        let shared_provider_edit_icon = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "icon key",
+                "图标 key",
+                "圖示 key",
+            ))
+        });
+        let shared_provider_edit_proxy_url = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "http://127.0.0.1:7890",
+                "http://127.0.0.1:7890",
+                "http://127.0.0.1:7890",
+            ))
+        });
         let route_group_name = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
                 "Route group name",
                 "路由组名称",
                 "路由組名稱",
+            ))
+        });
+        let route_group_first_token_timeout = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text("seconds", "秒", "秒"))
+        });
+        let route_group_context_tokens = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "tokens",
+                "Token 数",
+                "Token 數",
+            ))
+        });
+        let route_group_token_limit = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "tokens",
+                "Token 数",
+                "Token 數",
             ))
         });
         let profile_model_edit_id = cx.new(|cx| {
@@ -2134,6 +2247,7 @@ impl ManagementCenter {
             provider_bindings: Vec::new(),
             model_routes: Vec::new(),
             agent_model_route_bindings: Vec::new(),
+            agent_model_source_defaults: Vec::new(),
             gateway_requests: Vec::new(),
             gateway_inflight: Vec::new(),
             gateway_failover_prompt: None,
@@ -2157,6 +2271,19 @@ impl ManagementCenter {
             shared_provider_name_target: None,
             shared_provider_name_input: None,
             shared_provider_name_error: None,
+            shared_provider_edit_target: None,
+            shared_provider_edit_name,
+            shared_provider_edit_base_url,
+            shared_provider_edit_models,
+            shared_provider_edit_default_model,
+            shared_provider_edit_models_url,
+            shared_provider_edit_catalog_id,
+            shared_provider_edit_icon,
+            shared_provider_edit_category: None,
+            shared_provider_edit_proxy_url,
+            shared_provider_edit_proxy_disabled: false,
+            shared_provider_edit_only_through_groups: false,
+            shared_provider_edit_error: None,
             provider_preset_draft: None,
             provider_preset_region: None,
             provider_preset_picker: false,
@@ -2171,8 +2298,14 @@ impl ManagementCenter {
             route_group_strategy: vibex_core::RouteStrategy::Ordered,
             route_group_pin: true,
             route_group_auto_failover: true,
+            route_group_first_token_timeout,
+            route_group_context_tokens,
+            route_group_token_limit,
+            route_group_token_limit_window: vibex_core::GatewayTokenWindow::Day,
+            route_group_member_efforts: BTreeMap::new(),
             model_capability_suggestion: None,
             selected_global_provider_id: None,
+            provider_search,
             providers_sidebar_tab: ProviderSidebarTab::Providers,
             selected_global_route_id: None,
             profile_editor_open: false,
@@ -4675,6 +4808,7 @@ impl ManagementCenter {
         self.provider_bindings = snapshot.provider_bindings;
         self.model_routes = snapshot.model_routes;
         self.agent_model_route_bindings = snapshot.agent_model_route_bindings;
+        self.agent_model_source_defaults = snapshot.agent_model_source_defaults;
         self.provider_profiles = snapshot.provider_profiles;
         self.provider_display_order = snapshot.provider_display_order;
         self.provider_display_order_drag_state = None;
@@ -6586,6 +6720,10 @@ impl ManagementCenter {
             status: vibex_core::ModelProviderProfileStatus::Enabled,
         };
         let active_locale = locale::current_locale();
+        let catalog_id = self
+            .provider_preset_draft
+            .as_ref()
+            .and_then(|preset| preset.catalog_id.clone());
         self.mutation = Some(ManagementMutation::ProfileCreate);
         self.error = None;
         let this = cx.entity();
@@ -6596,24 +6734,50 @@ impl ManagementCenter {
                 .await;
             let outcome = match created {
                 Ok(profile) => {
-                    // The Key is written through the v2 credential API rather
-                    // than carried on the create request, because that is the
-                    // path that also stores the Secret and advances the
-                    // revision the bindings read.
-                    if api_key.is_empty() {
-                        Ok(profile)
-                    } else {
+                    // The catalogue id is advisory metadata and has no field on
+                    // the create request. Write it before the Key so a failure
+                    // leaves the Provider editable rather than half-created.
+                    let profile = if let Some(catalog_id) = catalog_id.clone() {
+                        let mut profile = profile;
+                        profile.metadata.catalog_id = Some(catalog_id);
+                        let expected_revision = profile.revision;
                         backend
                             .management()
-                            .add_model_provider_credential(vibex_backend::MutationRequest::new(
-                                vibex_core::AddModelProviderCredentialRequest {
-                                    model_provider_profile_id: profile.id.clone(),
-                                    display_name: None,
-                                    value: api_key,
+                            .update_model_provider_profile(vibex_backend::MutationRequest::new(
+                                vibex_core::ModelProviderProfileUpdateRequest {
+                                    profile,
+                                    expected_revision,
                                 },
                             ))
                             .await
-                            .map(|_| profile)
+                    } else {
+                        Ok(profile)
+                    };
+                    match profile {
+                        Ok(profile) => {
+                            // The Key is written through the v2 credential API
+                            // rather than carried on the create request, because
+                            // that is the path that also stores the Secret and
+                            // advances the revision the bindings read.
+                            if api_key.is_empty() {
+                                Ok(profile)
+                            } else {
+                                backend
+                                    .management()
+                                    .add_model_provider_credential(
+                                        vibex_backend::MutationRequest::new(
+                                            vibex_core::AddModelProviderCredentialRequest {
+                                                model_provider_profile_id: profile.id.clone(),
+                                                display_name: None,
+                                                value: api_key,
+                                            },
+                                        ),
+                                    )
+                                    .await
+                                    .map(|_| profile)
+                            }
+                        }
+                        Err(error) => Err(error),
                     }
                 }
                 Err(error) => Err(error),
@@ -11683,7 +11847,35 @@ impl ManagementCenter {
     /// add to?" had no visible answer.
     fn render_provider_page_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         self.schedule_gateway_cooldown_refresh(cx);
-        let rows = self.shared_providers();
+        let provider_query = self.provider_search.read(cx).value().trim().to_lowercase();
+        let rows = self
+            .shared_providers()
+            .into_iter()
+            .filter(|row| {
+                provider_query.is_empty()
+                    || row
+                        .profile
+                        .display_name
+                        .to_lowercase()
+                        .contains(&provider_query)
+                    || row
+                        .profile
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.url.to_lowercase().contains(&provider_query))
+                    || row
+                        .profile
+                        .configured_models
+                        .iter()
+                        .any(|model| model.id.to_lowercase().contains(&provider_query))
+                    || row.profile.credentials.iter().any(|credential| {
+                        credential
+                            .display_name
+                            .to_lowercase()
+                            .contains(&provider_query)
+                    })
+            })
+            .collect::<Vec<_>>();
         let selected = self.selected_global_provider_id.clone();
         let locale = locale::current_locale();
         let mut gateway_section = v_flex().w_full().min_w_0().flex_none().gap_2().child(
@@ -11807,7 +11999,7 @@ impl ManagementCenter {
                                         .truncate()
                                         .text_sm()
                                         .font_medium()
-                                        .child(gateway.settings.display_name.clone()),
+                                        .child(gateway_display_name(&gateway.settings)),
                                 ),
                         )
                         .child(
@@ -11825,6 +12017,7 @@ impl ManagementCenter {
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());
+                    this.selected_global_route_id = None;
                     cx.notify();
                 })),
         );
@@ -11893,29 +12086,47 @@ impl ManagementCenter {
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_global_provider_id = Some(select_id.clone());
+                        this.selected_global_route_id = None;
                         cx.notify();
                     })),
             );
         }
         // The gateway row is always there and is the page's first answer; a
         // selected Provider keeps the selection while it still exists.
-        if selected.is_none()
-            || (selected.as_deref() != Some(GATEWAY_ROW_ID)
-                && !rows
-                    .iter()
-                    .any(|row| Some(row.profile.id.as_str()) == selected.as_deref()))
+        if self.providers_sidebar_tab == ProviderSidebarTab::Providers
+            && (selected.is_none()
+                || (selected.as_deref() != Some(GATEWAY_ROW_ID)
+                    && !rows
+                        .iter()
+                        .any(|row| Some(row.profile.id.as_str()) == selected.as_deref())))
         {
             self.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());
         }
 
         if rows.is_empty() {
             list = list.child(compact_empty_state(
-                management_locale_text("No Providers yet", "还没有供应商", "還沒有供應商"),
-                management_locale_text(
-                    "Add one to give your Agents a model source.",
-                    "添加后 Agent 才有可用的模型来源。",
-                    "新增後 Agent 才有可用的模型來源。",
-                ),
+                if provider_query.is_empty() {
+                    management_locale_text("No Providers yet", "还没有供应商", "還沒有供應商")
+                } else {
+                    management_locale_text(
+                        "No matching Providers",
+                        "没有匹配的供应商",
+                        "沒有符合的供應商",
+                    )
+                },
+                if provider_query.is_empty() {
+                    management_locale_text(
+                        "Add one to give your Agents a model source.",
+                        "添加后 Agent 才有可用的模型来源。",
+                        "新增後 Agent 才有可用的模型來源。",
+                    )
+                } else {
+                    management_locale_text(
+                        "Try a different name, address, model, or key name.",
+                        "换一个名称、地址、模型或 Key 名称试试。",
+                        "換一個名稱、位址、模型或 Key 名稱試試。",
+                    )
+                },
                 cx,
             ));
         }
@@ -12015,6 +12226,7 @@ impl ManagementCenter {
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_global_route_id = Some(select_id.clone());
+                        this.selected_global_provider_id = None;
                         cx.notify();
                     })),
             );
@@ -12058,10 +12270,24 @@ impl ManagementCenter {
             .on_click(cx.listener(|this, index: &usize, _, cx| {
                 if let Some(tab) = ProviderSidebarTab::ALL.get(*index) {
                     this.providers_sidebar_tab = *tab;
+                    match tab {
+                        ProviderSidebarTab::Providers => {
+                            if this.selected_global_provider_id.is_none() {
+                                this.selected_global_provider_id = Some(GATEWAY_ROW_ID.to_string());
+                            }
+                        }
+                        ProviderSidebarTab::RouteGroups => {
+                            if this.selected_global_provider_id.as_deref() == Some(GATEWAY_ROW_ID) {
+                                this.selected_global_provider_id = None;
+                            }
+                        }
+                    }
                     cx.notify();
                 }
             }));
 
+        let provider_search_row = (active_tab == ProviderSidebarTab::Providers)
+            .then(|| management_search_input(&self.provider_search, cx));
         let (section_title, actions, section_body) = match active_tab {
             ProviderSidebarTab::Providers => (
                 management_locale_text("Providers", "供应商", "供應商"),
@@ -12137,6 +12363,7 @@ impl ManagementCenter {
                         actions,
                         cx,
                     ))
+                    .children(provider_search_row)
                     .child(
                         div()
                             .min_h_0()
@@ -12166,16 +12393,17 @@ impl ManagementCenter {
     /// The global Providers panel: the pinned gateway row's detail, or one
     /// Provider's keys and bindings.
     fn render_provider_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // The gateway is a row on this page, not a tab, so its selection wins
+        // over the tab's list: clicking the row while Route groups is showing
+        // must still describe the gateway.
+        if self.selected_global_provider_id.as_deref() == Some(GATEWAY_ROW_ID) {
+            return self.render_gateway(window, cx);
+        }
         // The route-group tab keeps the gateway row above it, because a group is
         // served by that gateway; but its detail pane describes a group, not the
         // gateway or a Provider.
         if self.providers_sidebar_tab == ProviderSidebarTab::RouteGroups {
             return self.render_route_group_page(window, cx);
-        }
-        // The gateway is a row on this page, so its detail is the page's detail
-        // pane rather than a page of its own.
-        if self.selected_global_provider_id.as_deref() == Some(GATEWAY_ROW_ID) {
-            return self.render_gateway(window, cx);
         }
         let rows = self.shared_providers();
         // No selection yet, or a Provider that has gone away, resolves to the
@@ -12192,16 +12420,29 @@ impl ManagementCenter {
         let profile = &row.profile;
         let mut body = v_flex().w_full().min_w_0().gap_3();
         body = body.child(self.render_shared_provider_header(profile, window, cx));
+        if self.shared_provider_edit_target.as_ref() == Some(&profile.id) {
+            body = body.child(self.render_shared_provider_editor(profile, cx));
+        }
         body = body.child(self.render_shared_provider_keys(profile, window, cx));
 
-        let mut agent_rows = v_flex().w_full().gap_1();
+        let mut agent_rows = h_flex().w_full().flex_wrap().gap_1p5();
         for agent_id in &row.agents {
-            agent_rows = agent_rows.child(stat_line(
-                agent_id.clone(),
-                management_locale_text("uses this Provider", "使用此供应商", "使用此供應商")
-                    .to_string(),
-                cx,
-            ));
+            let label = self
+                .snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.id.as_str() == agent_id)
+                .map(|agent| agent.label.clone())
+                .unwrap_or_else(|| agent_id.clone());
+            agent_rows = agent_rows.child(
+                Tag::secondary().child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(agent_brand_icon(agent_id, px(14.0), None))
+                        .child(label),
+                ),
+            );
         }
         if row.agents.is_empty() {
             agent_rows = agent_rows.child(div().text_sm().text_color(cx.theme().warning).child(
@@ -12571,7 +12812,7 @@ impl ManagementCenter {
 
         // The Agents that reference it. Naming them is what makes the delete at
         // the bottom of this page a consequence rather than a surprise.
-        let mut agent_rows = v_flex().w_full().gap_1();
+        let mut agent_rows = h_flex().w_full().flex_wrap().gap_1p5();
         for agent_id in &row.agents {
             let label = self
                 .snapshot
@@ -12580,12 +12821,15 @@ impl ManagementCenter {
                 .find(|agent| agent.id.as_str() == agent_id)
                 .map(|agent| agent.label.clone())
                 .unwrap_or_else(|| agent_id.clone());
-            agent_rows = agent_rows.child(stat_line(
-                label,
-                management_locale_text("uses this route group", "使用此路由组", "使用此路由組")
-                    .to_string(),
-                cx,
-            ));
+            agent_rows = agent_rows.child(
+                Tag::secondary().child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(agent_brand_icon(agent_id, px(14.0), None))
+                        .child(label),
+                ),
+            );
         }
         if row.agents.is_empty() {
             agent_rows = agent_rows.child(div().text_sm().text_color(cx.theme().warning).child(
@@ -12758,6 +13002,9 @@ impl ManagementCenter {
             return;
         }
         self.error = None;
+        let has_default_before_bind = self
+            .resolved_agent_default_source(agent_id.as_str())
+            .is_some();
         self.mutation = Some(ManagementMutation::Gateway);
         let this = cx.entity();
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
@@ -12767,7 +13014,7 @@ impl ManagementCenter {
                     vibex_core::AgentModelRouteBindRequest {
                         agent_id,
                         model_route_id: route_id,
-                        make_default: false,
+                        make_default: !has_default_before_bind,
                     },
                 ))
                 .await;
@@ -12904,6 +13151,9 @@ impl ManagementCenter {
             return;
         }
         let active_locale = locale::current_locale();
+        let has_default_before_bind = self
+            .resolved_agent_default_source(agent_id.as_str())
+            .is_some();
         self.mutation = Some(ManagementMutation::ProviderBind(
             agent_id.as_str().to_string(),
         ));
@@ -12917,7 +13167,7 @@ impl ManagementCenter {
                         provider_profile_id: profile_id,
                         model_provider_profile_id: shared_id,
                         agent_id: agent_id.clone(),
-                        make_default: true,
+                        make_default: !has_default_before_bind,
                     },
                 ))
                 .await;
@@ -12944,6 +13194,441 @@ impl ManagementCenter {
                 }
             });
         }));
+    }
+
+    fn open_shared_provider_editor(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.shared_provider_edit_target = Some(profile.id.clone());
+        self.shared_provider_edit_error = None;
+        let base_url = profile
+            .primary_api_endpoint()
+            .map(|endpoint| endpoint.url.clone())
+            .unwrap_or_default();
+        let models = profile
+            .configured_models
+            .iter()
+            .filter(|model| model.enabled)
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let catalog_id = profile.metadata.catalog_id.clone().unwrap_or_default();
+        let icon = profile.metadata.icon.clone().unwrap_or_default();
+        let category = profile.metadata.category.clone();
+        let models_url = profile
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == vibex_core::ModelProviderEndpointKind::ModelCatalog)
+            .map(|endpoint| endpoint.url.clone())
+            .unwrap_or_default();
+        let (proxy_disabled, proxy_url) = match &profile.proxy_policy {
+            vibex_core::ModelProviderProxyPolicy::Disabled => (true, String::new()),
+            vibex_core::ModelProviderProxyPolicy::Endpoint(url) => (false, url.clone()),
+            vibex_core::ModelProviderProxyPolicy::InheritSystem => (false, String::new()),
+        };
+        let only_through_groups = profile.metadata.only_through_route_groups;
+        for (input, value) in [
+            (
+                &self.shared_provider_edit_name,
+                profile.display_name.clone(),
+            ),
+            (&self.shared_provider_edit_base_url, base_url),
+            (&self.shared_provider_edit_models, models),
+            (
+                &self.shared_provider_edit_default_model,
+                profile.default_model_id.clone().unwrap_or_default(),
+            ),
+            (&self.shared_provider_edit_models_url, models_url),
+            (&self.shared_provider_edit_catalog_id, catalog_id),
+            (&self.shared_provider_edit_icon, icon),
+            (&self.shared_provider_edit_proxy_url, proxy_url),
+        ] {
+            input.update(cx, |state, cx| state.set_value(value, window, cx));
+        }
+        self.shared_provider_edit_proxy_disabled = proxy_disabled;
+        self.shared_provider_edit_only_through_groups = only_through_groups;
+        self.shared_provider_edit_category = category;
+        cx.notify();
+    }
+
+    fn close_shared_provider_editor(&mut self, cx: &mut Context<Self>) {
+        self.shared_provider_edit_target = None;
+        self.shared_provider_edit_error = None;
+        cx.notify();
+    }
+
+    fn save_shared_provider_editor(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut profile) = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        let name = self
+            .shared_provider_edit_name
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            self.shared_provider_edit_error = Some(
+                management_locale_text(
+                    "A Provider needs a name",
+                    "请填写供应商名称",
+                    "請填寫供應商名稱",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let base_url = self
+            .shared_provider_edit_base_url
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if base_url.is_empty() {
+            self.shared_provider_edit_error = Some(
+                management_locale_text(
+                    "A Provider needs at least one request URL",
+                    "请至少填写一个接口地址",
+                    "請至少填寫一個介面位址",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let model_ids = self
+            .shared_provider_edit_models
+            .read(cx)
+            .value()
+            .split([',', '\n'])
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .fold(Vec::<String>::new(), |mut ids, id| {
+                if !ids.iter().any(|existing| existing == id) {
+                    ids.push(id.to_string());
+                }
+                ids
+            });
+        if model_ids.is_empty() {
+            self.shared_provider_edit_error = Some(
+                management_locale_text(
+                    "Add at least one model id",
+                    "请至少填写一个模型 ID",
+                    "請至少填寫一個模型 ID",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let default_model = self
+            .shared_provider_edit_default_model
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if !default_model.is_empty() && !model_ids.iter().any(|id| id == &default_model) {
+            self.shared_provider_edit_error = Some(
+                management_locale_text(
+                    "The default model must be one of this Provider's models",
+                    "默认模型必须是该供应商的模型之一",
+                    "預設模型必須是該供應商的模型之一",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let models_url = self
+            .shared_provider_edit_models_url
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let proxy_url = self
+            .shared_provider_edit_proxy_url
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let catalog_id = self
+            .shared_provider_edit_catalog_id
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let icon = self
+            .shared_provider_edit_icon
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+
+        // Keep models the Provider already holds but the draft no longer
+        // lists only when they were disabled: this editor is not a place that
+        // silently re-enables a model someone turned off.
+        let mut configured_models = profile
+            .configured_models
+            .iter()
+            .filter(|model| !model.enabled)
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in &model_ids {
+            if let Some(existing) = profile
+                .configured_models
+                .iter()
+                .find(|model| &model.id == id)
+                .cloned()
+            {
+                let mut model = existing;
+                model.enabled = true;
+                configured_models.push(model);
+            } else {
+                configured_models.push(vibex_core::ModelProviderCatalogEntry {
+                    id: id.clone(),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities: Default::default(),
+                });
+            }
+        }
+        profile.display_name = name;
+        profile.configured_models = configured_models;
+        profile.default_model_id = (!default_model.is_empty()).then_some(default_model);
+        profile.endpoints.retain(|endpoint| {
+            endpoint.kind != vibex_core::ModelProviderEndpointKind::Api
+                || endpoint.wire_protocol_id.is_some()
+        });
+        profile.endpoints.retain(|endpoint| {
+            endpoint.kind != vibex_core::ModelProviderEndpointKind::ModelCatalog
+        });
+        profile.endpoints.push(vibex_core::ModelProviderEndpoint {
+            id: "api".to_string(),
+            kind: vibex_core::ModelProviderEndpointKind::Api,
+            url: base_url,
+            wire_protocol_id: None,
+        });
+        if !models_url.is_empty() {
+            profile.endpoints.push(vibex_core::ModelProviderEndpoint {
+                id: "models".to_string(),
+                kind: vibex_core::ModelProviderEndpointKind::ModelCatalog,
+                url: models_url,
+                wire_protocol_id: None,
+            });
+        }
+        profile.metadata.catalog_id = (!catalog_id.is_empty()).then_some(catalog_id);
+        profile.metadata.icon = (!icon.is_empty()).then_some(icon);
+        profile.metadata.category = self.shared_provider_edit_category.clone();
+        profile.metadata.only_through_route_groups = self.shared_provider_edit_only_through_groups;
+        profile.proxy_policy = if self.shared_provider_edit_proxy_disabled {
+            vibex_core::ModelProviderProxyPolicy::Disabled
+        } else if proxy_url.is_empty() {
+            vibex_core::ModelProviderProxyPolicy::InheritSystem
+        } else {
+            vibex_core::ModelProviderProxyPolicy::Endpoint(proxy_url)
+        };
+        self.shared_provider_edit_error = None;
+        self.update_shared_provider(
+            profile,
+            management_locale_text("Provider updated", "供应商已更新", "供應商已更新"),
+            cx,
+        );
+    }
+
+    fn render_shared_provider_editor(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let error = self.shared_provider_edit_error.clone();
+        let proxy_disabled = self.shared_provider_edit_proxy_disabled;
+        let selected_category = self.shared_provider_edit_category.clone();
+        let profile_id = profile.id.clone();
+        management_card_dynamic(
+            management_locale_text("Edit shared Provider", "编辑共享供应商", "編輯共用供應商")
+                .to_string(),
+            management_locale_text(
+                "Changes here apply to every Agent bound to this Provider.",
+                "这里的修改会应用到所有绑定该供应商的 Agent。",
+                "這裡的修改會套用到所有綁定該供應商的 Agent。",
+            ),
+            v_flex()
+                .w_full()
+                .gap_2p5()
+                .child(management_input_field(
+                    management_locale_text("Provider name", "供应商名称", "供應商名稱"),
+                    &self.shared_provider_edit_name,
+                    false,
+                    cx,
+                ))
+                .child(management_input_field(
+                    management_locale_text(
+                        "Default API request URL",
+                        "默认 API 请求地址",
+                        "預設 API 請求位址",
+                    ),
+                    &self.shared_provider_edit_base_url,
+                    false,
+                    cx,
+                ))
+                .child(management_input_field(
+                    management_locale_text(
+                        "Enabled models (comma separated)",
+                        "启用的模型（逗号分隔）",
+                        "啟用的模型（逗號分隔）",
+                    ),
+                    &self.shared_provider_edit_models,
+                    false,
+                    cx,
+                ))
+                .child(management_input_field(
+                    management_locale_text("Default model", "默认模型", "預設模型"),
+                    &self.shared_provider_edit_default_model,
+                    false,
+                    cx,
+                ))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_start()
+                        .gap_2()
+                        .child(div().min_w_0().flex_1().child(management_input_field(
+                            management_locale_text("Catalog ID", "目录 ID", "目錄 ID"),
+                            &self.shared_provider_edit_catalog_id,
+                            false,
+                            cx,
+                        )))
+                        .child(div().min_w_0().flex_1().child(management_input_field(
+                            management_locale_text("Models URL", "模型列表地址", "模型清單位址"),
+                            &self.shared_provider_edit_models_url,
+                            false,
+                            cx,
+                        ))),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_start()
+                        .gap_2()
+                        .child(div().min_w_0().flex_1().child(management_input_field(
+                            management_locale_text("Icon key", "图标 key", "圖示 key"),
+                            &self.shared_provider_edit_icon,
+                            false,
+                            cx,
+                        )))
+                        .child(
+                            h_flex().flex_none().items_center().gap_1().children(
+                                [
+                                    (
+                                        "vendor",
+                                        management_locale_text("Vendor", "供应商", "供應商"),
+                                    ),
+                                    ("relay", management_locale_text("Relay", "中转", "中轉")),
+                                    ("local", management_locale_text("Local", "本机", "本機")),
+                                ]
+                                .into_iter()
+                                .map(|(value, label)| {
+                                    let selected = selected_category.as_deref() == Some(value);
+                                    Button::new(SharedString::from(format!(
+                                        "management-shared-provider-category-{value}"
+                                    )))
+                                    .xsmall()
+                                    .when(selected, |button| button.primary())
+                                    .when(!selected, |button| button.outline())
+                                    .label(label)
+                                    .disabled(pending)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.shared_provider_edit_category =
+                                            Some(value.to_string());
+                                        cx.notify();
+                                    }))
+                                }),
+                            ),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_2()
+                        .child(div().min_w_0().flex_1().child(management_input_field(
+                            management_locale_text("Proxy URL", "代理地址", "代理位址"),
+                            &self.shared_provider_edit_proxy_url,
+                            false,
+                            cx,
+                        )))
+                        .child(
+                            h_flex()
+                                .flex_none()
+                                .items_center()
+                                .gap_1()
+                                .child(div().text_xs().child(management_locale_text(
+                                    "No proxy",
+                                    "不使用代理",
+                                    "不使用代理",
+                                )))
+                                .child(
+                                    Switch::new("management-shared-provider-proxy-disabled")
+                                        .small()
+                                        .checked(proxy_disabled)
+                                        .disabled(pending)
+                                        .on_click(cx.listener(|this, checked, _, cx| {
+                                            this.shared_provider_edit_proxy_disabled = *checked;
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                )
+                .children(
+                    error.map(|message| {
+                        div().text_xs().text_color(cx.theme().danger).child(message)
+                    }),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("management-shared-provider-edit-cancel")
+                                .xsmall()
+                                .ghost()
+                                .label(management_locale_text("Cancel", "取消", "取消"))
+                                .disabled(pending)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close_shared_provider_editor(cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("management-shared-provider-edit-save")
+                                .xsmall()
+                                .primary()
+                                .label(management_locale_text("Save", "保存", "儲存"))
+                                .disabled(pending)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.save_shared_provider_editor(profile_id.clone(), cx)
+                                })),
+                        ),
+                )
+                .into_any_element(),
+            cx,
+        )
     }
 
     /// One shared Provider's header: name, status, and the facts that decide
@@ -13041,6 +13726,19 @@ impl ManagementCenter {
                             let profile = profile.clone();
                             move |this, _, window, cx| {
                                 this.open_shared_provider_name_editor(&profile, window, cx)
+                            }
+                        })),
+                )
+                .child(
+                    Button::new("management-shared-provider-edit")
+                        .xsmall()
+                        .outline()
+                        .label(management_locale_text("Edit", "编辑", "編輯"))
+                        .disabled(pending)
+                        .on_click(cx.listener({
+                            let profile = profile.clone();
+                            move |this, _, window, cx| {
+                                this.open_shared_provider_editor(&profile, window, cx)
                             }
                         })),
                 )
@@ -13509,7 +14207,7 @@ impl ManagementCenter {
         if self.mutation.is_some() {
             return;
         }
-        let name = self.gateway.settings.display_name.clone();
+        let name = gateway_display_name(&self.gateway.settings);
         self.gateway_name_error = None;
         match self.gateway_name_input.as_ref() {
             Some(input) => input.update(cx, |input, cx| input.set_value(name, window, cx)),
@@ -13643,6 +14341,7 @@ impl ManagementCenter {
             return;
         }
         let expected_revision = profile.revision;
+        let updated_id = profile.id.clone();
         self.mutation = Some(ManagementMutation::Gateway);
         self.error = None;
         let this = cx.entity();
@@ -13660,6 +14359,10 @@ impl ManagementCenter {
                 this.mutation = None;
                 match outcome {
                     Ok(_) => {
+                        if this.shared_provider_edit_target.as_ref() == Some(&updated_id) {
+                            this.shared_provider_edit_target = None;
+                            this.shared_provider_edit_error = None;
+                        }
                         this.notice = Some(message.to_string());
                         this.refresh(cx);
                     }
@@ -14653,7 +15356,7 @@ impl ManagementCenter {
                         .truncate()
                         .text_base()
                         .font_semibold()
-                        .child(snapshot.settings.display_name.clone()),
+                        .child(gateway_display_name(&snapshot.settings)),
                 )
                 .child(
                     Button::new("management-gateway-name-edit")
@@ -18520,12 +19223,14 @@ impl ManagementCenter {
             );
         }
 
+        let capability_rows = self.render_profile_model_capabilities(index, pending, cx);
         editor = editor.child(profile_editor_section(
             management_locale_text("Advanced", "高级", "進階"),
             None,
             v_flex()
                 .w_full()
                 .gap_2p5()
+                .children(capability_rows)
                 .child(management_token_field(
                     management_locale_text(
                         "Context window (tokens)",
@@ -18568,6 +19273,114 @@ impl ManagementCenter {
         editor.into_any_element()
     }
 
+    /// The capability fields the Agent can read, as three-state choices.
+    ///
+    /// The catalogue only suggests these; a Provider with no catalogue entry
+    /// still has to be able to declare them, so the control is here rather than
+    /// only inside the suggestion list.
+    fn render_profile_model_capabilities(
+        &mut self,
+        index: usize,
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Some(model) = self.profile_configured_models.get(index) else {
+            return Vec::new();
+        };
+        let capabilities = model.capabilities.clone();
+        let fields = [
+            (
+                "imageInput",
+                management_locale_text("Image input", "图片输入", "圖片輸入"),
+                capabilities.image_input,
+            ),
+            (
+                "pdfInput",
+                management_locale_text("PDF input", "PDF 输入", "PDF 輸入"),
+                capabilities.pdf_input,
+            ),
+            (
+                "temperature",
+                management_locale_text("Honours temperature", "支持温度参数", "支援溫度參數"),
+                capabilities.temperature,
+            ),
+        ];
+        let mut rows = Vec::with_capacity(fields.len());
+        for (field, label, value) in fields {
+            let mut choices = h_flex().w_full().flex_wrap().gap_1p5();
+            for (choice, choice_label) in [
+                (
+                    None,
+                    management_locale_text(
+                        "Follow Agent default",
+                        "跟随 Agent 默认",
+                        "跟隨 Agent 預設",
+                    ),
+                ),
+                (
+                    Some(true),
+                    management_locale_text("Supported", "支持", "支援"),
+                ),
+                (
+                    Some(false),
+                    management_locale_text("Unsupported", "不支持", "不支援"),
+                ),
+            ] {
+                let selected = value == choice;
+                choices = choices.child(management_option_chip(
+                    SharedString::from(format!(
+                        "provider-model-capability-{index}-{field}-{}",
+                        match choice {
+                            None => "inherit",
+                            Some(true) => "yes",
+                            Some(false) => "no",
+                        }
+                    )),
+                    SharedString::from(choice_label),
+                    selected,
+                    pending,
+                    None,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_profile_model_capability(index, field, choice, cx)
+                    }),
+                    cx,
+                ));
+            }
+            rows.push(
+                v_flex()
+                    .w_full()
+                    .gap_1p5()
+                    .child(management_choice_group_label(label, cx))
+                    .child(choices)
+                    .into_any_element(),
+            );
+        }
+        rows
+    }
+
+    fn set_profile_model_capability(
+        &mut self,
+        index: usize,
+        field: &'static str,
+        value: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(model) = self.profile_configured_models.get_mut(index) else {
+            return;
+        };
+        match field {
+            "imageInput" => model.capabilities.image_input = value,
+            "pdfInput" => model.capabilities.pdf_input = value,
+            "temperature" => model.capabilities.temperature = value,
+            _ => return,
+        }
+        model
+            .capabilities
+            .set_source(field, vibex_core::ModelCapabilitySource::Declared);
+        self.navigation.mark_dirty(ManagementSection::Agents, true);
+        cx.notify();
+    }
+
     /// The catalogue's suggestions, one row per field with its own adopt
     /// control.
     ///
@@ -18584,6 +19397,28 @@ impl ManagementCenter {
         };
         let approximate = suggestion.approximate;
         let mut rows = Vec::new();
+        if !suggestion.fields.is_empty() {
+            rows.push(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_end()
+                    .child(
+                        Button::new("provider-model-adopt-all")
+                            .xsmall()
+                            .outline()
+                            .label(management_locale_text(
+                                "Apply all suggestions",
+                                "采用全部建议",
+                                "採用全部建議",
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.adopt_all_capability_fields(window, cx)
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
         for field in suggestion.fields {
             let label = match field.field.as_str() {
                 "contextTokens" => {
@@ -18670,6 +19505,19 @@ impl ManagementCenter {
             );
         }
         rows
+    }
+
+    /// Adopts every suggested field in one gesture.
+    ///
+    /// The per-field controls remain for the case where only one value is
+    /// trusted; this is the same adoption repeated, not a different path.
+    fn adopt_all_capability_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(suggestion) = self.model_capability_suggestion.clone() else {
+            return;
+        };
+        for field in suggestion.fields {
+            self.adopt_capability_field(field.field, window, cx);
+        }
     }
 
     /// Adopts one suggested field into the Model being edited.
@@ -19323,6 +20171,7 @@ impl ManagementCenter {
             .providers
             .iter()
             .filter(|profile| profile.status == vibex_core::ModelProviderProfileStatus::Enabled)
+            .filter(|profile| !profile.metadata.only_through_route_groups)
             .filter(|profile| {
                 profile
                     .legacy_provider_profile_id
@@ -21973,7 +22822,18 @@ impl ManagementCenter {
         self.route_group_editor_from_agent = from_agent;
         self.route_group_name_error = None;
         self.route_group_members.clear();
+        self.route_group_member_efforts.clear();
         self.route_group_strategy = vibex_core::RouteStrategy::Ordered;
+        self.route_group_pin = true;
+        self.route_group_auto_failover = true;
+        self.route_group_token_limit_window = vibex_core::GatewayTokenWindow::Day;
+        for input in [
+            &self.route_group_first_token_timeout,
+            &self.route_group_context_tokens,
+            &self.route_group_token_limit,
+        ] {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
         self.route_group_name.update(cx, |state, cx| {
             state.set_value(
                 management_locale_text("Route group", "路由组", "路由組"),
@@ -22015,6 +22875,53 @@ impl ManagementCenter {
         self.route_group_strategy = route.strategy;
         self.route_group_pin = route.pin == vibex_core::GatewayPinScope::Conversation;
         self.route_group_auto_failover = route.failover == vibex_core::GatewayFailover::Auto;
+        self.route_group_first_token_timeout
+            .update(cx, |state, cx| {
+                state.set_value(
+                    route
+                        .first_token_timeout_ms
+                        .map(|ms| (ms / 1000).max(1).to_string())
+                        .unwrap_or_default(),
+                    window,
+                    cx,
+                )
+            });
+        self.route_group_context_tokens.update(cx, |state, cx| {
+            state.set_value(
+                route
+                    .context_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                window,
+                cx,
+            )
+        });
+        self.route_group_token_limit.update(cx, |state, cx| {
+            state.set_value(
+                route
+                    .token_limit
+                    .map(|limit| limit.tokens.to_string())
+                    .unwrap_or_default(),
+                window,
+                cx,
+            )
+        });
+        self.route_group_token_limit_window = route
+            .token_limit
+            .map(|limit| limit.window)
+            .unwrap_or(vibex_core::GatewayTokenWindow::Day);
+        self.route_group_member_efforts = route
+            .members
+            .iter()
+            .filter_map(|member| {
+                member.reasoning_effort.clone().map(|effort| {
+                    (
+                        member.model_provider_profile_id.as_str().to_string(),
+                        effort,
+                    )
+                })
+            })
+            .collect();
         self.route_group_name.update(cx, |state, cx| {
             state.set_value(route.display_name.clone(), window, cx)
         });
@@ -22028,6 +22935,7 @@ impl ManagementCenter {
         self.route_group_editor_from_agent = false;
         self.route_group_name_error = None;
         self.route_group_members.clear();
+        self.route_group_member_efforts.clear();
         cx.notify();
     }
 
@@ -22084,6 +22992,10 @@ impl ManagementCenter {
             .then(|| self.selected_agent_id.clone())
             .flatten()
             .and_then(|agent_id| vibex_core::AgentId::parse(agent_id).ok());
+        let bind_should_default = bind_agent.as_ref().is_some_and(|agent_id| {
+            self.resolved_agent_default_source(agent_id.as_str())
+                .is_none()
+        });
         let name = self.route_group_name.read(cx).value().trim().to_string();
         self.route_group_name_error = name.is_empty().then(|| {
             management_error_text(
@@ -22109,6 +23021,49 @@ impl ManagementCenter {
             cx.notify();
             return;
         }
+        let first_token_seconds = match parse_optional_limit(
+            self.route_group_first_token_timeout
+                .read(cx)
+                .value()
+                .as_str(),
+        ) {
+            Ok(value) => value,
+            Err(message) => {
+                self.error = Some(format!("First token timeout: {message}"));
+                cx.notify();
+                return;
+            }
+        };
+        let context_tokens =
+            match parse_optional_limit(self.route_group_context_tokens.read(cx).value().as_str()) {
+                Ok(value) => value,
+                Err(message) => {
+                    self.error = Some(format!("Context: {message}"));
+                    cx.notify();
+                    return;
+                }
+            };
+        let token_limit =
+            match parse_optional_u64(self.route_group_token_limit.read(cx).value().as_str()) {
+                Ok(Some(0)) => {
+                    self.error = Some(
+                        management_locale_text(
+                            "A token ceiling must be greater than zero",
+                            "Token 上限必须大于 0",
+                            "Token 上限必須大於 0",
+                        )
+                        .to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                Ok(value) => value,
+                Err(message) => {
+                    self.error = Some(format!("Token ceiling: {message}"));
+                    cx.notify();
+                    return;
+                }
+            };
         let editing = self.route_group_editing_id.clone();
         let existing = editing.as_ref().and_then(|id| {
             self.model_routes
@@ -22120,6 +23075,13 @@ impl ManagementCenter {
         route.display_name = name;
         route.kind = vibex_core::RouteKind::ProviderGroup;
         route.strategy = self.route_group_strategy;
+        route.first_token_timeout_ms =
+            first_token_seconds.map(|seconds| u64::from(seconds) * 1_000);
+        route.context_tokens = context_tokens;
+        route.token_limit = token_limit.map(|tokens| vibex_core::GatewayTokenLimit {
+            window: self.route_group_token_limit_window,
+            tokens,
+        });
         route.pin = if self.route_group_pin {
             vibex_core::GatewayPinScope::Conversation
         } else {
@@ -22136,7 +23098,14 @@ impl ManagementCenter {
             .iter()
             .enumerate()
             .map(|(index, provider)| {
-                vibex_core::ModelRouteMember::provider(provider.clone(), index as i64)
+                let mut member =
+                    vibex_core::ModelRouteMember::provider(provider.clone(), index as i64);
+                member.reasoning_effort = self
+                    .route_group_member_efforts
+                    .get(provider.as_str())
+                    .map(|effort| effort.trim().to_string())
+                    .filter(|effort| !effort.is_empty());
+                member
             })
             .collect();
         let expected_revision = existing.as_ref().map(|route| route.revision).unwrap_or(0);
@@ -22170,7 +23139,7 @@ impl ManagementCenter {
                         vibex_core::AgentModelRouteBindRequest {
                             agent_id,
                             model_route_id: saved.id.clone(),
-                            make_default: false,
+                            make_default: bind_should_default,
                         },
                     ))
                     .await
@@ -22373,6 +23342,122 @@ impl ManagementCenter {
     /// answer one question between them: which model source this Agent uses.
     /// A group row differs only in what it says: a route mark instead of a
     /// vendor brand, and the members it composes instead of one address.
+    /// The same answer the session-start path resolves: explicit unified row,
+    /// then the route default, then the scoped Provider default.
+    fn resolved_agent_default_source(
+        &self,
+        agent_id: &str,
+    ) -> Option<vibex_core::AgentModelSourceRef> {
+        let scope = management_provider_default_scope(self.pairing_workspace_id.clone());
+        let explicit = self
+            .agent_model_source_defaults
+            .iter()
+            .find(|default| default.agent_id.as_str() == agent_id && default.scope == scope)
+            .and_then(|default| default.source.clone());
+        let route_default = self
+            .agent_model_route_bindings
+            .iter()
+            .find(|binding| binding.agent_id.as_str() == agent_id && binding.is_default)
+            .map(|binding| {
+                vibex_core::AgentModelSourceRef::RouteGroup(binding.model_route_id.clone())
+            });
+        let provider_default = self
+            .agent_profile_states
+            .iter()
+            .find(|state| state.agent_id == agent_id && state.is_default)
+            .and_then(|state| vibex_core::ProviderProfileId::parse(state.profile_id.clone()).ok())
+            .map(vibex_core::AgentModelSourceRef::Provider);
+        explicit.or(route_default).or(provider_default)
+    }
+
+    /// The Agent's resolved default model source, read-only in this wave.
+    ///
+    /// The authority keeps the unified row and the two legacy defaults; this
+    /// view names the same answer the session-start path resolves, so the page
+    /// never shows two different defaults.
+    fn render_agent_default_source_summary(
+        &self,
+        agent_id: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let source = self.resolved_agent_default_source(agent_id);
+        let label = match source {
+            Some(vibex_core::AgentModelSourceRef::Provider(provider_id)) => {
+                let name = self
+                    .providers
+                    .iter()
+                    .find(|provider| {
+                        provider
+                            .legacy_provider_profile_id
+                            .as_ref()
+                            .is_some_and(|legacy| legacy == &provider_id)
+                    })
+                    .map(|provider| provider.display_name.clone())
+                    .or_else(|| {
+                        self.provider_profiles
+                            .iter()
+                            .find(|profile| profile.id == provider_id)
+                            .map(|profile| profile.display_name.clone())
+                    })
+                    .unwrap_or_else(|| provider_id.as_str().to_string());
+                format!(
+                    "{} · {name}",
+                    management_locale_text("Provider", "供应商", "供應商")
+                )
+            }
+            Some(vibex_core::AgentModelSourceRef::RouteGroup(route_id)) => {
+                let name = self
+                    .model_routes
+                    .iter()
+                    .find(|route| route.id == route_id)
+                    .map(|route| route.display_name.clone())
+                    .unwrap_or_else(|| route_id.as_str().to_string());
+                format!(
+                    "{} · {name}",
+                    management_locale_text("Route group", "路由组", "路由組")
+                )
+            }
+            None => management_locale_text(
+                "No default model source",
+                "尚未设置默认模型源",
+                "尚未設定預設模型來源",
+            )
+            .to_string(),
+        };
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_0p5()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.7))
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Default model source",
+                        "默认模型源",
+                        "預設模型來源",
+                    )),
+            )
+            .child(div().text_sm().child(label))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "A new session starts here. Editing this choice arrives in the next wave.",
+                        "新会话从这里开始；修改将在下一波开放。",
+                        "新工作階段從這裡開始；修改將在下一波開放。",
+                    )),
+            )
+            .into_any_element()
+    }
+
     fn render_agent_route_groups(
         &mut self,
         _window: &mut Window,
@@ -22763,6 +23848,64 @@ impl ManagementCenter {
                             .child(format!("{}", index + 1)),
                     )
                     .child(div().min_w_0().flex_1().truncate().text_sm().child(name))
+                    .child({
+                        let current = self
+                            .route_group_member_efforts
+                            .get(provider_id.as_str())
+                            .cloned()
+                            .unwrap_or_default();
+                        let label = route_group_effort_label(&current);
+                        let center = cx.weak_entity();
+                        let provider = provider_id.clone();
+                        Button::new(SharedString::from(format!(
+                            "management-route-group-effort-{index}"
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .label(label)
+                        .dropdown_menu(move |menu, _, _| {
+                            let mut menu = menu;
+                            for (value, label) in [
+                                (
+                                    "",
+                                    management_locale_text(
+                                        "Inherit effort",
+                                        "继承推理档位",
+                                        "繼承推理檔位",
+                                    ),
+                                ),
+                                ("low", management_locale_text("Low", "低", "低")),
+                                ("medium", management_locale_text("Medium", "中", "中")),
+                                ("high", management_locale_text("High", "高", "高")),
+                                (
+                                    "xhigh",
+                                    management_locale_text("Extra high", "极高", "極高"),
+                                ),
+                                ("max", management_locale_text("Max", "最高", "最高")),
+                            ] {
+                                let center = center.clone();
+                                let provider = provider.clone();
+                                let value = value.to_string();
+                                menu = menu.item(PopupMenuItem::new(label).on_click(
+                                    move |_, _, cx| {
+                                        let _ = center.update(cx, |this, cx| {
+                                            if value.is_empty() {
+                                                this.route_group_member_efforts
+                                                    .remove(provider.as_str());
+                                            } else {
+                                                this.route_group_member_efforts.insert(
+                                                    provider.as_str().to_string(),
+                                                    value.clone(),
+                                                );
+                                            }
+                                            cx.notify();
+                                        });
+                                    },
+                                ));
+                            }
+                            menu
+                        })
+                    })
                     .child(
                         Button::new(SharedString::from(format!(
                             "management-route-group-up-{index}"
@@ -23051,6 +24194,87 @@ impl ManagementCenter {
                     }),
             );
         }
+        // The fields the gateway already understands but the editor used to
+        // hide. They are group policy, not Provider or Key settings.
+        rows = rows.child(
+            div()
+                .w_full()
+                .pt_2()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .text_xs()
+                .font_semibold()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text("Advanced", "高级", "進階")),
+        );
+        rows = rows.child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_start()
+                .gap_2()
+                .child(div().min_w_0().flex_1().child(management_input_field(
+                    management_locale_text(
+                        "First token timeout (s)",
+                        "首 token 超时（秒）",
+                        "首 Token 逾時（秒）",
+                    ),
+                    &self.route_group_first_token_timeout,
+                    false,
+                    cx,
+                )))
+                .child(div().min_w_0().flex_1().child(management_input_field(
+                    management_locale_text("Context tokens", "上下文 Token", "上下文 Token"),
+                    &self.route_group_context_tokens,
+                    false,
+                    cx,
+                )))
+                .child(div().min_w_0().flex_1().child(management_input_field(
+                    management_locale_text(
+                        "Token ceiling (local)",
+                        "Token 上限（本地）",
+                        "Token 上限（本機）",
+                    ),
+                    &self.route_group_token_limit,
+                    false,
+                    cx,
+                ))),
+        );
+        let mut token_windows = h_flex().w_full().items_center().gap_1();
+        for window_choice in vibex_core::GatewayTokenWindow::ALL {
+            let selected = window_choice == self.route_group_token_limit_window;
+            token_windows = token_windows.child(
+                Button::new(SharedString::from(format!(
+                    "management-route-group-token-window-{}",
+                    window_choice.id()
+                )))
+                .xsmall()
+                .when(selected, |button| button.primary())
+                .when(!selected, |button| button.outline())
+                .label(gateway_token_window_label(window_choice))
+                .disabled(pending)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.route_group_token_limit_window = window_choice;
+                    cx.notify();
+                })),
+            );
+        }
+        rows = rows.child(
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "The local token ceiling is counted from tokens the gateway observed; it is not the vendor's quota.",
+                            "本地 Token 上限按网关实际观测到的 Token 计数，不是厂商配额。",
+                            "本機 Token 上限按閘道實際觀測到的 Token 計數，不是廠商配額。",
+                        )),
+                )
+                .child(token_windows),
+        );
         rows = rows.child(
             h_flex()
                 .w_full()
@@ -23732,10 +24956,12 @@ impl ManagementCenter {
         } else {
             profile_rows.into_any_element()
         };
+        let default_source = self.render_agent_default_source_summary(&selected_agent_id, cx);
         let provider_configuration = v_flex()
             .w_full()
             .min_w_0()
             .gap_3()
+            .child(default_source)
             .child(add_rows)
             .child(route_groups)
             .child(
@@ -29078,6 +30304,17 @@ struct GatewayLimitInputs {
 ///
 /// An empty field means "no limit", never zero: a zero limit would forbid every
 /// request, which is not what clearing the box means.
+fn parse_optional_u64(value: &str) -> Result<Option<u64>, &'static str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| "must be a whole number")
+}
+
 fn parse_optional_limit(value: &str) -> Result<Option<u32>, &'static str> {
     let value = value.trim();
     if value.is_empty() {
@@ -29337,6 +30574,20 @@ fn gateway_runtime_text(state: &vibex_core::ModelGatewayRuntimeState) -> String 
 ///
 /// Trimmed, because a name of spaces is empty; length is counted in characters
 /// so a CJK name is measured the way the authority measures it.
+/// The name a Gateway row shows.
+///
+/// The stored default is English so the database and the runtime do not depend
+/// on the UI locale. The surface still translates that default: a Chinese
+/// reader sees `Vibex 网关`, and a name the user typed is shown as typed.
+fn gateway_display_name(settings: &vibex_core::ModelGatewaySettings) -> String {
+    let default_name = vibex_core::ModelGatewaySettings::default().display_name;
+    if settings.display_name == default_name {
+        management_locale_text("Vibex Gateway", "Vibex 网关", "Vibex 閘道").to_string()
+    } else {
+        settings.display_name.clone()
+    }
+}
+
 fn parse_gateway_display_name(value: &str) -> Result<String, &'static str> {
     let name = value.trim();
     if name.is_empty() {
@@ -32388,6 +33639,15 @@ fn management_route_group_users_label(count: usize) -> String {
 }
 
 /// How a route picks among its members, in the reader's terms.
+fn route_group_effort_label(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return management_locale_text("Inherit effort", "继承推理档位", "繼承推理檔位")
+            .to_string();
+    }
+    value.to_string()
+}
+
 fn management_route_strategy_label(strategy: vibex_core::RouteStrategy) -> String {
     let label = match (strategy, locale::current_locale()) {
         (vibex_core::RouteStrategy::Ordered, ResolvedLocale::En) => "In order",
@@ -33460,6 +34720,7 @@ async fn load_snapshot(
         provider_bindings,
         model_routes,
         agent_model_route_bindings,
+        agent_model_source_defaults: bundle.agent_model_source_defaults,
     })
 }
 
@@ -34770,7 +36031,7 @@ mod tests {
         let source = include_str!("management.rs");
         let renderer = source
             .split_once("    fn render_nav(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_content("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn shared_providers("))
             .map(|(body, _)| body)
             .expect("management primary navigation should remain inspectable");
 
@@ -34951,7 +36212,7 @@ mod tests {
         let source = include_str!("management.rs");
         let renderer = source
             .split_once("    fn render_nav(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_content("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn shared_providers("))
             .map(|(body, _)| body)
             .expect("management primary navigation should remain inspectable");
 
@@ -35861,6 +37122,7 @@ mod tests {
             "provider-model-wire-",
             "provider-model-reasoning-",
             "provider-model-efforts-level-",
+            "provider-model-capability-",
         ] {
             assert!(
                 editor.contains(group),
@@ -35869,7 +37131,7 @@ mod tests {
         }
         assert_eq!(
             editor.matches("management_option_chip(").count(),
-            4,
+            5,
             "each choice group draws its options through the shared chip"
         );
         // The token limits are quick values over a field, not a choice group, so
@@ -38089,6 +39351,75 @@ mod gateway_surface_tests {
         // Characters, not bytes: a CJK name of the same length fits.
         let cjk = "名".repeat(vibex_core::ModelGatewaySettings::MAX_DISPLAY_NAME_LEN);
         assert!(parse_gateway_display_name(&cjk).is_ok());
+    }
+
+    #[test]
+    fn the_gateway_default_name_is_localized_by_the_surface() {
+        let source = include_str!("management.rs");
+        let helper = source
+            .split_once("fn gateway_display_name(")
+            .and_then(|(_, tail)| tail.split_once("\nfn parse_gateway_display_name("))
+            .map(|(body, _)| body)
+            .expect("the localized Gateway name helper should remain inspectable");
+        assert!(helper.contains("Vibex Gateway"));
+        assert!(helper.contains("Vibex 网关"));
+        assert!(helper.contains("Vibex 閘道"));
+        assert!(source.contains("gateway_display_name(&gateway.settings)"));
+        assert!(source.contains("gateway_display_name(&snapshot.settings)"));
+    }
+
+    #[test]
+    fn the_route_group_editor_writes_the_gateway_defaults_it_shows() {
+        let source = include_str!("management.rs");
+        let save = source
+            .split_once("    fn save_route_group(")
+            .and_then(|(_, tail)| tail.split_once("    fn delete_route_group("))
+            .map(|(body, _)| body)
+            .expect("the route-group save path should remain inspectable");
+        for field in [
+            "first_token_timeout_ms",
+            "context_tokens",
+            "token_limit",
+            "reasoning_effort",
+            "route_group_member_efforts",
+        ] {
+            assert!(
+                save.contains(field),
+                "the route-group save must persist {field}"
+            );
+        }
+        assert!(source.contains("management-route-group-effort-"));
+        assert!(source.contains("management-route-group-token-window-"));
+    }
+
+    #[test]
+    fn the_shared_provider_editor_writes_the_shared_record() {
+        let source = include_str!("management.rs");
+        let save = source
+            .split_once("    fn save_shared_provider_editor(")
+            .and_then(|(_, tail)| tail.split_once("    fn render_shared_provider_editor("))
+            .map(|(body, _)| body)
+            .expect("the shared Provider editor should remain inspectable");
+        assert!(save.contains("update_shared_provider("));
+        assert!(save.contains("configured_models"));
+        assert!(save.contains("default_model_id"));
+        assert!(save.contains("proxy_policy"));
+        assert!(save.contains("metadata.catalog_id"));
+        assert!(save.contains("metadata.only_through_route_groups"));
+    }
+
+    #[test]
+    fn the_agent_default_source_summary_reads_before_it_edits() {
+        let source = include_str!("management.rs");
+        let summary = source
+            .split_once("    fn resolved_agent_default_source(")
+            .and_then(|(_, tail)| tail.split_once("    fn render_agent_route_groups("))
+            .map(|(body, _)| body)
+            .expect("the Agent default-source summary should remain inspectable");
+        assert!(summary.contains("agent_model_source_defaults"));
+        assert!(summary.contains("model_route_id"));
+        assert!(summary.contains("is_default"));
+        assert!(summary.contains("Default model source"));
     }
 
     /// The header edits the name and writes it through the settings command.

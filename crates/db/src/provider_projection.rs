@@ -19,13 +19,13 @@ use vibex_core::{
     ProviderProfileId, ProviderProfileStatus, ProviderSecretKind, ProviderSecretSetupState,
     TransportKind, VibexError, VibexResult, WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
     WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, WIRE_PROTOCOL_OPENAI_RESPONSES,
-    acp_agent_catalog_entries, builtin_agent_definitions,
+    acp_agent_catalog_entries, builtin_agent_definitions, unix_timestamp_ms,
 };
 
 use super::{
     AgentManagedInstallationRepository, ProviderProfileRepository,
     ProviderSecretReferenceRepository, enum_from_db_sql, enum_to_db, json_from_db_sql, json_to_db,
-    map_provider_profile_without_secrets, parse_id_sql, storage_err,
+    map_provider_profile_without_secrets, migration_applied, parse_id_sql, storage_err,
 };
 
 const LEGACY_ACP_CONFIG_OPTION_KEY: &str = "acp.config.v1";
@@ -58,7 +58,7 @@ impl ModelProviderProfileRepository {
                 display_name, vendor_hint, endpoints_json, proxy_policy_json,
                 credentials_json, configured_models_json, default_model_id,
                 headers_json, status, revision, created_at_ms, updated_at_ms,
-                deleted_at_ms
+                deleted_at_ms, metadata_json
             FROM model_provider_profiles
             WHERE model_provider_profile_id = ?1 AND deleted_at_ms IS NULL
             ",
@@ -82,7 +82,7 @@ impl ModelProviderProfileRepository {
                 display_name, vendor_hint, endpoints_json, proxy_policy_json,
                 credentials_json, configured_models_json, default_model_id,
                 headers_json, status, revision, created_at_ms, updated_at_ms,
-                deleted_at_ms
+                deleted_at_ms, metadata_json
             FROM model_provider_profiles
             WHERE legacy_provider_profile_id = ?1
             ",
@@ -169,7 +169,7 @@ impl ModelProviderProfileRepository {
                     display_name, vendor_hint, endpoints_json, proxy_policy_json,
                     credentials_json, configured_models_json, default_model_id,
                     headers_json, status, revision, created_at_ms, updated_at_ms,
-                    deleted_at_ms
+                    deleted_at_ms, metadata_json
                 FROM model_provider_profiles
                 WHERE deleted_at_ms IS NULL
                 ORDER BY updated_at_ms DESC, model_provider_profile_id ASC
@@ -213,7 +213,8 @@ impl ModelProviderProfileRepository {
                     status = ?11,
                     revision = ?12,
                     updated_at_ms = ?13,
-                    deleted_at_ms = ?14
+                    deleted_at_ms = ?14,
+                    metadata_json = ?15
                 WHERE model_provider_profile_id = ?1
                     AND revision = ?2
                     AND deleted_at_ms IS NULL
@@ -233,6 +234,7 @@ impl ModelProviderProfileRepository {
                     profile.revision,
                     profile.updated_at_ms,
                     profile.deleted_at_ms,
+                    json_to_db(&profile.metadata)?,
                 ],
             )
             .map_err(storage_err(
@@ -946,6 +948,7 @@ impl ProviderProjectionCompatibilityRepository {
                 .collect(),
             default_model_id: legacy.default_model.clone(),
             headers: Vec::new(),
+            metadata: Default::default(),
             status: match legacy.status {
                 ProviderProfileStatus::Enabled => ModelProviderProfileStatus::Enabled,
                 ProviderProfileStatus::Disabled => ModelProviderProfileStatus::Disabled,
@@ -1166,8 +1169,8 @@ fn insert_model_provider_profile(
             display_name, vendor_hint, endpoints_json, proxy_policy_json,
             credentials_json, configured_models_json, default_model_id,
             headers_json, status, revision, created_at_ms, updated_at_ms,
-            deleted_at_ms
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            deleted_at_ms, metadata_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         ",
         params![
             profile.id.as_str(),
@@ -1188,6 +1191,7 @@ fn insert_model_provider_profile(
             profile.created_at_ms,
             profile.updated_at_ms,
             profile.deleted_at_ms,
+            json_to_db(&profile.metadata)?,
         ],
     )
     .map_err(storage_err(
@@ -1364,6 +1368,7 @@ fn map_model_provider_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<Model
         created_at_ms: row.get(12)?,
         updated_at_ms: row.get(13)?,
         deleted_at_ms: row.get(14)?,
+        metadata: json_from_db_sql(row.get(15)?)?,
     })
 }
 
@@ -1576,6 +1581,7 @@ fn map_legacy_projection_records(
         credentials,
         configured_models: legacy_model_catalog(legacy),
         default_model_id: legacy.default_model.clone(),
+        metadata: Default::default(),
         status: if legacy.status == ProviderProfileStatus::Enabled {
             ModelProviderProfileStatus::Enabled
         } else {
@@ -3302,6 +3308,7 @@ mod tests {
             }],
             default_model_id: Some("shared-model".to_string()),
             headers: Vec::new(),
+            metadata: Default::default(),
             status: ModelProviderProfileStatus::Enabled,
             revision: 1,
             created_at_ms: now,
@@ -3370,6 +3377,7 @@ mod tests {
             configured_models: Vec::new(),
             default_model_id: None,
             headers: Vec::new(),
+            metadata: Default::default(),
             status: ModelProviderProfileStatus::Enabled,
             revision: 1,
             created_at_ms: 100,
@@ -3690,4 +3698,69 @@ mod real_database_upgrade_tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+/// Adds the advisory Provider metadata column.
+///
+/// The column is appended rather than replacing `vendor_hint`: older rows
+/// read as `{}`, and the launch projection never reads it.
+pub(crate) fn migrate_provider_metadata(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 82;
+    const NAME: &str = "model_provider_metadata";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage_err(
+            "model_provider_metadata_transaction_failed",
+            "failed to start the Provider metadata migration",
+        ))?;
+    let has_metadata = transaction
+        .prepare("PRAGMA table_info(model_provider_profiles)")
+        .map_err(storage_err(
+            "model_provider_metadata_inspect_failed",
+            "failed to inspect the Provider profile table",
+        ))?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage_err(
+            "model_provider_metadata_inspect_failed",
+            "failed to inspect the Provider profile table",
+        ))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(storage_err(
+            "model_provider_metadata_inspect_failed",
+            "failed to inspect the Provider profile table",
+        ))?
+        .iter()
+        .any(|column| column == "metadata_json");
+    if !has_metadata {
+        transaction
+            .execute_batch(
+                "ALTER TABLE model_provider_profiles
+                     ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}';",
+            )
+            .map_err(storage_err(
+                "model_provider_metadata_apply_failed",
+                "failed to add the Provider metadata column",
+            ))?;
+    }
+    transaction
+        .execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+            params![VERSION, NAME, unix_timestamp_ms()],
+        )
+        .map_err(storage_err(
+            "migration_record_failed",
+            "failed to record the Provider metadata migration",
+        ))?;
+    transaction.commit().map_err(storage_err(
+        "model_provider_metadata_commit_failed",
+        "failed to commit the Provider metadata migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
 }

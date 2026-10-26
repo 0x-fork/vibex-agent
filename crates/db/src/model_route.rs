@@ -455,6 +455,14 @@ impl AgentModelRouteBindingRepository {
         ))
     }
 
+    /// Removes the Agent's route default without touching its bindings.
+    ///
+    /// Setting a Provider as the unified default needs this: a route default
+    /// and a Provider default must not both claim the Agent.
+    pub fn clear_default_for_agent(conn: &Connection, agent_id: &AgentId) -> VibexResult<usize> {
+        clear_default(conn, agent_id, None)
+    }
+
     /// Removes one binding. A removed default leaves the Agent with none, which
     /// the caller reports rather than silently promoting another route.
     pub fn delete(
@@ -487,9 +495,9 @@ fn clear_default(
     conn: &Connection,
     agent_id: &AgentId,
     except: Option<&ModelRouteId>,
-) -> VibexResult<()> {
+) -> VibexResult<usize> {
     let now = unix_timestamp_ms();
-    match except {
+    let changed = match except {
         Some(route_id) => conn.execute(
             "
             UPDATE agent_model_route_bindings
@@ -516,7 +524,7 @@ fn clear_default(
         "agent_model_route_default_clear_failed",
         "failed to clear the Agent's previous default route",
     ))?;
-    Ok(())
+    Ok(changed)
 }
 
 /// The wall-clock stamp a rewrite gets.
@@ -1683,6 +1691,7 @@ mod route_policy_tests {
                 configured_models: Vec::new(),
                 default_model_id: None,
                 headers: Vec::new(),
+                metadata: Default::default(),
                 status: vibex_core::ModelProviderProfileStatus::Enabled,
                 revision: 1,
                 created_at_ms: 1,

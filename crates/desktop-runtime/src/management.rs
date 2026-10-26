@@ -137,6 +137,44 @@ impl ProviderManagementFacade {
         self.service.list_all_agent_model_route_bindings()
     }
 
+    /// Every explicit unified default source row.
+    pub fn list_agent_model_source_defaults(
+        &self,
+    ) -> VibexResult<Vec<vibex_core::AgentModelSourceDefault>> {
+        self.service.list_agent_model_source_defaults()
+    }
+
+    pub fn get_agent_model_source_default(
+        &self,
+        request: vibex_core::AgentModelSourceDefaultRequest,
+    ) -> VibexResult<vibex_core::AgentModelSourceDefault> {
+        self.service.get_agent_model_source_default(request)
+    }
+
+    pub fn set_agent_model_source_default(
+        &self,
+        request: vibex_core::SetAgentModelSourceDefaultRequest,
+    ) -> VibexResult<vibex_core::AgentModelSourceDefault> {
+        let _claim = self.mutation_guard.claim(format!(
+            "provider:agent-model-source:{}:{}",
+            request.agent_id,
+            request.scope.storage_key()
+        ))?;
+        self.service.set_agent_model_source_default(request)
+    }
+
+    pub fn clear_agent_model_source_default(
+        &self,
+        request: vibex_core::ClearAgentModelSourceDefaultRequest,
+    ) -> VibexResult<bool> {
+        let _claim = self.mutation_guard.claim(format!(
+            "provider:agent-model-source:{}:{}",
+            request.agent_id,
+            request.scope.storage_key()
+        ))?;
+        self.service.clear_agent_model_source_default(request)
+    }
+
     /// The shared Providers a reader created, without the machinery.
     pub fn list_visible_model_provider_profiles(
         &self,

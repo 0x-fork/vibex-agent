@@ -348,6 +348,31 @@ pub struct ModelProviderCredentialReference {
     pub revision: i64,
 }
 
+/// Provider metadata that is not part of the launch contract.
+///
+/// Kept in one record so future advisory fields do not widen the Provider
+/// profile column by column. Every field is optional or defaulted; an older
+/// record reads as the empty value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProviderMetadata {
+    /// The matching models.dev provider id, when the editor knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_id: Option<String>,
+    /// Keep the Provider's models out of Agent pickers; route groups still
+    /// reach the Provider.
+    #[serde(default)]
+    pub only_through_route_groups: bool,
+    /// A bundled icon key, when the Provider has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// The picker category: vendor, relay, or local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelProviderProfile {
@@ -362,6 +387,9 @@ pub struct ModelProviderProfile {
     pub configured_models: Vec<ModelProviderCatalogEntry>,
     pub default_model_id: Option<String>,
     pub headers: Vec<ModelProviderHeaderReference>,
+    /// Advisory metadata; never read by a launch projection.
+    #[serde(default)]
+    pub metadata: ModelProviderMetadata,
     pub status: ModelProviderProfileStatus,
     pub revision: i64,
     pub created_at_ms: i64,
@@ -387,6 +415,7 @@ impl Default for ModelProviderProfile {
             configured_models: Vec::new(),
             default_model_id: None,
             headers: Vec::new(),
+            metadata: ModelProviderMetadata::default(),
             status: ModelProviderProfileStatus::Disabled,
             revision: 1,
             created_at_ms: 0,
@@ -2308,6 +2337,7 @@ mod tests {
             configured_models: Vec::new(),
             default_model_id: None,
             headers: Vec::new(),
+            metadata: Default::default(),
             status: ModelProviderProfileStatus::Enabled,
             revision: 1,
             created_at_ms: 1,
@@ -2362,6 +2392,7 @@ mod tests {
                     redacted_hint: "non-secret header".to_string(),
                 },
             ],
+            metadata: Default::default(),
             status: ModelProviderProfileStatus::Enabled,
             revision: 1,
             created_at_ms: 1,

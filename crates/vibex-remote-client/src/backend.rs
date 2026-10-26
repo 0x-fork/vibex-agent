@@ -4259,6 +4259,36 @@ impl ManagementBackend for WebRemoteBackend {
         )
     }
 
+    fn get_agent_model_source_default(
+        &self,
+        _request: vibex_core::AgentModelSourceDefaultRequest,
+    ) -> BackendFuture<'_, vibex_core::AgentModelSourceDefault> {
+        self.unsupported(
+            "agent_model_source_remote_unsupported",
+            "this runtime does not serve the unified default model source over the remote protocol yet",
+        )
+    }
+
+    fn set_agent_model_source_default(
+        &self,
+        _request: MutationRequest<vibex_core::SetAgentModelSourceDefaultRequest>,
+    ) -> BackendFuture<'_, vibex_core::AgentModelSourceDefault> {
+        self.unsupported(
+            "agent_model_source_remote_unsupported",
+            "this runtime does not serve the unified default model source over the remote protocol yet",
+        )
+    }
+
+    fn clear_agent_model_source_default(
+        &self,
+        _request: MutationRequest<vibex_core::ClearAgentModelSourceDefaultRequest>,
+    ) -> BackendFuture<'_, bool> {
+        self.unsupported(
+            "agent_model_source_remote_unsupported",
+            "this runtime does not serve the unified default model source over the remote protocol yet",
+        )
+    }
+
     fn create_model_provider_profile(
         &self,
         request: MutationRequest<vibex_core::ModelProviderProfileCreateRequest>,

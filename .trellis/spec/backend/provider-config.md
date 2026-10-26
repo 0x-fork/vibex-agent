@@ -6100,3 +6100,108 @@ let models = vibex_core::provider_group_models(&route, &providers);
 let model_id = route.group_model_id(&models[0].model_id);
 // The gateway resolves only models actually in the intersection.
 ```
+
+## Scenario: Unified Agent Default Model Source
+
+### 1. Scope / Trigger
+
+- Trigger: a new session, scheduled task, or automation needs the model source an
+  Agent starts on.
+- Trigger: the Config Center reads or writes the default that used to live in
+  `agent_default_model_provider_profiles` and
+  `agent_model_route_bindings.is_default`.
+
+### 2. Signatures
+
+```rust
+AgentModelSourceRef::Provider(ProviderProfileId)
+AgentModelSourceRef::RouteGroup(ModelRouteId)
+
+AgentModelSourceDefault {
+    scope: ProviderProfileDefaultScope,
+    agent_id: AgentId,
+    source: Option<AgentModelSourceRef>,
+    updated_at_ms: i64,
+}
+
+AgentModelSourceDefaultRequest { scope, agent_id }
+SetAgentModelSourceDefaultRequest { scope, agent_id, source }
+ClearAgentModelSourceDefaultRequest { scope, agent_id }
+```
+
+The stored table is keyed by `(scope_kind, scope_id, agent_id)`. `source` is
+optional on a read because a read is a resolution, not a row lookup.
+
+### 3. Contracts
+
+- Precedence: explicit unified row, then the Agent's route default, then the
+  scoped Provider default, then the Agent's sole binding, then `None`.
+- A Provider source must be an Agent Profile that belongs to this Agent, is not
+  deleted, is enabled, and is not an internal placeholder.
+- A route source must exist, be enabled, have at least one enabled member, and
+  be bound to this Agent.
+- Writing a Provider source clears the Agent's route default; writing a route
+  source clears the scoped Provider default. Both happen in one immediate
+  transaction so no reader sees two defaults.
+- Clearing removes only the explicit unified row; the legacy fallbacks remain.
+- The snapshot carries explicit rows only, not resolved fallbacks. A client that
+  needs the answer calls the read API; it must not invent a row.
+- A disabled or deleted source is never promoted by fallback. An explicit row
+  that later becomes unusable is a data-repair case, not a new default.
+
+### 4. Tests Required
+
+- `vibex-core`: tagged camelCase wire shape; `None` source.
+- `vibex-db`: unique row per scope/Agent; backfill precedence; double-default
+  report; clear is idempotent.
+- `vibex-config-switch`: read fallback order; Provider write clears route
+  default; route write clears scoped Provider default; ownership and usability
+  validation.
+- `vibex-desktop`: Agent page shows one resolved default; global Provider and
+  route pages do not show an object-level default.
+
+## Scenario: Provider Advisory Metadata
+
+### 1. Scope / Trigger
+
+- Trigger: the Provider editor stores a models.dev catalogue id, icon key,
+  category, tags, or the "only through route groups" visibility choice.
+- The data is advisory: no launch projection reads it as a credential, command,
+  protocol, or model declaration.
+
+### 2. Signatures
+
+```rust
+ModelProviderMetadata {
+    catalog_id: Option<String>,
+    only_through_route_groups: bool,
+    icon: Option<String>,
+    category: Option<String>,
+    tags: Vec<String>,
+}
+
+ModelProviderProfile.metadata: ModelProviderMetadata
+```
+
+`model_provider_profiles.metadata_json` stores the record; older rows read as
+the empty value. The table keeps the column out of the launch contract.
+
+### 3. Contracts
+
+- `catalog_id` keys capability suggestions; a missing id means no suggestion,
+  never a guessed one.
+- `only_through_route_groups` hides the Provider from direct Agent pickers; the
+  Provider still appears in route-group member choices.
+- Metadata never overwrites a hand-typed model capability and never carries a
+  price, cost, currency, or quota field.
+- A create request that carries no metadata writes the empty record; the
+  catalogue id may be added by a follow-up v2 update when it comes from a
+  preset.
+
+### 4. Tests Required
+
+- `vibex-db`: metadata round-trips; older rows default; schema migration adds the
+  column without rewriting rows.
+- `vibex-core`: serde defaults and no money field.
+- `vibex-desktop`: shared editor writes the metadata through the v2 update; a
+  Provider marked only-through-groups is absent from the direct picker.
