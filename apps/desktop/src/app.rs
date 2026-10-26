@@ -4267,6 +4267,30 @@ fn should_defer_timeline_streaming_work(active_tab: &str, new_session_open: bool
     active_tab != "agent" || new_session_open
 }
 
+/// Whether a brand-new session's authoritative acknowledgment may move the
+/// workbench onto that session's conversation.
+///
+/// Submitting opens the conversation before the authority answers, so the
+/// acknowledgment exists to reconcile the page the reader is already on — not
+/// to choose it a second time. A reader who moved on in the meantime (to the
+/// New Session home, to another tab, to another session) has already said what
+/// they want to look at, and a creation landing in the background is not a
+/// reason to pull them back. The home is what "moved on" looks like when the
+/// selection still names the session being created, because opening the home
+/// leaves that selection alone.
+fn new_session_acknowledgment_may_navigate(
+    generation_is_current: bool,
+    selected_session_id: Option<&VibexSessionId>,
+    created_session_id: &VibexSessionId,
+    new_session_open: bool,
+    active_tab: &str,
+) -> bool {
+    generation_is_current
+        && selected_session_id == Some(created_session_id)
+        && !new_session_open
+        && active_tab == "agent"
+}
+
 fn timeline_live_event_is_streaming_only(event: &TimelineLiveEvent) -> bool {
     if !timeline_live_event_is_well_formed(event) {
         return false;
@@ -35692,9 +35716,21 @@ impl VibexWorkbench {
                             this.reconcile_sidebar_state();
                             this.publish_sidebar_invalidation();
                             let created_session_id = session_id.clone();
-                            let turn_generation = if this.session_generation == generation
-                                && this.selected_session_id.as_ref() == Some(&session_id)
-                            {
+                            // The conversation opened the moment the draft was
+                            // submitted, so this acknowledgment only has to
+                            // reconcile a page the reader is still on. Someone
+                            // who navigated away — the New Session home keeps
+                            // this session selected on purpose — has already
+                            // chosen where to look, and a creation finishing in
+                            // the background must not take that page back.
+                            let still_watching = new_session_acknowledgment_may_navigate(
+                                this.session_generation == generation,
+                                this.selected_session_id.as_ref(),
+                                &session_id,
+                                this.new_session_open,
+                                &this.ui_state.workbench.active_tab,
+                            );
+                            let turn_generation = if still_watching {
                                 this.new_session_workspace
                                     .mark_stage(if has_initial_message {
                                         NewSessionSubmissionStage::SendingPrompt
@@ -101041,6 +101077,78 @@ mod tests {
         assert!(pending_open.contains("self.set_session_turn_pending(&session_id, true);"));
         assert!(pending_open.contains("self.agent_loading = false;"));
         assert!(!pending_open.contains("self.agent_action_pending = true;"));
+    }
+
+    /// Submitting a draft already opened its conversation, so the authority's
+    /// acknowledgment has nothing left to choose. A reader who moved on while
+    /// the creation ran — most visibly to the New Session home, which leaves the
+    /// new session selected — is left where they went instead of being pulled
+    /// back when the first response lands.
+    #[test]
+    fn a_new_session_acknowledgment_leaves_a_page_the_reader_moved_to() {
+        let session = VibexSessionId::parse("session_creating").unwrap();
+        let other = VibexSessionId::parse("session_other").unwrap();
+
+        // Still watching the conversation the submit opened: reconcile it.
+        assert!(new_session_acknowledgment_may_navigate(
+            true,
+            Some(&session),
+            &session,
+            false,
+            "agent",
+        ));
+        // The New Session home keeps the selection but is not the conversation.
+        assert!(!new_session_acknowledgment_may_navigate(
+            true,
+            Some(&session),
+            &session,
+            true,
+            "agent",
+        ));
+        // Another tab, another session, and a superseded generation all mean the
+        // reader navigated away on purpose.
+        assert!(!new_session_acknowledgment_may_navigate(
+            true,
+            Some(&session),
+            &session,
+            false,
+            "management",
+        ));
+        assert!(!new_session_acknowledgment_may_navigate(
+            true,
+            Some(&other),
+            &session,
+            false,
+            "agent",
+        ));
+        assert!(!new_session_acknowledgment_may_navigate(
+            false,
+            Some(&session),
+            &session,
+            false,
+            "agent",
+        ));
+        assert!(!new_session_acknowledgment_may_navigate(
+            true, None, &session, false, "agent",
+        ));
+
+        let source = include_str!("app.rs");
+        let submit = source
+            .split_once("    fn submit_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn choose_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("new-session submission should remain inspectable");
+        // The acknowledgment cannot decide navigation by generation and
+        // selection alone: the home leaves the new session selected.
+        let fence = submit
+            .find("let still_watching = new_session_acknowledgment_may_navigate(")
+            .expect("the acknowledgment should consult the navigation fence");
+        let navigate = submit
+            .find("this.select_session_with_history(session_id.clone(), false, cx);")
+            .expect("the acknowledgment should still reconcile the open conversation");
+        assert!(fence < navigate);
+        assert!(submit.contains("this.new_session_open,"));
+        assert!(submit.contains("&this.ui_state.workbench.active_tab,"));
     }
 
     #[test]
