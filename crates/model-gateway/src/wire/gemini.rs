@@ -166,10 +166,30 @@ pub fn parse_request(value: &Value) -> GatewayResult<CanonicalRequest> {
                 Some("model") => Role::Assistant,
                 _ => Role::User,
             };
-            messages.push(CanonicalMessage {
-                role,
-                parts: parts(content.get("parts"))?,
-            });
+            let parts = parts(content.get("parts"))?;
+            // A `functionResponse` is a *tool* turn whatever role the client
+            // wrapped it in. Antigravity sends it under `model`, which reads as
+            // assistant; keeping that role put the result inside an assistant
+            // message, and the Chat/Responses encoders then emitted a tool call
+            // with no tool message answering it — the upstream refused the
+            // whole turn with "An assistant message with 'tool_calls' must be
+            // followed by tool messages responding to each 'tool_call_id'".
+            // The canonical form has always been a user-role tool result, so it
+            // is re-homed here rather than making every encoder defensive.
+            if parts
+                .iter()
+                .any(|part| matches!(part, ContentPart::ToolResult { .. }))
+                && !parts
+                    .iter()
+                    .any(|part| matches!(part, ContentPart::ToolCall { .. }))
+            {
+                messages.push(CanonicalMessage {
+                    role: Role::User,
+                    parts,
+                });
+                continue;
+            }
+            messages.push(CanonicalMessage { role, parts });
         }
     }
     assign_call_ordinals(&mut messages);
@@ -1027,6 +1047,77 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, CanonicalEvent::Stop(StopReason::ToolUse)))
         );
+    }
+
+    /// A `functionResponse` under the `model` role is still a tool turn.
+    ///
+    /// Antigravity wraps the result in a `model`-role content, which reads as
+    /// assistant. Keeping that role put the result inside an assistant message,
+    /// and the Chat/Responses encoders then emitted a tool call with no tool
+    /// message answering it; the upstream refused the entire turn with
+    /// `An assistant message with 'tool_calls' must be followed by tool messages
+    /// responding to each 'tool_call_id'`. Tools had already run by then, so the
+    /// turn died after doing its work.
+    #[test]
+    fn a_function_response_under_the_model_role_is_a_tool_turn() {
+        // The exact shape Antigravity's ACP server sends after a tool runs.
+        let request = parse_request(&json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "read the readme"}]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "read", "args": {"absolute_path": "/tmp/README.md"}}}
+                ]},
+                {"role": "model", "parts": [
+                    {"functionResponse": {"name": "read", "response": {"content": "hi"}}}
+                ]},
+                {"role": "model", "parts": [{"text": "the readme says hi"}]}
+            ]
+        }))
+        .unwrap();
+
+        let roles = request
+            .messages
+            .iter()
+            .map(|message| message.role)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            vec![
+                Role::User,
+                Role::Assistant,
+                // The tool result is a user-role turn, not the role the client
+                // wrapped it in: that is what pairs it with the call above.
+                Role::User,
+                Role::Assistant,
+            ],
+            "a tool result must not sit in an assistant turn"
+        );
+
+        // The translated Responses body has to answer the call, or the upstream
+        // refuses it. This is the assertion the real failure violated.
+        let body = crate::wire::responses::build_request(&request, "deepseek-v4.1-flash").unwrap();
+        let items = body["input"].as_array().unwrap();
+        let call_id = items
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .and_then(|item| item["call_id"].as_str())
+            .expect("the tool call is emitted");
+        assert!(
+            items.iter().any(|item| {
+                item["type"] == "function_call_output" && item["call_id"] == call_id
+            }),
+            "every function_call needs a function_call_output answering it: {body}"
+        );
+        // And nothing may be left stranded in an assistant turn.
+        for item in items {
+            if item["type"] == "message" && item["role"] == "assistant" {
+                let content = item["content"].to_string();
+                assert!(
+                    !content.contains("function_call_output"),
+                    "an assistant message must not carry a tool result: {item}"
+                );
+            }
+        }
     }
 
     /// A turn that calls one tool twice keeps two distinct call ids.

@@ -3106,6 +3106,165 @@ async fn a_vendor_tool_type_the_upstream_cannot_serve_is_dropped() {
     cleanup(path);
 }
 
+/// Antigravity's tool result under the `model` role still reaches the upstream
+/// as a tool message.
+///
+/// Its ACP server wraps `functionResponse` in a `model`-role content. Reading
+/// that role literally put the result inside an assistant message, so the
+/// translated Responses body carried a `function_call` with no
+/// `function_call_output` beside it and the upstream refused the whole turn
+/// with `An assistant message with 'tool_calls' must be followed by tool
+/// messages responding to each 'tool_call_id'`.
+#[tokio::test]
+async fn a_gemini_tool_result_under_the_model_role_answers_its_call() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) =
+        mock_upstream(200, responses_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::Responses,
+        &["deepseek-v4.1-flash"],
+        "sk-test",
+    );
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let model = group_model(&group, "deepseek-v4.1-flash");
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/v1beta/models/{}:streamGenerateContent?alt=sse",
+            model.replace('/', "%2F")
+        ))
+        .header(header::HOST, "127.0.0.1")
+        .header("x-goog-api-key", "vibex-local-gateway")
+        .json(&json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "read the readme"}]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "read", "args": {"absolute_path": "/tmp/README.md"}}}
+                ]},
+                {"role": "model", "parts": [
+                    {"functionResponse": {"name": "read", "response": {"content": "hi"}}}
+                ]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "the tool result must pair with its call: {body}"
+    );
+
+    let recorded = recorder.lock().await;
+    let sent = recorded.body.as_ref().unwrap();
+    let items = sent["input"].as_array().expect("input items");
+    let call_id = items
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .and_then(|item| item["call_id"].as_str())
+        .expect("the tool call is translated");
+    assert!(
+        items
+            .iter()
+            .any(|item| item["type"] == "function_call_output" && item["call_id"] == call_id),
+        "the result has to answer the call it belongs to: {sent}"
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// The exact body Antigravity sends after a tool runs is accepted.
+///
+/// Captured from its ACP server: the result is a `model`-role content, and the
+/// turn ends with a `model`-role text reply. Reading those roles literally put
+/// the tool result inside an assistant turn, so the translated Responses body
+/// had a `function_call` with no `function_call_output` and the upstream
+/// refused it with `An assistant message with 'tool_calls' must be followed by
+/// tool messages responding to each 'tool_call_id'`. The tool had already run,
+/// so the turn died after doing its work.
+#[tokio::test]
+async fn antigravity_style_history_pairs_every_call_with_its_result() {
+    let path = database_path();
+    let (upstream_url, recorder, upstream_task) =
+        mock_upstream(200, responses_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let upstream = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::Responses,
+        &["deepseek-v4.1-flash"],
+        "sk-test",
+    );
+    let group = point_gateway_at(&path, upstream.clone(), GatewayPolicy::default());
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+
+    let model = group_model(&group, "deepseek-v4.1-flash");
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/v1beta/models/{}:streamGenerateContent?alt=sse",
+            model.replace('/', "%2F")
+        ))
+        .header(header::HOST, "127.0.0.1")
+        .header("x-goog-api-key", "vibex-local-gateway")
+        .json(&json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "read the readme"}]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"id": "07f9178c", "name": "read",
+                                      "args": {"absolute_path": "/tmp/README.md"}}}
+                ]},
+                {"role": "model", "parts": [
+                    {"functionResponse": {"id": "07f9178c", "name": "read",
+                                          "response": {"content": "hi"}}}
+                ]},
+                {"role": "model", "parts": [{"text": "the readme says hi"}]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "a tool result the client wrapped in a model turn must still pair: {body}"
+    );
+
+    let recorded = recorder.lock().await;
+    let sent = recorded.body.as_ref().unwrap();
+    let items = sent["input"].as_array().expect("input items");
+    let call_id = items
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .and_then(|item| item["call_id"].as_str())
+        .expect("the tool call is translated");
+    let output = items
+        .iter()
+        .position(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
+        .expect("the result has to answer the call it belongs to");
+    let call = items
+        .iter()
+        .position(|item| item["type"] == "function_call")
+        .unwrap();
+    assert!(
+        output > call,
+        "the answer must follow its call, not precede it: {sent}"
+    );
+
+    gateway_task.abort();
+    upstream_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
 /// A reasoning-depth model id resolves to the group's base model.
 ///
 /// Antigravity's picker publishes one model per depth, so it asks the gateway

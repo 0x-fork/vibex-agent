@@ -534,6 +534,17 @@ runtime switch or a turn on an Agent that was otherwise healthy.
   interrupt, permissions, elicitation) rather than the emptiest possible set.
   Clearing a callback flag there disables something the Agent has already been
   observed to send.
+- **A tool result is a tool turn, whatever role wraps it.** Gemini pairs a
+  `functionResponse` back to its `functionCall` by name, and Antigravity sends
+  both under `model`. Reading that role literally put the result inside an
+  assistant message, so the Chat/Responses encoders emitted a `function_call`
+  with no `function_call_output` beside it and the upstream refused the whole
+  turn with `An assistant message with 'tool_calls' must be followed by tool
+  messages responding to each 'tool_call_id'`. A content whose parts are
+  entirely tool results is re-homed to the user role during parsing — the
+  canonical form has always been a user-role tool result, so the codecs stay
+  unchanged. Tools had already run by then, so the turn died after doing its
+  work.
 - **A reasoning depth in a model id is not a second model.** Antigravity's
   picker publishes one model per depth, so it asks the gateway for
   `group/<id>/<model>-high` while the group holds the base model. Treating the
@@ -649,6 +660,9 @@ runtime switch or a turn on an Agent that was otherwise healthy.
 `a_route_group_resolves_its_launching_profile_for_capabilities`,
 `a_reasoning_depth_suffix_resolves_to_the_base_model`,
 `repeated_tool_names_get_distinct_call_ids`,
+`a_function_response_under_the_model_role_is_a_tool_turn`,
+`antigravity_style_history_pairs_every_call_with_its_result`,
+`a_gemini_tool_result_under_the_model_role_answers_its_call`,
 `kimi_depth_category_is_read_as_reasoning_by_probe_and_planner`,
 `mcp_server_wire_names_are_identifiers`,
 `zcode_personal_provider_table_matches_the_registry_schema`,
