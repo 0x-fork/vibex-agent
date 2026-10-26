@@ -34383,6 +34383,94 @@ for line in sys.stdin:
     /// Antigravity answers a refused `session/new` with `Invalid params` plus a
     /// structured `data` body. Reading only `data.details` (a string) dropped
     /// it, so the journal said "Invalid params" and nothing else.
+    /// Kimi Code's real probe payload reaches one place, not two.
+    ///
+    /// Its live `session/new` advertises `thinking` in the `thought_level`
+    /// category. The probe read that category as reasoning effort and offered
+    /// `off`/`on` to the composer, while the planner resolved the option to its
+    /// own id and treated it as generic — so the level the composer offered
+    /// could never be applied. The selection then kept `reasoningEffort: "on"`
+    /// against a binding whose effective effort was `null`, and every dispatch
+    /// was refused with `message_submission_runtime_binding_mismatch`.
+    ///
+    /// This drives the recorded payload through both readers and asserts they
+    /// agree, so the two cannot drift apart again.
+    #[test]
+    fn kimi_depth_category_is_read_as_reasoning_by_probe_and_planner() {
+        let payload = json!({
+            "configOptions": [
+                {
+                    "id": "model",
+                    "label": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "group/model_route_x/deepseek-v4.1-flash",
+                    "options": [{
+                        "value": "group/model_route_x/deepseek-v4.1-flash",
+                        "label": "group/model_route_x/deepseek-v4.1-flash"
+                    }]
+                },
+                {
+                    "id": "thinking",
+                    "label": "Thinking",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "on",
+                    "options": [
+                        {"value": "off", "label": "Thinking Off"},
+                        {"value": "on", "label": "Thinking On"}
+                    ]
+                },
+                {
+                    "id": "mode",
+                    "label": "Mode",
+                    "category": "mode",
+                    "type": "select",
+                    "currentValue": "default",
+                    "options": [
+                        {"value": "default", "label": "Default"},
+                        {"value": "yolo", "label": "YOLO"}
+                    ]
+                }
+            ]
+        });
+
+        let efforts = extract_probe_reasoning_efforts(&payload);
+        assert_eq!(
+            efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["off", "on"]
+        );
+
+        let options = extract_config_options(&payload);
+        let planner = crate::session_config::SessionConfigPlanner::new(
+            "adapter=kimi@2.2.0",
+            1,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            options,
+        );
+        let reasoning_key = crate::session_config::CanonicalSessionConfigKey::parse(
+            crate::session_config::CANONICAL_REASONING_EFFORT,
+        )
+        .unwrap();
+        assert_eq!(
+            planner
+                .option_for_key(&reasoning_key)
+                .unwrap()
+                .expect("the probe's depth dimension must be plannable")
+                .id,
+            "thinking"
+        );
+        assert!(
+            planner.advertises_reasoning_effort(),
+            "the planner must agree with the probe that `off`/`on` is a depth"
+        );
+        assert!(planner.reasoning_effort_value_is_advertised("on"));
+    }
+
     #[test]
     fn a_validation_refusal_names_its_fields() {
         let failure = json!({

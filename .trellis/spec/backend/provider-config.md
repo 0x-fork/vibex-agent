@@ -617,6 +617,7 @@ runtime switch or a turn on an Agent that was otherwise healthy.
 `dropping_every_tool_removes_the_key`,
 `a_probe_without_a_reasoning_dimension_reports_none`,
 `a_depth_category_is_the_reasoning_dimension`,
+`kimi_depth_category_is_read_as_reasoning_by_probe_and_planner`,
 `mcp_server_wire_names_are_identifiers`,
 `zcode_personal_provider_table_matches_the_registry_schema`,
 `zcode_plan_projects_the_legacy_map_and_the_personal_table`,
