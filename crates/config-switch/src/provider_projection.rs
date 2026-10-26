@@ -6220,6 +6220,73 @@ mod tests {
     /// `CONFIGURATION_ERROR Select a model before continuing`: the backend had
     /// never learned the Provider. Both files therefore describe the same
     /// binding.
+    /// The ZCode plan writes both files from one binding.
+    ///
+    /// `config.json` is what the ACP bridge lists; `provider_config.json` is
+    /// what the backend registry resolves the model against. A plan carrying
+    /// only the first looks healthy and cannot run a turn.
+    #[test]
+    fn zcode_plan_projects_the_legacy_map_and_the_personal_table() {
+        let descriptor = vibex_core::AgentProviderProjectionRegistry::builtin()
+            .unwrap()
+            .descriptors()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "zcode")
+            .cloned()
+            .expect("zcode owns a projection descriptor");
+        let (provider, runtime, binding) = typed_projection_fixture(&descriptor);
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            &descriptor,
+            "zcode-personal-table",
+        )
+        .unwrap();
+        let paths = plan
+            .overlay_files
+            .iter()
+            .map(|overlay| overlay.relative_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            paths.contains(&".zcode/v2/config.json"),
+            "the bridge lists providers from config.json: {paths:?}"
+        );
+        assert!(
+            paths.contains(&".zcode/v2/provider_config.json"),
+            "the backend registry resolves models from the personal table: {paths:?}"
+        );
+
+        let personal = plan
+            .overlay_files
+            .iter()
+            .find(|overlay| overlay.relative_path == ".zcode/v2/provider_config.json")
+            .unwrap();
+        assert!(personal.contains_secret_reference);
+        let value: serde_json::Value = serde_json::from_str(&personal.content).unwrap();
+        assert_eq!(value["schemaVersion"], 1);
+        // The Provider and the Model rule have to name the same Provider, or
+        // the model is an orphan the registry cannot attach to anything.
+        let provider_id = value["config"]["providerConfigRules"]["providerRules"][0]["providerId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!provider_id.is_empty());
+        for rule in value["config"]["modelConfigRules"]["providerModelRules"]
+            .as_array()
+            .unwrap()
+        {
+            assert_eq!(rule["providerId"], provider_id.as_str());
+        }
+
+        // The preview has to say the file carries a Secret, or the editor
+        // reports a plaintext write of the credential.
+        assert!(
+            plan.preview.targets.iter().any(|target| {
+                target.target == ".zcode/v2/provider_config.json" && target.secret
+            })
+        );
+    }
+
     #[test]
     fn zcode_personal_provider_table_matches_the_registry_schema() {
         let (mut provider, _, binding, _) = fixture(ConfigOverlayStrategy::ZcodeJson);

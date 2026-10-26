@@ -619,6 +619,7 @@ runtime switch or a turn on an Agent that was otherwise healthy.
 `a_depth_category_is_the_reasoning_dimension`,
 `mcp_server_wire_names_are_identifiers`,
 `zcode_personal_provider_table_matches_the_registry_schema`,
+`zcode_plan_projects_the_legacy_map_and_the_personal_table`,
 `a_dotted_name_is_rewritten_and_restored`,
 `a_tool_name_the_target_protocol_refuses_is_rewritten_and_restored`,
 `a_rewritten_tool_name_comes_back_as_the_clients_own`,
