@@ -1065,6 +1065,9 @@ pub struct ManagementCenter {
     gateway_key_replace_error: Option<String>,
     /// The Key being added to one Provider, keyed by profile id.
     gateway_key_drafts: BTreeMap<String, Entity<InputState>>,
+    gateway_key_batch_target: Option<String>,
+    gateway_key_batch_drafts: BTreeMap<String, Entity<TextareaState>>,
+    gateway_key_batch_error: Option<String>,
     /// Which Provider the add-key field belongs to.
     gateway_key_add_target: Option<String>,
     gateway_key_add_error: Option<String>,
@@ -2327,6 +2330,9 @@ impl ManagementCenter {
             gateway_key_replace_input: None,
             gateway_key_replace_error: None,
             gateway_key_drafts: BTreeMap::new(),
+            gateway_key_batch_target: None,
+            gateway_key_batch_drafts: BTreeMap::new(),
+            gateway_key_batch_error: None,
             gateway_key_add_target: None,
             gateway_key_add_error: None,
             shared_provider_name_editing: false,
@@ -15722,6 +15728,16 @@ impl ManagementCenter {
         let count = profile.credentials.len();
         let mut key_rows = v_flex().w_full().gap_1();
         for credential in &profile.credentials {
+            let key_summary = self
+                .gateway
+                .upstreams
+                .iter()
+                .flat_map(|upstream| upstream.keys.iter())
+                .find(|key| key.credential_id == credential.id)
+                .cloned();
+            let key_enabled = key_summary
+                .as_ref()
+                .is_none_or(|key| key.state != vibex_core::GatewayKeyState::Disabled);
             let state = match credential.status {
                 vibex_core::AgentCredentialStatus::Ready => Tag::success()
                     .xsmall()
@@ -15771,6 +15787,62 @@ impl ManagementCenter {
                             .items_center()
                             .gap_2()
                             .child(state)
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "management-shared-provider-toggle-key-{}",
+                                    credential.id.as_str()
+                                )))
+                                .xsmall()
+                                .ghost()
+                                .label(if key_enabled {
+                                    management_locale_text("Disable", "停用", "停用")
+                                } else {
+                                    management_locale_text("Enable", "启用", "啟用")
+                                })
+                                .disabled(pending)
+                                .on_click(cx.listener({
+                                    let profile_id = profile.id.clone();
+                                    let credential_id = credential.id.clone();
+                                    move |this, _, _, cx| {
+                                        this.set_gateway_key_enabled(
+                                            profile_id.clone(),
+                                            credential_id.clone(),
+                                            !key_enabled,
+                                            cx,
+                                        )
+                                    }
+                                })),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "management-shared-provider-prefer-key-{}",
+                                    credential.id.as_str()
+                                )))
+                                .xsmall()
+                                .ghost()
+                                .label(management_locale_text("Prefer", "优先", "優先"))
+                                .disabled(pending)
+                                .on_click(cx.listener({
+                                    let profile_id = profile.id.clone();
+                                    let credential_id = credential.id.clone();
+                                    move |this, _, _, cx| {
+                                        this.update_gateway_settings(
+                                            |request| {
+                                                request.account_updates.push(
+                                                    vibex_core::GatewayAccountUpdate {
+                                                        model_provider_profile_id: profile_id
+                                                            .clone(),
+                                                        credential_id: credential_id.clone(),
+                                                        enabled: None,
+                                                        preferred: Some(true),
+                                                    },
+                                                );
+                                            },
+                                            cx,
+                                        )
+                                    }
+                                })),
+                            )
                             .child(
                                 Button::new(SharedString::from(format!(
                                     "management-shared-provider-replace-key-{}",
@@ -15833,6 +15905,9 @@ impl ManagementCenter {
                 window,
                 cx,
             ));
+            if let Some(key) = key_summary.as_ref() {
+                key_rows = key_rows.child(self.render_gateway_key_limits(key, window, cx));
+            }
         }
         if profile.credentials.is_empty() {
             key_rows = key_rows.child(compact_empty_state(
@@ -15845,7 +15920,9 @@ impl ManagementCenter {
                 cx,
             ));
         }
-        key_rows = key_rows.child(self.render_gateway_add_key(&profile.id, window, cx));
+        key_rows = key_rows
+            .child(self.render_gateway_add_key(&profile.id, window, cx))
+            .child(self.render_gateway_batch_add_key(&profile.id, window, cx));
         management_card_with_icon(
             management_locale_text("Keys", "Key", "Key"),
             management_locale_text(
@@ -16967,6 +17044,177 @@ impl ManagementCenter {
                 }
             });
         }));
+    }
+
+    /// Adds every non-empty line from the batch field as its own Key.
+    ///
+    /// The API adds one credential per call, so the loop is sequential on
+    /// purpose: a partial failure keeps the lines that already landed and
+    /// reports the first failure instead of pretending the batch was atomic.
+    fn save_gateway_key_batch(
+        &mut self,
+        profile: vibex_core::ModelProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let profile_key = profile.as_str().to_string();
+        let Some(input) = self.gateway_key_batch_drafts.get(&profile_key).cloned() else {
+            return;
+        };
+        let values = input
+            .read(cx)
+            .value()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            self.gateway_key_batch_error = Some(
+                management_locale_text(
+                    "Paste at least one key, one per line",
+                    "请粘贴至少一个 Key，每行一个",
+                    "請貼上至少一個 Key，每行一個",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        self.gateway_key_batch_error = None;
+        self.mutation = Some(ManagementMutation::Gateway);
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let mut added = 0usize;
+            let mut failure = None;
+            for value in values {
+                let outcome = backend
+                    .management()
+                    .add_model_provider_credential(vibex_backend::MutationRequest::new(
+                        vibex_core::AddModelProviderCredentialRequest {
+                            model_provider_profile_id: profile.clone(),
+                            display_name: None,
+                            value,
+                        },
+                    ))
+                    .await;
+                match outcome {
+                    Ok(_) => added += 1,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                if let Some(error) = failure {
+                    this.gateway_key_batch_error =
+                        Some(format!("{}: {}", error.code, error.message));
+                } else {
+                    this.notice = Some(format!(
+                        "{} {}",
+                        added,
+                        management_locale_text("keys added", "个 Key 已添加", "個 Key 已新增")
+                    ));
+                    this.gateway_key_batch_drafts.remove(&profile_key);
+                    this.gateway_key_batch_target = None;
+                    this.refresh(cx);
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn render_gateway_batch_add_key(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfileId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let profile_key = profile.as_str().to_string();
+        let active = self.gateway_key_batch_target.as_deref() == Some(profile_key.as_str());
+        if !active {
+            return Button::new(SharedString::from(format!(
+                "management-shared-provider-batch-key-{profile_key}"
+            )))
+            .xsmall()
+            .ghost()
+            .label(management_locale_text(
+                "Paste multiple",
+                "批量粘贴",
+                "批量貼上",
+            ))
+            .on_click(cx.listener({
+                let profile = profile.clone();
+                move |this, _, _, cx| {
+                    this.gateway_key_batch_target = Some(profile.as_str().to_string());
+                    this.gateway_key_batch_error = None;
+                    cx.notify();
+                }
+            }))
+            .into_any_element();
+        }
+        let input = self
+            .gateway_key_batch_drafts
+            .entry(profile_key.clone())
+            .or_insert_with(|| {
+                cx.new(|cx| {
+                    TextareaState::new(window, cx)
+                        .rows(4)
+                        .placeholder(management_locale_text(
+                            "One key per line",
+                            "每行一个 Key",
+                            "每行一個 Key",
+                        ))
+                })
+            })
+            .clone();
+        let saving = self.mutation.is_some();
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(Textarea::new(&input).small().w_full().h(px(96.0)))
+            .children(
+                self.gateway_key_batch_error
+                    .clone()
+                    .map(|message| div().text_xs().text_color(cx.theme().danger).child(message)),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-shared-provider-batch-save-{profile_key}"
+                        )))
+                        .xsmall()
+                        .primary()
+                        .label(management_locale_text("Add keys", "添加 Key", "新增 Key"))
+                        .disabled(saving)
+                        .on_click(cx.listener({
+                            let profile = profile.clone();
+                            move |this, _, _, cx| this.save_gateway_key_batch(profile.clone(), cx)
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-shared-provider-batch-cancel-{profile_key}"
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text("Cancel", "取消", "取消"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.gateway_key_batch_target = None;
+                            this.gateway_key_batch_error = None;
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// Removes one Key from its Provider.
@@ -42097,6 +42345,21 @@ mod gateway_surface_tests {
         assert!(source.contains("management-provider-agent-default-"));
         assert!(source.contains("management-route-group-agent-default-"));
         assert!(source.contains("set_agent_default_model_source("));
+    }
+
+    #[test]
+    fn shared_keys_support_batch_add_and_limits() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "management-shared-provider-batch-key-",
+            "management-shared-provider-batch-save-",
+            "save_gateway_key_batch(",
+            "management-shared-provider-toggle-key-",
+            "management-shared-provider-prefer-key-",
+            "render_gateway_key_limits(key, window, cx)",
+        ] {
+            assert!(source.contains(marker), "shared Keys must keep {marker}");
+        }
     }
 
     #[test]

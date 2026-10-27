@@ -6397,3 +6397,15 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - A Provider source uses the Agent's legacy v1 Profile id, not the shared v2 id.
 - A missing legacy Profile means no star is offered for that Agent.
 - The star is read-only when a mutation is already in flight.
+
+### Shared Key batch and per-Key controls
+
+- The Keys tab supports adding one Key, pasting several (one per line), and
+  per-Key enable/disable, prefer, replace, remove, and account limits.
+- Batch add is sequential, not atomic: the report names how many landed and the
+  first failure. A failed line leaves the earlier Keys stored.
+- Batch input is a multiline text area; the lines are never echoed back after a
+  successful write.
+- Per-Key limits live in the gateway policy map keyed by credential id, not in
+  the Provider credential reference.
+- There is no balance, quota, or budget control.
