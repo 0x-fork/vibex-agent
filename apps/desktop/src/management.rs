@@ -1128,6 +1128,9 @@ pub struct ManagementCenter {
     route_group_detail_tab: RouteGroupDetailTab,
     provider_models_search: Entity<InputState>,
     provider_models_filter: ProviderModelsFilter,
+    shared_provider_advanced_target: Option<vibex_core::ModelProviderProfileId>,
+    shared_provider_advanced_input: Option<Entity<TextareaState>>,
+    shared_provider_advanced_error: Option<String>,
     /// The picker's filter. It matches id, name, and address, because those
     /// are the three things a user remembers about a vendor.
     provider_preset_query: Entity<InputState>,
@@ -2366,6 +2369,9 @@ impl ManagementCenter {
             route_group_detail_tab: RouteGroupDetailTab::Overview,
             provider_models_search,
             provider_models_filter: ProviderModelsFilter::All,
+            shared_provider_advanced_target: None,
+            shared_provider_advanced_input: None,
+            shared_provider_advanced_error: None,
             provider_editor_shared: false,
             provider_preset_query,
             route_group_editor_open: false,
@@ -13296,6 +13302,7 @@ impl ManagementCenter {
                 advanced.into_any_element(),
                 cx,
             ));
+            body = body.child(self.render_shared_provider_advanced_editor(profile, window, cx));
         }
 
         if self.provider_detail_tab == ProviderDetailTab::Advanced {
@@ -14691,6 +14698,322 @@ impl ManagementCenter {
         self.selected_agent_id = Some(agent_id);
         self.close_shared_provider_editor(cx);
         cx.notify();
+    }
+
+    fn render_shared_provider_advanced_editor(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let active = self.shared_provider_advanced_target.as_ref() == Some(&profile.id);
+        if !active {
+            return h_flex()
+                .w_full()
+                .justify_end()
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "management-shared-provider-advanced-edit-{}",
+                        profile.id.as_str()
+                    )))
+                    .xsmall()
+                    .outline()
+                    .icon(Icon::default().path("icons/vibex/settings.svg"))
+                    .label(management_locale_text(
+                        "Edit advanced overrides",
+                        "编辑高级覆盖",
+                        "編輯進階覆寫",
+                    ))
+                    .disabled(pending)
+                    .on_click(cx.listener({
+                        let profile = profile.clone();
+                        move |this, _, window, cx| {
+                            this.open_shared_provider_advanced_editor(&profile, window, cx)
+                        }
+                    })),
+                )
+                .into_any_element();
+        }
+        let input = self
+            .shared_provider_advanced_input
+            .get_or_insert_with(|| cx.new(|cx| TextareaState::new(window, cx).rows(10)))
+            .clone();
+        let error = self.shared_provider_advanced_error.clone();
+        let profile_id = profile.id.clone();
+        v_flex()
+            .w_full()
+            .gap_2()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .p_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Advanced overrides are stored as advisory metadata; they do not alter the launch contract or contain a Secret.",
+                        "高级覆盖存为建议元数据；不会改变启动契约，也不包含 Secret。",
+                        "進階覆寫存為建議中繼資料；不會改變啟動契約，也不包含 Secret。",
+                    )),
+            )
+            .child(Textarea::new(&input).small().w_full().h(px(220.0)))
+            .children(error.map(|message| {
+                div().text_xs().text_color(cx.theme().danger).child(message)
+            }))
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-shared-provider-advanced-save-{}",
+                            profile.id.as_str()
+                        )))
+                        .xsmall()
+                        .primary()
+                        .label(management_locale_text("Save advanced", "保存高级设置", "儲存進階設定"))
+                        .disabled(pending)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.save_shared_provider_advanced_editor(profile_id.clone(), cx)
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-shared-provider-advanced-cancel-{}",
+                            profile.id.as_str()
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text("Cancel", "取消", "取消"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.shared_provider_advanced_target = None;
+                            this.shared_provider_advanced_error = None;
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn open_shared_provider_advanced_editor(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let metadata = &profile.metadata;
+        let extra_body = metadata
+            .extra_body_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let aliases = metadata
+            .model_aliases
+            .iter()
+            .map(|alias| {
+                (
+                    alias.alias.clone(),
+                    serde_json::Value::String(alias.upstream.clone()),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let value = serde_json::json!({
+            "authHeaderMode": metadata.auth_header_mode,
+            "extraBody": extra_body,
+            "userAgentMode": metadata.user_agent_mode,
+            "tlsAcceptInvalid": metadata.tls_accept_invalid,
+            "connectTimeoutMs": metadata.connect_timeout_ms,
+            "requestTimeoutMs": metadata.request_timeout_ms,
+            "streamIdleTimeoutMs": metadata.stream_idle_timeout_ms,
+            "autoRefreshModels": metadata.auto_refresh_models,
+            "modelAliases": aliases,
+        });
+        let text = serde_json::to_string_pretty(&value).unwrap_or_default();
+        self.shared_provider_advanced_target = Some(profile.id.clone());
+        self.shared_provider_advanced_error = None;
+        let input = self
+            .shared_provider_advanced_input
+            .get_or_insert_with(|| cx.new(|cx| TextareaState::new(window, cx).rows(10)))
+            .clone();
+        input.update(cx, |state, cx| state.set_value(text, window, cx));
+        cx.notify();
+    }
+
+    fn save_shared_provider_advanced_editor(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.shared_provider_advanced_input.clone() else {
+            return;
+        };
+        let raw = input.read(cx).value().to_string();
+        let value = match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => value,
+            Err(error) => {
+                self.shared_provider_advanced_error = Some(format!(
+                    "{}: {error}",
+                    management_locale_text(
+                        "Advanced JSON is invalid",
+                        "高级 JSON 无效",
+                        "進階 JSON 無效",
+                    )
+                ));
+                cx.notify();
+                return;
+            }
+        };
+        let Some(object) = value.as_object() else {
+            self.shared_provider_advanced_error = Some(
+                management_locale_text(
+                    "Advanced settings must be a JSON object",
+                    "高级设置必须是 JSON 对象",
+                    "進階設定必須是 JSON 物件",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(mut profile) = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        let string = |key: &str| {
+            object
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let number = |key: &str| {
+            object
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .filter(|value| *value > 0)
+        };
+        let auth_header_mode = string("authHeaderMode");
+        if auth_header_mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "auto" | "x-api-key" | "bearer" | "both"))
+        {
+            self.shared_provider_advanced_error = Some(
+                management_locale_text(
+                    "Auth header mode must be auto, x-api-key, bearer, or both",
+                    "认证头模式必须是 auto、x-api-key、bearer 或 both",
+                    "認證標頭模式必須是 auto、x-api-key、bearer 或 both",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let user_agent_mode = string("userAgentMode");
+        if user_agent_mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "default" | "pass_through"))
+        {
+            self.shared_provider_advanced_error = Some(
+                management_locale_text(
+                    "User-Agent mode must be default or pass_through",
+                    "User-Agent 模式必须是 default 或 pass_through",
+                    "User-Agent 模式必須是 default 或 pass_through",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let tls_accept_invalid = object
+            .get("tlsAcceptInvalid")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if tls_accept_invalid
+            && profile.metadata.catalog_id.is_some()
+            && profile.metadata.category.as_deref() != Some("local")
+        {
+            self.shared_provider_advanced_error = Some(
+                management_locale_text(
+                    "TLS verification can only be disabled for a custom or local Provider",
+                    "只有自定义或本机供应商可以关闭 TLS 校验",
+                    "只有自訂或本機供應商可以關閉 TLS 校驗",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let extra_body_json = object
+            .get("extraBody")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                if value.is_object() {
+                    Ok(value.to_string())
+                } else {
+                    Err(management_locale_text(
+                        "Extra body must be a JSON object",
+                        "Extra body 必须是 JSON 对象",
+                        "Extra body 必須是 JSON 物件",
+                    ))
+                }
+            })
+            .transpose();
+        let extra_body_json = match extra_body_json {
+            Ok(value) => value,
+            Err(message) => {
+                self.shared_provider_advanced_error = Some(message.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let model_aliases = object
+            .get("modelAliases")
+            .and_then(serde_json::Value::as_object)
+            .map(|aliases| {
+                aliases
+                    .iter()
+                    .filter_map(|(alias, upstream)| {
+                        upstream
+                            .as_str()
+                            .map(|upstream| vibex_core::ProviderModelAlias {
+                                alias: alias.clone(),
+                                upstream: upstream.to_string(),
+                            })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        profile.metadata.auth_header_mode = auth_header_mode;
+        profile.metadata.extra_body_json = extra_body_json;
+        profile.metadata.user_agent_mode = user_agent_mode;
+        profile.metadata.tls_accept_invalid = tls_accept_invalid;
+        profile.metadata.connect_timeout_ms = number("connectTimeoutMs");
+        profile.metadata.request_timeout_ms = number("requestTimeoutMs");
+        profile.metadata.stream_idle_timeout_ms = number("streamIdleTimeoutMs");
+        profile.metadata.auto_refresh_models = object
+            .get("autoRefreshModels")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        profile.metadata.model_aliases = model_aliases;
+        self.shared_provider_advanced_error = None;
+        self.shared_provider_advanced_target = None;
+        self.update_shared_provider(
+            profile,
+            management_locale_text(
+                "Advanced settings updated",
+                "高级设置已更新",
+                "進階設定已更新",
+            ),
+            cx,
+        );
     }
 
     fn set_shared_provider_default_model(
@@ -42345,6 +42668,26 @@ mod gateway_surface_tests {
         assert!(source.contains("management-provider-agent-default-"));
         assert!(source.contains("management-route-group-agent-default-"));
         assert!(source.contains("set_agent_default_model_source("));
+    }
+
+    #[test]
+    fn advanced_overrides_round_trip_through_metadata() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "management-shared-provider-advanced-edit-",
+            "management-shared-provider-advanced-save-",
+            "render_shared_provider_advanced_editor",
+            "authHeaderMode",
+            "extraBody",
+            "tlsAcceptInvalid",
+            "streamIdleTimeoutMs",
+            "modelAliases",
+        ] {
+            assert!(
+                source.contains(marker),
+                "advanced overrides must keep {marker}"
+            );
+        }
     }
 
     #[test]

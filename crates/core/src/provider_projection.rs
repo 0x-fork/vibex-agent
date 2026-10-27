@@ -371,6 +371,36 @@ pub struct ModelProviderMetadata {
     pub category: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// How the outbound auth header is shaped: auto, x-api-key, bearer, or both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_header_mode: Option<String>,
+    /// A JSON object merged into the request body; never carries a Secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_body_json: Option<String>,
+    /// `default` or `pass_through` for the Agent's User-Agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent_mode: Option<String>,
+    /// Only meaningful for a custom or local Provider; requires confirmation.
+    #[serde(default)]
+    pub tls_accept_invalid: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub auto_refresh_models: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_aliases: Vec<ProviderModelAlias>,
+}
+
+/// One local model id mapped to the upstream id the Provider serves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelAlias {
+    pub alias: String,
+    pub upstream: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2905,4 +2935,34 @@ pub struct ModelProviderTestResult {
     pub message: String,
     pub diagnostics: Vec<ProviderBindingMetadata>,
     pub checked_at_ms: i64,
+}
+
+#[cfg(test)]
+mod advanced_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn advanced_overrides_round_trip_without_money_fields() {
+        let metadata = ModelProviderMetadata {
+            auth_header_mode: Some("both".to_string()),
+            extra_body_json: Some(r#"{"reasoning":{"effort":"high"}}"#.to_string()),
+            user_agent_mode: Some("pass_through".to_string()),
+            tls_accept_invalid: true,
+            connect_timeout_ms: Some(5_000),
+            request_timeout_ms: Some(60_000),
+            stream_idle_timeout_ms: Some(30_000),
+            auto_refresh_models: true,
+            model_aliases: vec![ProviderModelAlias {
+                alias: "fast".to_string(),
+                upstream: "gpt-4.1-mini".to_string(),
+            }],
+            ..Default::default()
+        };
+        let encoded = serde_json::to_string(&metadata).unwrap();
+        assert!(!encoded.contains("cost"));
+        assert!(!encoded.contains("price"));
+        assert!(!encoded.contains("quota"));
+        let decoded: ModelProviderMetadata = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, metadata);
+    }
 }

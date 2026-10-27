@@ -6409,3 +6409,17 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - Per-Key limits live in the gateway policy map keyed by credential id, not in
   the Provider credential reference.
 - There is no balance, quota, or budget control.
+
+### Advanced override metadata (v2)
+
+- Advanced overrides live in `ModelProviderMetadata`, never in the launch
+  contract: auth header mode, extra body JSON, User-Agent mode, TLS acceptance,
+  connect/request/stream-idle timeouts, auto-refresh, and model aliases.
+- The shared Advanced tab edits them as a JSON object. The object is validated
+  before the v2 update; invalid JSON or an unknown auth/UA mode leaves the draft
+  open and reports the error.
+- `tlsAcceptInvalid` is refused for a catalogued vendor Provider; it is only for
+  a custom or local record.
+- `extraBody` must be a JSON object. `modelAliases` is an object of local id to
+  upstream id.
+- None of these fields may carry a price, cost, quota, or balance value.
