@@ -252,7 +252,23 @@ impl AgentModelSourceDefaultRepository {
         agent_id: AgentId,
     ) -> VibexResult<AgentModelSourceDefault> {
         if let Some(explicit) = Self::get(conn, scope.clone(), agent_id.clone())? {
-            return Ok(explicit);
+            // An explicit row is an answer only while its target is usable. A
+            // Provider or route that was deleted or disabled later must not be
+            // promoted by a stale row; the resolver falls through to the
+            // legacy sources instead, which is the data-repair behaviour.
+            let usable = match explicit.source.as_ref() {
+                Some(AgentModelSourceRef::Provider(provider_profile_id)) => {
+                    provider_is_usable(conn, &agent_id, provider_profile_id)?
+                }
+                Some(AgentModelSourceRef::RouteGroup(route_id)) => {
+                    ModelRouteRepository::get(conn, route_id)?
+                        .is_some_and(|route| route_is_usable(&route))
+                }
+                None => false,
+            };
+            if usable {
+                return Ok(explicit);
+            }
         }
 
         for binding in AgentModelRouteBindingRepository::list_for_agent(conn, &agent_id)? {
@@ -1358,6 +1374,42 @@ mod tests {
         assert_eq!(
             AgentModelSourceDefaultRepository::resolve(&conn, workspace_scope(), agent).unwrap(),
             explicit
+        );
+    }
+
+    /// A stale explicit source is ignored rather than promoted by fallback.
+    #[test]
+    fn an_unusable_explicit_default_falls_through_to_the_route_default() {
+        let conn = migrated_connection();
+        let agent = AgentId::parse("claude").unwrap();
+        let first = seed_provider(&conn, "claude", "First");
+        let (first_legacy, first_shared) = seed_binding(&conn, &first);
+        let route = seed_route(&conn, &first_shared, &agent, true);
+        let explicit = AgentModelSourceDefault {
+            scope: global_scope(),
+            agent_id: agent.clone(),
+            source: Some(AgentModelSourceRef::Provider(first_legacy.clone())),
+            updated_at_ms: 50,
+        };
+        AgentModelSourceDefaultRepository::set(&conn, &explicit).unwrap();
+        assert_eq!(
+            AgentModelSourceDefaultRepository::resolve(&conn, global_scope(), agent.clone())
+                .unwrap()
+                .source,
+            Some(AgentModelSourceRef::Provider(first_legacy))
+        );
+
+        conn.execute(
+            "UPDATE provider_profiles SET status = 'disabled' WHERE provider_profile_id = ?1",
+            params![first.id.as_str()],
+        )
+        .unwrap();
+        assert_eq!(
+            AgentModelSourceDefaultRepository::resolve(&conn, global_scope(), agent)
+                .unwrap()
+                .source,
+            Some(AgentModelSourceRef::RouteGroup(route.id)),
+            "the stale explicit row must not beat the usable route default"
         );
     }
 }

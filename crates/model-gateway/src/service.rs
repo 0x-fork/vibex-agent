@@ -6,13 +6,14 @@
 //! runtime startup: the status becomes [`ModelGatewayStatus::Unavailable`], the
 //! UI says so, and Agents keep their direct Provider configuration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
+use chrono::{Datelike, Timelike};
 use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -125,6 +126,8 @@ pub struct GatewaySnapshot {
 pub struct GatewayProviderGroup {
     pub group_id: String,
     pub display_name: String,
+    /// Whether this is a whole-Provider group or a model-level group.
+    pub kind: vibex_core::RouteKind,
     pub strategy: vibex_core::RouteStrategy,
     /// How this group wants one Provider's Keys tried.
     ///
@@ -138,10 +141,27 @@ pub struct GatewayProviderGroup {
     /// What happens when the member a conversation is pinned to fails.
     pub failover: vibex_core::GatewayFailover,
     pub token_limit: Option<vibex_core::GatewayTokenLimit>,
-    /// The Providers in attempt order, already filtered to the ones that exist.
+    /// The members in attempt order, already filtered to the ones that exist.
+    ///
+    /// A provider-group member carries an empty model because the model is
+    /// chosen per request. A model-group member carries the upstream model it
+    /// calls, so two members of one Provider may name different models.
     pub providers: Vec<crate::route::RouteMemberRef>,
-    /// The models every Provider serves, and which Providers serve each.
+    /// The models the group offers, and which Providers serve each.
     pub models: Vec<GatewayGroupModel>,
+    /// The single Agent-facing id of a model group.
+    pub agent_model_id: Option<String>,
+    /// Ordered rules that may override the member order for one turn.
+    pub rules: Vec<vibex_core::ModelRouteRule>,
+    pub classifier: Option<String>,
+    /// `auto` asks the classifier for an effort level.
+    pub effort: Option<String>,
+    /// Retry budget after every member failed and nothing was sent.
+    pub patience_ms: Option<u64>,
+    pub sink: bool,
+    pub unlists: bool,
+    pub levels: Vec<String>,
+    pub pick_member_id: Option<vibex_core::ModelRouteMemberId>,
 }
 
 /// One model a provider group offers.
@@ -235,6 +255,13 @@ impl GatewaySnapshot {
     pub fn model_catalog(&self) -> Vec<GatewayModelEntry> {
         let mut entries = Vec::new();
         for group in self.groups.values() {
+            // `Unlists` keeps the group addressable through its id but out of
+            // every list an Agent reads. A sink is the same kind of hidden
+            // composition: it exists to be called by something that already
+            // knows its id.
+            if group.unlists || group.sink {
+                continue;
+            }
             for model in &group.models {
                 entries.push(GatewayModelEntry {
                     id: group.model_id(&model.model),
@@ -362,6 +389,13 @@ pub struct ModelGatewayService {
     /// requests for a group whose Providers are fine, which is exactly what a
     /// single counter did.
     breakers: Mutex<BTreeMap<String, RouteBreaker>>,
+    /// Recent completed latency per Provider, newest last.
+    ///
+    /// The `Smart` and `Lowest latency` strategies need a recent figure, and
+    /// re-reading the ledger on every request would put a scan in the request
+    /// path. This is bounded request state, not configuration: a restart simply
+    /// starts with no history and the strategies fall back to configured order.
+    recent_latency: Mutex<BTreeMap<ModelProviderProfileId, VecDeque<i64>>>,
     /// Requests currently being served, newest last.
     ///
     /// Bounded, because the graph draws a handful: a long-running gateway under
@@ -385,6 +419,14 @@ pub struct ModelGatewayService {
     /// through something the request can await. Entries are removed as they are
     /// settled, so a prompt that was never drawn cannot leak.
     failover_asks: Mutex<BTreeMap<String, FailoverSender>>,
+}
+
+/// What the optional classifier said about one turn.
+#[derive(Debug, Clone, Default)]
+struct ClassifierOutcome {
+    intent: Option<String>,
+    effort: Option<String>,
+    error: Option<String>,
 }
 
 /// The waiting end of one failover prompt.
@@ -475,6 +517,7 @@ impl ModelGatewayService {
             snapshot: RwLock::new(None),
             shutting_down: RwLock::new(false),
             breakers: Mutex::new(BTreeMap::new()),
+            recent_latency: Mutex::new(BTreeMap::new()),
             lessons: RwLock::new(BTreeMap::new()),
             failover_asks: Mutex::new(BTreeMap::new()),
             inflight: RwLock::new(Vec::new()),
@@ -552,6 +595,15 @@ impl ModelGatewayService {
                     referenced.push(member.model_provider_profile_id.clone());
                 }
             }
+            // A classifier is a routing-side call to a model that need not be
+            // one of the route's members. It still has to be in the snapshot,
+            // because that is where its endpoint and Keys live.
+            if let Some(classifier) = route.classifier.as_deref()
+                && let Some(profile_id) = classifier_provider(classifier, route, &profiles)
+                && !referenced.contains(&profile_id)
+            {
+                referenced.push(profile_id);
+            }
         }
 
         let mut gateway_used_tokens = 0;
@@ -615,60 +667,104 @@ impl ModelGatewayService {
         let group_profiles = profiles.values().cloned().collect::<Vec<_>>();
         let groups = enabled_routes
             .iter()
-            .filter(|route| route.is_provider_group())
+            .filter(|route| route.kind.via_gateway())
             .filter_map(|route| {
-                let providers = route
-                    .enabled_members()
-                    .filter_map(|member| {
-                        profiles
-                            .get(&member.model_provider_profile_id)
-                            .map(|profile| {
-                                crate::route::RouteMemberRef {
-                                    profile: profile.id.clone(),
-                                    // A group member names a Provider, so the router
-                                    // substitutes the model per request.
-                                    model: String::new(),
-                                    reasoning_effort: member.reasoning_effort.clone(),
-                                }
-                            })
-                    })
-                    .collect::<Vec<_>>();
-                if providers.is_empty() {
-                    // A group with no reachable Provider has nothing to serve.
-                    // One Provider *is* useful, though: a group of one is how a
-                    // single upstream gets the gateway's protocol translation
-                    // without pretending there is a second source to fail over
-                    // to.
-                    return None;
-                }
-                let models = vibex_core::provider_group_models(route, &group_profiles)
-                    .into_iter()
-                    .map(|model| GatewayGroupModel {
-                        model: model.model_id,
-                        providers: model.provider_profile_ids,
-                    })
-                    .collect::<Vec<_>>();
-                if models.is_empty() {
-                    // No shared model means the group cannot answer anything,
-                    // which is a broken composition rather than a usable one.
-                    return None;
-                }
+                let member_ref = |member: &vibex_core::ModelRouteMember, model: &str| {
+                    profiles
+                        .get(&member.model_provider_profile_id)
+                        .map(|profile| crate::route::RouteMemberRef {
+                            member_id: Some(member.id.clone()),
+                            profile: profile.id.clone(),
+                            model: model.to_string(),
+                            reasoning_effort: member.reasoning_effort.clone(),
+                            weight: member.weight.max(vibex_core::DEFAULT_MEMBER_WEIGHT),
+                            context_tokens: member.context_tokens,
+                            first_token_timeout_ms: member.first_token_timeout_ms,
+                        })
+                };
+                let (providers, models, agent_model_id) = if route.is_provider_group() {
+                    let providers = route
+                        .enabled_members()
+                        .filter_map(|member| {
+                            // A group member names a Provider, so the router
+                            // substitutes the model per request.
+                            member_ref(member, "")
+                        })
+                        .collect::<Vec<_>>();
+                    if providers.is_empty() {
+                        // A group with no reachable Provider has nothing to
+                        // serve. One Provider *is* useful, though: a group of
+                        // one is how a single upstream gets the gateway's
+                        // protocol translation.
+                        return None;
+                    }
+                    let models = vibex_core::provider_group_models(route, &group_profiles)
+                        .into_iter()
+                        .map(|model| GatewayGroupModel {
+                            model: model.model_id,
+                            providers: model.provider_profile_ids,
+                        })
+                        .collect::<Vec<_>>();
+                    if models.is_empty() {
+                        // No shared model means the group cannot answer
+                        // anything, which is a broken composition.
+                        return None;
+                    }
+                    (providers, models, None)
+                } else {
+                    let agent_model_id = route.agent_model()?.to_string();
+                    let providers = route
+                        .enabled_members()
+                        .filter(|member| {
+                            profiles
+                                .get(&member.model_provider_profile_id)
+                                .map(|profile| member_is_served(profile, &member.model_id))
+                                .unwrap_or(false)
+                        })
+                        .filter_map(|member| member_ref(member, member.model_id.trim()))
+                        .collect::<Vec<_>>();
+                    if providers.is_empty() {
+                        return None;
+                    }
+                    // A model group offers exactly one virtual model. Its
+                    // providers are listed for the catalogue and for the
+                    // request's "which sources back this" line; the router
+                    // still uses the member list above so two entries of the
+                    // same Provider stay distinct.
+                    let mut serving = Vec::new();
+                    for member in &providers {
+                        if !serving.contains(&member.profile) {
+                            serving.push(member.profile.clone());
+                        }
+                    }
+                    (
+                        providers,
+                        vec![GatewayGroupModel {
+                            model: agent_model_id.clone(),
+                            providers: serving,
+                        }],
+                        Some(agent_model_id),
+                    )
+                };
                 Some((
                     route.id.as_str().to_string(),
                     GatewayProviderGroup {
                         group_id: route.id.as_str().to_string(),
                         display_name: route.display_name.clone(),
+                        kind: route.kind,
                         strategy: route.strategy,
                         // The group's own strategy, applied to its Keys as well
                         // as to its members.
                         key_strategy: match route.strategy {
-                            vibex_core::RouteStrategy::Ordered => GatewayRoutingStrategy::Ordered,
+                            vibex_core::RouteStrategy::Ordered
+                            | vibex_core::RouteStrategy::LowestLatency
+                            | vibex_core::RouteStrategy::Weighted
+                            | vibex_core::RouteStrategy::Manual => GatewayRoutingStrategy::Ordered,
                             vibex_core::RouteStrategy::RoundRobin => {
                                 GatewayRoutingStrategy::RoundRobin
                             }
-                            vibex_core::RouteStrategy::LeastUsed => {
-                                GatewayRoutingStrategy::LeastUsed
-                            }
+                            vibex_core::RouteStrategy::LeastUsed
+                            | vibex_core::RouteStrategy::Smart => GatewayRoutingStrategy::LeastUsed,
                         },
                         first_token_timeout_ms: route.first_token_timeout_ms,
                         pin: route.pin,
@@ -676,6 +772,15 @@ impl ModelGatewayService {
                         token_limit: route.token_limit,
                         providers,
                         models,
+                        agent_model_id,
+                        rules: route.rules.clone(),
+                        classifier: route.classifier.clone(),
+                        effort: route.effort.clone(),
+                        patience_ms: route.patience_ms,
+                        sink: route.sink,
+                        unlists: route.unlists,
+                        levels: route.levels.clone(),
+                        pick_member_id: route.pick_member_id.clone(),
                     },
                 ))
             })
@@ -1165,8 +1270,17 @@ impl ModelGatewayService {
         self.publish(state);
     }
 
-    pub fn publish(&self, state: ModelGatewayRuntimeState) {
+    pub fn publish(&self, mut state: ModelGatewayRuntimeState) {
         if let Ok(mut guard) = self.runtime.write() {
+            // A state transition that does not carry a start time keeps the one
+            // the listener already had: a degraded gateway is still the same
+            // uptime, and reporting "up since now" on every transition would
+            // make the number meaningless.
+            if state.started_at_ms.is_none() && state.status.is_listening() {
+                state.started_at_ms = guard
+                    .started_at_ms
+                    .or_else(|| Some(vibex_core::unix_timestamp_ms()));
+            }
             *guard = state;
         }
     }
@@ -1194,7 +1308,7 @@ impl ModelGatewayService {
     }
 
     /// Resolves an inbound body into a prepared upstream call.
-    pub fn prepare(
+    pub async fn prepare(
         &self,
         inbound: WireProtocol,
         headers: &HeaderMap,
@@ -1223,6 +1337,24 @@ impl ModelGatewayService {
             return Err(GatewayError::TokenCeilingReached {
                 provider: snapshot.settings.display_name.clone(),
             });
+        }
+
+        // Classifier: one small request at the start of the turn, never on a
+        // retry of the turn's own answer. It is skipped unless a rule can use
+        // an intent or the route asked for automatic effort.
+        let route_group =
+            resolved_group_id(&request.model).and_then(|group_id| snapshot.groups.get(group_id));
+        let mut classifier_outcome = ClassifierOutcome::default();
+        let mut forced_effort: Option<String> = None;
+        if let Some(group) = route_group
+            && group.classifier.is_some()
+            && (group.effort.as_deref() == Some("auto")
+                || group.rules.iter().any(|rule| rule.intent.is_some()))
+        {
+            classifier_outcome = self.classify_turn(&snapshot, group, &request).await;
+            if group.effort.as_deref() == Some("auto") {
+                forced_effort = classifier_outcome.effort.clone();
+            }
         }
 
         let now = vibex_core::unix_timestamp_ms();
@@ -1267,11 +1399,32 @@ impl ModelGatewayService {
         // expands to its members; anything else is a one-member list. Both then
         // take the same path, which is what keeps a direct Provider and a
         // route from growing two sets of routing rules.
-        let resolved_members = self.resolve_members(
+        let (resolved_members, mut route_decision) = self.resolve_members(
             &snapshot,
             &request,
             pinned.as_ref().map(|(profile, _)| profile),
+            agent_id.as_deref(),
+            headers,
+            classifier_outcome.intent.as_deref(),
+            forced_effort.as_deref(),
         )?;
+        if let Some(group) = route_group
+            && group.classifier.is_some()
+        {
+            route_decision.classifier = group.classifier.clone();
+            route_decision.classifier_error = classifier_outcome.error.clone();
+            route_decision.intent = classifier_outcome.intent.clone();
+            if let Some(effort) = forced_effort.as_deref() {
+                route_decision.effort = Some(effort.to_string());
+            }
+            if route_decision.reason.is_none() {
+                route_decision.reason = Some(if classifier_outcome.error.is_some() {
+                    "classifier_failed".to_string()
+                } else {
+                    "classifier".to_string()
+                });
+            }
+        }
         if resolved_members.is_empty() {
             return Err(GatewayError::ModelNotFound {
                 model: request.model.clone(),
@@ -1333,11 +1486,17 @@ impl ModelGatewayService {
         // snapshot: a prompt answered with "always" rewrites the route while
         // this request is still in flight, and it must keep the answer it was
         // given rather than start asking again mid-flight.
-        let (route_name, failover) = group_id
+        let (route_name, failover, patience_ms) = group_id
             .as_deref()
             .and_then(|group_id| snapshot.groups.get(group_id))
-            .map(|group| (group.display_name.clone(), group.failover))
-            .unwrap_or((String::new(), vibex_core::GatewayFailover::Auto));
+            .map(|group| {
+                (
+                    group.display_name.clone(),
+                    group.failover,
+                    group.patience_ms,
+                )
+            })
+            .unwrap_or((String::new(), vibex_core::GatewayFailover::Auto, None));
         let prepared = PreparedCall {
             inbound,
             requested_model: request.model.clone(),
@@ -1354,6 +1513,9 @@ impl ModelGatewayService {
             request_id: RequestId::new(),
             route_name,
             failover,
+            patience_ms,
+            route_decision,
+            retries: 0,
             // A pin only means "this member was chosen on purpose" when a live
             // conversation pin actually named it. The setting alone is not
             // enough: a first turn in a conversation has the setting but no
@@ -1382,12 +1544,17 @@ impl ModelGatewayService {
     /// pin only ever reordered Keys *inside* whichever member the strategy
     /// happened to pick, so a round-robin group re-pinned the conversation on
     /// every turn and the record never meant anything.
+    #[allow(clippy::too_many_arguments)]
     fn resolve_members(
         &self,
         snapshot: &GatewaySnapshot,
         request: &CanonicalRequest,
         pinned: Option<&ModelProviderProfileId>,
-    ) -> GatewayResult<Vec<ResolvedMember>> {
+        agent_id: Option<&str>,
+        headers: &HeaderMap,
+        intent: Option<&str>,
+        forced_effort: Option<&str>,
+    ) -> GatewayResult<(Vec<ResolvedMember>, vibex_core::GatewayRouteDecisionTrace)> {
         let Some((group, model)) = snapshot.group_for_model(&request.model) else {
             let parsed = vibex_core::provider_group_model_ref(&request.model);
             let closest = parsed
@@ -1417,21 +1584,26 @@ impl ModelGatewayService {
                 closest,
             });
         };
-        // The model is part of the id because the group itself is not a model.
-        // Only the Providers that serve this model are candidates, so the
-        // group's strategy never picks one that has never heard of it.
-        let model = model.to_string();
-        let mut candidates = group
-            .providers
-            .iter()
-            .filter(|provider| {
-                group
-                    .providers_for(&model)
-                    .iter()
-                    .any(|serving| serving == &provider.profile)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        // A model group names its members directly: every enabled member is a
+        // candidate, and the upstream model is the member's own. A provider
+        // group derives the candidates from the shared model's intersection,
+        // which is why the two branches do not share their filter.
+        let shared_model = model.to_string();
+        let mut candidates = if group.kind == vibex_core::RouteKind::ModelGroup {
+            group.providers.clone()
+        } else {
+            group
+                .providers
+                .iter()
+                .filter(|provider| {
+                    group
+                        .providers_for(&shared_model)
+                        .iter()
+                        .any(|serving| serving == &provider.profile)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         if candidates.is_empty() {
             return Err(GatewayError::ModelNotFound {
                 model: request.model.clone(),
@@ -1442,12 +1614,52 @@ impl ModelGatewayService {
                     .collect(),
             });
         }
-        let mut plans = crate::route::plan_members_with_usage(
+        let mut plans = crate::route::plan_members(
             &candidates,
             group.strategy,
             self.member_rotation.fetch_add(1, Ordering::Relaxed),
-            &self.member_usage(snapshot),
+            &self.member_observations(snapshot),
+            group.pick_member_id.as_ref(),
         );
+        // A default ordering is not worth a sentence; any strategy that is not
+        // "in order", a matched rule, or a manual pick is.
+        let mut decision = vibex_core::GatewayRouteDecisionTrace::default();
+        if group.strategy != vibex_core::RouteStrategy::Ordered {
+            decision.strategy = Some(group.strategy.id().to_string());
+        }
+        decision.patience_ms = group.patience_ms;
+        decision.intent = intent.map(str::to_string);
+        decision.effort = forced_effort.map(str::to_string);
+        if group.strategy == vibex_core::RouteStrategy::Manual {
+            decision.reason = Some("manual".to_string());
+        }
+        // Rules outrank the strategy for this turn. The first matching rule
+        // names the member to try first and any explicit order behind it; it
+        // does not remove the remaining members, so failover still has every
+        // source the group declared. A pause rule stops before any call.
+        if !group.rules.is_empty() {
+            let context = route_rule_context(request, agent_id, headers, intent);
+            if let Some((index, rule)) = vibex_core::first_matching_rule(&group.rules, &context) {
+                if rule.pause {
+                    return Err(GatewayError::RoutePaused {
+                        group: group.display_name.clone(),
+                        reason: format!("rule {} paused routing for this request", index + 1),
+                    });
+                }
+                decision.rule_index = Some(index);
+                decision.rule_id = Some(rule.id.clone());
+                decision.reason = Some("rule".to_string());
+                if let Some(effort) = rule.use_effort.as_deref() {
+                    decision.effort = Some(effort.trim().to_string());
+                }
+                reorder_for_rule(&mut plans, rule);
+                if let Some(effort) = rule.use_effort.as_deref()
+                    && let Some(first) = plans.first_mut()
+                {
+                    first.reasoning_effort = Some(effort.trim().to_string());
+                }
+            }
+        }
         // The pinned member goes first, ahead of whatever the strategy chose.
         // The strategy still orders everything else, so a group that pins and
         // then has to fail over keeps its preferred fallback order.
@@ -1457,24 +1669,232 @@ impl ModelGatewayService {
                 candidate.reasoning_effort = plan.reasoning_effort.clone();
             }
         }
-        Ok(plans
-            .into_iter()
-            .map(|member| ResolvedMember {
-                profile: member.profile,
-                model: model.clone(),
-                reasoning_effort: member.reasoning_effort,
-                first_token_timeout_ms: group.first_token_timeout_ms,
-                key_strategy: group.key_strategy,
-            })
-            .collect())
+        Ok((
+            plans
+                .into_iter()
+                .map(|member| ResolvedMember {
+                    profile: member.profile,
+                    // A model group's member names the upstream model; a
+                    // provider group's member names only the Provider, so the
+                    // shared model is the one to call.
+                    model: if member.model.is_empty() {
+                        shared_model.clone()
+                    } else {
+                        member.model.clone()
+                    },
+                    reasoning_effort: member
+                        .reasoning_effort
+                        .or_else(|| forced_effort.map(str::to_string)),
+                    first_token_timeout_ms: member
+                        .first_token_timeout_ms
+                        .or(group.first_token_timeout_ms),
+                    key_strategy: group.key_strategy,
+                })
+                .collect(),
+            decision,
+        ))
     }
 
-    /// Tokens each upstream has spent in the current accounting window.
+    /// Asks the route's classifier for the turn's intent and effort.
     ///
-    /// This is the same figure the token ceiling uses, read once per request.
-    /// A Provider missing from the list has spent nothing, which is how a newly
-    /// added member gets tried.
-    fn member_usage(&self, snapshot: &GatewaySnapshot) -> Vec<(ModelProviderProfileId, u64)> {
+    /// The classifier is one real, small Chat request to a member's upstream.
+    /// It never enters the ledger or the inflight table: it is routing
+    /// metadata, not a request the Agent made, and drawing it would make the
+    /// live card claim traffic nobody sent. Every failure is returned as text
+    /// so the decision trace can say why the default order was used.
+    async fn classify_turn(
+        &self,
+        snapshot: &GatewaySnapshot,
+        group: &GatewayProviderGroup,
+        request: &CanonicalRequest,
+    ) -> ClassifierOutcome {
+        let Some(classifier) = group
+            .classifier
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return ClassifierOutcome::default();
+        };
+        let Some((profile_id, model)) = resolve_classifier_target(snapshot, group, classifier)
+        else {
+            return ClassifierOutcome {
+                error: Some("the classifier names no reachable model".to_string()),
+                ..Default::default()
+            };
+        };
+        let Some(upstream) = snapshot.upstream(&profile_id) else {
+            return ClassifierOutcome {
+                error: Some("the classifier Provider is not in the snapshot".to_string()),
+                ..Default::default()
+            };
+        };
+        let protocol = WireProtocol::ChatCompletions;
+        let Some(endpoint) = upstream
+            .endpoint_for(protocol.wire_protocol_id())
+            .or_else(|| upstream.untyped_endpoint())
+        else {
+            return ClassifierOutcome {
+                error: Some("the classifier Provider has no Chat endpoint".to_string()),
+                ..Default::default()
+            };
+        };
+        let Some(key) = upstream.keys.iter().find(|key| key.state.is_ready()) else {
+            return ClassifierOutcome {
+                error: Some("the classifier Provider has no ready Key".to_string()),
+                ..Default::default()
+            };
+        };
+        let Some(credential) = upstream
+            .credentials
+            .iter()
+            .find(|credential| credential.id == key.credential_id)
+        else {
+            return ClassifierOutcome {
+                error: Some("the classifier Key is no longer configured".to_string()),
+                ..Default::default()
+            };
+        };
+        let secret = match resolve_key_secret(credential) {
+            Ok(Some(secret)) => secret,
+            Ok(None) => {
+                return ClassifierOutcome {
+                    error: Some("the classifier Key has no Secret".to_string()),
+                    ..Default::default()
+                };
+            }
+            Err(error) => {
+                return ClassifierOutcome {
+                    error: Some(format!(
+                        "the classifier Key could not be read: {}",
+                        error.code
+                    )),
+                    ..Default::default()
+                };
+            }
+        };
+        let user = request
+            .first_user_text()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("(the turn has no user text)");
+        let user = if user.chars().count() > 4_000 {
+            user.chars().take(4_000).collect::<String>()
+        } else {
+            user.to_string()
+        };
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Classify this coding-agent turn. Reply with JSON only: {\"intent\":\"code|debug|refactor|explain|test|docs|plan|other\",\"effort\":\"low|medium|high\"}. Use the effort the task itself needs, not the agent's default."
+                },
+                {"role": "user", "content": user}
+            ],
+            "max_tokens": 64,
+            "temperature": 0,
+            "stream": false
+        });
+        let url = match endpoint_url(&endpoint.url, protocol, &model, false) {
+            Ok(url) => url,
+            Err(error) => {
+                return ClassifierOutcome {
+                    error: Some(format!(
+                        "the classifier address is unusable: {}",
+                        error.message()
+                    )),
+                    ..Default::default()
+                };
+            }
+        };
+        let client = self.client_for_key(credential.proxy_url.as_deref(), &upstream.metadata);
+        let http_request = apply_auth(
+            client.post(&url).json(&body),
+            protocol,
+            &secret,
+            upstream.metadata.auth_header_mode.as_deref(),
+        );
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            let response = http_request
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            let status = response.status();
+            let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+            Ok::<_, String>((status, bytes))
+        })
+        .await;
+        let (status, bytes) = match sent {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                return ClassifierOutcome {
+                    error: Some(format!("the classifier request failed: {error}")),
+                    ..Default::default()
+                };
+            }
+            Err(_) => {
+                return ClassifierOutcome {
+                    error: Some("the classifier timed out after 8 seconds".to_string()),
+                    ..Default::default()
+                };
+            }
+        };
+        if !status.is_success() {
+            return ClassifierOutcome {
+                error: Some(format!(
+                    "the classifier answered HTTP {}: {}",
+                    status.as_u16(),
+                    truncate(&upstream_message(&String::from_utf8_lossy(&bytes)))
+                )),
+                ..Default::default()
+            };
+        }
+        let Some(text) = classifier_reply_text(protocol, &bytes) else {
+            return ClassifierOutcome {
+                error: Some("the classifier reply had no text".to_string()),
+                ..Default::default()
+            };
+        };
+        let parsed = classifier_decision(&text);
+        if parsed.intent.is_none() && parsed.effort.is_none() {
+            return ClassifierOutcome {
+                error: Some("the classifier reply was not usable".to_string()),
+                ..Default::default()
+            };
+        }
+        parsed
+    }
+
+    /// What the router knows about each upstream right now.
+    ///
+    /// Usage is the same figure the token ceiling uses; readiness comes from
+    /// the account states the snapshot already holds; latency is the bounded
+    /// in-memory history of completed requests; inflight is read from the
+    /// request table. A Provider missing from the map counts as unspent and
+    /// healthy enough to try, which is how a newly added member gets a turn.
+    fn member_observations(
+        &self,
+        snapshot: &GatewaySnapshot,
+    ) -> Vec<(ModelProviderProfileId, crate::route::MemberObservation)> {
+        let inflight = self
+            .inflight
+            .read()
+            .map(|entries| {
+                let mut counts = BTreeMap::<ModelProviderProfileId, u32>::new();
+                for entry in entries.iter() {
+                    *counts
+                        .entry(entry.model_provider_profile_id.clone())
+                        .or_insert(0) += 1;
+                }
+                counts
+            })
+            .unwrap_or_default();
+        let latencies = self
+            .recent_latency
+            .lock()
+            .map(|entries| entries.clone())
+            .unwrap_or_default();
         snapshot
             .upstreams
             .iter()
@@ -1484,9 +1904,38 @@ impl ModelGatewayService {
                     .first()
                     .map(|key| key.used_tokens)
                     .unwrap_or(0);
-                (upstream.profile_id.clone(), used)
+                let samples = latencies.get(&upstream.profile_id);
+                let (p50_ms, p95_ms) = samples
+                    .map(|samples| (percentile(samples, 0.5), percentile(samples, 0.95)))
+                    .unwrap_or((None, None));
+                let cooling = !upstream.keys.is_empty()
+                    && !upstream.keys.iter().any(|key| key.state.is_ready());
+                (
+                    upstream.profile_id.clone(),
+                    crate::route::MemberObservation {
+                        used_tokens: used,
+                        p50_ms,
+                        p95_ms,
+                        cooling,
+                        inflight: inflight.get(&upstream.profile_id).copied().unwrap_or(0),
+                    },
+                )
             })
             .collect()
+    }
+
+    /// Remembers one completed request's latency, keeping the window bounded.
+    fn note_latency(&self, profile: &ModelProviderProfileId, latency_ms: i64) {
+        if latency_ms <= 0 {
+            return;
+        }
+        if let Ok(mut entries) = self.recent_latency.lock() {
+            let window = entries.entry(profile.clone()).or_default();
+            window.push_back(latency_ms);
+            while window.len() > 32 {
+                window.pop_front();
+            }
+        }
     }
 
     /// Resolves one member into everything needed to call it.
@@ -1821,13 +2270,58 @@ impl ModelGatewayService {
                 .await
             {
                 Ok((response, target, passthrough, credential)) => {
+                    // Prove the first token *before* committing to this member
+                    // when another member is left to try. A vendor may accept
+                    // the connection and then stall; waiting for the caller's
+                    // stream to notice would mean the reply had already
+                    // started, and failover is only possible before the first
+                    // byte reaches the client. The last member is deliberately
+                    // excepted: there is nowhere to fail over to, so it waits.
+                    let mut body = response.bytes_stream().boxed();
+                    let mut prefetched = Vec::new();
+                    if prepared.stream
+                        && prepared.may_try_next(index)
+                        && let Some(timeout_ms) = member.first_token_timeout_ms
+                    {
+                        let deadline = std::time::Duration::from_millis(timeout_ms);
+                        match tokio::time::timeout(deadline, body.next()).await {
+                            Ok(Some(Ok(chunk))) => prefetched.push(chunk),
+                            Ok(Some(Err(_))) | Ok(None) => {
+                                skipped_members.push(vibex_core::GatewaySkippedMember {
+                                    model_provider_profile_id: member.profile_id.clone(),
+                                    wire_protocol_id: member.target.wire_protocol_id().to_string(),
+                                    failure: GatewayFailureKind::Upstream,
+                                });
+                                last_error = Some(GatewayError::Upstream {
+                                    status: 502,
+                                    message: "the upstream reply ended before its first token"
+                                        .to_string(),
+                                });
+                                continue;
+                            }
+                            Err(_) => {
+                                skipped_members.push(vibex_core::GatewaySkippedMember {
+                                    model_provider_profile_id: member.profile_id.clone(),
+                                    wire_protocol_id: member.target.wire_protocol_id().to_string(),
+                                    failure: GatewayFailureKind::Upstream,
+                                });
+                                last_error = Some(GatewayError::Upstream {
+                                    status: 504,
+                                    message: "the member produced no first token in time"
+                                        .to_string(),
+                                });
+                                continue;
+                            }
+                        }
+                    }
                     if let Some(group_id) = prepared.group_id.as_deref() {
                         self.note_success(group_id);
                     }
                     self.clear_failure(&member.profile_id, &credential);
                     return Ok((
                         UpstreamAttempt {
-                            response,
+                            body,
+                            prefetched,
                             target,
                             passthrough,
                             profile_id: member.profile_id.clone(),
@@ -2356,6 +2850,15 @@ impl ModelGatewayService {
             });
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         state.updated_at_ms = now;
+        let override_ms = ModelGatewaySettingsRepository::get_or_create(&connection)
+            .ok()
+            .and_then(|settings| {
+                settings
+                    .policy
+                    .cooldown_overrides_ms
+                    .get(kind.id())
+                    .copied()
+            });
         match KeyHealth::from_failure(kind, now) {
             KeyHealth::Invalid => {
                 state.cooldown_reason = Some(GatewayFailureKind::Auth);
@@ -2363,7 +2866,11 @@ impl ModelGatewayService {
             }
             KeyHealth::Cooling { kind, until_ms } => {
                 state.cooldown_reason = Some(kind);
-                state.cooldown_until_ms = Some(until_ms);
+                state.cooldown_until_ms = Some(
+                    override_ms
+                        .map(|milliseconds| now.saturating_add(milliseconds as i64))
+                        .unwrap_or(until_ms),
+                );
             }
             KeyHealth::Ready => {
                 state.cooldown_reason = None;
@@ -2395,6 +2902,9 @@ impl ModelGatewayService {
         // at each return site: this is the single funnel every finished request
         // passes through, so nothing can be left drawn as still running.
         self.note_finished(&prepared.request_id, outcome.kind);
+        if let (Some(profile), Some(latency)) = (outcome.profile_id.as_ref(), outcome.latency_ms) {
+            self.note_latency(profile, latency);
+        }
         let Ok(connection) = self.connection() else {
             return;
         };
@@ -2440,6 +2950,8 @@ impl ModelGatewayService {
                 skipped_members: outcome.skipped_members.clone(),
                 error_code: outcome.error_code.clone(),
                 error_message: outcome.error_message.clone(),
+                decision: (!prepared.route_decision.is_unremarkable())
+                    .then(|| prepared.route_decision.clone()),
                 ..GatewayRouteTrace::new(outcome.skipped_cooling, outcome.skipped_over_limit)
             }),
             created_at_ms: now,
@@ -2691,6 +3203,13 @@ pub struct PreparedCall {
     pub route_name: String,
     /// What the route does when the pinned member fails.
     pub failover: vibex_core::GatewayFailover,
+    /// How long the route is willing to retry after every member failed
+    /// before anything reached the client. `None` means no retry.
+    pub patience_ms: Option<u64>,
+    /// Why the member order was chosen, for the ledger and the simulator.
+    pub route_decision: vibex_core::GatewayRouteDecisionTrace,
+    /// Whole-walk retries performed under patience before this attempt.
+    pub retries: u32,
     /// Whether the first member is here because the conversation was pinned to
     /// it, rather than because the strategy happened to pick it.
     ///
@@ -2783,6 +3302,126 @@ fn hoist_pinned<T>(
     }
 }
 
+/// Applies a matched rule's explicit member order without dropping fallbacks.
+///
+/// The starter goes first, `more` follows in the rule's order, and the members
+/// the rule did not name keep the order the strategy produced. A rule therefore
+/// changes the preference for this turn, not the set of sources available.
+fn reorder_for_rule(
+    plans: &mut Vec<crate::route::RouteMemberRef>,
+    rule: &vibex_core::ModelRouteRule,
+) {
+    let mut wanted = Vec::new();
+    if let Some(member) = &rule.use_member_id {
+        wanted.push(member.clone());
+    }
+    wanted.extend(rule.more_member_ids.iter().cloned());
+    if wanted.is_empty() {
+        return;
+    }
+    let mut ordered = Vec::with_capacity(plans.len());
+    for member_id in &wanted {
+        if let Some(index) = plans
+            .iter()
+            .position(|plan| plan.member_id.as_ref() == Some(member_id))
+            && let Some(plan) = plans.get(index).cloned()
+            && !ordered.contains(&plan)
+        {
+            ordered.push(plan);
+        }
+    }
+    for plan in plans.iter() {
+        if !ordered.contains(plan) {
+            ordered.push(plan.clone());
+        }
+    }
+    *plans = ordered;
+}
+
+/// Everything a rule may be matched against for this inbound request.
+fn route_rule_context(
+    request: &CanonicalRequest,
+    agent_id: Option<&str>,
+    headers: &HeaderMap,
+    intent: Option<&str>,
+) -> vibex_core::RouteRuleContext {
+    let now = chrono::Local::now();
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    vibex_core::RouteRuleContext {
+        agent_id: agent_id.map(str::to_string),
+        context_tokens: Some(estimate_request_tokens(request)),
+        has_images: request_has_images(request),
+        requested_effort: request.reasoning.effort.clone(),
+        compact: header("x-vibex-compact").is_some_and(|value| value.eq_ignore_ascii_case("true")),
+        intent: intent
+            .map(str::to_string)
+            .or_else(|| header("x-vibex-intent")),
+        workspace_root: header("x-vibex-workspace"),
+        local_weekday: Some(now.weekday().number_from_monday() as u8),
+        local_minute: Some((now.hour() * 60 + now.minute()) as u16),
+    }
+}
+
+/// A deliberately cheap upper-bound estimate of the turn's context.
+///
+/// The gateway has no tokenizer and must not import one: rules only need a
+/// threshold, and four characters per token is close enough to distinguish
+/// "short turn" from "a 100k-token compaction". The trace labels it as an
+/// estimate rather than presenting it as the vendor's count.
+fn estimate_request_tokens(request: &CanonicalRequest) -> u64 {
+    let mut chars = 0u64;
+    let mut add_parts = |parts: &[crate::ir::ContentPart]| {
+        for part in parts {
+            if let crate::ir::ContentPart::Text(text) = part {
+                chars = chars.saturating_add(text.chars().count() as u64);
+            }
+        }
+    };
+    add_parts(&request.system);
+    for message in &request.messages {
+        add_parts(&message.parts);
+    }
+    chars.saturating_add(request.tools.len() as u64 * 180) / 4
+}
+
+fn request_has_images(request: &CanonicalRequest) -> bool {
+    fn any_in(parts: &[crate::ir::ContentPart]) -> bool {
+        parts.iter().any(|part| match part {
+            crate::ir::ContentPart::Image { .. } => true,
+            crate::ir::ContentPart::ToolResult { content, .. } => any_in(content),
+            _ => false,
+        })
+    }
+    any_in(&request.system)
+        || request
+            .messages
+            .iter()
+            .any(|message| any_in(&message.parts))
+}
+
+/// A nearest-rank percentile from a bounded sample window.
+///
+/// The sample size is small (32), so sorting a copy is cheaper than maintaining
+/// an ordered structure and cannot drift from what was observed.
+fn percentile(samples: &VecDeque<i64>, fraction: f64) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.iter().copied().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let index = ((sorted.len() as f64 - 1.0) * fraction).round() as usize;
+    sorted
+        .get(index.min(sorted.len() - 1))
+        .and_then(|value| u64::try_from(*value).ok())
+}
+
 impl PreparedCall {
     /// The member that should answer first.
     pub fn first_member(&self) -> Option<&PreparedMember> {
@@ -2855,7 +3494,12 @@ pub(crate) struct KeyReference {
 }
 
 pub(crate) struct UpstreamAttempt {
-    pub response: reqwest::Response,
+    /// The upstream body as a stream, already advanced past any bytes read
+    /// while proving the first token.
+    pub body: futures_util::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
+    /// Bytes read during the first-token wait, replayed to the caller before
+    /// `body` continues.
+    pub prefetched: Vec<bytes::Bytes>,
     pub target: WireProtocol,
     pub passthrough: bool,
     /// The member that answered.
@@ -3065,7 +3709,8 @@ fn member_failure_kind(error: &GatewayError) -> GatewayFailureKind {
         GatewayError::NotConfigured(_) => GatewayFailureKind::Auth,
         GatewayError::TranslationDisabled { .. }
         | GatewayError::UnsupportedImageReference
-        | GatewayError::MalformedRequest(_) => GatewayFailureKind::Other,
+        | GatewayError::MalformedRequest(_)
+        | GatewayError::RoutePaused { .. } => GatewayFailureKind::Other,
         GatewayError::ModelNotFound { .. } | GatewayError::Internal(_) => GatewayFailureKind::Other,
     }
 }
@@ -3155,6 +3800,194 @@ fn endpoint_url(
     Ok(format!("{base}{path}"))
 }
 
+/// Whether a Provider serves a model id or a local alias for one.
+fn member_is_served(profile: &vibex_core::ModelProviderProfile, model: &str) -> bool {
+    let model = model.trim();
+    if profile.configured_models.is_empty() {
+        return !model.is_empty();
+    }
+    profile.configured_models.iter().any(|entry| {
+        entry.enabled
+            && (entry.id == model
+                || profile
+                    .metadata
+                    .model_aliases
+                    .iter()
+                    .any(|alias| alias.alias == model && alias.upstream == entry.id))
+    })
+}
+
+/// The Provider a classifier string names, if it names one in the snapshot.
+fn classifier_provider(
+    classifier: &str,
+    route: &vibex_core::ModelRoute,
+    profiles: &BTreeMap<ModelProviderProfileId, vibex_core::ModelProviderProfile>,
+) -> Option<ModelProviderProfileId> {
+    let classifier = classifier.trim();
+    if let Some(member) = route
+        .members
+        .iter()
+        .find(|member| member.id.as_str() == classifier)
+    {
+        return Some(member.model_provider_profile_id.clone());
+    }
+    let (prefix, _) = classifier.split_once('/')?;
+    profiles
+        .values()
+        .find(|profile| {
+            profile.id.as_str() == prefix
+                || crate::route::provider_alias(&profile.display_name) == prefix
+        })
+        .map(|profile| profile.id.clone())
+}
+
+/// Resolves the classifier string to a Provider and upstream model.
+///
+/// A classifier is either a member id of this route or a `provider/model`
+/// pair. Resolving the member id first matters: two members of one Provider may
+/// name different models, and the id is the only unambiguous handle.
+fn resolve_classifier_target(
+    snapshot: &GatewaySnapshot,
+    group: &GatewayProviderGroup,
+    classifier: &str,
+) -> Option<(ModelProviderProfileId, String)> {
+    let classifier = classifier.trim();
+    if let Some(member) = group.providers.iter().find(|member| {
+        member
+            .member_id
+            .as_ref()
+            .is_some_and(|id| id.as_str() == classifier)
+    }) {
+        return Some((member.profile.clone(), member.model.clone()));
+    }
+    let (prefix, model) = classifier.split_once('/')?;
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    let upstream = snapshot.upstreams.iter().find(|upstream| {
+        upstream.profile_id.as_str() == prefix
+            || crate::route::provider_alias(&upstream.display_name) == prefix
+    })?;
+    let model = upstream
+        .metadata
+        .model_aliases
+        .iter()
+        .find(|alias| alias.alias.as_str() == model)
+        .map(|alias| alias.upstream.clone())
+        .unwrap_or_else(|| model.to_string());
+    if !upstream.models.is_empty() && !upstream.models.iter().any(|served| served == &model) {
+        return None;
+    }
+    Some((upstream.profile_id.clone(), model.to_string()))
+}
+
+/// Reads the text out of a classifier reply in any of the four wire shapes.
+fn classifier_reply_text(protocol: WireProtocol, bytes: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let texts = match protocol {
+        WireProtocol::ChatCompletions => value
+            .pointer("/choices/0/message/content")
+            .map(content_text)
+            .unwrap_or_default(),
+        WireProtocol::Responses => value
+            .pointer("/output/0/content/0/text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                value
+                    .pointer("/output_text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .into_iter()
+            .collect(),
+        WireProtocol::AnthropicMessages => value
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
+        WireProtocol::GeminiGenerateContent => value
+            .pointer("/candidates/0/content/parts")
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .into_iter()
+            .collect(),
+    };
+    let text = texts.join("").trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn content_text(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(text) => vec![text.clone()],
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Extracts `intent` and `effort` from the classifier's text.
+///
+/// The prompt asks for JSON, but a small model may wrap it in prose or fences;
+/// both are trimmed before parsing. A plain single word is accepted as an
+/// intent rather than turning a useful answer into an error.
+fn classifier_decision(text: &str) -> ClassifierOutcome {
+    let trimmed = text.trim();
+    let json_slice = trimmed
+        .find('{')
+        .zip(trimmed.rfind('}'))
+        .and_then(|(start, end)| (start <= end).then(|| &trimmed[start..=end]));
+    if let Some(json) = json_slice
+        && let Ok(value) = serde_json::from_str::<Value>(json)
+    {
+        let intent = value
+            .get("intent")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|intent| !intent.is_empty() && intent.chars().count() <= 64)
+            .map(str::to_string);
+        let effort = value
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|effort| !effort.is_empty() && effort.chars().count() <= 32)
+            .map(normalize_classifier_effort);
+        if intent.is_some() || effort.is_some() {
+            return ClassifierOutcome {
+                intent,
+                effort,
+                error: None,
+            };
+        }
+    }
+    let word = trimmed.split_whitespace().next().unwrap_or_default();
+    let intent = (!word.is_empty() && word.chars().count() <= 64).then(|| word.to_string());
+    ClassifierOutcome {
+        intent,
+        effort: None,
+        error: None,
+    }
+}
+
+fn normalize_classifier_effort(effort: &str) -> String {
+    match effort.to_ascii_lowercase().as_str() {
+        "minimal" => "low".to_string(),
+        "extra" | "xhigh" | "maximum" | "max" => "high".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn upstream_message(body: &str) -> String {
     let trimmed = body.trim();
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
@@ -3214,7 +4047,8 @@ pub(crate) async fn forward(
 ) {
     let tool_names = prepared.tool_names.clone();
     let UpstreamAttempt {
-        response,
+        body,
+        prefetched,
         target,
         passthrough,
         profile_id,
@@ -3246,16 +4080,35 @@ pub(crate) async fn forward(
     let mut encoder: Option<Box<dyn StreamEncoder>> =
         (!passthrough).then(|| encoder(prepared.inbound, &request_for_encoder));
     let mut accumulator = ReplyAccumulator::default();
-    let mut stream = response.bytes_stream();
+    // The bytes read while proving the first token are replayed first, then the
+    // rest of the upstream body follows.
+    let mut stream = futures_util::stream::iter(
+        prefetched
+            .into_iter()
+            .map(Ok::<bytes::Bytes, reqwest::Error>),
+    )
+    .chain(body);
     let mut failed = false;
     let mut last_output = std::time::Instant::now();
     // A vendor may accept the connection and then say nothing. No error arrives,
     // so the error-based failover never fires and the turn hangs. The first
     // token is the deadline this route set; afterwards a slow reply is the
     // model thinking, which is legitimate and must not be cut.
-    let first_token_deadline = prepared
-        .member(&profile_id)
-        .and_then(|member| member.first_token_timeout_ms)
+    //
+    // The last member waits forever on purpose: there is no next source to
+    // fail over to, and cutting it would turn a slow answer into a failure.
+    let has_later_member = prepared
+        .members
+        .iter()
+        .position(|member| member.profile_id == profile_id)
+        .is_some_and(|index| index + 1 < prepared.members.len());
+    let first_token_deadline = has_later_member
+        .then(|| {
+            prepared
+                .member(&profile_id)
+                .and_then(|member| member.first_token_timeout_ms)
+        })
+        .flatten()
         .map(|timeout| started + std::time::Duration::from_millis(timeout));
     let mut first_token_seen = false;
 
@@ -3459,7 +4312,8 @@ pub(crate) async fn gather(
 ) -> GatewayResult<Value> {
     let tool_names = prepared.tool_names.clone();
     let UpstreamAttempt {
-        response,
+        body,
+        prefetched,
         target,
         passthrough,
         profile_id,
@@ -3472,36 +4326,52 @@ pub(crate) async fn gather(
     // arrives, and the graph still needs to stop drawing this request as
     // starting.
     service.note_first_token(&prepared.request_id, vibex_core::unix_timestamp_ms());
-    let bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            // The reply body never arrived. The ledger keeps the fact, so a
-            // request that produced neither an answer nor a token count is
-            // still visible as a failure rather than as a gap.
-            service.record(
-                prepared,
-                &RequestOutcome {
-                    kind: GatewayRequestOutcome::Failed,
-                    profile_id: Some(profile_id.clone()),
-                    target: Some(target),
-                    skipped_cooling: 0,
-                    skipped_over_limit: 0,
-                    credential: Some(key.id.clone()),
-                    status: Some(502),
-                    usage: CanonicalUsage::default(),
-                    latency_ms: Some(started.elapsed().as_millis() as i64),
-                    served: None,
-                    failed_attempts,
-                    skipped_members,
-                    error_code: Some("model_gateway_upstream_failed".to_string()),
-                    error_message: None,
-                },
-            );
-            return Err(GatewayError::Upstream {
-                status: 502,
-                message: "the upstream reply ended before it was complete".to_string(),
-            });
+    let mut collected = Vec::new();
+    let mut chunks = futures_util::stream::iter(
+        prefetched
+            .into_iter()
+            .map(Ok::<bytes::Bytes, reqwest::Error>),
+    )
+    .chain(body);
+    let mut body_failed = false;
+    while let Some(chunk) = chunks.next().await {
+        match chunk {
+            Ok(chunk) => collected.extend_from_slice(&chunk),
+            Err(_) => {
+                body_failed = true;
+                break;
+            }
         }
+    }
+    let bytes = if body_failed {
+        // The reply body never arrived. The ledger keeps the fact, so a
+        // request that produced neither an answer nor a token count is
+        // still visible as a failure rather than as a gap.
+        service.record(
+            prepared,
+            &RequestOutcome {
+                kind: GatewayRequestOutcome::Failed,
+                profile_id: Some(profile_id.clone()),
+                target: Some(target),
+                skipped_cooling: 0,
+                skipped_over_limit: 0,
+                credential: Some(key.id.clone()),
+                status: Some(502),
+                usage: CanonicalUsage::default(),
+                latency_ms: Some(started.elapsed().as_millis() as i64),
+                served: None,
+                failed_attempts,
+                skipped_members,
+                error_code: Some("model_gateway_upstream_failed".to_string()),
+                error_message: None,
+            },
+        );
+        return Err(GatewayError::Upstream {
+            status: 502,
+            message: "the upstream reply ended before it was complete".to_string(),
+        });
+    } else {
+        bytes::Bytes::from(collected)
     };
     let (mut response, usage) = if passthrough {
         let parsed = parse_reply(target, &bytes).unwrap_or_default();
@@ -3945,6 +4815,7 @@ mod tests {
                 GatewayProviderGroup {
                     group_id: "g1".to_string(),
                     display_name: "Team".to_string(),
+                    kind: vibex_core::RouteKind::ProviderGroup,
                     strategy: vibex_core::RouteStrategy::Ordered,
                     key_strategy: GatewayRoutingStrategy::Ordered,
                     first_token_timeout_ms: None,
@@ -3956,6 +4827,15 @@ mod tests {
                         model: "deepseek-chat".to_string(),
                         providers: Vec::new(),
                     }],
+                    agent_model_id: None,
+                    rules: Vec::new(),
+                    classifier: None,
+                    effort: None,
+                    patience_ms: None,
+                    sink: false,
+                    unlists: false,
+                    levels: Vec::new(),
+                    pick_member_id: None,
                 },
             )]),
         };

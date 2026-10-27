@@ -1202,7 +1202,32 @@ pub struct ManagementCenter {
     /// A rejected group name, shown beside its field.
     route_group_name_error: Option<String>,
     /// The Providers the draft composes, in attempt order.
+    ///
+    /// A provider group names whole Providers. A model group uses
+    /// [`Self::route_group_model_members`] instead, because its members are
+    /// `(Provider, upstream model)` pairs.
     route_group_members: Vec<vibex_core::ModelProviderProfileId>,
+    /// Whether the draft is a model-level or whole-Provider composition.
+    route_group_kind: vibex_core::RouteKind,
+    /// The single Agent-facing model id of a model group.
+    route_group_agent_model_id: Entity<InputState>,
+    /// The model group's members, in attempt order.
+    route_group_model_members: Vec<vibex_core::ModelRouteMember>,
+    /// The draft's search term for the model palette.
+    route_group_model_query: Entity<InputState>,
+    /// The draft's patience budget, in seconds. Empty disables retries.
+    route_group_patience: Entity<InputState>,
+    /// Hide the group's model from pickers while keeping it callable by id.
+    route_group_unlists: bool,
+    /// A hidden composition that exists to be called explicitly.
+    route_group_sink: bool,
+    /// Simulator inputs: the Agent id and context size to match rules against.
+    route_group_sim_agent: Entity<InputState>,
+    route_group_sim_context: Entity<InputState>,
+    route_group_sim_images: bool,
+    route_group_sim_effort: String,
+    /// The member whose failure the simulator should assume.
+    route_group_sim_failure: Option<vibex_core::ModelRouteMemberId>,
     /// The draft's strategy.
     route_group_strategy: vibex_core::RouteStrategy,
     /// Whether one conversation stays on one Key within this group.
@@ -1774,6 +1799,41 @@ impl ManagementCenter {
                 "tokens",
                 "Token 数",
                 "Token 數",
+            ))
+        });
+        let route_group_agent_model_id = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "e.g. deepseek-fast",
+                "例如 deepseek-fast",
+                "例如 deepseek-fast",
+            ))
+        });
+        let route_group_model_query = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Search models",
+                "搜索模型",
+                "搜尋模型",
+            ))
+        });
+        let route_group_patience = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "seconds, empty off",
+                "秒，留空关闭",
+                "秒，留空關閉",
+            ))
+        });
+        let route_group_sim_agent = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Agent id, empty any",
+                "Agent ID，留空不限",
+                "Agent ID，留空不限",
+            ))
+        });
+        let route_group_sim_context = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "context tokens",
+                "上下文 Token",
+                "上下文 Token",
             ))
         });
         let profile_model_edit_id = cx.new(|cx| {
@@ -2444,6 +2504,18 @@ impl ManagementCenter {
             route_group_name,
             route_group_name_error: None,
             route_group_members: Vec::new(),
+            route_group_kind: vibex_core::RouteKind::ModelGroup,
+            route_group_agent_model_id,
+            route_group_model_members: Vec::new(),
+            route_group_model_query,
+            route_group_patience,
+            route_group_unlists: false,
+            route_group_sink: false,
+            route_group_sim_agent,
+            route_group_sim_context,
+            route_group_sim_images: false,
+            route_group_sim_effort: String::new(),
+            route_group_sim_failure: None,
             route_group_strategy: vibex_core::RouteStrategy::Ordered,
             route_group_pin: true,
             route_group_auto_failover: true,
@@ -13501,7 +13573,7 @@ impl ManagementCenter {
                     "该供应商在路由组尝试顺序中的位置。",
                     "該供應商在路由組嘗試順序中的位置。",
                 ),
-                "icons/vibex/route.svg",
+                "icons/vibex/boxes.svg",
                 route_rows.into_any_element(),
                 cx,
             ));
@@ -14060,6 +14132,29 @@ impl ManagementCenter {
                             h_flex()
                                 .flex_none()
                                 .gap_2()
+                                .child(
+                                    Button::new("management-route-group-page-clone")
+                                        .xsmall()
+                                        .outline()
+                                        .label(management_locale_text(
+                                            "Clone",
+                                            "克隆",
+                                            "複製",
+                                        ))
+                                        .disabled(pending)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let Some(route_id) = this
+                                                .selected_global_route_id
+                                                .clone()
+                                                .and_then(|id| {
+                                                    vibex_core::ModelRouteId::parse(id).ok()
+                                                })
+                                            else {
+                                                return;
+                                            };
+                                            this.clone_route_group(route_id, cx)
+                                        })),
+                                )
                                 .child(
                                     Button::new("management-route-group-page-edit")
                                         .xsmall()
@@ -15619,7 +15714,18 @@ impl ManagementCenter {
                             cx.notify();
                             return;
                         }
-                        profile.configured_models = response.models;
+                        profile.configured_models = if profile.metadata.auto_refresh_models {
+                            // AutoInclude adds newly discovered models while
+                            // keeping the user's existing rows: their
+                            // capabilities, names, and disabled state are
+                            // hand-authored data, not discovery output.
+                            merge_discovered_provider_models(
+                                &profile.configured_models,
+                                response.models,
+                            )
+                        } else {
+                            response.models
+                        };
                         if profile.default_model_id.as_ref().is_none_or(|default| {
                             !profile
                                 .configured_models
@@ -17571,6 +17677,7 @@ impl ManagementCenter {
             default_connect_timeout_ms: snapshot.settings.policy.default_connect_timeout_ms,
             default_request_timeout_ms: snapshot.settings.policy.default_request_timeout_ms,
             default_stream_idle_timeout_ms: snapshot.settings.policy.default_stream_idle_timeout_ms,
+            cooldown_overrides_ms: snapshot.settings.policy.cooldown_overrides_ms.clone(),
             expected_revision: snapshot.settings.revision,
         };
         update(&mut request);
@@ -18044,9 +18151,21 @@ impl ManagementCenter {
                 parse_u64(2)?,
                 parse_u64(3)?,
                 parse_u64(4)?,
+                parse_u64(5)?,
+                parse_u64(6)?,
+                parse_u64(7)?,
             ))
         })();
-        let (error_rate, latency, connect, request_timeout, stream) = match parsed {
+        let (
+            error_rate,
+            latency,
+            connect,
+            request_timeout,
+            stream,
+            rate_cooldown,
+            upstream_cooldown,
+            proxy_cooldown,
+        ) = match parsed {
             Ok(values) => values,
             Err(message) => {
                 self.gateway_default_error = Some(message);
@@ -18055,6 +18174,16 @@ impl ManagementCenter {
             }
         };
         self.gateway_default_error = None;
+        let mut cooldowns = BTreeMap::new();
+        for (kind, value) in [
+            ("rate", rate_cooldown),
+            ("upstream", upstream_cooldown),
+            ("proxy", proxy_cooldown),
+        ] {
+            if let Some(value) = value {
+                cooldowns.insert(kind.to_string(), value);
+            }
+        }
         self.update_gateway_settings(
             move |request| {
                 request.error_rate_warn_percent = error_rate;
@@ -18062,6 +18191,7 @@ impl ManagementCenter {
                 request.default_connect_timeout_ms = connect;
                 request.default_request_timeout_ms = request_timeout;
                 request.default_stream_idle_timeout_ms = stream;
+                request.cooldown_overrides_ms = cooldowns;
             },
             cx,
         );
@@ -18274,27 +18404,289 @@ impl ManagementCenter {
     ///
     /// Clearing is not reversible, so it asks first; and it says what it does
     /// not remove, so the wording cannot be mistaken for resetting usage.
-    fn render_gateway_topology(&self, cx: &mut Context<Self>) -> AnyElement {
-        let agent_ids = self
-            .agent_model_route_bindings
+    /// The gateway dashboard: the observed numbers, over a chosen window.
+    fn render_gateway_dashboard(&self, cx: &mut Context<Self>) -> AnyElement {
+        let now = vibex_core::unix_timestamp_ms();
+        let cutoff = now - self.traffic_range.window_ms();
+        let rows = self
+            .gateway_requests
             .iter()
-            .map(|binding| binding.agent_id.as_str().to_string())
-            .collect::<BTreeSet<_>>();
-        let mut agents = v_flex().w_full().gap_1();
-        for agent_id in &agent_ids {
-            let label = self
-                .snapshot
+            .filter(|request| request.created_at_ms >= cutoff)
+            .collect::<Vec<_>>();
+        let total = rows.len();
+        let answered = rows
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request.outcome,
+                    vibex_core::GatewayRequestOutcome::Ok
+                        | vibex_core::GatewayRequestOutcome::Failover
+                )
+            })
+            .count();
+        let success_rate = (total > 0).then(|| answered as f64 * 100.0 / total as f64);
+        let failover_count = rows
+            .iter()
+            .filter(|request| request.outcome == vibex_core::GatewayRequestOutcome::Failover)
+            .count();
+        let latencies = rows
+            .iter()
+            .filter_map(|request| request.latency_ms)
+            .collect::<Vec<_>>();
+        let p50 = management_percentile(latencies.clone(), 0.5);
+        let p95 = management_percentile(latencies, 0.95);
+        let input_tokens = rows.iter().map(|request| request.input_tokens).sum::<u64>();
+        let output_tokens = rows
+            .iter()
+            .map(|request| request.output_tokens)
+            .sum::<u64>();
+        let cache_tokens = rows
+            .iter()
+            .map(|request| request.cached_read_tokens)
+            .sum::<u64>();
+        let window_seconds = (self.traffic_range.window_ms() / 1000).max(1) as f64;
+        let qps = total as f64 / window_seconds;
+        let uptime = self.gateway.runtime.started_at_ms.map(|started| {
+            let seconds = now.saturating_sub(started).max(0) / 1000;
+            let hours = seconds / 3600;
+            let minutes = (seconds % 3600) / 60;
+            if hours > 0 {
+                format!("{hours}h {minutes}m")
+            } else {
+                format!("{minutes}m")
+            }
+        });
+        let mut top_providers = BTreeMap::<String, usize>::new();
+        let mut top_models = BTreeMap::<String, usize>::new();
+        let mut top_errors = BTreeMap::<String, usize>::new();
+        for request in &rows {
+            *top_providers
+                .entry(request.provider_name.clone())
+                .or_insert(0) += 1;
+            *top_models
+                .entry(request.model_requested.clone())
+                .or_insert(0) += 1;
+            if let Some(code) = request
+                .route
+                .as_ref()
+                .and_then(|route| route.error_code.clone())
+                .or_else(|| {
+                    matches!(
+                        request.outcome,
+                        vibex_core::GatewayRequestOutcome::Failed
+                            | vibex_core::GatewayRequestOutcome::Cooldown
+                    )
+                    .then(|| {
+                        request
+                            .status
+                            .map(|status| format!("HTTP {status}"))
+                            .unwrap_or_else(|| "error".to_string())
+                    })
+                })
+            {
+                *top_errors.entry(code).or_insert(0) += 1;
+            }
+        }
+        let top = |counts: &BTreeMap<String, usize>| {
+            let mut entries = counts.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
+            entries
+                .into_iter()
+                .take(3)
+                .map(|(name, count)| format!("{name} ({count})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut ranges = h_flex().items_center().gap_1();
+        for range in TrafficRange::ALL {
+            let selected = range == self.traffic_range;
+            ranges = ranges.child(
+                Button::new(SharedString::from(format!(
+                    "management-gateway-dashboard-range-{:?}",
+                    range
+                )))
+                .xsmall()
+                .when(selected, |button| button.primary())
+                .when(!selected, |button| button.outline())
+                .label(range.label())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.traffic_range = range;
+                    cx.notify();
+                })),
+            );
+        }
+        let metric = |label: &str, value: String| {
+            v_flex()
+                .min_w(px(112.0))
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label.to_string()),
+                )
+                .child(div().text_sm().font_medium().child(value))
+        };
+        management_card_with_icon(
+            management_locale_text("Dashboard", "仪表盘", "儀表板"),
+            management_locale_text(
+                "Observed requests for the chosen window. Tokens are what the gateway counted; there is no cost, price, or quota here.",
+                "所选时间窗口内观测到的请求。Token 是网关实际计数；这里没有费用、价格或配额。",
+                "所選時間窗口內觀測到的請求。Token 是閘道實際計數；這裡沒有費用、價格或配額。",
+            ),
+            "icons/vibex/activity.svg",
+            v_flex()
+                .w_full()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(ranges)
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{total} requests")),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .flex_wrap()
+                        .items_start()
+                        .gap_4()
+                        .child(metric("Uptime", uptime.unwrap_or_else(|| "—".to_string())))
+                        .child(metric("QPS", format!("{qps:.3}")))
+                        .child(metric(
+                            "Success",
+                            success_rate
+                                .map(|rate| format!("{rate:.1}%"))
+                                .unwrap_or_else(|| "—".to_string()),
+                        ))
+                        .child(metric(
+                            "p50",
+                            p50.map(|value| format!("{value} ms"))
+                                .unwrap_or_else(|| "—".to_string()),
+                        ))
+                        .child(metric(
+                            "p95",
+                            p95.map(|value| format!("{value} ms"))
+                                .unwrap_or_else(|| "—".to_string()),
+                        ))
+                        .child(metric("Tokens in", gateway_token_count(input_tokens)))
+                        .child(metric("Tokens out", gateway_token_count(output_tokens)))
+                        .child(metric("Cache read", gateway_token_count(cache_tokens)))
+                        .child(metric("Failovers", failover_count.to_string()))
+                        .child(metric("Inflight", self.gateway_inflight.len().to_string())),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .flex_wrap()
+                        .gap_4()
+                        .child(stat_line(
+                            management_locale_text("Top Provider", "最多供应商", "最多供應商"),
+                            top(&top_providers),
+                            cx,
+                        ))
+                        .child(stat_line(
+                            management_locale_text("Top model", "最多模型", "最多模型"),
+                            top(&top_models),
+                            cx,
+                        ))
+                        .child(stat_line(
+                            management_locale_text("Top error", "最多错误", "最多錯誤"),
+                            top(&top_errors),
+                            cx,
+                        )),
+                )
+                .into_any_element(),
+            cx,
+        )
+    }
+
+    fn render_gateway_topology(&self, cx: &mut Context<Self>) -> AnyElement {
+        // Live state, newest last. The cap is the same one the graph would use:
+        // past a couple of dozen concurrent attempts the picture is noise, and
+        // the aggregate below says how many were left out.
+        let total_inflight = self.gateway_inflight.len();
+        let live = self
+            .gateway_inflight
+            .iter()
+            .rev()
+            .take(24)
+            .cloned()
+            .collect::<Vec<_>>();
+        let now = vibex_core::unix_timestamp_ms();
+        let waiting = live
+            .iter()
+            .filter(|request| request.first_token_at_ms.is_none())
+            .count();
+        let producing = live.len().saturating_sub(waiting);
+        // Only routes that actually reach the gateway are drawn. A direct route
+        // deliberately has no live events, and pretending it did would make the
+        // graph claim traffic it cannot see.
+        let gateway_routes = self
+            .model_routes
+            .iter()
+            .filter(|route| route.kind.via_gateway())
+            .collect::<Vec<_>>();
+        let mut agent_ids = BTreeSet::new();
+        for binding in &self.agent_model_route_bindings {
+            let gateway_route = self
+                .model_routes
+                .iter()
+                .any(|route| route.id == binding.model_route_id && route.kind.via_gateway());
+            if gateway_route {
+                agent_ids.insert(binding.agent_id.as_str().to_string());
+            }
+        }
+        for request in &live {
+            if let Some(agent) = request.agent_id.as_deref() {
+                agent_ids.insert(agent.to_string());
+            }
+        }
+        let agent_label = |agent_id: &str| {
+            self.snapshot
                 .agents
                 .iter()
                 .find(|agent| agent.id.as_str() == agent_id)
                 .map(|agent| agent.label.clone())
-                .unwrap_or_else(|| agent_id.clone());
+                .unwrap_or_else(|| agent_id.to_string())
+        };
+        let mut agents = v_flex().w_full().gap_1();
+        for agent_id in &agent_ids {
+            let active = live
+                .iter()
+                .filter(|request| request.agent_id.as_deref() == Some(agent_id.as_str()))
+                .count();
             agents = agents.child(
                 h_flex()
                     .items_center()
                     .gap_1()
                     .child(agent_brand_icon(agent_id, px(14.0), None))
-                    .child(div().min_w_0().truncate().text_xs().child(label)),
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .child(agent_label(agent_id)),
+                    )
+                    .when(active > 0, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .rounded(px(8.0))
+                                .bg(cx.theme().success.opacity(0.16))
+                                .px_1()
+                                .text_xs()
+                                .text_color(cx.theme().success)
+                                .child(active.to_string()),
+                        )
+                    }),
             );
         }
         if agent_ids.is_empty() {
@@ -18303,47 +18695,133 @@ impl ManagementCenter {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(management_locale_text(
-                        "No Agents",
-                        "没有 Agent",
-                        "沒有 Agent",
+                        "No gateway-bound Agents",
+                        "没有绑定网关的 Agent",
+                        "沒有綁定閘道的 Agent",
                     )),
             );
         }
-        let mut providers = v_flex().w_full().gap_1();
-        for route in self.model_routes.iter().take(6) {
-            let names = route
-                .members
+        let mut providers = v_flex().w_full().gap_2();
+        for route in gateway_routes.iter().take(6) {
+            let mut names = Vec::new();
+            let mut member_models = Vec::new();
+            for member in route.enabled_members() {
+                if let Some(profile) = self
+                    .providers
+                    .iter()
+                    .find(|profile| profile.id == member.model_provider_profile_id)
+                {
+                    if !names.contains(&profile.display_name) {
+                        names.push(profile.display_name.clone());
+                    }
+                    if route.is_model_group() {
+                        member_models
+                            .push(format!("{} · {}", profile.display_name, member.model_id));
+                    }
+                }
+            }
+            let attempts = live
                 .iter()
-                .filter_map(|member| {
-                    self.providers
-                        .iter()
-                        .find(|profile| profile.id == member.model_provider_profile_id)
-                        .map(|profile| profile.display_name.clone())
-                })
+                .filter(|request| request.model_route_id.as_deref() == Some(route.id.as_str()))
                 .collect::<Vec<_>>();
-            providers = providers.child(
-                v_flex()
-                    .w_full()
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .font_medium()
-                            .child(route.display_name.clone()),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(names.join(" + ")),
+            let mut route_column = v_flex()
+                .w_full()
+                .gap_0p5()
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(if attempts.is_empty() {
+                    cx.theme().border.opacity(0.45)
+                } else {
+                    cx.theme().primary.opacity(0.55)
+                })
+                .px_2()
+                .py_1()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_1()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .font_medium()
+                                .child(route.display_name.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_route_strategy_label(route.strategy)),
+                        ),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if route.is_model_group() {
+                            route
+                                .agent_model()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| names.join(" + "))
+                        } else {
+                            names.join(" + ")
+                        }),
+                );
+            if route.is_model_group() && member_models.len() <= 3 {
+                route_column = route_column.child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(member_models.join("  ")),
+                );
+            }
+            for request in attempts {
+                let provider_name = self
+                    .providers
+                    .iter()
+                    .find(|profile| profile.id == request.model_provider_profile_id)
+                    .map(|profile| profile.display_name.clone())
+                    .unwrap_or_else(|| request.model_provider_profile_id.as_str().to_string());
+                let (state, color) = match request.first_token_at_ms {
+                    Some(at) => (
+                        format!(
+                            "TTFT {} ms",
+                            at.saturating_sub(request.started_at_ms).max(0)
+                        ),
+                        cx.theme().success,
                     ),
-            );
+                    None => (
+                        management_locale_text("waiting", "等待中", "等待中").to_string(),
+                        cx.theme().warning,
+                    ),
+                };
+                route_column = route_column.child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_1()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .child(format!("{} · #{}", provider_name, request.attempt)),
+                        )
+                        .child(div().flex_none().text_xs().text_color(color).child(state)),
+                );
+            }
+            providers = providers.child(route_column);
         }
-        if self.model_routes.is_empty() {
+        if gateway_routes.is_empty() {
             providers = providers.child(
                 div()
                     .text_xs()
@@ -18404,9 +18882,26 @@ impl ManagementCenter {
                             .text_color(cx.theme().muted_foreground)
                             .child(format!(
                                 "{} {}",
-                                self.gateway_inflight.len(),
+                                live.len(),
                                 management_locale_text("inflight", "进行中", "進行中")
                             )),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().success)
+                                    .child(format!("{producing} streaming")),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().warning)
+                                    .child(format!("{waiting} waiting")),
+                            ),
                     ),
             )
             .child(
@@ -18423,28 +18918,148 @@ impl ManagementCenter {
                     )
                     .child(providers),
             );
+        // One row per live attempt. This is the same event stream the graph
+        // draws, rendered as a list so a reader can still use the information
+        // when motion is reduced or the window is narrow.
+        let mut live_rows = v_flex().w_full().gap_1();
+        for request in &live {
+            let provider_name = self
+                .providers
+                .iter()
+                .find(|profile| profile.id == request.model_provider_profile_id)
+                .map(|profile| profile.display_name.clone())
+                .unwrap_or_else(|| request.model_provider_profile_id.as_str().to_string());
+            let route_name = request
+                .model_route_id
+                .as_deref()
+                .and_then(|route_id| {
+                    self.model_routes
+                        .iter()
+                        .find(|route| route.id.as_str() == route_id)
+                })
+                .map(|route| route.display_name.clone())
+                .unwrap_or_else(|| management_locale_text("Direct", "直连", "直連").to_string());
+            let elapsed = now.saturating_sub(request.started_at_ms).max(0);
+            let (state, color) = match request.first_token_at_ms {
+                Some(at) => (
+                    format!(
+                        "TTFT {} ms · {} ms",
+                        at.saturating_sub(request.started_at_ms).max(0),
+                        elapsed
+                    ),
+                    cx.theme().success,
+                ),
+                None => (
+                    format!(
+                        "{} · {} ms",
+                        management_locale_text("waiting", "等待中", "等待中"),
+                        elapsed
+                    ),
+                    cx.theme().warning,
+                ),
+            };
+            live_rows = live_rows.child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .flex_wrap()
+                    .gap_2()
+                    .rounded(px(4.0))
+                    .px_2()
+                    .py_1()
+                    .bg(cx.theme().background.opacity(0.6))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(7.0))
+                            .h(px(7.0))
+                            .rounded(px(4.0))
+                            .bg(color),
+                    )
+                    .child(div().min_w_0().truncate().text_xs().child(format!(
+                                "{} → {} → {}",
+                                request
+                                    .agent_id
+                                    .as_deref()
+                                    .map(agent_label)
+                                    .unwrap_or_else(|| {
+                                        management_locale_text("Agent", "Agent", "Agent")
+                                            .to_string()
+                                    }),
+                                route_name,
+                                provider_name
+                            )))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "#{} · {}",
+                                request.attempt, request.wire_protocol_id
+                            )),
+                    )
+                    .child(div().flex_none().text_xs().text_color(color).child(state)),
+            );
+        }
+        if live.is_empty() {
+            live_rows = live_rows.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "No requests are in flight. Rows appear from real Began, FirstToken, and Ended events only.",
+                        "当前没有进行中的请求。列表只来自真实的 Began、FirstToken 和 Ended 事件。",
+                        "目前沒有進行中的請求。列表只來自真實的 Began、FirstToken 和 Ended 事件。",
+                    )),
+            );
+        }
         management_card_with_icon(
-            management_locale_text("Topology", "静态拓扑", "靜態拓撲"),
+            management_locale_text("Live routing", "实时路由", "即時路由"),
             management_locale_text(
-                "Agents reach Providers through the gateway and its route groups. Direct Providers are not drawn; no live animation.",
-                "Agent 通过网关和路由组到达供应商。直连供应商不绘制；不做实时动画。",
-                "Agent 透過閘道和路由組到達供應商。直連供應商不繪製；不做即時動畫。",
+                "Agents reach Providers through the gateway and its route groups. Every marker below is a real request event; direct Providers are not drawn.",
+                "Agent 通过网关和路由组到达供应商。下方每个标记都来自真实请求事件；直连供应商不绘制。",
+                "Agent 透過閘道和路由組到達供應商。下方每個標記都來自真實請求事件；直連供應商不繪製。",
             ),
-            "icons/vibex/network.svg",
+            "icons/vibex/boxes.svg",
             v_flex()
                 .w_full()
                 .gap_2()
                 .child(topology)
                 .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(management_locale_text(
-                            "Static edges; current inflight is counted at the gateway.",
-                            "静态边；当前进行中的请求按网关计数。",
-                            "靜態邊；目前進行中的請求按閘道計數。",
-                        )),
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if total_inflight > live.len() {
+                                    format!(
+                                        "{} / {} {}",
+                                        live.len(),
+                                        total_inflight,
+                                        management_locale_text(
+                                            "shown; the rest are aggregated",
+                                            "已显示；其余已聚合",
+                                            "已顯示；其餘已聚合"
+                                        )
+                                    )
+                                } else {
+                                    management_locale_text(
+                                        "Fed by Begin, FirstToken, and End events. No simulated traffic.",
+                                        "由 Begin、FirstToken、End 事件驱动，不伪造流量。",
+                                        "由 Begin、FirstToken、End 事件驅動，不偽造流量。",
+                                    )
+                                    .to_string()
+                                }),
+                        ),
                 )
+                .child(live_rows)
                 .into_any_element(),
             cx,
         )
@@ -20495,6 +21110,36 @@ impl ManagementCenter {
                             self.gateway.settings.policy.default_stream_idle_timeout_ms,
                         ))
                     }),
+                    cx.new(|cx| {
+                        InputState::new(window, cx).default_value(value(
+                            self.gateway
+                                .settings
+                                .policy
+                                .cooldown_overrides_ms
+                                .get("rate")
+                                .copied(),
+                        ))
+                    }),
+                    cx.new(|cx| {
+                        InputState::new(window, cx).default_value(value(
+                            self.gateway
+                                .settings
+                                .policy
+                                .cooldown_overrides_ms
+                                .get("upstream")
+                                .copied(),
+                        ))
+                    }),
+                    cx.new(|cx| {
+                        InputState::new(window, cx).default_value(value(
+                            self.gateway
+                                .settings
+                                .policy
+                                .cooldown_overrides_ms
+                                .get("proxy")
+                                .copied(),
+                        ))
+                    }),
                 ]
             })
             .clone();
@@ -20518,6 +21163,18 @@ impl ManagementCenter {
             (
                 "stream",
                 management_locale_text("Stream idle ms", "流空闲超时 ms", "流閒置逾時 ms"),
+            ),
+            (
+                "cooldown-rate",
+                management_locale_text("Rate cooldown ms", "限流冷却 ms", "限流冷卻 ms"),
+            ),
+            (
+                "cooldown-upstream",
+                management_locale_text("Upstream cooldown ms", "上游冷却 ms", "上游冷卻 ms"),
+            ),
+            (
+                "cooldown-proxy",
+                management_locale_text("Proxy cooldown ms", "代理冷却 ms", "代理冷卻 ms"),
             ),
         ];
         let mut default_rows = h_flex().w_full().flex_wrap().gap_3();
@@ -20858,6 +21515,7 @@ impl ManagementCenter {
             cx,
         ));
 
+        body = body.child(self.render_gateway_dashboard(cx));
         body = body.child(self.render_gateway_topology(cx));
 
         // Recent requests: which upstream answered, which protocol changed,
@@ -28015,6 +28673,13 @@ impl ManagementCenter {
         self.route_group_name_error = None;
         self.route_group_members.clear();
         self.route_group_member_efforts.clear();
+        self.route_group_kind = vibex_core::RouteKind::ModelGroup;
+        self.route_group_model_members.clear();
+        self.route_group_unlists = false;
+        self.route_group_sink = false;
+        self.route_group_sim_images = false;
+        self.route_group_sim_effort = String::new();
+        self.route_group_sim_failure = None;
         self.route_group_strategy = vibex_core::RouteStrategy::Ordered;
         self.route_group_pin = true;
         self.route_group_auto_failover = true;
@@ -28023,6 +28688,11 @@ impl ManagementCenter {
             &self.route_group_first_token_timeout,
             &self.route_group_context_tokens,
             &self.route_group_token_limit,
+            &self.route_group_agent_model_id,
+            &self.route_group_model_query,
+            &self.route_group_patience,
+            &self.route_group_sim_agent,
+            &self.route_group_sim_context,
         ] {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }
@@ -28060,10 +28730,38 @@ impl ManagementCenter {
         self.route_group_editing_id = Some(route.id.clone());
         self.route_group_editor_from_agent = from_agent;
         self.route_group_name_error = None;
+        self.route_group_kind = route.kind;
         self.route_group_members = route
-            .enabled_members()
+            .members
+            .iter()
+            .filter(|member| member.enabled)
             .map(|member| member.model_provider_profile_id.clone())
             .collect();
+        self.route_group_model_members = route.members.clone();
+        self.route_group_unlists = route.unlists;
+        self.route_group_sink = route.sink;
+        self.route_group_agent_model_id.update(cx, |state, cx| {
+            state.set_value(route.agent_model_id.clone().unwrap_or_default(), window, cx)
+        });
+        self.route_group_patience.update(cx, |state, cx| {
+            state.set_value(
+                route
+                    .patience_ms
+                    .map(|ms| (ms / 1000).max(1).to_string())
+                    .unwrap_or_default(),
+                window,
+                cx,
+            )
+        });
+        self.route_group_model_query
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.route_group_sim_agent
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.route_group_sim_context
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.route_group_sim_images = false;
+        self.route_group_sim_effort = String::new();
+        self.route_group_sim_failure = None;
         self.route_group_strategy = route.strategy;
         self.route_group_pin = route.pin == vibex_core::GatewayPinScope::Conversation;
         self.route_group_auto_failover = route.failover == vibex_core::GatewayFailover::Auto;
@@ -28127,7 +28825,14 @@ impl ManagementCenter {
         self.route_group_editor_from_agent = false;
         self.route_group_name_error = None;
         self.route_group_members.clear();
+        self.route_group_model_members.clear();
         self.route_group_member_efforts.clear();
+        self.route_group_kind = vibex_core::RouteKind::ModelGroup;
+        self.route_group_unlists = false;
+        self.route_group_sink = false;
+        self.route_group_sim_images = false;
+        self.route_group_sim_effort = String::new();
+        self.route_group_sim_failure = None;
         cx.notify();
     }
 
@@ -28160,6 +28865,212 @@ impl ManagementCenter {
             return;
         };
         self.route_group_members.swap(index, target);
+        cx.notify();
+    }
+
+    /// Adds or removes one `(Provider, model)` from a model-group draft.
+    fn toggle_route_group_model_member(
+        &mut self,
+        provider_id: vibex_core::ModelProviderProfileId,
+        model_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.route_group_model_members.iter().position(|member| {
+            member.model_provider_profile_id == provider_id && member.model_id == model_id
+        }) {
+            self.route_group_model_members.remove(index);
+            self.reindex_route_group_model_members();
+        } else if self.route_group_model_members.len() < vibex_core::MAX_ROUTE_MEMBERS {
+            self.route_group_model_members
+                .push(vibex_core::ModelRouteMember::new(
+                    provider_id,
+                    model_id,
+                    self.route_group_model_members.len() as i64,
+                ));
+        }
+        cx.notify();
+    }
+
+    fn move_route_group_model_member(&mut self, index: usize, up: bool, cx: &mut Context<Self>) {
+        let target = if up {
+            index.checked_sub(1)
+        } else {
+            (index + 1 < self.route_group_model_members.len()).then_some(index + 1)
+        };
+        let Some(target) = target else {
+            return;
+        };
+        self.route_group_model_members.swap(index, target);
+        self.reindex_route_group_model_members();
+        cx.notify();
+    }
+
+    fn reindex_route_group_model_members(&mut self) {
+        for (index, member) in self.route_group_model_members.iter_mut().enumerate() {
+            member.order_index = index as i64;
+        }
+    }
+
+    fn toggle_route_group_model_enabled(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(member) = self.route_group_model_members.get_mut(index) {
+            member.enabled = !member.enabled;
+            cx.notify();
+        }
+    }
+
+    fn remove_route_group_model_member(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.route_group_model_members.len() {
+            self.route_group_model_members.remove(index);
+            self.reindex_route_group_model_members();
+            cx.notify();
+        }
+    }
+
+    /// Cycles a member's weight through the small set a picker offers.
+    fn cycle_route_group_model_weight(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(member) = self.route_group_model_members.get_mut(index) {
+            member.weight = match member.weight {
+                1 => 2,
+                2 => 3,
+                3 => 5,
+                _ => 1,
+            };
+            cx.notify();
+        }
+    }
+
+    fn set_route_group_model_effort(
+        &mut self,
+        index: usize,
+        effort: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(member) = self.route_group_model_members.get_mut(index) {
+            member.reasoning_effort = (!effort.trim().is_empty()).then_some(effort);
+            cx.notify();
+        }
+    }
+
+    /// Fills the pipeline from one of the templates.
+    ///
+    /// A template is a draft, never a saved policy: the caller still sees every
+    /// member and has to press Save. That is the difference between a useful
+    /// starting point and a configuration the user never asked for.
+    fn apply_model_group_template(&mut self, template: ModelGroupTemplate, cx: &mut Context<Self>) {
+        let mut candidates = Vec::<(vibex_core::ModelProviderProfileId, String, i64)>::new();
+        if template == ModelGroupTemplate::SameModel {
+            // The most widely served model is the best "same model" suggestion:
+            // adding all of its Providers is what a canonical-model grouping
+            // would do once models.dev supplies the canonical id.
+            let mut by_model = BTreeMap::<String, Vec<vibex_core::ModelProviderProfileId>>::new();
+            for profile in &self.providers {
+                if profile.status != vibex_core::ModelProviderProfileStatus::Enabled {
+                    continue;
+                }
+                for entry in profile
+                    .configured_models
+                    .iter()
+                    .filter(|entry| entry.enabled)
+                {
+                    by_model
+                        .entry(entry.id.clone())
+                        .or_default()
+                        .push(profile.id.clone());
+                }
+            }
+            if let Some((model, providers)) = by_model
+                .into_iter()
+                .max_by_key(|(_, providers)| providers.len())
+            {
+                for (index, provider) in providers.into_iter().enumerate() {
+                    candidates.push((provider, model.clone(), index as i64));
+                }
+            }
+        } else {
+            for (index, profile) in self.providers.iter().enumerate() {
+                if profile.status != vibex_core::ModelProviderProfileStatus::Enabled {
+                    continue;
+                }
+                let model = profile
+                    .default_model_id
+                    .as_ref()
+                    .or_else(|| {
+                        profile
+                            .configured_models
+                            .iter()
+                            .find(|entry| entry.enabled)
+                            .map(|entry| &entry.id)
+                    })
+                    .cloned();
+                let Some(model) = model else {
+                    continue;
+                };
+                let rank = match template {
+                    ModelGroupTemplate::Lightweight => {
+                        let context = profile
+                            .configured_models
+                            .iter()
+                            .find(|entry| entry.id == model)
+                            .and_then(|entry| entry.capabilities.context_tokens)
+                            .unwrap_or(u32::MAX);
+                        i64::from(context)
+                    }
+                    ModelGroupTemplate::LowLatency => {
+                        let latencies = self
+                            .gateway_requests
+                            .iter()
+                            .filter(|request| {
+                                request.model_provider_profile_id == profile.id
+                                    && request.model_served.as_deref() == Some(model.as_str())
+                            })
+                            .filter_map(|request| request.latency_ms)
+                            .collect::<Vec<_>>();
+                        management_percentile(latencies, 0.5).unwrap_or(i64::MAX)
+                    }
+                    _ => index as i64,
+                };
+                candidates.push((profile.id.clone(), model, rank));
+            }
+            candidates.sort_by_key(|(_, _, rank)| *rank);
+        }
+        candidates.truncate(vibex_core::MAX_ROUTE_MEMBERS);
+        self.route_group_model_members = candidates
+            .into_iter()
+            .enumerate()
+            .map(|(index, (provider, model, _))| {
+                let mut member = vibex_core::ModelRouteMember::new(provider, model, index as i64);
+                member.weight = vibex_core::DEFAULT_MEMBER_WEIGHT;
+                member
+            })
+            .collect();
+        cx.notify();
+    }
+
+    /// Adds every Provider that serves one model, in Provider order.
+    fn add_suggested_model_group(&mut self, model: &str, cx: &mut Context<Self>) {
+        for profile in &self.providers {
+            if profile.status != vibex_core::ModelProviderProfileStatus::Enabled {
+                continue;
+            }
+            let serves = profile
+                .configured_models
+                .iter()
+                .any(|entry| entry.enabled && entry.id == model);
+            if !serves || self.route_group_model_members.len() >= vibex_core::MAX_ROUTE_MEMBERS {
+                continue;
+            }
+            let selected = self.route_group_model_members.iter().any(|member| {
+                member.model_provider_profile_id == profile.id && member.model_id == model
+            });
+            if !selected {
+                self.route_group_model_members
+                    .push(vibex_core::ModelRouteMember::new(
+                        profile.id.clone(),
+                        model,
+                        self.route_group_model_members.len() as i64,
+                    ));
+            }
+        }
         cx.notify();
     }
 
@@ -28201,12 +29112,70 @@ impl ManagementCenter {
             cx.notify();
             return;
         }
-        if self.route_group_members.is_empty() {
+        if self.route_group_kind == vibex_core::RouteKind::ModelGroup {
+            if self
+                .route_group_agent_model_id
+                .read(cx)
+                .value()
+                .trim()
+                .is_empty()
+            {
+                self.error = Some(
+                    management_locale_text(
+                        "A model group needs the model name Agents ask for.",
+                        "模型组需要填写 Agent 请求时使用的模型名。",
+                        "模型組需要填寫 Agent 請求時使用的模型名。",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+                return;
+            }
+            if self
+                .route_group_model_members
+                .iter()
+                .all(|member| !member.enabled)
+            {
+                self.error = Some(
+                    management_locale_text(
+                        "A model group needs at least one enabled member.",
+                        "模型组至少需要一个启用的成员。",
+                        "模型組至少需要一個啟用的成員。",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+                return;
+            }
+        } else if self.route_group_members.is_empty() {
             self.error = Some(
                 management_locale_text(
                     "A route group needs at least one Provider.",
                     "路由组至少需要一个供应商。",
                     "路由組至少需要一個供應商。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let patience_seconds =
+            match parse_optional_limit(self.route_group_patience.read(cx).value().as_str()) {
+                Ok(value) => value,
+                Err(message) => {
+                    self.error = Some(format!("Patience: {message}"));
+                    cx.notify();
+                    return;
+                }
+            };
+        if patience_seconds
+            .is_some_and(|seconds| u64::from(seconds) * 1_000 > vibex_core::MAX_ROUTE_PATIENCE_MS)
+        {
+            self.error = Some(
+                management_locale_text(
+                    "Patience cannot exceed four minutes.",
+                    "耐心等待最长四分钟。",
+                    "耐心等待最長四分鐘。",
                 )
                 .to_string(),
             );
@@ -28265,7 +29234,7 @@ impl ManagementCenter {
         });
         let mut route = existing.clone().unwrap_or_default();
         route.display_name = name;
-        route.kind = vibex_core::RouteKind::ProviderGroup;
+        route.kind = self.route_group_kind;
         route.strategy = self.route_group_strategy;
         route.first_token_timeout_ms =
             first_token_seconds.map(|seconds| u64::from(seconds) * 1_000);
@@ -28284,22 +29253,85 @@ impl ManagementCenter {
         } else {
             vibex_core::GatewayFailover::Ask
         };
+        route.patience_ms = patience_seconds.map(|seconds| u64::from(seconds) * 1_000);
+        route.unlists = self.route_group_unlists;
+        route.sink = self.route_group_sink;
         route.status = vibex_core::RouteStatus::Enabled;
-        route.members = self
-            .route_group_members
-            .iter()
-            .enumerate()
-            .map(|(index, provider)| {
-                let mut member =
-                    vibex_core::ModelRouteMember::provider(provider.clone(), index as i64);
-                member.reasoning_effort = self
-                    .route_group_member_efforts
-                    .get(provider.as_str())
-                    .map(|effort| effort.trim().to_string())
-                    .filter(|effort| !effort.is_empty());
-                member
-            })
-            .collect();
+        if route.kind == vibex_core::RouteKind::ModelGroup {
+            route.agent_model_id = Some(
+                self.route_group_agent_model_id
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string(),
+            );
+            // Rules are authored against member ids. Ids of removed members
+            // are dropped here rather than saved into a rule that can never
+            // match; rules that still reference a live member survive an edit
+            // made in this simpler list editor.
+            let member_ids = self
+                .route_group_model_members
+                .iter()
+                .map(|member| member.id.as_str().to_string())
+                .collect::<Vec<_>>();
+            route.rules.retain(|rule| {
+                rule.use_member_id
+                    .as_ref()
+                    .is_none_or(|id| member_ids.contains(&id.as_str().to_string()))
+                    && rule
+                        .more_member_ids
+                        .iter()
+                        .all(|id| member_ids.contains(&id.as_str().to_string()))
+            });
+            route.members = self
+                .route_group_model_members
+                .iter()
+                .enumerate()
+                .map(|(index, member)| {
+                    let mut member = member.clone();
+                    member.order_index = index as i64;
+                    member.reasoning_effort = member
+                        .reasoning_effort
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|effort| !effort.is_empty())
+                        .map(str::to_string);
+                    member
+                })
+                .collect();
+            route.pick_member_id = if route.strategy == vibex_core::RouteStrategy::Manual {
+                route
+                    .members
+                    .iter()
+                    .find(|member| member.enabled)
+                    .or_else(|| route.members.first())
+                    .map(|member| member.id.clone())
+            } else {
+                None
+            };
+        } else {
+            route.agent_model_id = None;
+            route.rules.clear();
+            route.classifier = None;
+            route.effort = None;
+            route.levels.clear();
+            route.pick_member_id = None;
+            route.members = self
+                .route_group_members
+                .iter()
+                .enumerate()
+                .map(|(index, provider)| {
+                    let mut member =
+                        vibex_core::ModelRouteMember::provider(provider.clone(), index as i64);
+                    member.reasoning_effort = self
+                        .route_group_member_efforts
+                        .get(provider.as_str())
+                        .map(|effort| effort.trim().to_string())
+                        .filter(|effort| !effort.is_empty());
+                    member
+                })
+                .collect();
+        }
         let expected_revision = existing.as_ref().map(|route| route.revision).unwrap_or(0);
         self.error = None;
         self.mutation = Some(ManagementMutation::Gateway);
@@ -28354,6 +29386,98 @@ impl ManagementCenter {
                         if let Ok(saved) = &saved {
                             this.selected_global_route_id = Some(saved.id.to_string());
                         }
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    /// Copies a group into an application-local draft record.
+    ///
+    /// The copy is deliberately disabled and is not bound to any Agent: a
+    /// clone is a starting point to edit, not a second live source nobody
+    /// chose. Member ids and the rules that name them are remapped together so
+    /// a copied rule still matches the copied pipeline; no Secret is involved
+    /// because a route owns none.
+    fn clone_route_group(&mut self, route_id: vibex_core::ModelRouteId, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let Some(original) = self
+            .model_routes
+            .iter()
+            .find(|route| route.id == route_id)
+            .cloned()
+        else {
+            return;
+        };
+        let mut cloned = original.clone();
+        cloned.id = vibex_core::ModelRouteId::new();
+        cloned.display_name = format!("{} (copy)", original.display_name);
+        cloned.status = vibex_core::RouteStatus::Disabled;
+        cloned.revision = 1;
+        cloned.created_at_ms = 0;
+        cloned.updated_at_ms = 0;
+        cloned.deleted_at_ms = None;
+        let mut ids = BTreeMap::<String, vibex_core::ModelRouteMemberId>::new();
+        for (index, member) in original.members.iter().enumerate() {
+            let new_id = vibex_core::ModelRouteMemberId::new();
+            ids.insert(member.id.as_str().to_string(), new_id.clone());
+            if let Some(slot) = cloned.members.get_mut(index) {
+                slot.id = new_id;
+            }
+        }
+        for rule in &mut cloned.rules {
+            if let Some(id) = rule.use_member_id.as_ref()
+                && let Some(new_id) = ids.get(id.as_str())
+            {
+                rule.use_member_id = Some(new_id.clone());
+            }
+            for id in &mut rule.more_member_ids {
+                if let Some(new_id) = ids.get(id.as_str()) {
+                    *id = new_id.clone();
+                }
+            }
+        }
+        if let Some(pick) = cloned.pick_member_id.as_ref()
+            && let Some(new_id) = ids.get(pick.as_str())
+        {
+            cloned.pick_member_id = Some(new_id.clone());
+        }
+        if let Some(classifier) = cloned.classifier.as_ref()
+            && let Some(new_id) = ids.get(classifier.as_str())
+        {
+            cloned.classifier = Some(new_id.as_str().to_string());
+        }
+        if cloned.is_model_group() {
+            cloned.agent_model_id = original.agent_model().map(|model| format!("{model}-copy"));
+        }
+        self.error = None;
+        self.mutation = Some(ManagementMutation::Gateway);
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .create_model_route(vibex_backend::MutationRequest::new(cloned))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(saved) => {
+                        this.selected_global_route_id = Some(saved.id.to_string());
+                        this.notice = Some(format!(
+                            "{} {}",
+                            management_locale_text("Cloned as", "已克隆为", "已複製為"),
+                            saved.display_name
+                        ));
                         this.refresh(cx);
                     }
                     Err(error) => {
@@ -28990,12 +30114,1220 @@ impl ManagementCenter {
             .into_any_element()
     }
 
+    /// Templates, same-model suggestions, and the Provider/model palette.
+    ///
+    /// Split from the editor for the same reason as the simulator: each GPUI
+    /// element local adds to the render frame, and one frame large enough to
+    /// overflow a test thread's stack would overflow a short UI stack too.
+    fn render_model_group_palette(&mut self, pending: bool, cx: &mut Context<Self>) -> AnyElement {
+        let mut rows = v_flex().w_full().gap_1();
+        // Templates and suggestions are drafts, not saves. The copy says so
+        // because a template that silently replaced a user's own order would be
+        // worse than no template at all.
+        let mut templates = h_flex().w_full().flex_wrap().items_center().gap_1();
+        templates = templates.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text(
+                    "Start from:",
+                    "从模板开始：",
+                    "從模板開始：",
+                )),
+        );
+        for template in ModelGroupTemplate::ALL {
+            templates =
+                templates.child(
+                    Button::new(SharedString::from(format!(
+                        "management-model-group-template-{:?}",
+                        template
+                    )))
+                    .xsmall()
+                    .outline()
+                    .label(template.label())
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.apply_model_group_template(template, cx)
+                    })),
+                );
+        }
+        rows = rows.child(
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(templates)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "A template replaces the pipeline as a draft; nothing is saved until you press Save.",
+                            "模板只会替换草稿中的管线，按“保存”前不会写入。",
+                            "模板只會替換草稿中的管線，按「儲存」前不會寫入。",
+                        )),
+                ),
+        );
+        // Same-model suggestions: a model several Providers serve is the
+        // natural model-group candidate, and adding all of them is one click.
+        let mut by_model = BTreeMap::<String, Vec<vibex_core::ModelProviderProfileId>>::new();
+        for profile in &self.providers {
+            if profile.status != vibex_core::ModelProviderProfileStatus::Enabled {
+                continue;
+            }
+            for entry in profile
+                .configured_models
+                .iter()
+                .filter(|entry| entry.enabled)
+            {
+                by_model
+                    .entry(entry.id.clone())
+                    .or_default()
+                    .push(profile.id.clone());
+            }
+        }
+        let mut suggestions = by_model
+            .into_iter()
+            .filter(|(_, providers)| providers.len() >= 2)
+            .take(3)
+            .collect::<Vec<_>>();
+        suggestions
+            .sort_by(|left, right| right.1.len().cmp(&left.1.len()).then(left.0.cmp(&right.0)));
+        if !suggestions.is_empty() {
+            let mut suggestion_row = h_flex().w_full().flex_wrap().items_center().gap_1();
+            suggestion_row = suggestion_row.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text("Suggested:", "建议：", "建議：")),
+            );
+            for (model, providers) in suggestions {
+                let label = format!("{} \u{00b7} {}", model, providers.len());
+                let model_id = model.clone();
+                suggestion_row = suggestion_row.child(
+                    Button::new(SharedString::from(format!(
+                        "management-model-group-suggest-{model}"
+                    )))
+                    .xsmall()
+                    .outline()
+                    .label(label)
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.add_suggested_model_group(&model_id, cx)
+                    })),
+                );
+            }
+            rows = rows.child(suggestion_row);
+        }
+        rows = rows.child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text("Add models", "添加模型", "新增模型")),
+        );
+        rows = rows.child(management_input_field(
+            management_locale_text("Search models", "搜索模型", "搜尋模型"),
+            &self.route_group_model_query,
+            false,
+            cx,
+        ));
+        let query = self
+            .route_group_model_query
+            .read(cx)
+            .value()
+            .trim()
+            .to_lowercase();
+        let mut palette = h_flex().w_full().flex_wrap().items_center().gap_1();
+        let mut shown = 0usize;
+        for profile in &self.providers {
+            if profile.status != vibex_core::ModelProviderProfileStatus::Enabled {
+                continue;
+            }
+            for entry in &profile.configured_models {
+                if !entry.enabled {
+                    continue;
+                }
+                let haystack = format!(
+                    "{} {} {}",
+                    profile.display_name,
+                    entry.id,
+                    entry.display_name.as_deref().unwrap_or_default()
+                )
+                .to_lowercase();
+                if !query.is_empty() && !haystack.contains(&query) {
+                    continue;
+                }
+                let selected = self.route_group_model_members.iter().any(|member| {
+                    member.model_provider_profile_id == profile.id && member.model_id == entry.id
+                });
+                if !selected && shown >= 48 {
+                    continue;
+                }
+                let provider_id = profile.id.clone();
+                let model_id = entry.id.clone();
+                palette = palette.child(
+                    Button::new(SharedString::from(format!(
+                        "management-model-group-add-{}-{}",
+                        provider_id.as_str(),
+                        model_id
+                    )))
+                    .xsmall()
+                    .when(selected, |button| button.primary())
+                    .when(!selected, |button| button.outline())
+                    .label(format!("{} · {}", profile.display_name, model_id))
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_route_group_model_member(
+                            provider_id.clone(),
+                            model_id.clone(),
+                            cx,
+                        )
+                    })),
+                );
+                if !selected {
+                    shown += 1;
+                }
+            }
+            // Local aliases are first-class members too: the gateway maps the
+            // alias to its upstream id when it calls the Provider, so the group
+            // can name a model by the handle the Agent already uses.
+            for alias in &profile.metadata.model_aliases {
+                let alias_name = alias.alias.trim();
+                if alias_name.is_empty() {
+                    continue;
+                }
+                let haystack =
+                    format!("{} {} {}", profile.display_name, alias_name, alias.upstream)
+                        .to_lowercase();
+                if !query.is_empty() && !haystack.contains(&query) {
+                    continue;
+                }
+                let selected = self.route_group_model_members.iter().any(|member| {
+                    member.model_provider_profile_id == profile.id && member.model_id == alias_name
+                });
+                if !selected && shown >= 48 {
+                    continue;
+                }
+                let provider_id = profile.id.clone();
+                let model_id = alias_name.to_string();
+                palette = palette.child(
+                    Button::new(SharedString::from(format!(
+                        "management-model-group-add-alias-{}-{}",
+                        provider_id.as_str(),
+                        model_id
+                    )))
+                    .xsmall()
+                    .when(selected, |button| button.primary())
+                    .when(!selected, |button| button.outline())
+                    .label(format!(
+                        "{} · {} → {}",
+                        profile.display_name, model_id, alias.upstream
+                    ))
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_route_group_model_member(
+                            provider_id.clone(),
+                            model_id.clone(),
+                            cx,
+                        )
+                    })),
+                );
+                if !selected {
+                    shown += 1;
+                }
+            }
+        }
+        if shown == 0 && query.is_empty() {
+            palette = palette.child(div().text_xs().text_color(cx.theme().warning).child(
+                management_locale_text(
+                    "No enabled Provider models are available. Add a model to a Provider first.",
+                    "没有可用的已启用供应模型。请先在供应商中添加模型。",
+                    "沒有可用的已啟用供應模型。請先在供應商中新增模型。",
+                ),
+            ));
+        } else if shown >= 48 {
+            palette = palette.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Showing the first matches; type to narrow the list.",
+                        "仅显示前几项；输入可缩小范围。",
+                        "僅顯示前幾項；輸入可縮小範圍。",
+                    )),
+            );
+        }
+        rows = rows.child(palette);
+        rows.into_any_element()
+    }
+
+    /// The model-group simulator: inputs and the decision they produce.
+    ///
+    /// Split out of the editor so the GPUI element frame stays small; the
+    /// editor is already the largest form in this file.
+    fn render_model_group_simulator(
+        &mut self,
+        members: &[vibex_core::ModelRouteMember],
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let members = members.to_vec();
+        let mut rows = v_flex().w_full().gap_1();
+        // Simulator. It answers "what would the router choose" from the draft,
+        // the request context, and recent observations. It never calls an
+        // upstream, so a bad answer costs nothing and cannot leave a trace.
+        use chrono::{Datelike as _, Timelike as _};
+        let mut sim_route = self
+            .route_group_editing_id
+            .as_ref()
+            .and_then(|id| self.model_routes.iter().find(|route| &route.id == id))
+            .cloned()
+            .unwrap_or_default();
+        sim_route.kind = vibex_core::RouteKind::ModelGroup;
+        sim_route.agent_model_id = Some(
+            self.route_group_agent_model_id
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+        );
+        sim_route.members = members.clone();
+        sim_route.strategy = self.route_group_strategy;
+        let sim_agent = self
+            .route_group_sim_agent
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let sim_context =
+            parse_optional_u64(self.route_group_sim_context.read(cx).value().as_str())
+                .ok()
+                .flatten();
+        let local = chrono::Local::now();
+        let sim_context_data = vibex_core::RouteRuleContext {
+            agent_id: (!sim_agent.is_empty()).then_some(sim_agent),
+            context_tokens: sim_context,
+            has_images: self.route_group_sim_images,
+            requested_effort: (!self.route_group_sim_effort.is_empty())
+                .then(|| self.route_group_sim_effort.clone()),
+            workspace_root: None,
+            local_weekday: Some(local.weekday().number_from_monday() as u8),
+            local_minute: Some((local.hour() * 60 + local.minute()) as u16),
+            ..Default::default()
+        };
+        let observations = members
+            .iter()
+            .map(|member| {
+                let latencies = self
+                    .gateway_requests
+                    .iter()
+                    .filter(|request| {
+                        request.model_provider_profile_id == member.model_provider_profile_id
+                            && request
+                                .model_served
+                                .as_deref()
+                                .is_none_or(|served| served == member.model_id)
+                    })
+                    .filter_map(|request| request.latency_ms)
+                    .collect::<Vec<_>>();
+                let used_tokens = self
+                    .gateway_requests
+                    .iter()
+                    .filter(|request| {
+                        request.model_provider_profile_id == member.model_provider_profile_id
+                    })
+                    .map(|request| request.total_tokens)
+                    .sum::<u64>();
+                let cooling = self
+                    .gateway
+                    .upstreams
+                    .iter()
+                    .find(|upstream| {
+                        upstream.model_provider_profile_id == member.model_provider_profile_id
+                    })
+                    .is_some_and(|upstream| {
+                        !upstream.keys.is_empty()
+                            && !upstream.keys.iter().any(|key| key.state.is_ready())
+                    });
+                vibex_core::RouteMemberObservation {
+                    member_id: Some(member.id.clone()),
+                    used_tokens,
+                    p50_ms: management_percentile(latencies.clone(), 0.5)
+                        .and_then(|value| u64::try_from(value).ok()),
+                    p95_ms: management_percentile(latencies, 0.95)
+                        .and_then(|value| u64::try_from(value).ok()),
+                    cooling,
+                    inflight: self
+                        .gateway_inflight
+                        .iter()
+                        .filter(|request| {
+                            request.model_provider_profile_id == member.model_provider_profile_id
+                        })
+                        .count() as u32,
+                }
+            })
+            .collect::<Vec<_>>();
+        let simulation = vibex_core::simulate_model_route(
+            &sim_route,
+            &sim_context_data,
+            0,
+            &observations,
+            self.route_group_sim_failure.as_ref(),
+        );
+        rows = rows.child(
+            div()
+                .w_full()
+                .pt_2()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .text_xs()
+                .font_semibold()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text("Simulator", "模拟器", "模擬器")),
+        );
+        rows = rows.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text(
+                    "Reads the decision only; it sends no request. Latency is the observed p50, not a promise.",
+                    "只读取决策，不发送请求。延迟为观测到的 p50，不是承诺。",
+                    "只讀取決策，不發送請求。延遲為觀測到的 p50，不是承諾。",
+                )),
+        );
+        rows = rows.child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_start()
+                .flex_wrap()
+                .gap_2()
+                .child(
+                    div()
+                        .min_w(px(140.0))
+                        .flex_1()
+                        .child(management_input_field(
+                            management_locale_text("Simulated Agent", "模拟 Agent", "模擬 Agent"),
+                            &self.route_group_sim_agent,
+                            false,
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .min_w(px(140.0))
+                        .flex_1()
+                        .child(management_input_field(
+                            management_locale_text(
+                                "Simulated context tokens",
+                                "模拟上下文 Token",
+                                "模擬上下文 Token",
+                            ),
+                            &self.route_group_sim_context,
+                            false,
+                            cx,
+                        )),
+                )
+                .child(
+                    v_flex()
+                        .items_center()
+                        .gap_0p5()
+                        .child(div().text_xs().child("Images"))
+                        .child(
+                            Switch::new("management-model-group-sim-images")
+                                .small()
+                                .checked(self.route_group_sim_images)
+                                .disabled(pending)
+                                .on_click(cx.listener(|this, checked, _, cx| {
+                                    this.route_group_sim_images = *checked;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child({
+                    let center = cx.weak_entity();
+                    let current = self.route_group_sim_effort.clone();
+                    Button::new("management-model-group-sim-effort")
+                        .xsmall()
+                        .ghost()
+                        .label(route_group_effort_label(&current))
+                        .dropdown_menu(move |menu, _, _| {
+                            let mut menu = menu;
+                            for (value, label) in [
+                                (
+                                    "",
+                                    management_locale_text(
+                                        "Any effort",
+                                        "任意推理档位",
+                                        "任意推理檔位",
+                                    ),
+                                ),
+                                ("low", management_locale_text("Low", "低", "低")),
+                                ("medium", management_locale_text("Medium", "中", "中")),
+                                ("high", management_locale_text("High", "高", "高")),
+                            ] {
+                                let center = center.clone();
+                                let value = value.to_string();
+                                menu = menu.item(PopupMenuItem::new(label).on_click(
+                                    move |_, _, cx| {
+                                        let _ = center.update(cx, |this, cx| {
+                                            this.route_group_sim_effort = value.clone();
+                                            cx.notify();
+                                        });
+                                    },
+                                ));
+                            }
+                            menu
+                        })
+                })
+                .child({
+                    let center = cx.weak_entity();
+                    let failure_members = members.clone();
+                    let current = self
+                        .route_group_sim_failure
+                        .as_ref()
+                        .and_then(|id| {
+                            members
+                                .iter()
+                                .find(|member| &member.id == id)
+                                .map(|member| member.model_id.clone())
+                        })
+                        .unwrap_or_else(|| {
+                            management_locale_text("No failure", "不模拟失败", "不模擬失敗")
+                                .to_string()
+                        });
+                    Button::new("management-model-group-sim-failure")
+                        .xsmall()
+                        .ghost()
+                        .label(current)
+                        .dropdown_menu(move |menu, _, _| {
+                            let mut menu = menu;
+                            let members = failure_members.clone();
+                            let center_clear = center.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(management_locale_text(
+                                    "No failure",
+                                    "不模拟失败",
+                                    "不模擬失敗",
+                                ))
+                                .on_click(move |_, _, cx| {
+                                    let _ = center_clear.update(cx, |this, cx| {
+                                        this.route_group_sim_failure = None;
+                                        cx.notify();
+                                    });
+                                }),
+                            );
+                            for member in &members {
+                                let center = center.clone();
+                                let member_id = member.id.clone();
+                                let label = format!(
+                                    "{} · {}",
+                                    member.model_provider_profile_id.as_str(),
+                                    member.model_id
+                                );
+                                menu = menu.item(PopupMenuItem::new(label).on_click(
+                                    move |_, _, cx| {
+                                        let _ = center.update(cx, |this, cx| {
+                                            this.route_group_sim_failure = Some(member_id.clone());
+                                            cx.notify();
+                                        });
+                                    },
+                                ));
+                            }
+                            menu
+                        })
+                }),
+        );
+        let sim_result = if simulation.paused {
+            Some(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().warning)
+                    .child(management_locale_text(
+                        "A pause rule matches this request: routing would stop before any member.",
+                        "有暂停规则命中此请求：路由会在任何成员之前停止。",
+                        "有暫停規則命中此請求：路由會在任何成員之前停止。",
+                    )),
+            )
+        } else if simulation.order.is_empty() {
+            Some(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().warning)
+                    .child(management_locale_text(
+                        "No enabled member would be tried.",
+                        "没有启用的成员可供尝试。",
+                        "沒有啟用的成員可供嘗試。",
+                    )),
+            )
+        } else {
+            let mut result = v_flex().w_full().gap_1();
+            if let Some(index) = simulation.matched_rule_index {
+                result = result.child(div().text_xs().text_color(cx.theme().primary).child(
+                    format!(
+                        "{} #{} {}",
+                        management_locale_text("Rule matched:", "命中规则：", "命中規則："),
+                        index + 1,
+                        simulation.matched_rule_id.clone().unwrap_or_default()
+                    ),
+                ));
+            }
+            for (index, member) in simulation.order.iter().enumerate() {
+                let p50 = observations
+                    .iter()
+                    .find(|observation| observation.member_id.as_ref() == Some(&member.id))
+                    .and_then(|observation| observation.p50_ms);
+                let cooling = simulation.cooling_members.contains(&member.id);
+                result = result.child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .flex_wrap()
+                        .gap_2()
+                        .text_xs()
+                        .child(div().w(px(18.0)).child(format!("{}", index + 1)))
+                        .child(div().min_w_0().flex_1().truncate().child(format!(
+                            "{} · {}",
+                            member.model_provider_profile_id.as_str(),
+                            member.model_id
+                        )))
+                        .when(cooling, |row| {
+                            row.child(
+                                div()
+                                    .text_color(cx.theme().warning)
+                                    .child(management_locale_text("cooling", "冷却中", "冷卻中")),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(match p50 {
+                                    Some(value) => format!("p50 {value} ms"),
+                                    None => {
+                                        management_locale_text("no history", "无历史", "無歷史")
+                                            .to_string()
+                                    }
+                                }),
+                        ),
+                );
+            }
+            if simulation.failed_member_skipped {
+                result = result.child(div().text_xs().text_color(cx.theme().warning).child(
+                    management_locale_text(
+                        "The failed member was skipped; the order above is the fallback.",
+                        "已跳过模拟失败的成员；上方的顺序即回退顺序。",
+                        "已跳過模擬失敗的成員；上方的順序即回退順序。",
+                    ),
+                ));
+            }
+            Some(
+                result.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(match simulation.estimated_latency_ms {
+                            Some(value) => format!(
+                                "{} {value} ms",
+                                management_locale_text(
+                                    "Estimated first candidate:",
+                                    "预计首选成员：",
+                                    "預計首選成員："
+                                )
+                            ),
+                            None => management_locale_text(
+                                "No latency history for the first candidate.",
+                                "首选成员没有延迟历史。",
+                                "首選成員沒有延遲歷史。",
+                            )
+                            .to_string(),
+                        }),
+                ),
+            )
+        };
+        rows = rows.child(v_flex().w_full().gap_1().children(sim_result));
+        rows.into_any_element()
+    }
+
+    /// The model-level route builder: a pipeline of `(Provider, model)` pairs,
+    /// a palette to add more, and an inspector for the policy around them.
+    fn render_model_group_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let editing = self.route_group_editing_id.is_some();
+        let mut rows = v_flex().w_full().min_w_0().gap_3();
+        rows = rows.child(management_input_field_with_error(
+            management_locale_text("Group name", "路由组名称", "路由組名稱"),
+            &self.route_group_name,
+            false,
+            self.route_group_name_error.as_deref(),
+            cx,
+        ));
+        rows = rows.child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "A model group exposes one model name and may fall back across different upstream models.",
+                            "模型组对外暴露一个模型名，可在不同的上游模型之间回退。",
+                            "模型組對外暴露一個模型名，可在不同的上游模型之間回退。",
+                        )),
+                )
+                .child(
+                    Button::new("management-model-group-to-providers")
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text(
+                            "Use whole Providers instead",
+                            "改用整个供应商",
+                            "改用整個供應商",
+                        ))
+                        .disabled(pending)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.route_group_kind = vibex_core::RouteKind::ProviderGroup;
+                            cx.notify();
+                        })),
+                ),
+        );
+        rows = rows.child(management_input_field(
+            management_locale_text(
+                "Model Agents ask for",
+                "Agent 请求的模型名",
+                "Agent 請求的模型名",
+            ),
+            &self.route_group_agent_model_id,
+            false,
+            cx,
+        ));
+        rows = rows.child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text("Pipeline", "路由管线", "路由管線")),
+        );
+        let members = self.route_group_model_members.clone();
+        let mut pipeline = v_flex().w_full().min_w_0().gap_1();
+        for (index, member) in members.iter().enumerate() {
+            let provider_name = self
+                .providers
+                .iter()
+                .find(|profile| profile.id == member.model_provider_profile_id)
+                .map(|profile| profile.display_name.clone())
+                .unwrap_or_else(|| member.model_provider_profile_id.as_str().to_string());
+            let up = index > 0;
+            let down = index + 1 < members.len();
+            let effort = member.reasoning_effort.clone().unwrap_or_default();
+            let toggle_index = index;
+            let weight = member.weight;
+            pipeline = pipeline.child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .flex_wrap()
+                    .gap_1()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(if member.enabled {
+                        cx.theme().border.opacity(0.7)
+                    } else {
+                        cx.theme().border.opacity(0.35)
+                    })
+                    .px_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(18.0))
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{}", index + 1)),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .when(!member.enabled, |text| {
+                                        text.text_color(cx.theme().muted_foreground)
+                                    })
+                                    .child(format!("{provider_name} · {}", member.model_id)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(route_group_effort_label(&effort)),
+                            ),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-model-group-weight-{index}"
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .tooltip(management_locale_text(
+                            "Click to cycle the weight",
+                            "点击切换权重",
+                            "點擊切換權重",
+                        ))
+                        .label(format!("\u{00d7}{weight}"))
+                        .disabled(pending)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.cycle_route_group_model_weight(index, cx)
+                        })),
+                    )
+                    .child({
+                        let center = cx.weak_entity();
+                        let current = effort.clone();
+                        Button::new(SharedString::from(format!(
+                            "management-model-group-effort-{index}"
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .label(route_group_effort_label(&current))
+                        .dropdown_menu(move |menu, _, _| {
+                            let mut menu = menu;
+                            for (value, label) in [
+                                (
+                                    "",
+                                    management_locale_text(
+                                        "Inherit effort",
+                                        "继承推理档位",
+                                        "繼承推理檔位",
+                                    ),
+                                ),
+                                ("low", management_locale_text("Low", "低", "低")),
+                                ("medium", management_locale_text("Medium", "中", "中")),
+                                ("high", management_locale_text("High", "高", "高")),
+                                (
+                                    "xhigh",
+                                    management_locale_text("Extra high", "极高", "極高"),
+                                ),
+                                ("max", management_locale_text("Max", "最高", "最高")),
+                            ] {
+                                let center = center.clone();
+                                let value = value.to_string();
+                                menu = menu.item(PopupMenuItem::new(label).on_click(
+                                    move |_, _, cx| {
+                                        let _ = center.update(cx, |this, cx| {
+                                            this.set_route_group_model_effort(
+                                                index,
+                                                value.clone(),
+                                                cx,
+                                            );
+                                        });
+                                    },
+                                ));
+                            }
+                            menu
+                        })
+                    })
+                    .child(
+                        Switch::new(SharedString::from(format!(
+                            "management-model-group-enabled-{index}"
+                        )))
+                        .small()
+                        .checked(member.enabled)
+                        .disabled(pending)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_route_group_model_enabled(toggle_index, cx)
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-model-group-up-{index}"
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .icon(IconName::ArrowUp)
+                        .disabled(pending || !up)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.move_route_group_model_member(index, true, cx)
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-model-group-down-{index}"
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .icon(IconName::ArrowDown)
+                        .disabled(pending || !down)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.move_route_group_model_member(index, false, cx)
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-model-group-remove-{index}"
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                        .accessibility_label(management_locale_text(
+                            "Remove member",
+                            "移除成员",
+                            "移除成員",
+                        ))
+                        .disabled(pending)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.remove_route_group_model_member(index, cx)
+                        })),
+                    ),
+            );
+        }
+        if members.is_empty() {
+            pipeline = pipeline.child(div().text_xs().text_color(cx.theme().warning).child(
+                management_locale_text(
+                    "Add at least one model from the palette below.",
+                    "请从下方模型列表添加至少一个模型。",
+                    "請從下方模型列表新增至少一個模型。",
+                ),
+            ));
+        }
+        rows = rows.child(pipeline);
+        rows = rows.child(self.render_model_group_palette(pending, cx));
+        rows = rows.child(
+            div()
+                .w_full()
+                .pt_2()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .text_xs()
+                .font_semibold()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text("Policy", "路由策略", "路由策略")),
+        );
+        let current = self.route_group_strategy;
+        let mut policies = h_flex().w_full().flex_wrap().items_center().gap_1();
+        for strategy in vibex_core::RouteStrategy::ALL {
+            policies = policies.child(
+                Button::new(SharedString::from(format!(
+                    "management-model-group-strategy-{}",
+                    strategy.id()
+                )))
+                .xsmall()
+                .ghost()
+                .label(management_route_strategy_label(strategy))
+                .selected(strategy == current)
+                .disabled(pending)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.route_group_strategy = strategy;
+                    cx.notify();
+                })),
+            );
+        }
+        rows = rows.child(
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(policies)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_route_strategy_guidance(current)),
+                )
+                .when(current == vibex_core::RouteStrategy::Manual, |column| {
+                    column.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Manual uses the first enabled member in the pipeline.",
+                                "手动策略使用管线中第一个启用的成员。",
+                                "手動策略使用管線中第一個啟用的成員。",
+                            )),
+                    )
+                }),
+        );
+        rows = rows.child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text(
+                                    "Keep a conversation on one key",
+                                    "同一对话固定在同一 Key",
+                                    "同一對話固定在同一 Key",
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text(
+                                    "Vendors cache a prompt per account, so moving a conversation loses that cache.",
+                                    "厂商按账号缓存提示词，换 Key 会丢掉该缓存。",
+                                    "廠商按帳號快取提示詞，換 Key 會丟掉該快取。",
+                                )),
+                        ),
+                )
+                .child(
+                    Switch::new("management-model-group-pin")
+                        .small()
+                        .checked(self.route_group_pin)
+                        .disabled(pending)
+                        .on_click(cx.listener(|this, checked, _, cx| {
+                            this.route_group_pin = *checked;
+                            cx.notify();
+                        })),
+                ),
+        );
+        if members.len() >= 2 {
+            rows = rows.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Switch automatically when the current member fails",
+                                "当前成员请求异常时自动切换",
+                                "目前成員請求異常時自動切換",
+                            )),
+                    )
+                    .child(
+                        Switch::new("management-model-group-auto-failover")
+                            .small()
+                            .checked(self.route_group_auto_failover)
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                this.route_group_auto_failover = *checked;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        rows = rows.child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_start()
+                .flex_wrap()
+                .gap_2()
+                .child(
+                    div()
+                        .min_w(px(140.0))
+                        .flex_1()
+                        .child(management_input_field(
+                            management_locale_text(
+                                "First token timeout (s)",
+                                "首 token 超时（秒）",
+                                "首 Token 逾時（秒）",
+                            ),
+                            &self.route_group_first_token_timeout,
+                            false,
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .min_w(px(140.0))
+                        .flex_1()
+                        .child(management_input_field(
+                            management_locale_text(
+                                "Context tokens",
+                                "上下文 Token",
+                                "上下文 Token",
+                            ),
+                            &self.route_group_context_tokens,
+                            false,
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .min_w(px(140.0))
+                        .flex_1()
+                        .child(management_input_field(
+                            management_locale_text(
+                                "Token ceiling (local)",
+                                "Token 上限（本地）",
+                                "Token 上限（本機）",
+                            ),
+                            &self.route_group_token_limit,
+                            false,
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .min_w(px(140.0))
+                        .flex_1()
+                        .child(management_input_field(
+                            management_locale_text(
+                                "Patience (s)",
+                                "耐心等待（秒）",
+                                "耐心等待（秒）",
+                            ),
+                            &self.route_group_patience,
+                            false,
+                            cx,
+                        )),
+                ),
+        );
+        rows = rows.child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "Unlists keeps this model out of pickers while its id stays callable. Sink is a hidden composition with the same behaviour.",
+                            "隐藏（Unlists）会让该模型不出现在选择器中，但仍可按 ID 调用；Sink 是同样行为的隐藏组合。",
+                            "隱藏（Unlists）會讓該模型不出現在選擇器中，但仍可按 ID 呼叫；Sink 是同樣行為的隱藏組合。",
+                        )),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            v_flex()
+                                .items_center()
+                                .gap_0p5()
+                                .child(div().text_xs().child("Unlists"))
+                                .child(
+                                    Switch::new("management-model-group-unlists")
+                                        .small()
+                                        .checked(self.route_group_unlists)
+                                        .disabled(pending)
+                                        .on_click(cx.listener(|this, checked, _, cx| {
+                                            this.route_group_unlists = *checked;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .items_center()
+                                .gap_0p5()
+                                .child(div().text_xs().child("Sink"))
+                                .child(
+                                    Switch::new("management-model-group-sink")
+                                        .small()
+                                        .checked(self.route_group_sink)
+                                        .disabled(pending)
+                                        .on_click(cx.listener(|this, checked, _, cx| {
+                                            this.route_group_sink = *checked;
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                ),
+        );
+        rows = rows.child(self.render_model_group_simulator(&members, pending, cx));
+        let effective_id = self
+            .route_group_agent_model_id
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let enabled_count = members.iter().filter(|member| member.enabled).count();
+        if !effective_id.is_empty() {
+            rows = rows.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "group/<route>/{effective_id} \u{00b7} {enabled_count}/{}",
+                        members.len()
+                    )),
+            );
+        }
+        rows = rows.child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_end()
+                .gap_2()
+                .child(
+                    Button::new("management-model-group-cancel")
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text("Cancel", "取消", "取消"))
+                        .disabled(pending)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.close_route_group_editor(cx);
+                            if window.has_active_dialog(cx) {
+                                window.close_dialog(cx);
+                            }
+                        })),
+                )
+                .child(
+                    Button::new("management-model-group-save")
+                        .xsmall()
+                        .primary()
+                        .label(if editing {
+                            management_locale_text("Save group", "保存路由组", "儲存路由組")
+                        } else {
+                            management_locale_text("Create group", "创建路由组", "建立路由組")
+                        })
+                        .disabled(pending || enabled_count == 0)
+                        .on_click(cx.listener(|this, _, _, cx| this.save_route_group(cx))),
+                ),
+        );
+        let _ = window;
+        div()
+            .id("management-model-group-editor-scroll")
+            .w_full()
+            .max_h(px(520.0))
+            .overflow_y_scroll()
+            .child(rows)
+            .into_any_element()
+    }
+
     /// The route-group draft: a name, its Providers in order, and its policy.
     fn render_route_group_editor(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if self.route_group_kind == vibex_core::RouteKind::ModelGroup {
+            return self.render_model_group_editor(window, cx);
+        }
         let pending = self.mutation.is_some();
         let editing = self.route_group_editing_id.is_some();
         let mut rows = v_flex().w_full().min_w_0().gap_2();
@@ -29520,10 +31852,15 @@ impl ManagementCenter {
         let dialog_content = cx.new(|cx| ManagementRouteGroupDialog::new(center.clone(), cx));
         let dialog_width = (f32::from(window.viewport_size().width) - 32.0).clamp(360.0, 720.0);
         let dialog_height = (f32::from(window.viewport_size().height) - 32.0).clamp(320.0, 640.0);
-        let title = if self.route_group_editing_id.is_some() {
-            management_locale_text("Edit route group", "编辑路由组", "編輯路由組")
-        } else {
-            management_locale_text("New route group", "新建路由组", "新增路由組")
+        let title = match (self.route_group_editing_id.is_some(), self.route_group_kind) {
+            (true, vibex_core::RouteKind::ModelGroup) => {
+                management_locale_text("Edit model group", "编辑模型组", "編輯模型組")
+            }
+            (true, _) => management_locale_text("Edit route group", "编辑路由组", "編輯路由組"),
+            (false, vibex_core::RouteKind::ModelGroup) => {
+                management_locale_text("New model group", "新建模型组", "新增模型組")
+            }
+            (false, _) => management_locale_text("New route group", "新建路由组", "新增路由組"),
         };
         window.open_dialog(cx, move |dialog, _, _| {
             let dialog_center = dialog_center.clone();
@@ -34914,6 +37251,24 @@ fn replace_provider_models_keeping_capabilities(
         .collect();
 }
 
+/// Adds newly discovered models without touching rows the user already has.
+///
+/// This is the AutoInclude contract: discovery may add a model, never
+/// overwrite a capability, display name, or enabled flag the user set. A model
+/// that disappears from the vendor list is left alone for the same reason.
+fn merge_discovered_provider_models(
+    existing: &[vibex_core::ModelProviderCatalogEntry],
+    discovered: Vec<vibex_core::ModelProviderCatalogEntry>,
+) -> Vec<vibex_core::ModelProviderCatalogEntry> {
+    let mut merged = existing.to_vec();
+    for model in discovered {
+        if !merged.iter().any(|entry| entry.id == model.id) {
+            merged.push(model);
+        }
+    }
+    merged
+}
+
 fn merge_provider_models(
     current: &mut Vec<vibex_core::ProviderConfiguredModel>,
     incoming: Vec<vibex_core::ProviderConfiguredModel>,
@@ -35614,6 +37969,32 @@ impl ProviderSort {
             Self::RecentlyUpdated => management_locale_text("Updated", "最近更新", "最近更新"),
             Self::MostAgents => management_locale_text("Agents", "Agent 数", "Agent 數"),
             Self::Health => management_locale_text("Health", "健康", "健康"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelGroupTemplate {
+    Stable,
+    Lightweight,
+    LowLatency,
+    SameModel,
+}
+
+impl ModelGroupTemplate {
+    const ALL: [Self; 4] = [
+        Self::Stable,
+        Self::Lightweight,
+        Self::LowLatency,
+        Self::SameModel,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stable => management_locale_text("Stable first", "稳定优先", "穩定優先"),
+            Self::Lightweight => management_locale_text("Lightweight", "轻量优先", "輕量優先"),
+            Self::LowLatency => management_locale_text("Low latency", "低延迟", "低延遲"),
+            Self::SameModel => management_locale_text("Same model", "同类聚合", "同類聚合"),
         }
     }
 }
@@ -39251,8 +41632,74 @@ fn management_route_strategy_label(strategy: vibex_core::RouteStrategy) -> Strin
         (vibex_core::RouteStrategy::LeastUsed, ResolvedLocale::En) => "Least used",
         (vibex_core::RouteStrategy::LeastUsed, ResolvedLocale::ZhCn) => "用得最少",
         (vibex_core::RouteStrategy::LeastUsed, ResolvedLocale::ZhTw) => "用得最少",
+        (vibex_core::RouteStrategy::Smart, ResolvedLocale::En) => "Smart",
+        (vibex_core::RouteStrategy::Smart, ResolvedLocale::ZhCn) => "智能",
+        (vibex_core::RouteStrategy::Smart, ResolvedLocale::ZhTw) => "智慧",
+        (vibex_core::RouteStrategy::LowestLatency, ResolvedLocale::En) => "Lowest latency",
+        (vibex_core::RouteStrategy::LowestLatency, ResolvedLocale::ZhCn) => "延迟最低",
+        (vibex_core::RouteStrategy::LowestLatency, ResolvedLocale::ZhTw) => "延遲最低",
+        (vibex_core::RouteStrategy::Weighted, ResolvedLocale::En) => "By weight",
+        (vibex_core::RouteStrategy::Weighted, ResolvedLocale::ZhCn) => "按权重",
+        (vibex_core::RouteStrategy::Weighted, ResolvedLocale::ZhTw) => "按權重",
+        (vibex_core::RouteStrategy::Manual, ResolvedLocale::En) => "Manual",
+        (vibex_core::RouteStrategy::Manual, ResolvedLocale::ZhCn) => "手动",
+        (vibex_core::RouteStrategy::Manual, ResolvedLocale::ZhTw) => "手動",
     };
     label.to_string()
+}
+
+/// One sentence explaining when a strategy is the right choice.
+fn management_route_strategy_guidance(strategy: vibex_core::RouteStrategy) -> String {
+    match (strategy, locale::current_locale()) {
+        (vibex_core::RouteStrategy::Ordered, ResolvedLocale::En) => {
+            "Try members in the order you arranged them."
+        }
+        (vibex_core::RouteStrategy::Ordered, ResolvedLocale::ZhCn) => "按你排列的顺序尝试成员。",
+        (vibex_core::RouteStrategy::Ordered, ResolvedLocale::ZhTw) => "按你排列的順序嘗試成員。",
+        (vibex_core::RouteStrategy::RoundRobin, ResolvedLocale::En) => {
+            "Spread requests across members turn by turn."
+        }
+        (vibex_core::RouteStrategy::RoundRobin, ResolvedLocale::ZhCn) => "逐次把请求分散到各成员。",
+        (vibex_core::RouteStrategy::RoundRobin, ResolvedLocale::ZhTw) => "逐次把請求分散到各成員。",
+        (vibex_core::RouteStrategy::LeastUsed, ResolvedLocale::En) => {
+            "Prefer the member that has carried the fewest tokens."
+        }
+        (vibex_core::RouteStrategy::LeastUsed, ResolvedLocale::ZhCn) => {
+            "优先选择已承载 Token 最少的成员。"
+        }
+        (vibex_core::RouteStrategy::LeastUsed, ResolvedLocale::ZhTw) => {
+            "優先選擇已承載 Token 最少的成員。"
+        }
+        (vibex_core::RouteStrategy::Smart, ResolvedLocale::En) => {
+            "Prefer healthy members, then the recently fastest, then the least busy."
+        }
+        (vibex_core::RouteStrategy::Smart, ResolvedLocale::ZhCn) => {
+            "优先健康成员，其次最近最快，最后最空闲。"
+        }
+        (vibex_core::RouteStrategy::Smart, ResolvedLocale::ZhTw) => {
+            "優先健康成員，其次最近最快，最後最空閒。"
+        }
+        (vibex_core::RouteStrategy::LowestLatency, ResolvedLocale::En) => {
+            "Prefer the member with the lowest observed latency."
+        }
+        (vibex_core::RouteStrategy::LowestLatency, ResolvedLocale::ZhCn) => {
+            "优先选择观测延迟最低的成员。"
+        }
+        (vibex_core::RouteStrategy::LowestLatency, ResolvedLocale::ZhTw) => {
+            "優先選擇觀測延遲最低的成員。"
+        }
+        (vibex_core::RouteStrategy::Weighted, ResolvedLocale::En) => {
+            "Share requests by each member's weight."
+        }
+        (vibex_core::RouteStrategy::Weighted, ResolvedLocale::ZhCn) => "按成员权重分配请求。",
+        (vibex_core::RouteStrategy::Weighted, ResolvedLocale::ZhTw) => "按成員權重分配請求。",
+        (vibex_core::RouteStrategy::Manual, ResolvedLocale::En) => {
+            "Always use the one member you pick."
+        }
+        (vibex_core::RouteStrategy::Manual, ResolvedLocale::ZhCn) => "始终使用你选中的那一个成员。",
+        (vibex_core::RouteStrategy::Manual, ResolvedLocale::ZhTw) => "始終使用你選中的那一個成員。",
+    }
+    .to_string()
 }
 
 fn management_profile_count(count: usize) -> String {
@@ -44992,6 +47439,96 @@ mod gateway_surface_tests {
         assert!(source.contains("management-route-group-token-window-"));
     }
 
+    /// A new route group is a model group by default, and the model-level
+    /// editor is the one that can actually author one.
+    ///
+    /// The legacy provider-group editor remains for existing records, but a
+    /// new group must be able to name an Agent-facing model and choose
+    /// `(Provider, upstream model)` pairs; otherwise the model-group contract
+    /// would exist only in the gateway.
+    #[test]
+    fn the_route_group_editor_can_author_a_model_group() {
+        let source = include_str!("management.rs");
+        let open = source
+            .split_once("fn open_route_group_editor(")
+            .and_then(|(_, tail)| tail.split_once("fn edit_route_group("))
+            .map(|(body, _)| body)
+            .expect("the route-group opener should remain inspectable");
+        assert!(
+            open.contains("RouteKind::ModelGroup"),
+            "a newly opened group must default to a model group"
+        );
+        let editor = source
+            .split_once("fn render_model_group_editor(")
+            .and_then(|(_, tail)| tail.split_once("fn render_route_group_editor("))
+            .map(|(body, _)| body)
+            .expect("the model-group editor should remain inspectable");
+        for marker in [
+            "route_group_agent_model_id",
+            "route_group_model_members",
+            "RouteStrategy::ALL",
+            "route_group_patience",
+            "management-model-group-unlists",
+            "management-model-group-sink",
+            "management-model-group-weight-",
+        ] {
+            assert!(
+                editor.contains(marker),
+                "the model-group editor must keep {marker}"
+            );
+        }
+        let palette = source
+            .split_once("fn render_model_group_palette(")
+            .and_then(|(_, tail)| tail.split_once("fn render_model_group_simulator("))
+            .map(|(body, _)| body)
+            .expect("the model-group palette should remain inspectable");
+        for marker in [
+            "route_group_model_query",
+            "apply_model_group_template",
+            "management-model-group-suggest-",
+            "add_suggested_model_group",
+            "model_aliases",
+            "toggle_route_group_model_member",
+        ] {
+            assert!(
+                palette.contains(marker),
+                "the model-group palette must keep {marker}"
+            );
+        }
+        let simulator = source
+            .split_once("fn render_model_group_simulator(")
+            .and_then(|(_, tail)| tail.split_once("fn render_model_group_editor("))
+            .map(|(body, _)| body)
+            .expect("the model-group simulator should remain inspectable");
+        for marker in [
+            "simulate_model_route",
+            "management-model-group-sim-failure",
+            "management-model-group-sim-images",
+        ] {
+            assert!(
+                simulator.contains(marker),
+                "the model-group simulator must keep {marker}"
+            );
+        }
+        let save = source
+            .split_once("fn save_route_group(")
+            .and_then(|(_, tail)| tail.split_once("fn delete_route_group("))
+            .map(|(body, _)| body)
+            .expect("the route-group save should remain inspectable");
+        assert!(save.contains("route.kind = self.route_group_kind"));
+        assert!(save.contains("route.agent_model_id = Some("));
+        assert!(save.contains("route.patience_ms = patience_seconds"));
+        assert!(save.contains("route.unlists = self.route_group_unlists"));
+        assert!(save.contains("route.sink = self.route_group_sink"));
+        assert!(
+            !save.contains("route.kind = vibex_core::RouteKind::ProviderGroup;"),
+            "the save path must not overwrite every draft as a provider group"
+        );
+        assert!(source.contains("fn clone_route_group("));
+        assert!(source.contains("management-route-group-page-clone"));
+        assert!(source.contains("route.kind.via_gateway()"));
+    }
+
     #[test]
     fn the_shared_provider_editor_writes_the_shared_record() {
         let source = include_str!("management.rs");
@@ -45220,18 +47757,62 @@ mod gateway_surface_tests {
         }
     }
 
+    /// The dashboard reports the observed metrics and stays free of money.
     #[test]
-    fn the_gateway_page_has_a_static_topology() {
+    fn the_gateway_dashboard_reports_observed_metrics() {
         let source = include_str!("management.rs");
+        let dashboard = source
+            .split_once("fn render_gateway_dashboard(")
+            .and_then(|(_, tail)| tail.split_once("fn render_gateway_topology("))
+            .map(|(body, _)| body)
+            .expect("the gateway dashboard should remain inspectable");
         for marker in [
-            "fn render_gateway_topology(",
-            "Static edges; current inflight is counted at the gateway.",
-            "self.gateway_inflight.len()",
-            "icons/vibex/network.svg",
+            "success_rate",
+            "management_percentile(latencies.clone(), 0.5)",
+            "management_percentile(latencies, 0.95)",
+            "Tokens in",
+            "Tokens out",
+            "Cache read",
+            "Failovers",
+            "Inflight",
+            "Top Provider",
+            "Top error",
+            "uptime",
+            "traffic_range",
         ] {
             assert!(
-                source.contains(marker),
-                "the topology card must keep {marker}"
+                dashboard.contains(marker),
+                "the gateway dashboard must keep {marker}"
+            );
+        }
+        assert!(
+            !dashboard.contains("cost_usd"),
+            "the gateway dashboard must not invent a money metric"
+        );
+    }
+
+    #[test]
+    fn the_gateway_page_draws_live_routing_from_events() {
+        let source = include_str!("management.rs");
+        let topology = source
+            .split_once("fn render_gateway_topology(")
+            .and_then(|(_, tail)| tail.split_once("fn confirm_clear_gateway_requests("))
+            .map(|(body, _)| body)
+            .expect("the live routing card should remain inspectable");
+        for marker in [
+            "self.gateway_inflight",
+            "take(24)",
+            "first_token_at_ms",
+            "TTFT",
+            "Began",
+            "FirstToken",
+            "Ended",
+            "icons/vibex/boxes.svg",
+            "route.kind.via_gateway()",
+        ] {
+            assert!(
+                topology.contains(marker),
+                "the live routing card must keep {marker}"
             );
         }
     }
@@ -45420,6 +48001,7 @@ mod gateway_surface_tests {
             default_connect_timeout_ms: policy.default_connect_timeout_ms,
             default_request_timeout_ms: policy.default_request_timeout_ms,
             default_stream_idle_timeout_ms: policy.default_stream_idle_timeout_ms,
+            cooldown_overrides_ms: policy.cooldown_overrides_ms.clone(),
             expected_revision: 1,
         };
         assert_eq!(
@@ -46168,7 +48750,11 @@ mod gateway_surface_tests {
         let source = include_str!("management.rs");
         let card = source
             .split_once("    fn render_agent_route_groups(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// The route-group draft:"))
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// Templates, same-model suggestions, and the Provider/model palette.",
+                )
+            })
             .map(|(body, _)| body)
             .expect("the Agent's group section should remain inspectable");
         assert!(
@@ -46248,7 +48834,11 @@ mod gateway_surface_tests {
         let source = include_str!("management.rs");
         let card = source
             .split_once("    fn render_agent_route_groups(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// The route-group draft:"))
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// Templates, same-model suggestions, and the Provider/model palette.",
+                )
+            })
             .map(|(body, _)| body)
             .expect("the Agent's group rows should remain inspectable");
 
@@ -46488,6 +49078,7 @@ mod gateway_surface_tests {
                 skipped_members: Vec::new(),
                 error_code: None,
                 error_message: None,
+                decision: None,
             }),
         );
 
@@ -46520,6 +49111,7 @@ mod gateway_surface_tests {
                 skipped_members: Vec::new(),
                 error_code: None,
                 error_message: None,
+                decision: None,
             }),
         );
         let lines = gateway_route_lines(&over_limit, ResolvedLocale::ZhCn);
@@ -46551,6 +49143,7 @@ mod gateway_surface_tests {
                 skipped_members: Vec::new(),
                 error_code: None,
                 error_message: None,
+                decision: None,
             }),
         );
         let lines = gateway_route_lines(&two_dead, ResolvedLocale::En);
@@ -46634,6 +49227,7 @@ mod gateway_surface_tests {
                 skipped_members: Vec::new(),
                 error_code: Some("model_gateway_translation_failed".to_string()),
                 error_message: None,
+                decision: None,
             }),
         );
         failed.outcome = vibex_core::GatewayRequestOutcome::Failed;
@@ -46652,5 +49246,53 @@ mod gateway_surface_tests {
         let mut legacy = failed;
         legacy.route = None;
         assert_eq!(gateway_request_error_code(&legacy), None);
+    }
+}
+
+#[cfg(test)]
+mod auto_include_tests {
+    use super::*;
+
+    fn entry(id: &str) -> vibex_core::ModelProviderCatalogEntry {
+        vibex_core::ModelProviderCatalogEntry {
+            id: id.to_string(),
+            display_name: None,
+            enabled: true,
+            metadata: Vec::new(),
+            capabilities: Default::default(),
+        }
+    }
+
+    /// AutoInclude adds a discovered model and never rewrites an authored row.
+    #[test]
+    fn auto_include_adds_only_and_keeps_user_rows() {
+        let mut existing = entry("known");
+        existing.enabled = false;
+        existing.capabilities.context_tokens = Some(123_000);
+        let mut rediscovered = entry("known");
+        rediscovered.capabilities.context_tokens = Some(999_000);
+        let merged =
+            merge_discovered_provider_models(&[existing.clone()], vec![rediscovered, entry("new")]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0], existing, "an authored row must not change");
+        assert_eq!(merged[1].id, "new");
+    }
+
+    /// The cooldown override editor is wired to the gateway settings write.
+    #[test]
+    fn cooldown_overrides_are_editable_and_written() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "cooldown_overrides_ms",
+            "cooldowns.insert(kind.to_string(), value)",
+            "Rate cooldown ms",
+            "Upstream cooldown ms",
+            "Proxy cooldown ms",
+        ] {
+            assert!(
+                source.contains(marker),
+                "the gateway settings surface must keep {marker}"
+            );
+        }
     }
 }

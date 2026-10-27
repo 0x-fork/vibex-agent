@@ -413,16 +413,34 @@ impl ProviderConfigService {
                 let Some(parsed) = vibex_core::provider_group_model_ref(&model.id) else {
                     return model;
                 };
-                let Some(route) = routes.iter().find(|route| {
-                    route.is_provider_group() && route.id.as_str() == parsed.group_id
-                }) else {
+                let Some(route) = routes
+                    .iter()
+                    .find(|route| route.id.as_str() == parsed.group_id)
+                else {
                     return model;
                 };
-                let caps = vibex_core::provider_group_models(route, &profiles)
-                    .into_iter()
-                    .find(|entry| entry.model_id == parsed.model_id)
-                    .map(|entry| entry.capabilities)
-                    .unwrap_or_default();
+                let caps = if route.is_model_group() {
+                    // A model group's upstream models may differ, so the
+                    // capabilities of its virtual model are what every
+                    // reachable member promises.
+                    let caps = route
+                        .enabled_members()
+                        .filter_map(|member| {
+                            profiles
+                                .iter()
+                                .find(|profile| profile.id == member.model_provider_profile_id)
+                                .and_then(|profile| member_catalog_entry(profile, &member.model_id))
+                                .map(|entry| entry.capabilities.clone())
+                        })
+                        .collect::<Vec<_>>();
+                    vibex_core::intersect_route_capabilities(caps)
+                } else {
+                    vibex_core::provider_group_models(route, &profiles)
+                        .into_iter()
+                        .find(|entry| entry.model_id == parsed.model_id)
+                        .map(|entry| entry.capabilities)
+                        .unwrap_or_default()
+                };
                 ProviderConfiguredModel {
                     capabilities: vibex_core::ProviderModelCapabilities {
                         context_tokens: route.context_tokens.or(caps.context_tokens),
@@ -502,6 +520,38 @@ impl ProviderConfigService {
             // Publishing it here would invite an Agent to call the gateway for
             // something whose whole point is not to go through it.
             if !route.kind.via_gateway() {
+                continue;
+            }
+            // A hidden composition is still callable by its id, but it must not
+            // appear in the list an Agent's model picker reads.
+            if route.unlists || route.sink {
+                continue;
+            }
+            if route.is_model_group() {
+                let Some(agent_model) = route.agent_model() else {
+                    continue;
+                };
+                let source_count = route
+                    .enabled_members()
+                    .filter(|member| {
+                        profiles.iter().any(|profile| {
+                            profile.id == member.model_provider_profile_id
+                                && (profile.configured_models.is_empty()
+                                    || member_catalog_entry(profile, &member.model_id).is_some())
+                        })
+                    })
+                    .count();
+                if source_count == 0 {
+                    continue;
+                }
+                catalog.push(GatewayCatalogModel {
+                    route_id: Some(route.id.as_str().to_string()),
+                    display_name: route.display_name.clone(),
+                    model: route.group_model_id(agent_model),
+                    kind: route.kind,
+                    source_count,
+                    model_count: 1,
+                });
                 continue;
             }
             let models = vibex_core::provider_group_models(&route, &profiles);
@@ -606,6 +656,35 @@ fn group_catalog_belongs_to(model: &str, route: &vibex_core::ModelRoute) -> bool
         return false;
     };
     parsed.group_id == route.id.as_str()
+}
+
+/// The catalogue entry a model-group member names.
+///
+/// A member may name the entry id directly or the local alias the Provider's
+/// metadata maps to it. The upstream id is what capabilities and the gateway
+/// request use, so the alias is resolved here rather than at call time.
+fn member_catalog_entry<'a>(
+    profile: &'a vibex_core::ModelProviderProfile,
+    model: &str,
+) -> Option<&'a vibex_core::ModelProviderCatalogEntry> {
+    let model = model.trim();
+    profile
+        .configured_models
+        .iter()
+        .find(|entry| entry.enabled && entry.id == model)
+        .or_else(|| {
+            let upstream = profile
+                .metadata
+                .model_aliases
+                .iter()
+                .find(|alias| alias.alias == model)?
+                .upstream
+                .as_str();
+            profile
+                .configured_models
+                .iter()
+                .find(|entry| entry.enabled && entry.id == upstream)
+        })
 }
 
 fn gateway_default_scope() -> vibex_core::ProviderProfileDefaultScope {

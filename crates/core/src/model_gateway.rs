@@ -393,6 +393,13 @@ pub struct GatewayPolicy {
     /// Default silence timeout before a stream is considered stalled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_stream_idle_timeout_ms: Option<u64>,
+    /// Per-failure-kind cooldowns, in milliseconds.
+    ///
+    /// The key is a [`GatewayFailureKind::id`]. Only the kinds that can cool a
+    /// Key are accepted; auth is absent because a rejected credential does not
+    /// heal with time. An empty map keeps the built-in durations.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cooldown_overrides_ms: BTreeMap<String, u64>,
 }
 
 impl Default for GatewayPolicy {
@@ -408,6 +415,7 @@ impl Default for GatewayPolicy {
             default_connect_timeout_ms: None,
             default_request_timeout_ms: None,
             default_stream_idle_timeout_ms: None,
+            cooldown_overrides_ms: BTreeMap::new(),
         }
     }
 }
@@ -440,6 +448,29 @@ impl GatewayPolicy {
                     "model_gateway_timeout_invalid",
                     "a timeout or latency threshold must be at least one millisecond",
                 ));
+            }
+        }
+        for (kind, milliseconds) in &self.cooldown_overrides_ms {
+            let parsed = GatewayFailureKind::from_id(kind).ok_or_else(|| {
+                VibexError::validation(
+                    "model_gateway_cooldown_kind_invalid",
+                    "a cooldown override names an unknown failure kind",
+                )
+                .with_diagnostic("failureKind", kind)
+            })?;
+            if parsed == GatewayFailureKind::Auth {
+                return Err(VibexError::validation(
+                    "model_gateway_cooldown_kind_invalid",
+                    "an authentication failure does not cool down with time",
+                ));
+            }
+            if *milliseconds == 0 || *milliseconds > 24 * 60 * 60 * 1000 {
+                return Err(VibexError::validation(
+                    "model_gateway_cooldown_invalid",
+                    "a cooldown override must be between one millisecond and one day",
+                )
+                .with_diagnostic("failureKind", kind)
+                .with_diagnostic("milliseconds", milliseconds.to_string()));
             }
         }
         Ok(())
@@ -566,6 +597,13 @@ pub struct ModelGatewayRuntimeState {
     pub degraded_routes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,
+    /// When the current listener became ready, for the uptime reading.
+    ///
+    /// It survives later status publishes so a degraded state still reports
+    /// how long the gateway has been up. Absent on a state written before the
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
     pub updated_at_ms: i64,
 }
 
@@ -577,6 +615,7 @@ impl Default for ModelGatewayRuntimeState {
             route_count: None,
             degraded_routes: 0,
             notice: None,
+            started_at_ms: None,
             updated_at_ms: unix_timestamp_ms(),
         }
     }
@@ -590,6 +629,7 @@ impl ModelGatewayRuntimeState {
             route_count: Some(route_count),
             degraded_routes: 0,
             notice: None,
+            started_at_ms: Some(unix_timestamp_ms()),
             updated_at_ms: unix_timestamp_ms(),
         }
     }
@@ -601,6 +641,7 @@ impl ModelGatewayRuntimeState {
             route_count: None,
             degraded_routes: 0,
             notice: Some(notice.into()),
+            started_at_ms: None,
             updated_at_ms: unix_timestamp_ms(),
         }
     }
@@ -906,6 +947,9 @@ pub struct GatewayRouteTrace {
     /// same way every other diagnostic is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Why the member order was chosen, when a rule or classifier decided it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<GatewayRouteDecisionTrace>,
 }
 
 /// One route member that did not answer, and why.
@@ -919,6 +963,61 @@ pub struct GatewaySkippedMember {
     pub failure: GatewayFailureKind,
 }
 
+/// Why the router chose the member order it did.
+///
+/// This is the part of the trace a reader can turn into a sentence: which rule
+/// matched, what the classifier said, which effort was chosen, and how long the
+/// route was willing to wait. It names ids and kinds only, never a prompt.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayRouteDecisionTrace {
+    /// The zero-based rule index that matched, for "rule 2" copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_index: Option<usize>,
+    /// The rule id, which survives reordering better than an index does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    /// A short machine-readable reason: `rule`, `classifier`, or `default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier: Option<String>,
+    /// The classifier request failed; the router fell back to the default order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patience_ms: Option<u64>,
+    /// How many times the whole member walk was retried before it answered.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retries: u32,
+}
+
+const fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+impl GatewayRouteDecisionTrace {
+    /// Whether there is anything to explain beyond the default order.
+    pub fn is_unremarkable(&self) -> bool {
+        self.rule_index.is_none()
+            && self.rule_id.is_none()
+            && self.reason.is_none()
+            && self.classifier.is_none()
+            && self.classifier_error.is_none()
+            && self.intent.is_none()
+            && self.effort.is_none()
+            && self.strategy.is_none()
+            && self.patience_ms.is_none()
+            && self.retries == 0
+    }
+}
+
 impl GatewayRouteTrace {
     /// A fresh trace at the current payload version.
     pub fn new(skipped_cooling: usize, skipped_over_limit: usize) -> Self {
@@ -930,6 +1029,7 @@ impl GatewayRouteTrace {
             skipped_members: Vec::new(),
             error_code: None,
             error_message: None,
+            decision: None,
         }
     }
 
@@ -944,6 +1044,10 @@ impl GatewayRouteTrace {
             && self.skipped_over_limit == 0
             && self.failed_attempts.is_empty()
             && self.skipped_members.is_empty()
+            && self
+                .decision
+                .as_ref()
+                .is_none_or(GatewayRouteDecisionTrace::is_unremarkable)
     }
 
     /// Whether a reader can interpret this payload.
@@ -1338,6 +1442,7 @@ impl GatewayRequestSummary {
                     .collect(),
                 error_code: trace.error_code,
                 error_message: trace.error_message,
+                decision: trace.decision,
             });
         Self {
             model_provider_profile_id: profile
@@ -1482,6 +1587,9 @@ pub struct GatewayRouteSummary {
     /// What the upstream said it refused, when it refused one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Why the router chose this member order, when a rule or classifier did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<GatewayRouteDecisionTrace>,
 }
 
 /// One skipped route member, named for display.
@@ -1542,6 +1650,9 @@ pub struct GatewaySettingsUpdateRequest {
     pub default_request_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_stream_idle_timeout_ms: Option<u64>,
+    /// Per-failure-kind cooldown overrides; the write replaces the whole map.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cooldown_overrides_ms: BTreeMap<String, u64>,
     pub expected_revision: i64,
 }
 
@@ -2179,5 +2290,44 @@ mod gateway_defaults_tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn cooldown_overrides_accept_only_cooling_kinds_and_sane_durations() {
+        let mut policy = GatewayPolicy::default();
+        policy
+            .cooldown_overrides_ms
+            .insert("upstream".to_string(), 2_000);
+        policy.validate().unwrap();
+        policy
+            .cooldown_overrides_ms
+            .insert("auth".to_string(), 2_000);
+        assert_eq!(
+            policy.validate().unwrap_err().code,
+            "model_gateway_cooldown_kind_invalid"
+        );
+        policy.cooldown_overrides_ms.remove("auth");
+        policy
+            .cooldown_overrides_ms
+            .insert("made-up".to_string(), 2_000);
+        assert_eq!(
+            policy.validate().unwrap_err().code,
+            "model_gateway_cooldown_kind_invalid"
+        );
+        policy.cooldown_overrides_ms.remove("made-up");
+        policy.cooldown_overrides_ms.insert("rate".to_string(), 0);
+        assert_eq!(
+            policy.validate().unwrap_err().code,
+            "model_gateway_cooldown_invalid"
+        );
+    }
+
+    #[test]
+    fn a_running_gateway_records_when_it_became_ready() {
+        let running = ModelGatewayRuntimeState::running(3425, 1);
+        assert!(running.started_at_ms.is_some());
+        assert_eq!(running.started_at_ms, Some(running.updated_at_ms));
+        let unavailable = ModelGatewayRuntimeState::unavailable("not running");
+        assert_eq!(unavailable.started_at_ms, None);
     }
 }

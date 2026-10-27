@@ -1657,6 +1657,7 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
         policy.default_connect_timeout_ms = request.default_connect_timeout_ms;
         policy.default_request_timeout_ms = request.default_request_timeout_ms;
         policy.default_stream_idle_timeout_ms = request.default_stream_idle_timeout_ms;
+        policy.cooldown_overrides_ms = request.cooldown_overrides_ms.clone();
         for update in &request.account_updates {
             match update.preferred {
                 Some(true) => {

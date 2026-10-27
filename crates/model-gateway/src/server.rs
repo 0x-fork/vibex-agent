@@ -210,6 +210,17 @@ fn perimeter(headers: &HeaderMap) -> Result<(), GatewayError> {
     Ok(())
 }
 
+/// The wait before one patience retry, capped by the schedule's last step.
+///
+/// The first four waits double, then the schedule repeats its ceiling. A
+/// `None` means the retry budget is spent.
+fn patience_delay(retries: u32) -> Option<std::time::Duration> {
+    const STEPS_MS: [u64; 5] = [2_000, 4_000, 8_000, 16_000, 30_000];
+    let index = retries as usize;
+    let millis = STEPS_MS.get(index).copied().unwrap_or(*STEPS_MS.last()?);
+    Some(std::time::Duration::from_millis(millis))
+}
+
 /// The route group a raw request body names.
 ///
 /// Only reached on a failure path where `prepare` did not produce a call. The
@@ -232,7 +243,7 @@ async fn serve(
         return state.service.error_response(protocol, &error);
     }
     let service = Arc::clone(&state.service);
-    let prepared = match service.prepare(protocol, &headers, &body) {
+    let mut prepared = match service.prepare(protocol, &headers, &body).await {
         Ok(prepared) => prepared,
         Err(error) => {
             // A routing refusal is a failed turn from the caller's point of
@@ -259,7 +270,51 @@ async fn serve(
             return service.error_response(protocol, &error);
         }
     };
-    let (attempt, key) = match service.open_attempt(&prepared).await {
+    // Patience is a route's willingness to wait out a transient failure after
+    // every member refused and before a byte reached the client. The loop
+    // re-prepares, which is what refreshes Key cooldowns and member rotation;
+    // retrying a frozen preparation would keep asking Keys that are still
+    // cooling and prove nothing.
+    let patience_deadline = prepared
+        .patience_ms
+        .filter(|millis| *millis > 0)
+        .map(|millis| std::time::Instant::now() + std::time::Duration::from_millis(millis));
+    let mut retries = 0u32;
+    let mut attempt_result = service.open_attempt(&prepared).await;
+    while let Err(error) = &attempt_result {
+        let Some(deadline) = patience_deadline else {
+            break;
+        };
+        if !error.is_recoverable() {
+            break;
+        }
+        let Some(delay) = patience_delay(retries) else {
+            break;
+        };
+        let now = std::time::Instant::now();
+        if now + delay >= deadline {
+            break;
+        }
+        tokio::time::sleep(delay).await;
+        retries = retries.saturating_add(1);
+        match service.prepare(protocol, &headers, &body).await {
+            Ok(fresh) => {
+                prepared = fresh;
+                attempt_result = service.open_attempt(&prepared).await;
+            }
+            Err(error) => {
+                // The re-read can fail for a recoverable reason too: every Key
+                // is still cooling, for instance. That is exactly what the
+                // next patience step is for, so keep the loop instead of
+                // turning a wait into an immediate refusal.
+                attempt_result = Err(error);
+                continue;
+            }
+        }
+    }
+    prepared.retries = retries;
+    prepared.route_decision.retries = retries;
+    let (attempt, key) = match attempt_result {
         Ok(attempt) => attempt,
         Err(error) => {
             // A request that could not reach any upstream is what degrades a

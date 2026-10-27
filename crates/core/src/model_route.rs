@@ -5,13 +5,17 @@
 //! it, while a route says *how* a request reaches a model — which sources are
 //! tried, in what order, and under which policy.
 //!
-//! Two shapes exist:
+//! Three shapes exist:
 //!
 //! - [`RouteKind::ProviderGroup`] — the route composes whole Providers: every
 //!   model their enabled catalogues share is offered once, and a request for
 //!   that model is routed across the Providers that serve it. This is what
 //!   makes a Provider set look like one Provider to a session. A group is the
 //!   gateway's only input: the gateway owns no Provider list of its own.
+//! - [`RouteKind::ModelGroup`] — the route composes individual models, each a
+//!   `(Provider, upstream model)` pair, behind one Agent-facing model id. The
+//!   members may be different upstream models, which is what makes "try the
+//!   same model at three vendors, then a cheaper fallback" expressible.
 //! - [`RouteKind::Direct`] — the route names exactly one Provider and skips the
 //!   gateway entirely. Its `base_url` is the Provider's, not the loopback one.
 //! - An account (`RuntimeAuthSource::AgentAccount`) is *not* a route. Its
@@ -63,20 +67,28 @@ pub enum RouteKind {
     /// A provider group names no models of its own: its members are Providers,
     /// and the models it offers are the intersection of their enabled
     /// catalogues. One model id may therefore be served by several Providers,
-    /// and the group's strategy picks which one answers. This is the only shape
-    /// the gateway serves, and therefore its only source of upstreams.
+    /// and the group's strategy picks which one answers.
     #[default]
     ProviderGroup,
+    /// Served by the local gateway, composed from individual models.
+    ///
+    /// Each member is a `(Provider, upstream model)` pair and the route exposes
+    /// one Agent-facing model id, [`ModelRoute::agent_model_id`]. Unlike a
+    /// provider group the members may name different upstream models, so a
+    /// route can express "the same model at two vendors, then a cheaper
+    /// fallback" without pretending the catalogues intersect.
+    ModelGroup,
     /// One Provider, called directly. The gateway is not involved.
     Direct,
 }
 
 impl RouteKind {
-    pub const ALL: [Self; 2] = [Self::ProviderGroup, Self::Direct];
+    pub const ALL: [Self; 3] = [Self::ProviderGroup, Self::ModelGroup, Self::Direct];
 
     pub const fn id(self) -> &'static str {
         match self {
             Self::ProviderGroup => "provider_group",
+            Self::ModelGroup => "model_group",
             Self::Direct => "direct",
         }
     }
@@ -89,13 +101,13 @@ impl RouteKind {
     ///
     /// A direct route is the one shape that never reaches the listener.
     pub const fn via_gateway(self) -> bool {
-        matches!(self, Self::ProviderGroup)
+        matches!(self, Self::ProviderGroup | Self::ModelGroup)
     }
 
     /// Direct routes carry exactly one member; gateway routes may carry more.
     pub const fn member_limit(self) -> usize {
         match self {
-            Self::ProviderGroup => MAX_ROUTE_MEMBERS,
+            Self::ProviderGroup | Self::ModelGroup => MAX_ROUTE_MEMBERS,
             Self::Direct => 1,
         }
     }
@@ -103,9 +115,11 @@ impl RouteKind {
 
 /// How the members of a gateway route are tried.
 ///
-/// These are the strategies the gateway can honour from data it already holds.
-/// A quota-aware "smart" strategy would need vendor allowance windows, which an
-/// API Key does not expose, so it is deliberately absent rather than faked.
+/// Every strategy is computable from data the gateway already holds: local
+/// health and cooldowns, observed latency and token usage, configured weights,
+/// and the attempt order. None of them needs a vendor quota, balance, or price,
+/// which is why a quota-aware strategy is deliberately absent rather than
+/// approximated.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteStrategy {
@@ -116,16 +130,69 @@ pub enum RouteStrategy {
     RoundRobin,
     /// The member with the fewest tokens in the window goes first.
     LeastUsed,
+    /// Healthy members first, then recently faster ones, then the least busy.
+    ///
+    /// "Smart" is a statement about this ordering, not a promise of a better
+    /// model: it never inspects the prompt, cost, or a vendor's allowance.
+    Smart,
+    /// The member with the lowest observed p50 first, then p95, then order.
+    LowestLatency,
+    /// Smooth weighted round-robin over the members' configured weights.
+    Weighted,
+    /// Only the member the user picked, with no rotation.
+    Manual,
 }
 
 impl RouteStrategy {
-    pub const ALL: [Self; 3] = [Self::Ordered, Self::RoundRobin, Self::LeastUsed];
+    pub const ALL: [Self; 7] = [
+        Self::Ordered,
+        Self::RoundRobin,
+        Self::LeastUsed,
+        Self::Smart,
+        Self::LowestLatency,
+        Self::Weighted,
+        Self::Manual,
+    ];
 
     pub const fn id(self) -> &'static str {
         match self {
             Self::Ordered => "ordered",
             Self::RoundRobin => "round_robin",
             Self::LeastUsed => "least_used",
+            Self::Smart => "smart",
+            Self::LowestLatency => "lowest_latency",
+            Self::Weighted => "weighted",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ordered => "In order",
+            Self::RoundRobin => "Rotate",
+            Self::LeastUsed => "Least used",
+            Self::Smart => "Smart",
+            Self::LowestLatency => "Lowest latency",
+            Self::Weighted => "By weight",
+            Self::Manual => "Manual",
+        }
+    }
+
+    /// One sentence describing when the strategy is the right choice.
+    ///
+    /// The UI uses this so a strategy picker explains itself instead of offering
+    /// "Smart" with no definition.
+    pub const fn guidance(self) -> &'static str {
+        match self {
+            Self::Ordered => "Try members in the order you arranged them.",
+            Self::RoundRobin => "Spread requests across members turn by turn.",
+            Self::LeastUsed => "Prefer the member that has carried the fewest tokens.",
+            Self::Smart => {
+                "Prefer healthy members, then the recently fastest, then the least busy."
+            }
+            Self::LowestLatency => "Prefer the member with the lowest observed latency.",
+            Self::Weighted => "Share requests by each member's weight.",
+            Self::Manual => "Always use the one member you pick.",
         }
     }
 
@@ -153,6 +220,28 @@ pub struct ModelRouteMember {
     /// Reasoning effort to ask for, overriding what the Agent requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Relative share of requests under [`RouteStrategy::Weighted`].
+    ///
+    /// One means "the same as every other unweighted member". The value is kept
+    /// under the other strategies so switching strategy does not lose it.
+    #[serde(default = "default_member_weight")]
+    pub weight: u32,
+    /// An explicit context window for this member, overriding the route's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
+    /// How long this member may take to produce its first token, overriding the
+    /// route's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_timeout_ms: Option<u64>,
+}
+
+/// The weight a member carries unless the user changes it.
+pub const DEFAULT_MEMBER_WEIGHT: u32 = 1;
+/// The largest weight a member may carry.
+pub const MAX_MEMBER_WEIGHT: u32 = 100;
+
+const fn default_member_weight() -> u32 {
+    DEFAULT_MEMBER_WEIGHT
 }
 
 impl ModelRouteMember {
@@ -168,6 +257,9 @@ impl ModelRouteMember {
             enabled: true,
             order_index,
             reasoning_effort: None,
+            weight: DEFAULT_MEMBER_WEIGHT,
+            context_tokens: None,
+            first_token_timeout_ms: None,
         }
     }
 
@@ -190,6 +282,24 @@ impl ModelRouteMember {
             return Err(VibexError::validation(
                 "route_member_order_invalid",
                 "a route member order must not be negative",
+            ));
+        }
+        if self.weight == 0 || self.weight > MAX_MEMBER_WEIGHT {
+            return Err(VibexError::validation(
+                "route_member_weight_invalid",
+                "a route member weight must be between one and one hundred",
+            ));
+        }
+        if self.context_tokens == Some(0) {
+            return Err(VibexError::validation(
+                "route_member_context_invalid",
+                "a route member context window must be greater than zero",
+            ));
+        }
+        if self.first_token_timeout_ms == Some(0) {
+            return Err(VibexError::validation(
+                "route_member_first_token_timeout_invalid",
+                "a route member first-token timeout must be greater than zero",
             ));
         }
         if let Some(effort) = self.reasoning_effort.as_deref() {
@@ -223,6 +333,619 @@ impl ModelRouteMember {
     }
 }
 
+/// The largest number of levels a route may declare.
+///
+/// A level is a named variant of the same route (for example `fast` and
+/// `deep`); past a handful the picker is harder to read than the model list it
+/// replaced.
+pub const MAX_ROUTE_LEVELS: usize = 8;
+
+/// The longest a route may hold a request open as it retries after every member
+/// failed.
+///
+/// Four minutes is long enough to ride out a vendor's brief outage and short
+/// enough that an Agent's turn does not appear hung forever. `None` disables the
+/// behaviour, which is the default for existing routes.
+pub const MAX_ROUTE_PATIENCE_MS: u64 = 240_000;
+
+/// The patience a new model group starts with.
+pub const DEFAULT_ROUTE_PATIENCE_MS: u64 = 60_000;
+
+/// A window of the week during which a rule applies.
+///
+/// Minutes are counted from local midnight (`0..=1439`). `start_minute >
+/// end_minute` is a window that crosses midnight, which is the normal shape for
+/// "overnight". An absent `zone` means the machine's local time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteTimeWindow {
+    /// ISO weekdays, Monday (`1`) through Sunday (`7`).
+    #[serde(default)]
+    pub days: Vec<u8>,
+    #[serde(default)]
+    pub start_minute: u16,
+    #[serde(default)]
+    pub end_minute: u16,
+    /// An IANA zone name. `None` means local time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+}
+
+impl RouteTimeWindow {
+    /// Validates a window without consulting a clock or a timezone database.
+    pub fn validate(&self) -> VibexResult<()> {
+        if self.days.is_empty() {
+            return Err(VibexError::validation(
+                "route_rule_time_days_missing",
+                "a time window must name at least one weekday",
+            ));
+        }
+        let mut seen = Vec::new();
+        for day in &self.days {
+            if !(1..=7).contains(day) {
+                return Err(VibexError::validation(
+                    "route_rule_time_day_invalid",
+                    "a weekday must be between Monday (1) and Sunday (7)",
+                ));
+            }
+            if seen.contains(day) {
+                return Err(VibexError::validation(
+                    "route_rule_time_day_duplicate",
+                    "a time window lists the same weekday twice",
+                ));
+            }
+            seen.push(*day);
+        }
+        if self.start_minute >= 24 * 60 || self.end_minute >= 24 * 60 {
+            return Err(VibexError::validation(
+                "route_rule_time_minute_invalid",
+                "a time window must stay within one day",
+            ));
+        }
+        if self.start_minute == self.end_minute {
+            return Err(VibexError::validation(
+                "route_rule_time_empty",
+                "a time window must start and end at different minutes",
+            ));
+        }
+        if let Some(zone) = self.zone.as_deref() {
+            let zone = zone.trim();
+            if zone.is_empty() || zone.chars().count() > 64 {
+                return Err(VibexError::validation(
+                    "route_rule_time_zone_invalid",
+                    "a timezone name must be non-empty and bounded",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `minute` (from midnight) falls inside the window on `day`.
+    ///
+    /// The caller supplies the local weekday and minute, so this stays a pure
+    /// intersection test and the gateway owns the clock read.
+    pub fn contains(&self, day: u8, minute: u16) -> bool {
+        if !self.days.contains(&day) {
+            return false;
+        }
+        if self.start_minute <= self.end_minute {
+            minute >= self.start_minute && minute < self.end_minute
+        } else {
+            // The window runs past midnight: the tail belongs to the same
+            // weekday the rule named, which is how "Friday 22:00–02:00" reads.
+            minute >= self.start_minute || minute < self.end_minute
+        }
+    }
+}
+
+/// What a rule does with the members it names.
+///
+/// The order is deliberate: the starter is tried first, `more` afterwards in
+/// their listed order, and any remaining enabled member follows the route's
+/// strategy. Only a `Pause` rule stops routing instead of choosing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRouteRule {
+    /// Stable identity. Renaming Providers or reordering members never
+    /// invalidates a rule.
+    pub id: String,
+    /// The member this rule tries first. Absent on a pause rule, which chooses
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_member_id: Option<ModelRouteMemberId>,
+    /// Members to try after the starter, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub more_member_ids: Vec<ModelRouteMemberId>,
+    /// An effort to ask for when this rule matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_effort: Option<String>,
+    /// Match when the request's estimated context is at least this many tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_min: Option<u64>,
+    /// Match when the request does (`true`) or does not (`false`) carry images.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<bool>,
+    /// Match the effort the Agent asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Match these Agent ids. Empty means any Agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
+    /// Match this classifier intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    /// Match when the turn is (`true`) or is not (`false`) a compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact: Option<bool>,
+    /// Match this window of the week.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<RouteTimeWindow>,
+    /// Match when the workspace root contains this path fragment. Empty means
+    /// any folder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<String>,
+    /// Veto the rule when the workspace root contains one of these fragments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub except_folders: Vec<String>,
+    /// Stop routing for this turn instead of choosing a member.
+    #[serde(default)]
+    pub pause: bool,
+}
+
+impl ModelRouteRule {
+    /// Whether the rule names at least one match condition.
+    pub fn has_condition(&self) -> bool {
+        self.tokens_min.is_some()
+            || self.images.is_some()
+            || self.effort.is_some()
+            || !self.agents.is_empty()
+            || self.intent.is_some()
+            || self.compact.is_some()
+            || self.time.is_some()
+            || !self.folders.is_empty()
+            || !self.except_folders.is_empty()
+    }
+
+    /// Whether the rule names an action that selects a member.
+    pub fn selects_member(&self) -> bool {
+        self.use_member_id.is_some()
+    }
+
+    fn validate(&self, member_ids: &[&str]) -> VibexResult<()> {
+        let id = self.id.trim();
+        if id.is_empty() || id.chars().count() > 128 {
+            return Err(VibexError::validation(
+                "route_rule_id_invalid",
+                "a rule id must be non-empty and bounded",
+            ));
+        }
+        if !self.has_condition() {
+            return Err(VibexError::validation(
+                "route_rule_condition_missing",
+                "a rule must name at least one match condition",
+            ));
+        }
+        if let Some(window) = &self.time {
+            window.validate()?;
+        }
+        if let Some(member) = &self.use_member_id
+            && !member_ids.contains(&member.as_str())
+        {
+            return Err(VibexError::validation(
+                "route_rule_member_unknown",
+                "a rule names a member that is not part of the route",
+            ));
+        }
+        let mut seen = Vec::new();
+        for member in &self.more_member_ids {
+            if !member_ids.contains(&member.as_str()) {
+                return Err(VibexError::validation(
+                    "route_rule_member_unknown",
+                    "a rule names a member that is not part of the route",
+                ));
+            }
+            if self.use_member_id.as_ref() == Some(member) || seen.contains(&member.as_str()) {
+                return Err(VibexError::validation(
+                    "route_rule_member_duplicate",
+                    "a rule lists the same member twice",
+                ));
+            }
+            seen.push(member.as_str());
+        }
+        if let Some(effort) = self.use_effort.as_deref() {
+            let effort = effort.trim();
+            if effort.is_empty() || effort.chars().count() > 64 {
+                return Err(VibexError::validation(
+                    "route_rule_effort_invalid",
+                    "a rule effort must be non-empty and bounded",
+                ));
+            }
+        }
+        if self.pause {
+            // A pause rule exists to stop routing in a narrow circumstance.
+            // Letting it also name a member made the two actions ambiguous.
+            if self.selects_member()
+                || !self.more_member_ids.is_empty()
+                || self.use_effort.is_some()
+            {
+                return Err(VibexError::validation(
+                    "route_rule_pause_action_invalid",
+                    "a pause rule cannot choose a member or an effort",
+                ));
+            }
+        } else {
+            if !self.selects_member() {
+                return Err(VibexError::validation(
+                    "route_rule_member_missing",
+                    "a rule must name the member it tries first",
+                ));
+            }
+            if self.intent.is_some() && self.intent.as_deref().is_some_and(|i| i.trim().is_empty())
+            {
+                return Err(VibexError::validation(
+                    "route_rule_intent_invalid",
+                    "a rule intent must be non-empty when present",
+                ));
+            }
+        }
+        for agent in &self.agents {
+            if agent.trim().is_empty() || agent.chars().count() > 128 {
+                return Err(VibexError::validation(
+                    "route_rule_agent_invalid",
+                    "a rule Agent id must be non-empty and bounded",
+                ));
+            }
+        }
+        for folder in self.folders.iter().chain(&self.except_folders) {
+            if folder.trim().is_empty() || folder.chars().count() > 512 {
+                return Err(VibexError::validation(
+                    "route_rule_folder_invalid",
+                    "a rule folder must be non-empty and bounded",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Everything a rule may be matched against for one request.
+///
+/// The caller supplies the clock reading and the workspace root, because those
+/// are facts about the request, not about the rule. Keeping them here rather
+/// than reading a clock inside the matcher is what lets the simulator and the
+/// gateway reach the same answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteRuleContext {
+    pub agent_id: Option<String>,
+    /// An estimate of the turn's context, in tokens.
+    pub context_tokens: Option<u64>,
+    pub has_images: bool,
+    pub requested_effort: Option<String>,
+    pub compact: bool,
+    pub intent: Option<String>,
+    /// The workspace root, when the caller has one.
+    pub workspace_root: Option<String>,
+    /// Local ISO weekday, `1` (Monday) through `7` (Sunday).
+    pub local_weekday: Option<u8>,
+    /// Local minute from midnight.
+    pub local_minute: Option<u16>,
+}
+
+/// The first rule that matches a request, with its position.
+///
+/// Position zero is reported as `Some(0)`, so a caller cannot confuse "the
+/// first rule matched" with "no rule matched".
+pub fn first_matching_rule<'a>(
+    rules: &'a [ModelRouteRule],
+    context: &RouteRuleContext,
+) -> Option<(usize, &'a ModelRouteRule)> {
+    rules
+        .iter()
+        .enumerate()
+        .find(|(_, rule)| rule_matches(rule, context))
+}
+
+/// Whether one rule matches.
+///
+/// Every condition present must hold; an absent condition is not a condition.
+/// Folders compare as path fragments so a rule authored on one machine still
+/// matches a project checked out elsewhere.
+pub fn rule_matches(rule: &ModelRouteRule, context: &RouteRuleContext) -> bool {
+    if let Some(agents) = (!rule.agents.is_empty()).then_some(&rule.agents) {
+        let Some(agent_id) = context.agent_id.as_deref() else {
+            return false;
+        };
+        if !agents.iter().any(|agent| agent.trim() == agent_id) {
+            return false;
+        }
+    }
+    if let Some(minimum) = rule.tokens_min
+        && context.context_tokens.is_none_or(|tokens| tokens < minimum)
+    {
+        return false;
+    }
+    if let Some(images) = rule.images
+        && images != context.has_images
+    {
+        return false;
+    }
+    if let Some(effort) = rule.effort.as_deref() {
+        let Some(requested) = context.requested_effort.as_deref() else {
+            return false;
+        };
+        if !requested.eq_ignore_ascii_case(effort.trim()) {
+            return false;
+        }
+    }
+    if let Some(compact) = rule.compact
+        && compact != context.compact
+    {
+        return false;
+    }
+    if let Some(intent) = rule.intent.as_deref() {
+        let Some(actual) = context.intent.as_deref() else {
+            return false;
+        };
+        if !actual.eq_ignore_ascii_case(intent.trim()) {
+            return false;
+        }
+    }
+    if let Some(window) = &rule.time {
+        let (Some(day), Some(minute)) = (context.local_weekday, context.local_minute) else {
+            return false;
+        };
+        // A zone other than the machine's local zone is stored for a later
+        // evaluator. Treating it as local would be a silent wrong answer, so
+        // the rule simply does not match.
+        if let Some(zone) = window.zone.as_deref()
+            && !zone.trim().eq_ignore_ascii_case("local")
+        {
+            return false;
+        }
+        if !window.contains(day, minute) {
+            return false;
+        }
+    }
+    if !rule.folders.is_empty() {
+        let Some(root) = context.workspace_root.as_deref() else {
+            return false;
+        };
+        if !rule
+            .folders
+            .iter()
+            .any(|fragment| root.contains(fragment.trim()))
+        {
+            return false;
+        }
+    }
+    if rule.except_folders.iter().any(|fragment| {
+        context
+            .workspace_root
+            .as_deref()
+            .is_some_and(|root| root.contains(fragment.trim()))
+    }) {
+        return false;
+    }
+    true
+}
+
+/// What the simulator knows about one member.
+///
+/// The gateway supplies the same facts from its live state; the builder
+/// supplies them from recent ledger rows. Keeping the shape here lets the
+/// simulator and the router answer the same question the same way.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteMemberObservation {
+    pub member_id: Option<ModelRouteMemberId>,
+    pub used_tokens: u64,
+    pub p50_ms: Option<u64>,
+    pub p95_ms: Option<u64>,
+    pub cooling: bool,
+    pub inflight: u32,
+}
+
+/// The result of simulating one request against a route.
+///
+/// This is a decision, never a call: it reads the route, the request context,
+/// and the observations supplied by the caller. Nothing here sends a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteSimulation {
+    /// The enabled members in the order the router would try them.
+    pub order: Vec<ModelRouteMember>,
+    /// The matching rule, when one applies.
+    pub matched_rule_index: Option<usize>,
+    pub matched_rule_id: Option<String>,
+    /// A matching pause rule stops before any member.
+    pub paused: bool,
+    /// A p50 estimate taken from the first candidate's history, not a promise.
+    pub estimated_latency_ms: Option<u64>,
+    /// Members the simulation removed because the caller asked to fail them.
+    pub failed_member_skipped: bool,
+    /// Enabled members whose Keys are currently cooling.
+    pub cooling_members: Vec<ModelRouteMemberId>,
+}
+
+impl RouteSimulation {
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+}
+
+/// Simulates the member order for one request without sending anything.
+///
+/// `rotation` is the same per-route counter the router uses for rotation and
+/// weighted choice. `failed_member` lets a builder ask "what happens if this
+/// one is down?" and see the fallback, which is the question a real outage
+/// answers too late.
+pub fn simulate_model_route(
+    route: &ModelRoute,
+    context: &RouteRuleContext,
+    rotation: u64,
+    observations: &[RouteMemberObservation],
+    failed_member: Option<&ModelRouteMemberId>,
+) -> RouteSimulation {
+    let mut result = RouteSimulation {
+        order: Vec::new(),
+        matched_rule_index: None,
+        matched_rule_id: None,
+        paused: false,
+        estimated_latency_ms: None,
+        failed_member_skipped: false,
+        cooling_members: Vec::new(),
+    };
+    if !route.is_model_group() {
+        return result;
+    }
+    let observation = |member: &ModelRouteMember| {
+        observations
+            .iter()
+            .find(|observation| {
+                observation.member_id.as_ref() == Some(&member.id)
+                    || observation.member_id.is_none()
+            })
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut order = route
+        .members
+        .iter()
+        .filter(|member| member.enabled)
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some((index, rule)) = first_matching_rule(&route.rules, context) {
+        result.matched_rule_index = Some(index);
+        result.matched_rule_id = Some(rule.id.clone());
+        if rule.pause {
+            result.paused = true;
+            return result;
+        }
+        let mut wanted = Vec::new();
+        if let Some(member) = &rule.use_member_id {
+            wanted.push(member.clone());
+        }
+        wanted.extend(rule.more_member_ids.iter().cloned());
+        let mut reordered = Vec::with_capacity(order.len());
+        for member_id in &wanted {
+            if let Some(position) = order.iter().position(|member| &member.id == member_id)
+                && let Some(member) = order.get(position).cloned()
+                && !reordered.contains(&member)
+            {
+                reordered.push(member);
+            }
+        }
+        for member in &order {
+            if !reordered.contains(member) {
+                reordered.push(member.clone());
+            }
+        }
+        order = reordered;
+    } else {
+        order = strategy_order(route, order, rotation, &observation);
+    }
+    if let Some(failed) = failed_member
+        && let Some(position) = order.iter().position(|member| &member.id == failed)
+    {
+        order.remove(position);
+        result.failed_member_skipped = true;
+    }
+    result.cooling_members = order
+        .iter()
+        .filter(|member| observation(member).cooling)
+        .map(|member| member.id.clone())
+        .collect();
+    result.estimated_latency_ms = order.first().and_then(|member| observation(member).p50_ms);
+    result.order = order;
+    result
+}
+
+fn strategy_order(
+    route: &ModelRoute,
+    mut order: Vec<ModelRouteMember>,
+    rotation: u64,
+    observation: &impl Fn(&ModelRouteMember) -> RouteMemberObservation,
+) -> Vec<ModelRouteMember> {
+    match route.strategy {
+        RouteStrategy::Ordered => {}
+        RouteStrategy::RoundRobin => {
+            if !order.is_empty() {
+                let offset = (rotation as usize) % order.len();
+                order.rotate_left(offset);
+            }
+        }
+        RouteStrategy::LeastUsed => {
+            order.sort_by_key(|member| observation(member).used_tokens);
+        }
+        RouteStrategy::Smart => {
+            order.sort_by_key(|member| {
+                let observed = observation(member);
+                (
+                    observed.cooling,
+                    observed.p50_ms.unwrap_or(u64::MAX),
+                    observed.inflight,
+                    observed.used_tokens,
+                )
+            });
+        }
+        RouteStrategy::LowestLatency => {
+            order.sort_by_key(|member| {
+                let observed = observation(member);
+                (
+                    observed.cooling,
+                    observed.p50_ms.unwrap_or(u64::MAX),
+                    observed.p95_ms.unwrap_or(u64::MAX),
+                )
+            });
+        }
+        RouteStrategy::Weighted => {
+            order = simulate_weighted_order(&order, rotation);
+        }
+        RouteStrategy::Manual => {
+            if let Some(picked) = &route.pick_member_id {
+                order.retain(|member| &member.id == picked);
+            } else {
+                order.truncate(1);
+            }
+        }
+    }
+    order
+}
+
+fn simulate_weighted_order(members: &[ModelRouteMember], rotation: u64) -> Vec<ModelRouteMember> {
+    let weights = members
+        .iter()
+        .map(|member| member.weight.max(DEFAULT_MEMBER_WEIGHT) as usize)
+        .collect::<Vec<_>>();
+    let total = weights.iter().sum::<usize>();
+    if total == 0 {
+        return members.to_vec();
+    }
+    let max_weight = weights.iter().copied().max().unwrap_or(1);
+    let mut cycle = Vec::with_capacity(total);
+    for round in 0..max_weight {
+        for (index, member) in members.iter().enumerate() {
+            if round < weights[index] {
+                cycle.push(member.clone());
+            }
+        }
+    }
+    let start = (rotation as usize) % cycle.len().max(1);
+    let mut ordered = Vec::with_capacity(members.len());
+    for member in cycle
+        .into_iter()
+        .cycle()
+        .skip(start)
+        .take(members.len() * 2)
+    {
+        if !ordered.contains(&member) {
+            ordered.push(member);
+        }
+        if ordered.len() == members.len() {
+            break;
+        }
+    }
+    ordered
+}
+
 /// A reusable composition of model sources.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -235,6 +958,42 @@ pub struct ModelRoute {
     /// Members in attempt order.
     pub members: Vec<ModelRouteMember>,
     pub strategy: RouteStrategy,
+    /// The model id Agents ask for, on a [`RouteKind::ModelGroup`].
+    ///
+    /// A model group exposes one virtual model; its members may be different
+    /// upstream models at different Providers. Provider groups leave this empty
+    /// because each shared model is its own entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_model_id: Option<String>,
+    /// Ordered rules that may override the member order for one turn.
+    ///
+    /// The first match wins. An empty list means the strategy always decides.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<ModelRouteRule>,
+    /// A member or `provider/model` used to classify the turn's intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier: Option<String>,
+    /// `Some("auto")` asks the classifier to choose an effort level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// How long a fully failed attempt is retried before the turn gives up.
+    ///
+    /// `None` disables patience. The value is bounded so a request cannot be
+    /// held indefinitely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patience_ms: Option<u64>,
+    /// Keep this route out of model pickers and address it only explicitly.
+    #[serde(default)]
+    pub sink: bool,
+    /// Hide this route's models from Agent and gateway model lists.
+    #[serde(default)]
+    pub unlists: bool,
+    /// Named variants of this route offered by the picker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub levels: Vec<String>,
+    /// The only member [`RouteStrategy::Manual`] may use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pick_member_id: Option<ModelRouteMemberId>,
     /// How long a member may take to produce its first token before the next
     /// one is asked instead.
     ///
@@ -321,6 +1080,15 @@ impl Default for ModelRoute {
             kind: RouteKind::ProviderGroup,
             members: Vec::new(),
             strategy: RouteStrategy::Ordered,
+            agent_model_id: None,
+            rules: Vec::new(),
+            classifier: None,
+            effort: None,
+            patience_ms: None,
+            sink: false,
+            unlists: false,
+            levels: Vec::new(),
+            pick_member_id: None,
             first_token_timeout_ms: None,
             context_tokens: None,
             pin: crate::GatewayPinScope::Conversation,
@@ -346,14 +1114,21 @@ impl ModelRoute {
     /// The models this route offers to an Agent, deduplicated but order-stable.
     ///
     /// A member is a `(Provider, model)` pair, so one model configured at three
-    /// Providers appears three times in `members` and once here. This is what
-    /// the model picker lists inside the route's group.
+    /// Providers appears three times in `members` and once here.
     ///
     /// A provider group has no model-carrying members at all: its models are
     /// derived from the Providers' catalogues by
-    /// [`intersect_provider_group_models`], so this reads empty for it.
+    /// [`provider_group_models`], so this reads empty for it. A model group
+    /// exposes exactly its Agent-facing id, not the upstream names of its
+    /// members.
     pub fn distinct_models(&self) -> Vec<&str> {
         let mut seen = Vec::new();
+        if self.is_model_group() {
+            if let Some(model) = self.agent_model() {
+                seen.push(model);
+            }
+            return seen;
+        }
         for member in self.enabled_members().filter(|member| member.names_model()) {
             if !seen.contains(&member.model_id.as_str()) {
                 seen.push(member.model_id.as_str());
@@ -367,18 +1142,33 @@ impl ModelRoute {
         self.kind == RouteKind::ProviderGroup
     }
 
+    /// Whether this route composes individual models behind one virtual name.
+    pub fn is_model_group(&self) -> bool {
+        self.kind == RouteKind::ModelGroup
+    }
+
+    /// The Agent-facing model id of a model group, trimmed.
+    pub fn agent_model(&self) -> Option<&str> {
+        self.agent_model_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+    }
+
     /// How many sources back this route.
     pub fn source_count(&self) -> usize {
         self.enabled_members().count()
     }
 
-    /// The prefix every model of a provider group is addressed by.
+    /// The prefix every model of a gateway group is addressed by.
     ///
-    /// A group is several selectable models rather than one, so its ids carry
-    /// the model after the route: `group/<id>/<model>`. The model has to live
-    /// in the id because the group itself is not a model; the Provider is
-    /// chosen per request, which is exactly what the id's first half leaves
-    /// out.
+    /// A provider group is several selectable models, so its ids carry the
+    /// model after the route: `group/<id>/<model>`. The model has to live in
+    /// the id because the group itself is not a model; the Provider is chosen
+    /// per request, which is exactly what the id's first half leaves out.
+    ///
+    /// A model group exposes one virtual model, so its callable id is the
+    /// prefix plus [`ModelRoute::agent_model`].
     ///
     /// A direct route never reaches the gateway, so it has no gateway id and
     /// this prefix describes nothing callable; it exists for the group shape
@@ -390,6 +1180,25 @@ impl ModelRoute {
     /// The id one model of a provider group is selected by.
     pub fn group_model_id(&self, model_id: &str) -> String {
         format!("{}{}", self.model_id(), model_id.trim().trim_matches('/'))
+    }
+
+    /// The single id a model group is called by, if it has one.
+    pub fn gateway_model_id(&self) -> Option<String> {
+        self.agent_model().map(|model| self.group_model_id(model))
+    }
+
+    /// Whether a request for this id names this route's model group.
+    ///
+    /// The id is still `group/<route>/<model>`; the model half has to equal the
+    /// route's Agent-facing id so a request cannot address a member's upstream
+    /// name through the group.
+    pub fn serves_model_group_id(&self, requested: &str) -> bool {
+        let Some(parsed) = provider_group_model_ref(requested) else {
+            return false;
+        };
+        parsed.group_id == self.id.as_str()
+            && self.is_model_group()
+            && self.agent_model() == Some(parsed.model_id)
     }
 
     /// Sorts members into attempt order. Callers mutate freely; `validate`
@@ -473,6 +1282,14 @@ impl ModelRoute {
                 seen_providers.push(member.model_provider_profile_id.clone());
             }
         }
+        if self.is_model_group() {
+            self.validate_model_group()?;
+        } else if self.agent_model_id.is_some() {
+            return Err(VibexError::validation(
+                "route_agent_model_unexpected",
+                "only a model group has an Agent-facing model id",
+            ));
+        }
         if self.first_token_timeout_ms == Some(0) {
             return Err(VibexError::validation(
                 "route_first_token_timeout_invalid",
@@ -484,6 +1301,143 @@ impl ModelRoute {
                 "route_context_invalid",
                 "a route context window must be greater than zero",
             ));
+        }
+        if let Some(patience) = self.patience_ms
+            && (patience == 0 || patience > MAX_ROUTE_PATIENCE_MS)
+        {
+            return Err(VibexError::validation(
+                "route_patience_invalid",
+                "route patience must be between one millisecond and four minutes",
+            ));
+        }
+        if let Some(effort) = self.effort.as_deref() {
+            let effort = effort.trim();
+            if effort.is_empty() || effort.chars().count() > 64 {
+                return Err(VibexError::validation(
+                    "route_effort_invalid",
+                    "a route effort must be non-empty and bounded",
+                ));
+            }
+            if effort != "auto" {
+                return Err(VibexError::validation(
+                    "route_effort_invalid",
+                    "a route effort is either absent or auto",
+                ));
+            }
+        }
+        if let Some(classifier) = self.classifier.as_deref() {
+            let classifier = classifier.trim();
+            if classifier.is_empty() || classifier.chars().count() > 256 {
+                return Err(VibexError::validation(
+                    "route_classifier_invalid",
+                    "a route classifier must be non-empty and bounded",
+                ));
+            }
+            if Some(classifier) == self.agent_model() {
+                return Err(VibexError::validation(
+                    "route_classifier_cycle",
+                    "a route cannot classify itself",
+                ));
+            }
+        }
+        if self.levels.len() > MAX_ROUTE_LEVELS {
+            return Err(VibexError::validation(
+                "route_level_limit_exceeded",
+                "the route has more levels than it supports",
+            ));
+        }
+        let mut seen_levels = Vec::new();
+        for level in &self.levels {
+            let level = level.trim();
+            if level.is_empty() || level.chars().count() > 64 {
+                return Err(VibexError::validation(
+                    "route_level_invalid",
+                    "a route level must be non-empty and bounded",
+                ));
+            }
+            if seen_levels.contains(&level) {
+                return Err(VibexError::validation(
+                    "route_level_duplicate",
+                    "the route lists the same level twice",
+                ));
+            }
+            seen_levels.push(level);
+        }
+        let member_ids = self
+            .members
+            .iter()
+            .map(|member| member.id.as_str())
+            .collect::<Vec<_>>();
+        if let Some(pick) = &self.pick_member_id
+            && !member_ids.contains(&pick.as_str())
+        {
+            return Err(VibexError::validation(
+                "route_manual_member_unknown",
+                "the manually picked member is not part of the route",
+            ));
+        }
+        if self.strategy == RouteStrategy::Manual && self.pick_member_id.is_none() {
+            return Err(VibexError::validation(
+                "route_manual_member_missing",
+                "a manual route must name the member it uses",
+            ));
+        }
+        let mut seen_rule_ids = Vec::new();
+        for rule in &self.rules {
+            rule.validate(&member_ids)?;
+            let rule_id = rule.id.trim();
+            if seen_rule_ids.contains(&rule_id) {
+                return Err(VibexError::validation(
+                    "route_rule_id_duplicate",
+                    "the route lists the same rule id twice",
+                ));
+            }
+            seen_rule_ids.push(rule_id);
+        }
+        Ok(())
+    }
+
+    /// The checks that only a model group has to satisfy.
+    fn validate_model_group(&self) -> VibexResult<()> {
+        let agent_model = self.agent_model().ok_or_else(|| {
+            VibexError::validation(
+                "route_agent_model_missing",
+                "a model group must name the model Agents ask for",
+            )
+        })?;
+        if agent_model.chars().count() > 256 {
+            return Err(VibexError::validation(
+                "route_agent_model_invalid",
+                "a model group's Agent-facing id is longer than the supported length",
+            ));
+        }
+        if agent_model.contains('/') {
+            // The gateway splits `group/<route>/<model>` on the first slash.
+            // A slash in the model half would make the id unresolvable.
+            return Err(VibexError::validation(
+                "route_agent_model_invalid",
+                "a model group's Agent-facing id must not contain a slash",
+            ));
+        }
+        if self.enabled_members().next().is_none() {
+            return Err(VibexError::validation(
+                "route_group_no_enabled_member",
+                "a model group needs at least one enabled member",
+            ));
+        }
+        let mut seen = Vec::new();
+        for member in &self.members {
+            let key = (
+                member.model_provider_profile_id.as_str(),
+                member.model_id.trim(),
+            );
+            if seen.contains(&key) {
+                return Err(VibexError::validation(
+                    "route_member_duplicate_model",
+                    "a model group lists the same Provider and model twice",
+                ));
+            }
+            seen.push(key);
         }
         Ok(())
     }
@@ -987,5 +1941,296 @@ mod tests {
         assert_eq!(parsed.group_id, route.id.as_str());
         assert_eq!(parsed.model_id, "deepseek-chat");
         assert!(provider_group_model_ref("route/standard").is_none());
+    }
+
+    fn model_group(members: Vec<ModelRouteMember>) -> ModelRoute {
+        ModelRoute {
+            display_name: "Smart".to_string(),
+            kind: RouteKind::ModelGroup,
+            agent_model_id: Some("deepseek-chat".to_string()),
+            members,
+            status: RouteStatus::Enabled,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_model_group_lists_models_from_different_providers() {
+        let mut left = model_member(0, "deepseek-chat");
+        left.weight = 3;
+        let mut right = model_member(1, "deepseek-v3");
+        right.first_token_timeout_ms = Some(9_000);
+        right.context_tokens = Some(64_000);
+        let route = model_group(vec![left, right]);
+        route
+            .validate()
+            .expect("two upstream models are a valid group");
+        assert_eq!(route.agent_model(), Some("deepseek-chat"));
+        assert_eq!(
+            route.gateway_model_id().unwrap(),
+            format!("group/{}/deepseek-chat", route.id.as_str())
+        );
+        assert!(route.serves_model_group_id(&route.gateway_model_id().unwrap()));
+        assert!(!route.serves_model_group_id(&route.group_model_id("deepseek-v3")));
+        assert_eq!(route.distinct_models(), vec!["deepseek-chat"]);
+    }
+
+    #[test]
+    fn a_model_group_requires_an_agent_facing_id_and_an_enabled_member() {
+        let mut route = model_group(vec![model_member(0, "deepseek-chat")]);
+        route.agent_model_id = None;
+        assert_eq!(
+            route.validate().unwrap_err().code,
+            "route_agent_model_missing"
+        );
+
+        let mut slashed = model_group(vec![model_member(0, "deepseek-chat")]);
+        slashed.agent_model_id = Some("vendor/model".to_string());
+        assert_eq!(
+            slashed.validate().unwrap_err().code,
+            "route_agent_model_invalid"
+        );
+
+        let mut disabled = model_group(vec![model_member(0, "deepseek-chat")]);
+        disabled.members[0].enabled = false;
+        assert_eq!(
+            disabled.validate().unwrap_err().code,
+            "route_group_no_enabled_member"
+        );
+    }
+
+    #[test]
+    fn a_model_group_rejects_the_same_provider_and_model_twice() {
+        let provider = ModelProviderProfileId::new();
+        let first = ModelRouteMember::new(provider.clone(), "deepseek-chat", 0);
+        let second = ModelRouteMember::new(provider, "deepseek-chat", 1);
+        assert_eq!(
+            model_group(vec![first, second])
+                .validate()
+                .unwrap_err()
+                .code,
+            "route_member_duplicate_model"
+        );
+    }
+
+    #[test]
+    fn a_model_group_requires_a_manual_member() {
+        let mut route = model_group(vec![model_member(0, "deepseek-chat")]);
+        route.strategy = RouteStrategy::Manual;
+        assert_eq!(
+            route.validate().unwrap_err().code,
+            "route_manual_member_missing"
+        );
+        route.pick_member_id = Some(route.members[0].id.clone());
+        assert!(route.validate().is_ok());
+    }
+
+    #[test]
+    fn member_weights_and_timeouts_are_bounded() {
+        let mut route = model_group(vec![model_member(0, "deepseek-chat")]);
+        route.members[0].weight = 0;
+        assert_eq!(
+            route.validate().unwrap_err().code,
+            "route_member_weight_invalid"
+        );
+        route.members[0].weight = MAX_MEMBER_WEIGHT + 1;
+        assert_eq!(
+            route.validate().unwrap_err().code,
+            "route_member_weight_invalid"
+        );
+        route.members[0].weight = 1;
+        route.members[0].first_token_timeout_ms = Some(0);
+        assert_eq!(
+            route.validate().unwrap_err().code,
+            "route_member_first_token_timeout_invalid"
+        );
+    }
+
+    #[test]
+    fn route_patience_is_bounded_and_defaults_to_off() {
+        let default = model_group(vec![model_member(0, "deepseek-chat")]);
+        assert_eq!(default.patience_ms, None);
+        assert!(default.validate().is_ok());
+
+        let mut too_long = model_group(vec![model_member(0, "deepseek-chat")]);
+        too_long.patience_ms = Some(MAX_ROUTE_PATIENCE_MS + 1);
+        assert_eq!(
+            too_long.validate().unwrap_err().code,
+            "route_patience_invalid"
+        );
+
+        let mut off = model_group(vec![model_member(0, "deepseek-chat")]);
+        off.patience_ms = Some(0);
+        assert_eq!(off.validate().unwrap_err().code, "route_patience_invalid");
+    }
+
+    #[test]
+    fn a_rule_matches_agents_tokens_images_and_time() {
+        let member = model_member(0, "deepseek-chat");
+        let member_id = member.id.clone();
+        let mut route = model_group(vec![member]);
+        route.rules = vec![ModelRouteRule {
+            id: "rule-1".to_string(),
+            use_member_id: Some(member_id.clone()),
+            more_member_ids: vec![],
+            use_effort: Some("high".to_string()),
+            tokens_min: Some(100_000),
+            images: Some(true),
+            effort: Some("high".to_string()),
+            agents: vec!["codex".to_string()],
+            intent: None,
+            compact: None,
+            time: Some(RouteTimeWindow {
+                days: vec![1, 2, 3, 4, 5],
+                start_minute: 9 * 60,
+                end_minute: 18 * 60,
+                zone: None,
+            }),
+            folders: vec!["vibex".to_string()],
+            except_folders: vec!["vendor".to_string()],
+            pause: false,
+        }];
+        route.validate().expect("a fully specified rule validates");
+
+        let mut context = RouteRuleContext {
+            agent_id: Some("codex".to_string()),
+            context_tokens: Some(200_000),
+            has_images: true,
+            requested_effort: Some("high".to_string()),
+            intent: None,
+            workspace_root: Some("/home/me/vibex".to_string()),
+            local_weekday: Some(3),
+            local_minute: Some(10 * 60),
+            ..Default::default()
+        };
+        assert!(rule_matches(&route.rules[0], &context));
+        assert_eq!(
+            first_matching_rule(&route.rules, &context).map(|(index, _)| index),
+            Some(0)
+        );
+
+        context.agent_id = Some("claude".to_string());
+        assert!(!rule_matches(&route.rules[0], &context));
+        context.agent_id = Some("codex".to_string());
+        context.context_tokens = Some(10_000);
+        assert!(!rule_matches(&route.rules[0], &context));
+        context.context_tokens = Some(200_000);
+        context.has_images = false;
+        assert!(!rule_matches(&route.rules[0], &context));
+        context.has_images = true;
+        context.local_minute = Some(20 * 60);
+        assert!(!rule_matches(&route.rules[0], &context));
+        context.local_minute = Some(10 * 60);
+        context.workspace_root = Some("/home/me/vibex/vendor".to_string());
+        assert!(!rule_matches(&route.rules[0], &context));
+    }
+
+    #[test]
+    fn a_pause_rule_cannot_also_choose_a_member() {
+        let member = model_member(0, "deepseek-chat");
+        let member_id = member.id.clone();
+        let mut route = model_group(vec![member]);
+        route.rules = vec![ModelRouteRule {
+            id: "pause".to_string(),
+            use_member_id: Some(member_id.clone()),
+            pause: true,
+            images: Some(false),
+            ..Default::default()
+        }];
+        assert_eq!(
+            route.validate().unwrap_err().code,
+            "route_rule_pause_action_invalid"
+        );
+        route.rules[0].use_member_id = None;
+        assert!(route.validate().is_ok());
+    }
+
+    #[test]
+    fn a_time_window_may_cross_midnight() {
+        let window = RouteTimeWindow {
+            days: vec![5],
+            start_minute: 22 * 60,
+            end_minute: 2 * 60,
+            zone: None,
+        };
+        window.validate().unwrap();
+        assert!(window.contains(5, 23 * 60));
+        assert!(window.contains(5, 60));
+        assert!(!window.contains(5, 12 * 60));
+        assert!(!window.contains(6, 60), "the tail belongs to Friday");
+    }
+
+    #[test]
+    fn the_simulator_orders_by_strategy_and_reports_a_simulated_failure() {
+        let mut first = model_member(0, "deepseek-chat");
+        first.weight = 3;
+        let second = model_member(1, "kimi-k2");
+        let first_id = first.id.clone();
+        let second_id = second.id.clone();
+        let mut route = model_group(vec![first, second]);
+        route.strategy = RouteStrategy::Weighted;
+        let context = RouteRuleContext::default();
+        let observations = vec![
+            RouteMemberObservation {
+                member_id: Some(first_id.clone()),
+                p50_ms: Some(400),
+                ..Default::default()
+            },
+            RouteMemberObservation {
+                member_id: Some(second_id.clone()),
+                p50_ms: Some(100),
+                ..Default::default()
+            },
+        ];
+        let start = simulate_model_route(&route, &context, 0, &observations, None);
+        assert_eq!(start.order[0].id, first_id, "weight three starts first");
+        assert_eq!(start.estimated_latency_ms, Some(400));
+
+        let failure = simulate_model_route(&route, &context, 0, &observations, Some(&first_id));
+        assert!(failure.failed_member_skipped);
+        assert_eq!(failure.order[0].id, second_id);
+        assert_eq!(failure.estimated_latency_ms, Some(100));
+
+        route.strategy = RouteStrategy::LowestLatency;
+        let latency = simulate_model_route(&route, &context, 0, &observations, None);
+        assert_eq!(latency.order[0].id, second_id, "the faster member leads");
+    }
+
+    #[test]
+    fn the_simulator_reports_a_matching_pause_rule() {
+        let member = model_member(0, "deepseek-chat");
+        let mut route = model_group(vec![member]);
+        route.rules = vec![ModelRouteRule {
+            id: "pause".to_string(),
+            pause: true,
+            time: Some(RouteTimeWindow {
+                days: vec![1, 2, 3, 4, 5],
+                start_minute: 9 * 60,
+                end_minute: 10 * 60,
+                zone: None,
+            }),
+            ..Default::default()
+        }];
+        let context = RouteRuleContext {
+            local_weekday: Some(2),
+            local_minute: Some(9 * 60 + 30),
+            ..Default::default()
+        };
+        let simulation = simulate_model_route(&route, &context, 0, &[], None);
+        assert!(simulation.paused);
+        assert_eq!(simulation.matched_rule_id.as_deref(), Some("pause"));
+        assert!(simulation.order.is_empty());
+    }
+
+    #[test]
+    fn the_seven_strategies_round_trip_their_wire_ids() {
+        assert_eq!(RouteStrategy::ALL.len(), 7);
+        for strategy in RouteStrategy::ALL {
+            assert_eq!(RouteStrategy::from_id(strategy.id()), Some(strategy));
+            assert!(!strategy.guidance().is_empty());
+        }
+        assert_eq!(RouteStrategy::from_id("pace"), None);
+        assert_eq!(RouteKind::ALL.len(), 3);
+        assert!(RouteKind::ModelGroup.via_gateway());
     }
 }

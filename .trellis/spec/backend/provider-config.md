@@ -6101,6 +6101,240 @@ let model_id = route.group_model_id(&models[0].model_id);
 // The gateway resolves only models actually in the intersection.
 ```
 
+## Scenario: Model-Level Route Groups
+
+### 1. Scope / Trigger
+
+- Trigger: the Providers page creates or edits a model-level route group, or an
+  Agent picks the virtual model one publishes.
+- Trigger: the gateway resolves `group/<route>/<model>`, orders a model group's
+  members, applies a rule, waits for a first token, or retries under patience.
+- Trigger: the Gateway page reads its dashboard, live routing card, or ledger
+  decision trace.
+
+### 2. Signatures
+
+```rust
+RouteKind::{ProviderGroup, ModelGroup, Direct}
+ModelRoute {
+  kind, agent_model_id: Option<String>, rules: Vec<ModelRouteRule>,
+  classifier: Option<String>, effort: Option<String>, patience_ms: Option<u64>,
+  sink: bool, unlists: bool, levels: Vec<String>,
+  pick_member_id: Option<ModelRouteMemberId>,
+}
+ModelRouteMember { weight: u32, context_tokens: Option<u32>, first_token_timeout_ms: Option<u64> }
+RouteStrategy::{Ordered, RoundRobin, LeastUsed, Smart, LowestLatency, Weighted, Manual}
+RouteTimeWindow { days, start_minute, end_minute, zone }
+RouteRuleContext { agent_id, context_tokens, has_images, requested_effort, compact, intent, workspace_root, local_weekday, local_minute }
+simulate_model_route(route, context, rotation, observations, failed_member) -> RouteSimulation
+GatewayRouteDecisionTrace {
+    rule_index, rule_id, reason, classifier, classifier_error,
+    intent, effort, strategy, patience_ms, retries,
+}
+```
+
+### 3. Contracts
+
+- **ModelGroup is additive; ProviderGroup does not change.** A provider group
+  still names Providers and offers the intersection of their catalogues. A
+  model group names `(Provider, upstream model)` pairs and exposes exactly one
+  Agent-facing id, `agent_model_id`. Existing provider-group rows therefore read
+  back unchanged, and `route.kind` is the discriminator.
+- **The virtual id is the only address.** A model group is called as
+  `group/<route>/<agent_model_id>`. The member's upstream model id is never
+  addressable through the group: accepting it would let a caller bypass the
+  composition. The id may not contain `/`, because the gateway splits the model
+  path on the first slash.
+- **A local model alias is a member handle, not a second catalogue row.** The
+  Provider metadata `modelAliases` maps an agent-facing alias to one upstream
+  entry id. A model-group member may name either id; the gateway resolves the
+  alias to the upstream id only when it builds the outbound body, so the group
+  and the Agent can use the handle while the vendor still receives its own
+  model name. A classifier `provider/model` pair accepts the alias the same way.
+- **A model group needs one enabled member, and each member needs a model.** A
+  provider-group member must keep an empty `model_id`; a model-group member must
+  fill it. A duplicate `(Provider, model)` pair, a zero weight, a zero member
+  timeout, or a manual strategy with no picked member is refused at write time
+  as well as at `validate`.
+- **Weights are 1–100 and survive a strategy switch.** Under `Weighted` the
+  cycle interleaves each unit round by round (3:1 reads A, B, A, A) and rotates
+  its start by the request counter, so the first attempt is proportional
+  instead of always the same member. Other strategies keep the value for the
+  next switch.
+- **Seven strategies are computed from local observations only.**
+  - `Ordered` uses the configured order.
+  - `RoundRobin` advances one member per request.
+  - `LeastUsed` prefers the fewest locally observed tokens.
+  - `Smart` orders by cooling, observed p50, inflight, then usage.
+  - `LowestLatency` orders by p50, then p95.
+  - `Weighted` uses the weighted cycle.
+  - `Manual` uses only `pick_member_id`; it deliberately has no fallback.
+  No strategy reads a price, balance, quota, or vendor allowance.
+- **Rules are ordered and the first match wins.** A rule must name at least one
+  condition and, unless it is a pause rule, the member to try first. `more`
+  members follow in order; members the rule did not name keep the strategy's
+  order, so a rule changes preference without removing a fallback. A pause rule
+  is limited to time, Agent, folder, and except-folder conditions and refuses
+  every request for the turn before any Provider is called.
+- **A classifier is one small, real request, and only when it can decide
+  something.** It runs once per prepared request when the route names a
+  classifier and either a rule can match an intent or `effort = "auto"`. The
+  request is a non-streaming Chat call with an eight-second timeout; it is not a
+  gateway model call, so it never enters the request ledger or the inflight
+  table. Its intent feeds rule matching; its effort replaces the Agent's
+  requested effort unless a member pins its own. A timeout, a missing model, a
+  missing ready Key, an unusable reply, or a non-success status leaves the
+  default order in place and records `classifier_error` on the decision trace.
+- **A rule time window is local unless the zone is `local`.** Weekdays are ISO
+  `1..=7`, minutes are `0..=1439`, and `start > end` crosses midnight. The rule
+  belongs to the weekday it names, so a Friday 22:00–02:00 window does not match
+  Saturday's tail. A non-local IANA zone is stored but not evaluated yet; the
+  rule does not match rather than silently using the wrong clock.
+- **Rules match an estimated context, not a tokenizer count.** The gateway
+  bounds the turn's text/tool size at roughly four characters per token and
+  labels the result an estimate. Images, Agent id, requested effort, intent,
+  compaction, folder fragments, and except-folder vetoes are exact matches.
+- **Patience retries only recoverable failures.** 408/429/5xx, all-keys-cooling,
+  and first-token timeouts qualify; auth, missing models, malformed bodies,
+  wrong protocols, and translation failures do not. The schedule is
+  2/4/8/16/30 seconds, bounded by `patience_ms` (None is off, maximum four
+  minutes). Each retry re-prepares the call, which is what refreshes Key
+  cooldowns and member rotation. A recoverable failure during that re-read
+  continues the wait rather than turning it into an immediate refusal.
+- **A cooldown override replaces the built-in rest for that failure kind.** The
+  keys are the failure-kind ids that can cool a Key (`rate`, `upstream`,
+  `proxy`, `credit`, `quota`, `other`); `auth` is rejected because a rejected
+  credential does not heal with time. Values are one millisecond to one day.
+  The override is read when a failure is recorded, so it applies from the next
+  rest onward and does not change a Key already cooling.
+- **Provider reliability P2 is the two confirmed behaviours.** AutoInclude is
+  the shared Provider's `autoRefreshModels` flag: a model-list refresh adds
+  newly discovered entries and never rewrites a row the user authored
+  (capabilities, display name, enabled state), while a Provider without the
+  flag keeps the replace-the-list refresh. Cooldown overrides are the policy
+  above. There is no Provider budget, quota, or compatibility flag in this
+  wave.
+- **The first-token deadline can fail over, and the last member never times
+  out.** When a member is not the last, the gateway reads its first body byte
+  before committing; a timeout or an empty body is recorded as a skipped member
+  and the next member is tried. The last member waits indefinitely because
+  there is nowhere to go. The deadline is the member override or the route
+  default, and only applies to streaming calls.
+- **Unlists and Sink hide a model from lists, not from its id.** `unlists`
+  removes the group's model from the gateway catalogue, Agent pickers, and the
+  config-center catalogue; `sink` does the same for a composition that exists to
+  be called explicitly. `group_for_model` still resolves the id, which is what
+  makes an explicitly-addressed hidden route usable.
+- **The gateway catalogue has one entry per virtual model.** A model group
+  contributes one `group/<id>/<agent_model_id>` entry; its capabilities are the
+  intersection of the capabilities of its reachable members. A model group whose
+  members cannot be resolved contributes nothing rather than a broken entry.
+- **The decision trace explains the order.** A rule match writes its zero-based
+  index, stable id, reason, chosen effort, and strategy; a non-ordered strategy
+  writes its id; patience writes its budget and retry count. The trace is
+  additive to `GatewayRouteTrace`, ignores an unreadable payload like every
+  other trace, and never contains a prompt or reply.
+- **The live routing card consumes real events only.** It derives from
+  `GatewayInflight` plus `Began`/`FirstToken`/`Ended`; the newest 24 attempts are
+  drawn and the rest are aggregated. It never draws direct Providers, because
+  they produce no gateway events. Its rows are a static, reduced-motion-readable
+  equivalent of the graph, not random or simulated traffic.
+- **The dashboard is local observation.** It reports uptime from the listener's
+  start time, request count/QPS for the chosen window, success rate, p50/p95,
+  input/output/cache tokens, failovers, inflight, and top Providers/models/errors.
+  It has no cost, price, quota, or balance field.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Model group has no `agent_model_id` | `route_agent_model_missing` |
+| `agent_model_id` contains `/` | `route_agent_model_invalid` |
+| Model group has no enabled member | `route_group_no_enabled_member` |
+| Two members name the same Provider and model | `route_member_duplicate_model` |
+| Member weight is 0 or above 100 | `route_member_weight_invalid` |
+| Manual strategy has no picked member | `route_manual_member_missing` |
+| A rule names a member outside the route | `route_rule_member_unknown` |
+| A pause rule also selects a member | `route_rule_pause_action_invalid` |
+| Patience is zero or above four minutes | `route_patience_invalid` |
+| A second live group publishes the same virtual id | `model_route_agent_model_conflict` / unique index |
+| A request names a member's upstream id through the group | `404 model_not_found` |
+| A matching pause rule applies | `503 model_gateway_route_paused`, no upstream call |
+| First-token timeout with another member left | That member is skipped; the next is called |
+| First-token timeout on the last member | The member keeps waiting |
+| Non-recoverable upstream failure under patience | Refused immediately; no retry |
+
+### 5. Good / Base / Bad Cases
+
+- Good: two Providers serve different upstream models; a model group exposes
+  `vibex-fast`, sends `deepseek-chat` to the first, and falls back to
+  `kimi-k2` on the second without the Agent ever seeing either name.
+- Good: a 3:1 weighted pair starts on the heavy member three requests out of
+  four and still keeps the light member as the fallback.
+- Base: a legacy provider group reads back with `agent_model_id = None`, no
+  rules, default weights, and behaves exactly as before.
+- Base: a rule matches "context > 100k" and names member B; A remains second in
+  the order for failover, and the ledger names rule 2 in its decision trace.
+- Bad: publishing the member's upstream model id as a second gateway entry;
+  that bypasses `agent_model_id` and makes the group two incompatible sources.
+- Bad: treating a first-token timeout on the last member as an error; there is
+  no fallback, and the correct behaviour is to wait.
+
+### 6. Tests Required
+
+- `vibex-core` unit: a model group validates across different Providers and
+  upstream models; it rejects a missing virtual id, a slash, no enabled member,
+  a duplicate pair, an out-of-range weight, a manual pick that is absent, a rule
+  with no condition, a pause rule with an action, and a cross-midnight window.
+  `simulate_model_route` orders by strategy, reports a matched pause rule, and
+  skips a simulated failure.
+- `vibex-db` unit: a model group round-trips its virtual id, rules, levels,
+  patience, sink/unlists, member weight/timeouts, and picked member; clearing
+  those fields stores NULL/empty; the partial unique index refuses a second live
+  group with the same virtual id; a provider group still round-trips unchanged.
+- `vibex-config-switch` unit: a model group is created and edited through the
+  service; a duplicate virtual id is refused with a readable validation error
+  before the database constraint; a member whose Provider no longer serves the
+  model is refused.
+- `vibex-model-gateway` integration: a model group falls back across different
+  upstream models; a matching rule changes the first member and the ledger trace
+  names the rule; a first-token timeout fails over to the next member; patience
+  retries a 503 and succeeds once the upstream recovers; a classifier supplies
+  intent and automatic effort; a per-kind cooldown override replaces the
+  built-in rest.
+- `vibex-model-gateway` unit: the seven strategy ids round-trip; weighted
+  rotation starts in proportion; manual uses only the picked member; smart and
+  lowest-latency prefer health and p50; a paused rule returns
+  `model_gateway_route_paused` without an upstream call.
+- `vibex-desktop` unit: a new group opens as a model group; the editor, palette,
+  and simulator expose the virtual id, model/alias palette, pipeline, policy,
+  templates, suggestions, simulated failure, patience, and Unlists/Sink; the save
+  path writes the model-group fields; the dashboard and live card read real
+  gateway state and expose no money metric; AutoInclude adds a discovered model
+  without rewriting an authored row; cooldown inputs write the policy map.
+- Manual: 10k request rows, 20–30 concurrent inflight attempts, reduced motion,
+  keyboard-only editing, and a legacy provider group that must not regress.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+// Offer the member's upstream model id as a second entry, so old callers work.
+catalog.push(group.model_id(&member.model_id));
+```
+
+The Agent then names `deepseek-chat` directly and bypasses the group's virtual
+id, its rules, and its attempted order.
+
+#### Correct
+
+```rust
+let virtual_id = route.gateway_model_id()?; // group/<route>/<agent_model_id>
+let members = route.enabled_members().collect::<Vec<_>>();
+let plan = plan_members(&members, route.strategy, rotation, &observations, route.pick_member_id.as_ref());
+```
+
 ## Scenario: Unified Agent Default Model Source
 
 ### 1. Scope / Trigger
@@ -6144,6 +6378,13 @@ optional on a read because a read is a resolution, not a row lookup.
   source clears the scoped Provider default. Both happen in one immediate
   transaction so no reader sees two defaults.
 - Clearing removes only the explicit unified row; the legacy fallbacks remain.
+- The retired `get/set_agent_model_provider_default` pair reads and writes the
+  unified source for user-facing Providers. The hidden gateway Profile and the
+  per-kind local fallback keep their legacy row because the launch path still
+  reads it and they are machinery rather than a user default. The retired
+  `set_agent_default_model_route` writes the unified route source in the same
+  call as the binding's default flag, so the route the user chose is the one the
+  unified read returns.
 - The snapshot carries explicit rows only, not resolved fallbacks. A client that
   needs the answer calls the read API; it must not invent a row.
 - A disabled or deleted source is never promoted by fallback. An explicit row
@@ -6152,6 +6393,11 @@ optional on a read because a read is a resolution, not a row lookup.
 ### 4. Tests Required
 
 - `vibex-core`: tagged camelCase wire shape; `None` source.
+- `vibex-config-switch`: the retired Provider-default get/set pair reads and
+  writes the unified source; the retired route-default setter makes the unified
+  route source win over an explicit Provider source.
+- `vibex-db`: a disabled explicit Provider source is ignored by resolution and
+  falls through to a usable route default.
 - `vibex-db`: unique row per scope/Agent; backfill precedence; double-default
   report; clear is idempotent.
 - `vibex-config-switch`: read fallback order; Provider write clears route

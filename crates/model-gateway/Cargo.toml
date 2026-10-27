@@ -10,6 +10,7 @@ repository.workspace = true
 axum.workspace = true
 base64.workspace = true
 bytes = "1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 futures-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true

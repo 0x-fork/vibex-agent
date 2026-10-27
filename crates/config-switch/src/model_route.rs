@@ -97,6 +97,7 @@ impl ProviderConfigService {
                     .flatten()
             })
             .filter(|route| route.status == vibex_core::RouteStatus::Enabled)
+            .filter(|route| !route.unlists && !route.sink)
             .filter(|route| !route.enabled_members().collect::<Vec<_>>().is_empty())
             .collect())
     }
@@ -154,9 +155,10 @@ impl ProviderConfigService {
                 let profile = vibex_db::ProviderProfileRepository::get(&conn, &legacy_id)?;
                 Ok(profile.filter(|profile| &profile.agent_id == agent_id))
             }
-            vibex_core::RouteKind::ProviderGroup => {
-                // A group contributes one catalogue entry per shared model, so
-                // the Profile carries the group's prefix rather than one id.
+            vibex_core::RouteKind::ProviderGroup | vibex_core::RouteKind::ModelGroup => {
+                // A group contributes one catalogue entry per shared model (or
+                // one virtual model for a model group), so the Profile carries
+                // the group's prefix rather than one id.
                 let prefix = route.model_id();
                 Ok(self.gateway_legacy_profile(agent_id)?.filter(|profile| {
                     profile
@@ -215,6 +217,7 @@ impl ProviderConfigService {
             ));
         }
         self.require_members_are_served(&conn, &route)?;
+        self.require_model_group_identity(&conn, &route)?;
         ModelRouteRepository::insert(&conn, &route)?;
         self.get_model_route(&route.id)?.ok_or_else(|| {
             VibexError::storage(
@@ -234,6 +237,7 @@ impl ProviderConfigService {
         route.validate()?;
         let conn = self.open_connection()?;
         self.require_members_are_served(&conn, &route)?;
+        self.require_model_group_identity(&conn, &route)?;
         ModelRouteRepository::update(&conn, &route, expected_revision)
     }
 
@@ -292,6 +296,19 @@ impl ProviderConfigService {
         agent_id: &AgentId,
         route_id: &ModelRouteId,
     ) -> VibexResult<()> {
+        // The retired entry point now writes the unified default as well. If
+        // it only moved the legacy binding, an explicit Provider source in the
+        // unified record would keep winning and the route the user just chose
+        // would never be used.
+        self.set_agent_model_source_default(vibex_core::SetAgentModelSourceDefaultRequest {
+            scope: vibex_core::ProviderProfileDefaultScope {
+                kind: vibex_core::ProviderDefaultScopeKind::Global,
+                project_id: None,
+                workspace_id: None,
+            },
+            agent_id: agent_id.clone(),
+            source: vibex_core::AgentModelSourceRef::RouteGroup(route_id.clone()),
+        })?;
         let conn = self.open_connection()?;
         AgentModelRouteBindingRepository::set_default(&conn, agent_id, route_id)
     }
@@ -303,6 +320,40 @@ impl ProviderConfigService {
     ) -> VibexResult<bool> {
         let conn = self.open_connection()?;
         AgentModelRouteBindingRepository::delete(&conn, agent_id, route_id)
+    }
+
+    /// Refuses a model group whose Agent-facing id another group already uses.
+    ///
+    /// The id is not the database key — the route id is — but it is the name an
+    /// Agent sees and the suffix of the callable `group/<id>/<model>` address.
+    /// Two live groups publishing the same name would make two picker rows look
+    /// identical, so the write path refuses it with a readable error before the
+    /// database's partial unique index reports a constraint.
+    fn require_model_group_identity(
+        &self,
+        conn: &vibex_db::DbConnection,
+        route: &ModelRoute,
+    ) -> VibexResult<()> {
+        if !route.is_model_group() {
+            return Ok(());
+        }
+        let Some(agent_model) = route.agent_model() else {
+            return Ok(());
+        };
+        for existing in ModelRouteRepository::list(conn)? {
+            if existing.id == route.id || !existing.is_model_group() {
+                continue;
+            }
+            if existing.agent_model() == Some(agent_model) {
+                return Err(VibexError::validation(
+                    "model_route_agent_model_conflict",
+                    "another model group already publishes this model id",
+                )
+                .with_diagnostic("agentModelId", agent_model)
+                .with_diagnostic("modelRouteId", existing.id.as_str()));
+            }
+        }
+        Ok(())
     }
 
     /// Refuses a member that names a model its Provider does not serve.
@@ -363,10 +414,15 @@ fn model_is_served(profile: &ModelProviderProfile, model_id: &str) -> bool {
     if profile.configured_models.is_empty() {
         return !model_id.is_empty();
     }
-    profile
-        .configured_models
-        .iter()
-        .any(|entry| entry.enabled && entry.id == model_id)
+    profile.configured_models.iter().any(|entry| {
+        entry.enabled
+            && (entry.id == model_id
+                || profile
+                    .metadata
+                    .model_aliases
+                    .iter()
+                    .any(|alias| alias.alias == model_id && alias.upstream == entry.id))
+    })
 }
 
 #[cfg(test)]
@@ -1176,6 +1232,200 @@ mod capability_tests {
             .capabilities;
         let declared = route.context_tokens.or(merged.context_tokens);
         assert_eq!(declared, Some(64_000));
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod model_group_tests {
+    use super::*;
+    use vibex_core::{
+        ModelProviderCatalogEntry, ModelProviderProfileId, ModelProviderProfileStatus,
+        ModelRouteMember, RouteKind, RouteStrategy,
+    };
+
+    fn service() -> (std::path::PathBuf, ProviderConfigService) {
+        let path = std::env::temp_dir().join(format!(
+            "vibex-route-model-group-{}.db",
+            vibex_core::RequestId::new().as_str()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let service = ProviderConfigService::new(&path);
+        (path, service)
+    }
+
+    fn provider(
+        service: &ProviderConfigService,
+        name: &str,
+        models: &[&str],
+    ) -> ModelProviderProfileId {
+        let profile = ModelProviderProfile {
+            display_name: name.to_string(),
+            status: ModelProviderProfileStatus::Enabled,
+            configured_models: models
+                .iter()
+                .map(|model| ModelProviderCatalogEntry {
+                    id: (*model).to_string(),
+                    display_name: None,
+                    enabled: true,
+                    metadata: Vec::new(),
+                    capabilities: Default::default(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        service
+            .create_model_provider_profile(vibex_core::ModelProviderProfileCreateRequest {
+                display_name: profile.display_name.clone(),
+                vendor_hint: None,
+                endpoints: Vec::new(),
+                proxy_policy: vibex_core::ModelProviderProxyPolicy::InheritSystem,
+                credentials: Vec::new(),
+                configured_models: profile.configured_models.clone(),
+                default_model_id: models.first().map(|model| (*model).to_string()),
+                headers: Vec::new(),
+                status: ModelProviderProfileStatus::Enabled,
+            })
+            .unwrap()
+            .id
+    }
+
+    fn model_group(
+        left: ModelProviderProfileId,
+        left_model: &str,
+        right: ModelProviderProfileId,
+        right_model: &str,
+        agent_model: &str,
+    ) -> ModelRoute {
+        ModelRoute {
+            display_name: "Fast".to_string(),
+            kind: RouteKind::ModelGroup,
+            agent_model_id: Some(agent_model.to_string()),
+            strategy: RouteStrategy::Ordered,
+            status: RouteStatus::Enabled,
+            members: vec![
+                ModelRouteMember::new(left, left_model, 0),
+                ModelRouteMember::new(right, right_model, 1),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_model_group_saves_across_different_upstream_models() {
+        let (path, service) = service();
+        let left = provider(&service, "DeepSeek", &["deepseek-chat"]);
+        let right = provider(&service, "Kimi", &["kimi-k2"]);
+        let route = service
+            .create_model_route(model_group(
+                left,
+                "deepseek-chat",
+                right,
+                "kimi-k2",
+                "vibex-fast",
+            ))
+            .unwrap();
+        assert_eq!(route.kind, RouteKind::ModelGroup);
+        assert_eq!(route.agent_model_id.as_deref(), Some("vibex-fast"));
+        assert_eq!(route.members.len(), 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_second_live_model_group_cannot_publish_the_same_model() {
+        let (path, service) = service();
+        let left = provider(&service, "DeepSeek", &["deepseek-chat"]);
+        let right = provider(&service, "Kimi", &["kimi-k2"]);
+        service
+            .create_model_route(model_group(
+                left.clone(),
+                "deepseek-chat",
+                right.clone(),
+                "kimi-k2",
+                "vibex-fast",
+            ))
+            .unwrap();
+        let error = service
+            .create_model_route(model_group(
+                left,
+                "deepseek-chat",
+                right,
+                "kimi-k2",
+                "vibex-fast",
+            ))
+            .unwrap_err();
+        assert_eq!(error.code, "model_route_agent_model_conflict");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_model_group_member_must_name_a_served_model() {
+        let (path, service) = service();
+        let left = provider(&service, "DeepSeek", &["deepseek-chat"]);
+        let right = provider(&service, "Kimi", &["kimi-k2"]);
+        let error = service
+            .create_model_route(model_group(
+                left,
+                "not-served",
+                right,
+                "kimi-k2",
+                "vibex-fast",
+            ))
+            .unwrap_err();
+        assert_eq!(error.code, "model_route_member_model_unknown");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_model_group_member_may_name_a_local_alias() {
+        let (path, service) = service();
+        let provider_id = provider(&service, "DeepSeek", &["deepseek-chat"]);
+        let mut profile = service
+            .list_model_provider_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.id == provider_id)
+            .unwrap();
+        profile.metadata.model_aliases = vec![vibex_core::ProviderModelAlias {
+            alias: "fast".to_string(),
+            upstream: "deepseek-chat".to_string(),
+        }];
+        let revision = profile.revision;
+        service
+            .update_model_provider_profile(vibex_core::ModelProviderProfileUpdateRequest {
+                profile,
+                expected_revision: revision,
+            })
+            .unwrap();
+        let route = service
+            .create_model_route(ModelRoute {
+                display_name: "Alias".to_string(),
+                kind: RouteKind::ModelGroup,
+                agent_model_id: Some("vibex-alias".to_string()),
+                strategy: RouteStrategy::Ordered,
+                status: RouteStatus::Enabled,
+                members: vec![ModelRouteMember::new(provider_id, "fast", 0)],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(route.members[0].model_id, "fast");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_unlisted_model_group_is_not_selectable() {
+        let (path, service) = service();
+        let left = provider(&service, "DeepSeek", &["deepseek-chat"]);
+        let right = provider(&service, "Kimi", &["kimi-k2"]);
+        let mut route = model_group(left, "deepseek-chat", right, "kimi-k2", "vibex-fast");
+        route.unlists = true;
+        let route = service.create_model_route(route).unwrap();
+        let agent = AgentId::parse("codex").unwrap();
+        service.bind_model_route(&agent, &route.id, true).unwrap();
+        assert!(
+            service.selectable_routes(&agent).unwrap().is_empty(),
+            "an unlisted group must not appear in a model picker"
+        );
         let _ = std::fs::remove_file(path);
     }
 }

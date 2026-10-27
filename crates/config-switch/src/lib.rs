@@ -1492,16 +1492,41 @@ impl ProviderConfigService {
         build_agent_model_provider_secret_value_response(request.agent_id, &updated)
     }
 
+    /// Reads the legacy Provider-default view of the unified source.
+    ///
+    /// Kept for older clients. The unified record is authoritative: a route
+    /// default has no Provider id to report, so this view answers `None` rather
+    /// than reviving the retired table as a second source of truth.
     pub fn get_agent_model_provider_default(
         &self,
         request: AgentModelProviderDefaultRequest,
     ) -> VibexResult<AgentModelProviderDefaultSelection> {
-        validate_default_scope(&request.scope)?;
-        require_agent_definition(&request.agent_id)?;
-        let conn = self.open_connection()?;
-        AgentDefaultModelProviderProfileRepository::get(&conn, request.scope, request.agent_id)
+        let default =
+            self.get_agent_model_source_default(vibex_core::AgentModelSourceDefaultRequest {
+                scope: request.scope.clone(),
+                agent_id: request.agent_id.clone(),
+            })?;
+        let provider_profile_id = default
+            .source
+            .as_ref()
+            .and_then(|source| source.provider_profile_id().cloned());
+        Ok(AgentModelProviderDefaultSelection {
+            scope: default.scope,
+            agent_id: default.agent_id,
+            provider_profile_id,
+            updated_at_ms: (default.updated_at_ms > 0).then_some(default.updated_at_ms),
+        })
     }
 
+    /// Writes the unified default from the retired Provider-default request.
+    ///
+    /// The old API stays a compatibility shim: a user-facing Provider goes
+    /// through the same transactional write as
+    /// [`Self::set_agent_model_source_default`], so a caller using the old entry
+    /// point cannot create a second default. The hidden gateway Profile and the
+    /// per-kind local fallback are machinery, not a user default source; the
+    /// unified record refuses them, and the launch path still reads their
+    /// legacy row, so those keep the old write.
     pub fn set_agent_model_provider_default(
         &self,
         request: AgentModelProviderSetDefaultRequest,
@@ -1510,20 +1535,37 @@ impl ProviderConfigService {
         let conn = self.open_connection()?;
         let profile =
             require_agent_profile(&conn, &request.agent_id, &request.provider_profile_id)?;
-        if profile.status != ProviderProfileStatus::Enabled {
-            return Err(VibexError::validation(
-                "agent_model_provider_default_disabled",
-                "default model provider profile must be enabled",
-            )
-            .with_diagnostic("agentId", request.agent_id.as_str())
-            .with_diagnostic("providerProfileId", request.provider_profile_id.as_str()));
+        let internal = request
+            .provider_profile_id
+            .as_str()
+            .starts_with("provider_local_default_")
+            || provider_option_value(&profile.provider_options, INTERNAL_PROFILE_ROLE_OPTION_KEY)
+                .is_some();
+        if internal {
+            return AgentDefaultModelProviderProfileRepository::set(
+                &conn,
+                request.scope,
+                request.agent_id,
+                request.provider_profile_id,
+            );
         }
-        AgentDefaultModelProviderProfileRepository::set(
-            &conn,
-            request.scope,
-            request.agent_id,
-            request.provider_profile_id,
-        )
+        let default =
+            self.set_agent_model_source_default(vibex_core::SetAgentModelSourceDefaultRequest {
+                scope: request.scope.clone(),
+                agent_id: request.agent_id.clone(),
+                source: vibex_core::AgentModelSourceRef::Provider(
+                    request.provider_profile_id.clone(),
+                ),
+            })?;
+        Ok(AgentModelProviderDefaultSelection {
+            scope: default.scope,
+            agent_id: default.agent_id,
+            provider_profile_id: default
+                .source
+                .as_ref()
+                .and_then(|source| source.provider_profile_id().cloned()),
+            updated_at_ms: Some(default.updated_at_ms),
+        })
     }
 
     pub fn get_agent_model_provider_failover(

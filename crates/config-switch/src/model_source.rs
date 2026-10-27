@@ -191,10 +191,11 @@ impl ProviderConfigService {
 mod tests {
     use super::*;
     use vibex_core::{
-        AgentId, AgentModelProviderSetDefaultRequest, ModelProviderCatalogEntry,
-        ModelProviderProfileCreateRequest, ModelProviderProfileStatus, ModelProviderProxyPolicy,
-        ModelRoute, ModelRouteMember, ProviderDefaultScopeKind, ProviderKind, ProviderProfile,
-        ProviderProfileDefaultScope, ProviderProfileId, RouteKind, RouteStrategy,
+        AgentId, AgentModelProviderDefaultRequest, AgentModelProviderSetDefaultRequest,
+        ModelProviderCatalogEntry, ModelProviderProfileCreateRequest, ModelProviderProfileStatus,
+        ModelProviderProxyPolicy, ModelRoute, ModelRouteMember, ProviderDefaultScopeKind,
+        ProviderKind, ProviderProfile, ProviderProfileDefaultScope, ProviderProfileId, RouteKind,
+        RouteStrategy,
     };
     use vibex_db::{ProviderProfileRepository, ProviderProjectionCompatibilityRepository};
 
@@ -546,6 +547,44 @@ mod tests {
             })
             .unwrap();
         assert_eq!(read.source, Some(AgentModelSourceRef::Provider(bounded.id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The retired Provider-default API reads and writes the unified source.
+    ///
+    /// An older client must not be able to create a second default, and a
+    /// Provider it sets must be visible through the new read.
+    #[test]
+    fn the_legacy_provider_default_api_uses_the_unified_source() {
+        let (path, service) = service();
+        let first = provider(&service, &agent("claude"), "First");
+        let second = provider(&service, &agent("claude"), "Second");
+        let selection = service
+            .set_agent_model_provider_default(AgentModelProviderSetDefaultRequest {
+                scope: global_scope(),
+                agent_id: agent("claude"),
+                provider_profile_id: second.id.clone(),
+            })
+            .unwrap();
+        assert_eq!(selection.provider_profile_id, Some(second.id.clone()));
+        let unified = service
+            .get_agent_model_source_default(AgentModelSourceDefaultRequest {
+                scope: global_scope(),
+                agent_id: agent("claude"),
+            })
+            .unwrap();
+        assert_eq!(
+            unified.source,
+            Some(AgentModelSourceRef::Provider(second.id.clone()))
+        );
+        let legacy = service
+            .get_agent_model_provider_default(AgentModelProviderDefaultRequest {
+                scope: global_scope(),
+                agent_id: agent("claude"),
+            })
+            .unwrap();
+        assert_eq!(legacy.provider_profile_id, Some(second.id.clone()));
+        let _ = first;
         let _ = std::fs::remove_file(path);
     }
 }

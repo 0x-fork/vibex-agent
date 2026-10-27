@@ -10,13 +10,44 @@
 //! history survives a route being unbound.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+use vibex_core::DEFAULT_MEMBER_WEIGHT;
 use vibex_core::{
     AgentId, AgentModelRouteBinding, AgentModelRouteBindingId, ModelProviderProfileId, ModelRoute,
-    ModelRouteId, ModelRouteMember, ModelRouteMemberId, RouteKind, RouteStatus, RouteStrategy,
-    VibexError, VibexResult,
+    ModelRouteId, ModelRouteMember, ModelRouteMemberId, ModelRouteRule, RouteKind, RouteStatus,
+    RouteStrategy, VibexError, VibexResult,
 };
 
-use super::{enum_from_db_sql, enum_to_db, parse_id_sql, storage_err, unix_timestamp_ms};
+use super::{
+    enum_from_db_sql, enum_to_db, parse_id_sql, parse_optional_id_sql, storage_err,
+    unix_timestamp_ms,
+};
+
+/// The version of the JSON payload we write into `model_routes.rules_json`.
+///
+/// The column grows by adding fields inside the payload rather than by altering
+/// the table again, so a reader has to know which shape it is looking at. An
+/// unknown version is refused instead of guessed: a rule that cannot be read
+/// must not silently become "no rule".
+const ROUTE_RULES_SCHEMA_VERSION: u32 = 1;
+/// The version of the JSON payload we write into `model_routes.levels_json`.
+const ROUTE_LEVELS_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RouteRulesPayload {
+    schema_version: u32,
+    #[serde(default)]
+    rules: Vec<ModelRouteRule>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RouteLevelsPayload {
+    schema_version: u32,
+    #[serde(default)]
+    levels: Vec<String>,
+}
 
 pub struct ModelRouteRepository;
 pub struct AgentModelRouteBindingRepository;
@@ -44,7 +75,9 @@ impl ModelRouteRepository {
                 SELECT model_route_id, display_name, description, kind, strategy,
                     first_token_timeout_ms, context_tokens, pin, token_limit_json,
                     status, revision,
-                    created_at_ms, updated_at_ms, deleted_at_ms, failover
+                    created_at_ms, updated_at_ms, deleted_at_ms, failover,
+                    agent_model_id, rules_json, classifier, effort, patience_ms,
+                    sink, unlists, levels_json, pick_member_id
                 FROM model_routes
                 WHERE model_route_id = ?1 AND deleted_at_ms IS NULL
                 ",
@@ -134,7 +167,16 @@ impl ModelRouteRepository {
                     status = ?10,
                     revision = revision + 1,
                     updated_at_ms = ?11,
-                    failover = ?13
+                    failover = ?13,
+                    agent_model_id = ?14,
+                    rules_json = ?15,
+                    classifier = ?16,
+                    effort = ?17,
+                    patience_ms = ?18,
+                    sink = ?19,
+                    unlists = ?20,
+                    levels_json = ?21,
+                    pick_member_id = ?22
                 WHERE model_route_id = ?1
                     AND revision = ?12
                     AND deleted_at_ms IS NULL
@@ -153,6 +195,18 @@ impl ModelRouteRepository {
                     next_stamp(conn, route)?,
                     expected_revision,
                     enum_to_db(&route.failover)?,
+                    route.agent_model().map(str::to_string),
+                    encode_rules(&route.rules)?,
+                    route.classifier.as_deref().map(str::trim),
+                    route.effort.as_deref().map(str::trim),
+                    route.patience_ms,
+                    i64::from(route.sink),
+                    i64::from(route.unlists),
+                    encode_levels(&route.levels)?,
+                    route
+                        .pick_member_id
+                        .as_ref()
+                        .map(ModelRouteMemberId::as_str),
                 ],
             )
             .map_err(storage_err(
@@ -553,9 +607,14 @@ fn insert_route(conn: &Connection, route: &ModelRoute) -> VibexResult<()> {
             model_route_id, display_name, description, kind, strategy,
             first_token_timeout_ms, context_tokens, pin, token_limit_json,
             status, revision,
-            created_at_ms, updated_at_ms, deleted_at_ms, failover
+            created_at_ms, updated_at_ms, deleted_at_ms, failover,
+            agent_model_id, rules_json, classifier, effort, patience_ms,
+            sink, unlists, levels_json, pick_member_id
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+        )
         ",
         params![
             route.id.as_str(),
@@ -573,6 +632,18 @@ fn insert_route(conn: &Connection, route: &ModelRoute) -> VibexResult<()> {
             route.updated_at_ms.max(1),
             route.deleted_at_ms,
             enum_to_db(&route.failover)?,
+            route.agent_model().map(str::to_string),
+            encode_rules(&route.rules)?,
+            route.classifier.as_deref().map(str::trim),
+            route.effort.as_deref().map(str::trim),
+            route.patience_ms,
+            i64::from(route.sink),
+            i64::from(route.unlists),
+            encode_levels(&route.levels)?,
+            route
+                .pick_member_id
+                .as_ref()
+                .map(ModelRouteMemberId::as_str),
         ],
     )
     .map_err(storage_err(
@@ -588,9 +659,10 @@ fn insert_members(conn: &Connection, route: &ModelRoute) -> VibexResult<()> {
             "
             INSERT INTO model_route_members (
                 model_route_member_id, model_route_id, model_provider_profile_id,
-                model_id, enabled, order_index, reasoning_effort
+                model_id, enabled, order_index, reasoning_effort,
+                weight, context_tokens, first_token_timeout_ms
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ",
             params![
                 member.id.as_str(),
@@ -600,6 +672,9 @@ fn insert_members(conn: &Connection, route: &ModelRoute) -> VibexResult<()> {
                 i64::from(member.enabled),
                 member.order_index,
                 member.reasoning_effort.as_deref().map(str::trim),
+                i64::from(member.weight.max(DEFAULT_MEMBER_WEIGHT)),
+                member.context_tokens,
+                member.first_token_timeout_ms,
             ],
         )
         .map_err(storage_err(
@@ -615,7 +690,8 @@ fn list_members(conn: &Connection, route_id: &ModelRouteId) -> VibexResult<Vec<M
         .prepare(
             "
             SELECT model_route_member_id, model_provider_profile_id, model_id,
-                enabled, order_index, reasoning_effort
+                enabled, order_index, reasoning_effort,
+                weight, context_tokens, first_token_timeout_ms
             FROM model_route_members
             WHERE model_route_id = ?1
             ORDER BY order_index ASC, model_route_member_id ASC
@@ -637,6 +713,18 @@ fn list_members(conn: &Connection, route_id: &ModelRouteId) -> VibexResult<Vec<M
                 enabled: row.get::<_, i64>(3)? != 0,
                 order_index: row.get(4)?,
                 reasoning_effort: row.get(5)?,
+                weight: row
+                    .get::<_, i64>(6)
+                    .ok()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .unwrap_or(DEFAULT_MEMBER_WEIGHT),
+                context_tokens: row
+                    .get::<_, Option<i64>>(7)?
+                    .and_then(|value| u32::try_from(value).ok().filter(|value| *value > 0)),
+                first_token_timeout_ms: row
+                    .get::<_, Option<i64>>(8)?
+                    .and_then(|value| u64::try_from(value).ok().filter(|value| *value > 0)),
             })
         })
         .map_err(storage_err(
@@ -652,7 +740,9 @@ fn list_where(conn: &Connection, predicate: &str, order: &str) -> VibexResult<Ve
         SELECT model_route_id, display_name, description, kind, strategy,
             first_token_timeout_ms, context_tokens, pin, token_limit_json,
                     status, revision,
-            created_at_ms, updated_at_ms, deleted_at_ms, failover
+            created_at_ms, updated_at_ms, deleted_at_ms, failover,
+            agent_model_id, rules_json, classifier, effort, patience_ms,
+            sink, unlists, levels_json, pick_member_id
         FROM model_routes
         WHERE {predicate}
         {order}
@@ -709,6 +799,20 @@ fn map_route(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRoute> {
         updated_at_ms: row.get(12)?,
         deleted_at_ms: row.get(13)?,
         failover: enum_from_db_sql(row.get(14)?)?,
+        agent_model_id: row.get(15)?,
+        rules: decode_rules(row.get::<_, Option<String>>(16)?)?,
+        classifier: row.get(17)?,
+        effort: row.get(18)?,
+        patience_ms: row
+            .get::<_, Option<i64>>(19)?
+            .and_then(|value| u64::try_from(value).ok().filter(|value| *value > 0)),
+        sink: row.get::<_, i64>(20)? != 0,
+        unlists: row.get::<_, i64>(21)? != 0,
+        levels: decode_levels(row.get::<_, Option<String>>(22)?)?,
+        pick_member_id: parse_optional_id_sql(
+            row.get::<_, Option<String>>(23)?,
+            ModelRouteMemberId::parse,
+        )?,
     })
 }
 
@@ -921,7 +1025,7 @@ pub fn legacy_profile_for_route(
             let profile = super::ProviderProfileRepository::get(conn, &legacy_id)?;
             Ok(profile.filter(|profile| &profile.agent_id == agent_id))
         }
-        vibex_core::RouteKind::ProviderGroup => {
+        vibex_core::RouteKind::ProviderGroup | vibex_core::RouteKind::ModelGroup => {
             // A gateway Profile is per Agent and lists exactly the groups that
             // Agent is bound to. A group contributes one entry per shared
             // model, so the check is by prefix rather than by a single id.
@@ -967,6 +1071,84 @@ fn encode_token_limit(
             format!("failed to encode the route token limit: {error}"),
         )
     })
+}
+
+/// Encodes a route's rules for storage.
+///
+/// An empty list is stored as NULL, so a route that has never had a rule and a
+/// route whose rules were all removed read the same way.
+fn encode_rules(rules: &[ModelRouteRule]) -> VibexResult<Option<String>> {
+    if rules.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(&RouteRulesPayload {
+        schema_version: ROUTE_RULES_SCHEMA_VERSION,
+        rules: rules.to_vec(),
+    })
+    .map(Some)
+    .map_err(|error| {
+        VibexError::storage(
+            "model_route_rules_encode_failed",
+            format!("failed to encode the route rules: {error}"),
+        )
+    })
+}
+
+fn decode_rules(raw: Option<String>) -> rusqlite::Result<Vec<ModelRouteRule>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let payload = serde_json::from_str::<RouteRulesPayload>(&raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(16, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    if payload.schema_version != ROUTE_RULES_SCHEMA_VERSION {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            16,
+            rusqlite::types::Type::Text,
+            Box::new(VibexError::storage(
+                "model_route_rules_version_unknown",
+                "the route rules were written by an unsupported schema version",
+            )),
+        ));
+    }
+    Ok(payload.rules)
+}
+
+fn encode_levels(levels: &[String]) -> VibexResult<Option<String>> {
+    if levels.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(&RouteLevelsPayload {
+        schema_version: ROUTE_LEVELS_SCHEMA_VERSION,
+        levels: levels.to_vec(),
+    })
+    .map(Some)
+    .map_err(|error| {
+        VibexError::storage(
+            "model_route_levels_encode_failed",
+            format!("failed to encode the route levels: {error}"),
+        )
+    })
+}
+
+fn decode_levels(raw: Option<String>) -> rusqlite::Result<Vec<String>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let payload = serde_json::from_str::<RouteLevelsPayload>(&raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(22, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    if payload.schema_version != ROUTE_LEVELS_SCHEMA_VERSION {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            22,
+            rusqlite::types::Type::Text,
+            Box::new(VibexError::storage(
+                "model_route_levels_version_unknown",
+                "the route levels were written by an unsupported schema version",
+            )),
+        ));
+    }
+    Ok(payload.levels)
 }
 
 #[cfg(test)]
@@ -1664,6 +1846,22 @@ mod route_auth_source_tests {
 mod route_policy_tests {
     use super::*;
 
+    fn migrated_connection() -> Connection {
+        let mut connection = Connection::open_in_memory().unwrap();
+        crate::apply_migrations(&mut connection).unwrap();
+        connection
+    }
+
+    fn seed_provider(conn: &Connection, name: &str) -> ModelProviderProfileId {
+        let profile = vibex_core::ModelProviderProfile {
+            display_name: name.to_string(),
+            status: vibex_core::ModelProviderProfileStatus::Enabled,
+            ..Default::default()
+        };
+        crate::ModelProviderProfileRepository::insert(conn, &profile).unwrap();
+        profile.id
+    }
+
     /// A route's pin and token ceiling survive storage.
     ///
     /// These are the fields the route graph edits. Without them stored, the UI
@@ -1751,5 +1949,120 @@ mod route_policy_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A model group stores its virtual model, rules, and member overrides.
+    ///
+    /// This is the shape the old provider-group rows must not be forced into:
+    /// every new column is nullable or defaulted, so the same table holds both.
+    #[test]
+    fn a_model_group_round_trips_its_rules_and_member_overrides() {
+        let conn = migrated_connection();
+        let left = seed_provider(&conn, "DeepSeek");
+        let right = seed_provider(&conn, "Kimi");
+        let mut first = ModelRouteMember::new(left, "deepseek-chat", 0);
+        first.weight = 3;
+        first.first_token_timeout_ms = Some(12_000);
+        first.context_tokens = Some(128_000);
+        let mut second = ModelRouteMember::new(right, "kimi-k2", 1);
+        second.reasoning_effort = Some("high".to_string());
+        let route = ModelRoute {
+            display_name: "Fast".to_string(),
+            kind: RouteKind::ModelGroup,
+            agent_model_id: Some("vibex-fast".to_string()),
+            strategy: RouteStrategy::Weighted,
+            members: vec![first.clone(), second],
+            rules: vec![ModelRouteRule {
+                id: "rule-1".to_string(),
+                use_member_id: Some(first.id.clone()),
+                use_effort: Some("high".to_string()),
+                images: Some(false),
+                tokens_min: Some(1_000),
+                ..Default::default()
+            }],
+            classifier: Some("deepseek-chat".to_string()),
+            effort: Some("auto".to_string()),
+            patience_ms: Some(60_000),
+            sink: true,
+            unlists: true,
+            levels: vec!["fast".to_string(), "deep".to_string()],
+            pick_member_id: Some(first.id.clone()),
+            status: RouteStatus::Enabled,
+            ..Default::default()
+        };
+        ModelRouteRepository::insert(&conn, &route).unwrap();
+
+        let read = ModelRouteRepository::get(&conn, &route.id)
+            .unwrap()
+            .expect("the model group must exist");
+        assert_eq!(read.kind, RouteKind::ModelGroup);
+        assert_eq!(read.agent_model_id.as_deref(), Some("vibex-fast"));
+        assert_eq!(read.strategy, RouteStrategy::Weighted);
+        assert_eq!(read.rules.len(), 1);
+        assert_eq!(read.rules[0].id, "rule-1");
+        assert_eq!(read.rules[0].use_member_id, Some(first.id.clone()));
+        assert_eq!(read.classifier.as_deref(), Some("deepseek-chat"));
+        assert_eq!(read.effort.as_deref(), Some("auto"));
+        assert_eq!(read.patience_ms, Some(60_000));
+        assert!(read.sink);
+        assert!(read.unlists);
+        assert_eq!(read.levels, vec!["fast", "deep"]);
+        assert_eq!(read.pick_member_id, Some(first.id.clone()));
+        assert_eq!(read.members[0].weight, 3);
+        assert_eq!(read.members[0].first_token_timeout_ms, Some(12_000));
+        assert_eq!(read.members[0].context_tokens, Some(128_000));
+        assert_eq!(read.members[1].reasoning_effort.as_deref(), Some("high"));
+
+        // Clearing every optional field must round-trip as absent, not as a
+        // magic empty payload. The route stays a valid model group with one
+        // member, so the clear is what is being tested.
+        let mut cleared = read.clone();
+        cleared.strategy = RouteStrategy::Ordered;
+        cleared.rules.clear();
+        cleared.levels.clear();
+        cleared.pick_member_id = None;
+        cleared.classifier = None;
+        cleared.effort = None;
+        cleared.patience_ms = None;
+        cleared.sink = false;
+        cleared.unlists = false;
+        cleared.members.truncate(1);
+        cleared.members[0].weight = vibex_core::DEFAULT_MEMBER_WEIGHT;
+        cleared.members[0].context_tokens = None;
+        cleared.members[0].first_token_timeout_ms = None;
+        ModelRouteRepository::update(&conn, &cleared, read.revision).unwrap();
+        let reread = ModelRouteRepository::get(&conn, &route.id)
+            .unwrap()
+            .unwrap();
+        assert!(reread.rules.is_empty());
+        assert!(reread.levels.is_empty());
+        assert_eq!(reread.pick_member_id, None);
+        assert_eq!(reread.classifier, None);
+        assert_eq!(reread.effort, None);
+        assert_eq!(reread.patience_ms, None);
+        assert!(!reread.sink);
+        assert!(!reread.unlists);
+        assert_eq!(reread.members[0].weight, 1);
+        assert_eq!(reread.members[0].context_tokens, None);
+        assert_eq!(reread.members[0].first_token_timeout_ms, None);
+    }
+
+    #[test]
+    fn two_live_model_groups_cannot_publish_the_same_model() {
+        let conn = migrated_connection();
+        let provider = seed_provider(&conn, "DeepSeek");
+        let route = |name: &str| ModelRoute {
+            display_name: name.to_string(),
+            kind: RouteKind::ModelGroup,
+            agent_model_id: Some("shared-model".to_string()),
+            members: vec![ModelRouteMember::new(provider.clone(), "deepseek-chat", 0)],
+            status: RouteStatus::Enabled,
+            ..Default::default()
+        };
+        ModelRouteRepository::insert(&conn, &route("One")).unwrap();
+        assert!(
+            ModelRouteRepository::insert(&conn, &route("Two")).is_err(),
+            "the database must refuse a second live group with the same virtual model"
+        );
     }
 }

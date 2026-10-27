@@ -1494,6 +1494,13 @@ mod tests {
                 skipped_members: Vec::new(),
                 error_code: None,
                 error_message: None,
+                decision: Some(vibex_core::GatewayRouteDecisionTrace {
+                    rule_index: Some(1),
+                    rule_id: Some("rule-2".to_string()),
+                    reason: Some("rule".to_string()),
+                    effort: Some("high".to_string()),
+                    ..Default::default()
+                }),
             }),
             created_at_ms: now,
         };

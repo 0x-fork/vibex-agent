@@ -62,6 +62,15 @@ pub enum GatewayError {
         status: u16,
         message: String,
     },
+    /// The route's rules paused routing for this request.
+    ///
+    /// A pause is the user's own decision, not an upstream failure: the turn
+    /// stops before any Provider is called and the message says which rule did
+    /// it. It must not cool a Key or count toward a group's breaker.
+    RoutePaused {
+        group: String,
+        reason: String,
+    },
     /// The gateway's own configuration is unusable.
     NotConfigured(String),
     /// An internal invariant broke. Never includes request content.
@@ -79,6 +88,7 @@ impl GatewayError {
             Self::MalformedRequest(_) => 400,
             Self::Upstream { status, .. } => *status,
             Self::ProtocolMismatch { .. } | Self::TranslationFailed { .. } => 502,
+            Self::RoutePaused { .. } => 503,
             Self::NotConfigured(_) => 503,
             Self::Internal(_) => 500,
         }
@@ -95,6 +105,7 @@ impl GatewayError {
             Self::Upstream { .. } => "model_gateway_upstream_failed",
             Self::ProtocolMismatch { .. } => "model_gateway_protocol_mismatch",
             Self::TranslationFailed { .. } => "model_gateway_translation_failed",
+            Self::RoutePaused { .. } => "model_gateway_route_paused",
             Self::NotConfigured(_) => "model_gateway_not_configured",
             Self::Internal(_) => "model_gateway_internal",
         }
@@ -140,6 +151,9 @@ impl GatewayError {
             } => format!(
                 "The gateway could not build a `{wire_protocol_id}` request this endpoint accepts: {message}"
             ),
+            Self::RoutePaused { group, reason } => format!(
+                "Routing for `{group}` is paused: {reason}"
+            ),
             Self::NotConfigured(detail) => format!("The gateway is not configured: {detail}"),
             Self::Internal(detail) => format!("The gateway could not complete this request: {detail}"),
         }
@@ -171,6 +185,21 @@ impl GatewayError {
         match self {
             Self::AllKeysCooling { retry_after_ms, .. } => *retry_after_ms,
             _ => None,
+        }
+    }
+
+    /// Whether retrying the same request later could succeed.
+    ///
+    /// Only transport-shaped and capacity failures qualify: a bad credential,
+    /// a missing model, a wrong protocol, and a body the gateway could not
+    /// build are all deterministic, so patience would only delay the error.
+    pub const fn is_recoverable(&self) -> bool {
+        match self {
+            Self::Upstream { status, .. } => {
+                matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529)
+            }
+            Self::AllKeysCooling { .. } => true,
+            _ => false,
         }
     }
 }

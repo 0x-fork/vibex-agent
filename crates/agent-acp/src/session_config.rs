@@ -909,13 +909,9 @@ impl RuntimeRouteFacts {
     /// it through the direct Provider instead.
     pub fn option_model_id(&self, route_id: &vibex_core::ModelRouteId, model: &str) -> String {
         match self.kind {
-            vibex_core::RouteKind::ProviderGroup => format!(
-                "{}{}/{}",
-                vibex_core::PROVIDER_GROUP_MODEL_PREFIX,
-                route_id.as_str(),
-                model
-            ),
-            vibex_core::RouteKind::Direct => {
+            vibex_core::RouteKind::ProviderGroup
+            | vibex_core::RouteKind::ModelGroup
+            | vibex_core::RouteKind::Direct => {
                 format!(
                     "{}{}/{}",
                     vibex_core::PROVIDER_GROUP_MODEL_PREFIX,

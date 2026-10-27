@@ -2269,6 +2269,7 @@ impl Dispatch {
                     default_connect_timeout_ms: settings.policy.default_connect_timeout_ms,
                     default_request_timeout_ms: settings.policy.default_request_timeout_ms,
                     default_stream_idle_timeout_ms: settings.policy.default_stream_idle_timeout_ms,
+                    cooldown_overrides_ms: settings.policy.cooldown_overrides_ms.clone(),
                     expected_revision: settings.revision,
                 };
                 match self
@@ -2313,6 +2314,7 @@ impl Dispatch {
                     default_connect_timeout_ms: settings.policy.default_connect_timeout_ms,
                     default_request_timeout_ms: settings.policy.default_request_timeout_ms,
                     default_stream_idle_timeout_ms: settings.policy.default_stream_idle_timeout_ms,
+                    cooldown_overrides_ms: settings.policy.cooldown_overrides_ms.clone(),
                     expected_revision: settings.revision,
                 };
                 match self

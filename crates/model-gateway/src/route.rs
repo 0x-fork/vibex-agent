@@ -469,30 +469,70 @@ pub fn provider_alias(display_name: &str) -> String {
 /// One member of a route, resolved to something the gateway can call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteMemberRef {
+    /// The stable member id, when the member came from a persisted route.
+    pub member_id: Option<vibex_core::ModelRouteMemberId>,
     pub profile: ModelProviderProfileId,
     pub model: String,
     /// Reasoning effort to ask for, overriding the Agent's request.
     pub reasoning_effort: Option<String>,
+    /// Relative share under [`vibex_core::RouteStrategy::Weighted`].
+    pub weight: u32,
+    /// A member-level context window, when it overrides the route's.
+    pub context_tokens: Option<u32>,
+    /// A member-level first-token deadline, when it overrides the route's.
+    pub first_token_timeout_ms: Option<u64>,
 }
 
-/// Chooses the member order, using observed usage for `LeastUsed`.
+impl RouteMemberRef {
+    /// A member with the defaults every route uses: weight one, no overrides.
+    pub fn new(profile: ModelProviderProfileId, model: impl Into<String>) -> Self {
+        Self {
+            member_id: None,
+            profile,
+            model: model.into(),
+            reasoning_effort: None,
+            weight: vibex_core::DEFAULT_MEMBER_WEIGHT,
+            context_tokens: None,
+            first_token_timeout_ms: None,
+        }
+    }
+}
+
+/// What the router has observed about one member recently.
+///
+/// All of it is local request state: cooldown comes from the account-state
+/// table, usage from the token window, latency from completed requests, and
+/// inflight from the service's own counter. None of it is a vendor quota.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemberObservation {
+    pub used_tokens: u64,
+    pub p50_ms: Option<u64>,
+    pub p95_ms: Option<u64>,
+    /// The member has no ready Key right now.
+    pub cooling: bool,
+    pub inflight: u32,
+}
+
+/// Chooses the member order from configured order, weights, and observations.
 ///
 /// The strategy applies across members; the Key strategy inside the chosen
 /// member is the existing `plan_route`, unchanged. A member with no usable Key
 /// is still tried — its failure is what tells the caller why nothing answered,
 /// and the caller may fail over to the next member.
-///
-/// `usage` is per Provider, in tokens spent in the current window. A member
-/// with no recorded usage counts as zero, which is what makes a new Provider
-/// get tried instead of waiting behind one that has already spent its budget.
-/// Ties keep the configured order, so the strategy never shuffles a route that
-/// has nothing to distinguish.
-pub fn plan_members_with_usage(
+pub fn plan_members(
     members: &[RouteMemberRef],
     strategy: vibex_core::RouteStrategy,
     rotation: u64,
-    usage: &[(ModelProviderProfileId, u64)],
+    observations: &[(ModelProviderProfileId, MemberObservation)],
+    pick_member_id: Option<&vibex_core::ModelRouteMemberId>,
 ) -> Vec<RouteMemberRef> {
+    let observation = |member: &RouteMemberRef| {
+        observations
+            .iter()
+            .find(|(profile, _)| profile == &member.profile)
+            .map(|(_, observation)| observation.clone())
+            .unwrap_or_default()
+    };
     let mut ordered = members.to_vec();
     match strategy {
         vibex_core::RouteStrategy::Ordered => {}
@@ -503,16 +543,108 @@ pub fn plan_members_with_usage(
             }
         }
         vibex_core::RouteStrategy::LeastUsed => {
+            ordered.sort_by_key(|member| observation(member).used_tokens);
+        }
+        vibex_core::RouteStrategy::Smart => {
             ordered.sort_by_key(|member| {
-                usage
-                    .iter()
-                    .find(|(profile, _)| profile == &member.profile)
-                    .map(|(_, tokens)| *tokens)
-                    .unwrap_or(0)
+                let observed = observation(member);
+                (
+                    observed.cooling,
+                    observed.p50_ms.unwrap_or(u64::MAX),
+                    observed.inflight,
+                    observed.used_tokens,
+                )
             });
+        }
+        vibex_core::RouteStrategy::LowestLatency => {
+            ordered.sort_by_key(|member| {
+                let observed = observation(member);
+                (
+                    observed.cooling,
+                    observed.p50_ms.unwrap_or(u64::MAX),
+                    observed.p95_ms.unwrap_or(u64::MAX),
+                )
+            });
+        }
+        vibex_core::RouteStrategy::Weighted => {
+            ordered = weighted_order(&ordered, rotation);
+        }
+        vibex_core::RouteStrategy::Manual => {
+            if let Some(picked) = pick_member_id {
+                ordered.retain(|member| member.member_id.as_ref() == Some(picked));
+            }
         }
     }
     ordered
+}
+
+/// A stable weighted cycle, rotated so the first member is chosen in proportion
+/// to its weight.
+///
+/// The cycle places each member once per weight unit, round by round, so a 3:1
+/// pair reads `A, B, A, A` rather than three A's in a row. Rotating by the
+/// request counter makes the first attempt A three times out of four; the
+/// deduplicated order that follows keeps every member available for failover.
+fn weighted_order(members: &[RouteMemberRef], rotation: u64) -> Vec<RouteMemberRef> {
+    let weights = members
+        .iter()
+        .map(|member| member.weight.max(1) as usize)
+        .collect::<Vec<_>>();
+    let total = weights.iter().sum::<usize>();
+    if total == 0 {
+        return members.to_vec();
+    }
+    let max_weight = weights.iter().copied().max().unwrap_or(1);
+    let mut cycle = Vec::with_capacity(total);
+    for round in 0..max_weight {
+        for (index, member) in members.iter().enumerate() {
+            if round < weights[index] {
+                cycle.push(member.clone());
+            }
+        }
+    }
+    let start = (rotation as usize) % cycle.len().max(1);
+    let mut ordered = Vec::with_capacity(members.len());
+    for member in cycle
+        .into_iter()
+        .cycle()
+        .skip(start)
+        .take(members.len() * 2)
+    {
+        if !ordered.contains(&member) {
+            ordered.push(member);
+        }
+        if ordered.len() == members.len() {
+            break;
+        }
+    }
+    ordered
+}
+
+/// Chooses the member order, using observed usage for `LeastUsed`.
+///
+/// Kept as the small entry point older tests and callers use; it delegates to
+/// [`plan_members`] with only usage observed.
+#[cfg(test)]
+pub fn plan_members_with_usage(
+    members: &[RouteMemberRef],
+    strategy: vibex_core::RouteStrategy,
+    rotation: u64,
+    usage: &[(ModelProviderProfileId, u64)],
+) -> Vec<RouteMemberRef> {
+    let observations = usage
+        .iter()
+        .map(|(profile, tokens)| {
+            (
+                profile.clone(),
+                MemberObservation {
+                    used_tokens: *tokens,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    plan_members(members, strategy, rotation, &observations, None)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1064,9 +1196,13 @@ mod route_members {
 
     fn member(profile: &str, model: &str) -> RouteMemberRef {
         RouteMemberRef {
+            member_id: None,
             profile: ModelProviderProfileId::parse(profile).unwrap(),
             model: model.to_string(),
             reasoning_effort: None,
+            weight: vibex_core::DEFAULT_MEMBER_WEIGHT,
+            context_tokens: None,
+            first_token_timeout_ms: None,
         }
     }
 
@@ -1173,6 +1309,152 @@ mod route_members {
     fn an_empty_route_plans_to_nothing() {
         let planned = plan_members_with_usage(&[], vibex_core::RouteStrategy::RoundRobin, 5, &[]);
         assert!(planned.is_empty());
+    }
+
+    #[test]
+    fn weighted_rotation_starts_in_proportion_to_the_weights() {
+        let mut members = vec![
+            member("model_provider_a", "a"),
+            member("model_provider_b", "b"),
+        ];
+        members[0].weight = 3;
+        members[1].weight = 1;
+        let mut firsts = Vec::new();
+        for rotation in 0..4 {
+            let planned = plan_members(
+                &members,
+                vibex_core::RouteStrategy::Weighted,
+                rotation,
+                &[],
+                None,
+            );
+            assert_eq!(
+                planned.len(),
+                2,
+                "every member stays available for failover"
+            );
+            firsts.push(planned[0].model.clone());
+        }
+        assert_eq!(
+            firsts.iter().filter(|model| *model == "a").count(),
+            3,
+            "a weight of three wins three starts out of four"
+        );
+        assert_eq!(firsts.iter().filter(|model| *model == "b").count(), 1);
+    }
+
+    #[test]
+    fn manual_uses_only_the_picked_member() {
+        let mut members = vec![
+            member("model_provider_a", "a"),
+            member("model_provider_b", "b"),
+        ];
+        let picked = vibex_core::ModelRouteMemberId::new();
+        members[1].member_id = Some(picked.clone());
+        let planned = plan_members(
+            &members,
+            vibex_core::RouteStrategy::Manual,
+            0,
+            &[],
+            Some(&picked),
+        );
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].model, "b");
+    }
+
+    #[test]
+    fn smart_prefers_health_then_latency_then_inflight() {
+        let members = vec![
+            member("model_provider_a", "a"),
+            member("model_provider_b", "b"),
+            member("model_provider_c", "c"),
+        ];
+        let profile = |name: &str| ModelProviderProfileId::parse(name).unwrap();
+        let observations = vec![
+            (
+                profile("model_provider_a"),
+                MemberObservation {
+                    p50_ms: Some(900),
+                    inflight: 3,
+                    ..Default::default()
+                },
+            ),
+            (
+                profile("model_provider_b"),
+                MemberObservation {
+                    p50_ms: Some(200),
+                    inflight: 4,
+                    ..Default::default()
+                },
+            ),
+            (
+                profile("model_provider_c"),
+                MemberObservation {
+                    p50_ms: Some(100),
+                    // A cooling member is tried after every healthy one, even
+                    // with the best recorded latency.
+                    cooling: true,
+                    ..Default::default()
+                },
+            ),
+        ];
+        let planned = plan_members(
+            &members,
+            vibex_core::RouteStrategy::Smart,
+            0,
+            &observations,
+            None,
+        );
+        assert_eq!(
+            planned
+                .iter()
+                .map(|member| member.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a", "c"]
+        );
+    }
+
+    #[test]
+    fn lowest_latency_orders_by_observed_p50_then_p95() {
+        let members = vec![
+            member("model_provider_a", "a"),
+            member("model_provider_b", "b"),
+            member("model_provider_c", "c"),
+        ];
+        let profile = |name: &str| ModelProviderProfileId::parse(name).unwrap();
+        let observations = vec![
+            (
+                profile("model_provider_a"),
+                MemberObservation {
+                    p50_ms: Some(300),
+                    p95_ms: Some(900),
+                    ..Default::default()
+                },
+            ),
+            (
+                profile("model_provider_b"),
+                MemberObservation {
+                    p50_ms: Some(300),
+                    p95_ms: Some(400),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let planned = plan_members(
+            &members,
+            vibex_core::RouteStrategy::LowestLatency,
+            0,
+            &observations,
+            None,
+        );
+        assert_eq!(
+            planned
+                .iter()
+                .map(|member| member.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a", "c"],
+            "equal p50 is broken by p95, and an unseen member follows the measured ones"
+        );
     }
 
     /// A refusal that names a shape problem is the protocol's fault, not the

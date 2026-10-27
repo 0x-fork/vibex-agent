@@ -97,7 +97,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 82;
+pub const CURRENT_SCHEMA_VERSION: i64 = 83;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12501,6 +12501,11 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // migration list.
     apply_agent_model_source_defaults(conn, &mut applied)?;
     provider_projection::migrate_provider_metadata(conn, &mut applied)?;
+    // Model-group columns come after the recorded tail so a database migrated
+    // from an older build reports an ascending version list. The migration
+    // itself is column-by-column, so a rewound version row over an existing
+    // schema is safe to re-run.
+    apply_model_group_routing(conn, &mut applied)?;
     Ok(applied)
 }
 
@@ -13381,7 +13386,144 @@ fn apply_route_failover(conn: &mut Connection, applied: &mut Vec<String>) -> Vib
     Ok(())
 }
 
-/// Adds the Agent-scoped launch fields to the v2 binding.
+/// Adds the model-level routing columns to the reusable route tables.
+///
+/// A model group stores one Agent-facing model id, its ordered rules, and the
+/// knobs that only make sense for a model-level composition. Every column is
+/// nullable or defaulted, so a provider group or direct route reads back exactly
+/// as it did before the columns existed.
+///
+/// The partial unique index is the database's fence against two live model
+/// groups publishing the same virtual model: the service checks first for a
+/// readable error, but a direct write that skipped it would otherwise make the
+/// gateway catalogue ambiguous.
+fn apply_model_group_routing(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 83;
+    const NAME: &str = "model_group_routing";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start model group routing migration transaction",
+    ))?;
+    // Column-by-column rather than one batch: a database whose version row was
+    // rewound over an already-new schema must re-run this without failing on
+    // `duplicate column name`. Every column is additive.
+    let add_column = |tx: &Transaction<'_>, table: &str, column: &str, sql: &str| {
+        let exists: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if exists == 0 {
+            tx.execute_batch(sql).map_err(storage_err(
+                "migration_apply_failed",
+                "failed to add a model group routing column",
+            ))?;
+        }
+        Ok::<(), VibexError>(())
+    };
+    add_column(
+        &tx,
+        "model_routes",
+        "agent_model_id",
+        "ALTER TABLE model_routes ADD COLUMN agent_model_id TEXT NULL;",
+    )?;
+    add_column(
+        &tx,
+        "model_routes",
+        "rules_json",
+        "ALTER TABLE model_routes ADD COLUMN rules_json TEXT NULL;",
+    )?;
+    add_column(
+        &tx,
+        "model_routes",
+        "classifier",
+        "ALTER TABLE model_routes ADD COLUMN classifier TEXT NULL;",
+    )?;
+    add_column(
+        &tx,
+        "model_routes",
+        "effort",
+        "ALTER TABLE model_routes ADD COLUMN effort TEXT NULL;",
+    )?;
+    add_column(
+        &tx,
+        "model_routes",
+        "patience_ms",
+        "ALTER TABLE model_routes ADD COLUMN patience_ms INTEGER NULL;",
+    )?;
+    add_column(
+        &tx,
+        "model_routes",
+        "sink",
+        "ALTER TABLE model_routes ADD COLUMN sink INTEGER NOT NULL DEFAULT 0;",
+    )?;
+    add_column(
+        &tx,
+        "model_routes",
+        "unlists",
+        "ALTER TABLE model_routes ADD COLUMN unlists INTEGER NOT NULL DEFAULT 0;",
+    )?;
+    add_column(
+        &tx,
+        "model_routes",
+        "levels_json",
+        "ALTER TABLE model_routes ADD COLUMN levels_json TEXT NULL;",
+    )?;
+    add_column(
+        &tx,
+        "model_routes",
+        "pick_member_id",
+        "ALTER TABLE model_routes ADD COLUMN pick_member_id TEXT NULL;",
+    )?;
+    add_column(
+        &tx,
+        "model_route_members",
+        "weight",
+        "ALTER TABLE model_route_members ADD COLUMN weight INTEGER NOT NULL DEFAULT 1;",
+    )?;
+    add_column(
+        &tx,
+        "model_route_members",
+        "context_tokens",
+        "ALTER TABLE model_route_members ADD COLUMN context_tokens INTEGER NULL;",
+    )?;
+    add_column(
+        &tx,
+        "model_route_members",
+        "first_token_timeout_ms",
+        "ALTER TABLE model_route_members ADD COLUMN first_token_timeout_ms INTEGER NULL;",
+    )?;
+    tx.execute_batch(
+        "
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_model_routes_agent_model
+            ON model_routes(agent_model_id)
+            WHERE agent_model_id IS NOT NULL AND deleted_at_ms IS NULL;
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to create the model group routing index",
+    ))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the model group routing migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit the model group routing migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
 ///
 /// These three had no home on the v2 side at all: they lived only on the legacy
 /// `ProviderProfile`, which is why that row could not yet retire to a projection.
@@ -18771,6 +18913,7 @@ mod tests {
                 "80:route_failover",
                 "81:agent_model_source_defaults",
                 "82:model_provider_metadata",
+                "83:model_group_routing",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -18937,6 +19080,7 @@ mod tests {
                 "80:route_failover",
                 "81:agent_model_source_defaults",
                 "82:model_provider_metadata",
+                "83:model_group_routing",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -19084,6 +19228,7 @@ mod tests {
                 "80:route_failover",
                 "81:agent_model_source_defaults",
                 "82:model_provider_metadata",
+                "83:model_group_routing",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -19269,6 +19414,7 @@ mod tests {
                 "80:route_failover",
                 "81:agent_model_source_defaults",
                 "82:model_provider_metadata",
+                "83:model_group_routing",
             ]
         );
         assert_eq!(
@@ -20714,6 +20860,7 @@ mod tests {
                 "80:route_failover",
                 "81:agent_model_source_defaults",
                 "82:model_provider_metadata",
+                "83:model_group_routing",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)

@@ -188,6 +188,73 @@ async fn mock_upstream(
     (url, recorder, task)
 }
 
+/// An upstream that accepts the request and then stays silent.
+///
+/// The headers arrive immediately, so the gateway commits to the connection;
+/// no body byte arrives until long after any first-token deadline. This is the
+/// shape of a vendor that accepts and stalls, which no error-based failover
+/// can see.
+async fn mock_silent_upstream() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let body = Body::from_stream(futures_util::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: {}\n\n"))
+            }));
+            Response::new(body)
+        }),
+    );
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (format!("http://{address}"), task)
+}
+
+/// An upstream that refuses the first `failures` attempts and then answers.
+///
+/// Patience is a property of repeated attempts, so the mock has to know how
+/// many times it has been called.
+async fn mock_flaky_upstream(
+    failures: usize,
+) -> (
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&attempts);
+    let router = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                let seen = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if seen < failures {
+                    let mut response = Response::new(Body::from(
+                        json!({"error": {"message": "try again"}}).to_string(),
+                    ));
+                    *response.status_mut() = axum::http::StatusCode::SERVICE_UNAVAILABLE;
+                    return response;
+                }
+                Response::new(Body::from(chat_stream()))
+            }
+        }),
+    );
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (format!("http://{address}"), attempts, task)
+}
+
 /// A mock that refuses one Key and serves every other one normally.
 ///
 /// A failover needs two different answers from the same upstream, which a
@@ -289,6 +356,30 @@ fn database_path() -> std::path::PathBuf {
 }
 
 /// Creates a shared Provider Profile with one stored Key.
+/// Keeps the integration suite off the OS keychain.
+///
+/// A headless test process has no Secret Service session, and a keychain call
+/// can block waiting for one. The host-file store is the same code path a
+/// headless server uses, so the tests stay honest and deterministic.
+/// Serializes host-file secret writes.
+///
+/// The host-file store rewrites one JSON document, so two test threads writing
+/// at the same time race on the same temporary file. The lock covers the write
+/// only; reads of the renamed document stay concurrent.
+static TEST_SECRET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn configure_test_secrets() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let root =
+            std::env::temp_dir().join(format!("vibex-gateway-test-secrets-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        secrets::configure_provider_secret_store(
+            vibex_config_switch::secrets::ProviderSecretStoreConfig::host_file(root),
+        );
+    });
+}
+
 fn seed_upstream(
     service: &ProviderConfigService,
     endpoint: &str,
@@ -296,8 +387,12 @@ fn seed_upstream(
     models: &[&str],
     api_key: &str,
 ) -> ModelProviderProfileId {
+    configure_test_secrets();
     let lookup_key = format!("vibex-test-secret-{}", RequestId::new().as_str());
-    secrets::store_provider_secret(&lookup_key, api_key).unwrap();
+    {
+        let _guard = TEST_SECRET_LOCK.lock().unwrap();
+        secrets::store_provider_secret(&lookup_key, api_key).unwrap();
+    }
     let credential = ModelProviderCredentialReference {
         id: RequestId::new(),
         display_name: "Primary".to_string(),
@@ -386,8 +481,12 @@ fn seed_untyped_upstream(
     models: &[&str],
     api_key: &str,
 ) -> ModelProviderProfileId {
+    configure_test_secrets();
     let lookup_key = format!("vibex-test-secret-{}", RequestId::new().as_str());
-    secrets::store_provider_secret(&lookup_key, api_key).unwrap();
+    {
+        let _guard = TEST_SECRET_LOCK.lock().unwrap();
+        secrets::store_provider_secret(&lookup_key, api_key).unwrap();
+    }
     let credential = ModelProviderCredentialReference {
         id: RequestId::new(),
         display_name: "Primary".to_string(),
@@ -2650,6 +2749,37 @@ fn seed_provider_group(
     route.id.clone()
 }
 
+/// Seeds a model group: explicit `(Provider, upstream model)` members behind
+/// one Agent-facing model id.
+fn seed_model_group(
+    path: &std::path::Path,
+    name: &str,
+    agent_model: &str,
+    members: &[(ModelProviderProfileId, &str)],
+    rules: Vec<vibex_core::ModelRouteRule>,
+) -> vibex_core::ModelRouteId {
+    let mut connection = open_database(path).unwrap();
+    apply_migrations(&mut connection).unwrap();
+    let route = vibex_core::ModelRoute {
+        display_name: name.to_string(),
+        kind: vibex_core::RouteKind::ModelGroup,
+        agent_model_id: Some(agent_model.to_string()),
+        status: vibex_core::RouteStatus::Enabled,
+        strategy: vibex_core::RouteStrategy::Ordered,
+        rules,
+        members: members
+            .iter()
+            .enumerate()
+            .map(|(index, (provider, model))| {
+                vibex_core::ModelRouteMember::new(provider.clone(), *model, index as i64)
+            })
+            .collect(),
+        ..Default::default()
+    };
+    vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
+    route.id.clone()
+}
+
 /// A provider group offers only the models every Provider serves, and a
 /// request for one is answered by a Provider that serves it.
 ///
@@ -3665,6 +3795,467 @@ async fn a_request_refused_before_routing_is_still_a_ledger_row() {
     );
 
     gateway_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A model group may name different upstream models per member, and a failure
+/// on the first walks to the second even though the requested model never
+/// existed at either vendor under that name.
+#[tokio::test]
+async fn a_model_group_falls_back_across_different_upstream_models() {
+    let path = database_path();
+    let (left_url, left_recorder, left_task) = mock_upstream(503, String::new(), None).await;
+    let (right_url, right_recorder, right_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let left = seed_upstream(
+        &config,
+        &left_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-left",
+    );
+    let right = seed_upstream(
+        &config,
+        &right_url,
+        WireProtocol::ChatCompletions,
+        &["kimi-k2"],
+        "sk-right",
+    );
+    let group = seed_model_group(
+        &path,
+        "Mixed",
+        "vibex-fast",
+        &[(left, "deepseek-chat"), (right, "kimi-k2")],
+        Vec::new(),
+    );
+
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": group_model(&group, "vibex-fast"),
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "the group must answer via its second member"
+    );
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("hello"),
+        "the second member's stream must arrive"
+    );
+
+    assert_eq!(
+        left_recorder
+            .lock()
+            .await
+            .body
+            .as_ref()
+            .and_then(|body| body["model"].as_str()),
+        Some("deepseek-chat"),
+        "the first member must be asked for its own upstream model"
+    );
+    assert_eq!(
+        right_recorder
+            .lock()
+            .await
+            .body
+            .as_ref()
+            .and_then(|body| body["model"].as_str()),
+        Some("kimi-k2"),
+        "the second member must be asked for its own upstream model"
+    );
+
+    gateway_task.abort();
+    left_task.abort();
+    right_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A matching rule reorders the members for that request and leaves the
+/// decision explainable in the ledger.
+#[tokio::test]
+async fn a_model_group_rule_chooses_the_first_member_and_is_traced() {
+    let path = database_path();
+    let (left_url, left_recorder, left_task) = mock_upstream(200, chat_stream(), None).await;
+    let (right_url, right_recorder, right_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let left = seed_upstream(
+        &config,
+        &left_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-left",
+    );
+    let right = seed_upstream(
+        &config,
+        &right_url,
+        WireProtocol::ChatCompletions,
+        &["kimi-k2"],
+        "sk-right",
+    );
+    let first = vibex_core::ModelRouteMember::new(left, "deepseek-chat", 0);
+    let second = vibex_core::ModelRouteMember::new(right, "kimi-k2", 1);
+    let rule = vibex_core::ModelRouteRule {
+        id: "claude-rule".to_string(),
+        use_member_id: Some(second.id.clone()),
+        agents: vec!["claude".to_string()],
+        ..Default::default()
+    };
+    let mut connection = open_database(&path).unwrap();
+    apply_migrations(&mut connection).unwrap();
+    let route = vibex_core::ModelRoute {
+        display_name: "Ruled".to_string(),
+        kind: vibex_core::RouteKind::ModelGroup,
+        agent_model_id: Some("vibex-ruled".to_string()),
+        status: vibex_core::RouteStatus::Enabled,
+        rules: vec![rule],
+        members: vec![first, second],
+        ..Default::default()
+    };
+    vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
+    drop(connection);
+
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+    let status = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .header("x-vibex-agent", "claude")
+        .json(&json!({
+            "model": group_model(&route.id, "vibex-ruled"),
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 200);
+    assert!(
+        left_recorder.lock().await.path.is_empty(),
+        "the rule must skip the configured first member"
+    );
+    assert_eq!(
+        right_recorder
+            .lock()
+            .await
+            .body
+            .as_ref()
+            .and_then(|body| body["model"].as_str()),
+        Some("kimi-k2")
+    );
+
+    let connection = open_database(&path).unwrap();
+    let rows = ModelGatewayRequestLogRepository::recent(&connection, 5).unwrap();
+    let row = rows.first().expect("the request must be recorded");
+    let decision = row
+        .route
+        .as_ref()
+        .and_then(|trace| trace.decision.as_ref())
+        .expect("a rule decision must be traced");
+    assert_eq!(decision.rule_id.as_deref(), Some("claude-rule"));
+    assert_eq!(decision.rule_index, Some(0));
+    assert_eq!(decision.reason.as_deref(), Some("rule"));
+
+    gateway_task.abort();
+    left_task.abort();
+    right_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A stalled member is abandoned for the next one, before any body byte
+/// reaches the client.
+///
+/// This is the case error-based failover cannot see: the connection succeeded,
+/// the status is 200, and the vendor then says nothing. The last member is
+/// deliberately not tested here because it has nowhere to fail over to and is
+/// supposed to wait.
+#[tokio::test]
+async fn a_first_token_timeout_fails_over_to_the_next_member() {
+    let path = database_path();
+    let (silent_url, silent_task) = mock_silent_upstream().await;
+    let (fast_url, fast_recorder, fast_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let silent = seed_upstream(
+        &config,
+        &silent_url,
+        WireProtocol::ChatCompletions,
+        &["slow-model"],
+        "sk-slow",
+    );
+    let fast = seed_upstream(
+        &config,
+        &fast_url,
+        WireProtocol::ChatCompletions,
+        &["fast-model"],
+        "sk-fast",
+    );
+    let mut first = vibex_core::ModelRouteMember::new(silent, "slow-model", 0);
+    first.first_token_timeout_ms = Some(150);
+    let second = vibex_core::ModelRouteMember::new(fast, "fast-model", 1);
+    let mut connection = open_database(&path).unwrap();
+    apply_migrations(&mut connection).unwrap();
+    let route = vibex_core::ModelRoute {
+        display_name: "Stall".to_string(),
+        kind: vibex_core::RouteKind::ModelGroup,
+        agent_model_id: Some("vibex-stall".to_string()),
+        status: vibex_core::RouteStatus::Enabled,
+        members: vec![first, second],
+        ..Default::default()
+    };
+    vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
+    drop(connection);
+
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": group_model(&route.id, "vibex-stall"),
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("hello"), "the second member must answer");
+    assert_eq!(
+        fast_recorder
+            .lock()
+            .await
+            .body
+            .as_ref()
+            .and_then(|body| body["model"].as_str()),
+        Some("fast-model")
+    );
+
+    gateway_task.abort();
+    silent_task.abort();
+    fast_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A recoverable failure is retried under the route's patience budget.
+#[tokio::test]
+async fn patience_retries_a_retryable_failure_before_giving_up() {
+    let path = database_path();
+    let (flaky_url, attempts, flaky_task) = mock_flaky_upstream(1).await;
+    let config = ProviderConfigService::new(&path);
+    let provider = seed_upstream(
+        &config,
+        &flaky_url,
+        WireProtocol::ChatCompletions,
+        &["flaky-model"],
+        "sk-flaky",
+    );
+    let mut connection = open_database(&path).unwrap();
+    apply_migrations(&mut connection).unwrap();
+    let route = vibex_core::ModelRoute {
+        display_name: "Patient".to_string(),
+        kind: vibex_core::RouteKind::ModelGroup,
+        agent_model_id: Some("vibex-patient".to_string()),
+        status: vibex_core::RouteStatus::Enabled,
+        patience_ms: Some(15_000),
+        members: vec![vibex_core::ModelRouteMember::new(
+            provider,
+            "flaky-model",
+            0,
+        )],
+        ..Default::default()
+    };
+    vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
+    drop(connection);
+
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+    let status = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": group_model(&route.id, "vibex-patient"),
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 200, "the retry must answer after the first 503");
+    assert!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "patience must actually call the upstream again"
+    );
+
+    gateway_task.abort();
+    flaky_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A configured classifier is called once, its intent matches a rule, and its
+/// effort reaches the ledger decision.
+#[tokio::test]
+async fn a_classifier_supplies_intent_and_automatic_effort() {
+    let path = database_path();
+    let classifier_reply = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "{\"intent\":\"code\",\"effort\":\"high\"}"
+            }
+        }]
+    });
+    let (classifier_url, classifier_recorder, classifier_task) =
+        mock_upstream(200, String::new(), Some(classifier_reply)).await;
+    let (main_url, main_recorder, main_task) = mock_upstream(200, chat_stream(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let classifier = seed_upstream(
+        &config,
+        &classifier_url,
+        WireProtocol::ChatCompletions,
+        &["classifier-model"],
+        "sk-classifier",
+    );
+    let main = seed_upstream(
+        &config,
+        &main_url,
+        WireProtocol::ChatCompletions,
+        &["main-model"],
+        "sk-main",
+    );
+    let member = vibex_core::ModelRouteMember::new(main, "main-model", 0);
+    let rule = vibex_core::ModelRouteRule {
+        id: "code-rule".to_string(),
+        use_member_id: Some(member.id.clone()),
+        intent: Some("code".to_string()),
+        ..Default::default()
+    };
+    let mut connection = open_database(&path).unwrap();
+    apply_migrations(&mut connection).unwrap();
+    let route = vibex_core::ModelRoute {
+        display_name: "Classified".to_string(),
+        kind: vibex_core::RouteKind::ModelGroup,
+        agent_model_id: Some("vibex-classified".to_string()),
+        status: vibex_core::RouteStatus::Enabled,
+        classifier: Some(format!("{}/classifier-model", classifier.as_str())),
+        effort: Some("auto".to_string()),
+        rules: vec![rule],
+        members: vec![member],
+        ..Default::default()
+    };
+    vibex_db::ModelRouteRepository::insert(&connection, &route).unwrap();
+    drop(connection);
+
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+    let status = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": group_model(&route.id, "vibex-classified"),
+            "messages": [{"role": "user", "content": "fix this failing test"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 200);
+    assert!(
+        !classifier_recorder.lock().await.path.is_empty(),
+        "the classifier must be asked"
+    );
+    assert!(
+        !main_recorder.lock().await.path.is_empty(),
+        "the main member must answer"
+    );
+
+    let connection = open_database(&path).unwrap();
+    let rows = ModelGatewayRequestLogRepository::recent(&connection, 5).unwrap();
+    let decision = rows
+        .first()
+        .and_then(|row| row.route.as_ref())
+        .and_then(|trace| trace.decision.as_ref())
+        .expect("the classifier decision must be traced");
+    assert_eq!(
+        decision.classifier.as_deref(),
+        Some(format!("{}/classifier-model", classifier.as_str()).as_str())
+    );
+    assert_eq!(decision.intent.as_deref(), Some("code"));
+    assert_eq!(decision.effort.as_deref(), Some("high"));
+    assert_eq!(decision.rule_id.as_deref(), Some("code-rule"));
+
+    gateway_task.abort();
+    classifier_task.abort();
+    main_task.abort();
+    service.shutdown().await;
+    cleanup(path);
+}
+
+/// A configured cooldown override replaces the built-in duration.
+#[tokio::test]
+async fn a_cooldown_override_shortens_the_key_rest() {
+    let path = database_path();
+    let (upstream_url, _recorder, upstream_task) = mock_upstream(503, String::new(), None).await;
+    let config = ProviderConfigService::new(&path);
+    let provider = seed_upstream(
+        &config,
+        &upstream_url,
+        WireProtocol::ChatCompletions,
+        &["deepseek-chat"],
+        "sk-rate",
+    );
+    let group = point_gateway_at(
+        &path,
+        provider.clone(),
+        GatewayPolicy {
+            cooldown_overrides_ms: std::collections::BTreeMap::from([(
+                "upstream".to_string(),
+                1_500,
+            )]),
+            ..GatewayPolicy::default()
+        },
+    );
+    let (service, gateway_url, gateway_task) = gateway(&path).await;
+    let _ = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(header::HOST, "127.0.0.1")
+        .json(&json!({
+            "model": group_model(&group, "deepseek-chat"),
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let connection = open_database(&path).unwrap();
+    let states = ModelProviderAccountStateRepository::list(&connection, &provider).unwrap();
+    let state = states.first().expect("the failed Key must have a state");
+    let now = vibex_core::unix_timestamp_ms();
+    let remaining = state.cooldown_until_ms.unwrap_or_default() - now;
+    assert!(
+        (0..=3_000).contains(&remaining),
+        "the override must replace the ten-second default, got {remaining} ms"
+    );
+    assert_eq!(state.cooldown_reason, Some(GatewayFailureKind::Upstream));
+
+    gateway_task.abort();
+    upstream_task.abort();
     service.shutdown().await;
     cleanup(path);
 }
