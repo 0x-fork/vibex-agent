@@ -1283,6 +1283,19 @@ exactly two channels:
   ignores. `TerminalProfile::detect_from` is the table (`TERM_PROGRAM`, `TERM`,
   `KITTY_WINDOW_ID`, `WT_SESSION`, `VTE_VERSION`, …) and it is a unit test; an
   unrecognised terminal gets `OSC 2`, the title.
+* **Detection is only as good as the environment, so a terminal host states its
+  own identity.** The same table decides whether an Agent's mark is a picture,
+  and the reader's environment describes the terminal the *host* sits in. A
+  Vibex terminal tab is a cell emulator with no pixel layer, but it starts with
+  the desktop's environment — kitty's `TERM`, a window id — so a client inside
+  it concluded it could place images and every mark landed as blank cells. The
+  emulator therefore publishes what it can draw
+  (`vibex_terminal_ui::child_environment`) and the PTY host applies it when it
+  spawns: `TERM=xterm-256color`, `COLORTERM=truecolor`, `VIBEX_TUI_IMAGE=off`,
+  and the outer terminal's identity names cleared. The declaration belongs to
+  the emulator rather than the host, because the grid is what a child writes
+  into and a second host would otherwise reintroduce the bug. The fallback is
+  not a degraded picture: the Agent's name stands in the same cells.
 * **A multiplexer is respected.** tmux and screen swallow OSCs they do not
   implement, so inside one the default is the bell (tmux always forwards it and
   flags the window) and a configured OSC is wrapped in tmux's passthrough

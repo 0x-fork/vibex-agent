@@ -1007,6 +1007,8 @@ Every one of these has a defined behaviour rather than a broken screen:
 | non-UTF-8 locale | ASCII borders and markers, and a two-row ASCII mark for both logo styles |
 | narrow terminal | a mark that cannot be drawn whole is not drawn at all; the lines under it name the product instead |
 | sixteen colours only | the page keeps the terminal's own background; the palette carries ink, accents and rules, and no plane is painted |
+| no image protocol | an Agent's brand mark is the Agent's name in the same cells, never a blank column — the session list, the composer's info line and the new-session sentence all fall back the same way |
+| started inside a Vibex terminal tab | same as above: the tab's emulator has no pixel layer, so it declares `TERM=xterm-256color` and `VIBEX_TUI_IMAGE=off` to the programs it starts. Without that, the tab inherits the *outer* terminal's identity (kitty's `TERM`, `KITTY_WINDOW_ID`, `TERM_PROGRAM`), the client believes it can place pictures, and every mark arrives as blank cells the escape cannot fill |
 | no keyboard protocol | `Shift+Enter` arrives as `Enter`; `Ctrl+J` breaks the line, and the help panel lists it |
 | no clipboard on the host — the `ssh` case — with a terminal that does not speak OSC 5522 | the paste says there is nothing to paste, once per run; a terminal that refuses the read says so instead, and naming an image file still attaches it |
 | disconnected | a banner, mutations disabled, the last known state marked stale |
@@ -1019,6 +1021,17 @@ terminal — `xterm-kitty`, `xterm-ghostty`, `wezterm`, `foot`, `contour`,
 `alacritty`, or a `-direct` entry — is believed on its own, because `COLORTERM`
 is not always there to be read: `sshd` forwards only the names it is configured
 to accept, so the terminal's own name is what survives a link.
+
+The same environment decides whether an Agent's mark is a picture, so the
+terminal *host* has to describe the terminal truthfully before a client reads it.
+The Vibex terminal tab does that when it spawns a program
+(`vibex_terminal_ui::child_environment`): `TERM=xterm-256color`,
+`COLORTERM=truecolor`, `VIBEX_TUI_IMAGE=off`, and none of the outer terminal's
+identity names. The tab is the authority here, not the reader's shell: a
+`VIBEX_TUI_IMAGE=kitty` exported for the outer terminal describes that terminal,
+not this tab's cell grid, and is not carried in. The mark is a name there, which
+is the honest answer; run the client in the outer terminal itself to see the
+picture.
 
 ## Previewing
 

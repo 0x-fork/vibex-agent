@@ -289,10 +289,16 @@ impl TerminalManager {
         let mut command = CommandBuilder::new(command_name);
         command.args(&request.args);
         command.cwd(cwd.as_os_str());
-        sanitize_terminal_environment(&mut command);
+        // The caller's environment first, then the two rewrites: a requested
+        // variable may describe the launch, but neither the AppImage markers
+        // nor the terminal's identity are the caller's to override — an
+        // integration that passed `TERM_PROGRAM=kitty` would hand the child a
+        // pixel layer this emulator does not have.
         for (key, value) in request.env {
             command.env(key, value);
         }
+        sanitize_terminal_environment(&mut command);
+        declare_pty_terminal_environment(&mut command);
         self.spawn_runtime_with_command(cwd, session, command, false)
     }
 
@@ -348,6 +354,7 @@ impl TerminalManager {
         configure_interactive_shell(&mut command, &shell);
         command.cwd(cwd.as_os_str());
         sanitize_terminal_environment(&mut command);
+        declare_pty_terminal_environment(&mut command);
         self.spawn_runtime_with_command(cwd, session, command, true)
     }
 
@@ -1214,6 +1221,37 @@ fn sanitize_terminal_environment(command: &mut CommandBuilder) {
 #[cfg(not(target_os = "linux"))]
 fn sanitize_terminal_environment(_: &mut CommandBuilder) {}
 
+/// The terminal a child must believe it is writing to.
+///
+/// The PTY this process holds is an emulator that knows about cells, colours and
+/// cursor shapes — not about pictures. A client that writes an image protocol
+/// into it gets nothing drawn: the APC the escape travels in is swallowed, and
+/// the cells the picture was supposed to cover stay blank. That is what a brand
+/// mark in the TUI looks like inside a Vibex terminal tab today.
+///
+/// The problem is that the child is told otherwise. The desktop inherits the
+/// environment of whatever launched *it* — kitty's `TERM=xterm-kitty`,
+/// `KITTY_WINDOW_ID`, `LC_TERMINAL`, `TERM_PROGRAM` — and every spawned shell
+/// inherits that environment again. So a TUI running in the tab reads the outer
+/// terminal's identity, concludes it can draw pixels, and spends the cells on
+/// escapes this emulator drops. A name that says "no pictures" is the honest
+/// one: the client then falls back to the character it already has for a mark,
+/// which is the answer that renders.
+///
+/// What to say is the emulator's own statement
+/// ([`vibex_terminal_ui::child_environment`]) rather than a list kept here: the
+/// grid is what a child draws into, so the grid is what decides. This function
+/// only applies it, in the one order that leaves the image override set.
+fn declare_pty_terminal_environment(command: &mut CommandBuilder) {
+    let declared = vibex_terminal_ui::child_environment();
+    for key in declared.removed() {
+        command.env_remove(key);
+    }
+    for (key, value) in declared.written() {
+        command.env(key, value);
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn filter_app_dir_paths(command: &mut CommandBuilder, key: &str, app_dir: &Path) {
     let Some(value) = command.get_env(key).map(OsStr::to_os_string) else {
@@ -1619,6 +1657,150 @@ mod tests {
         assert_eq!(
             command.get_env("VIBEX_TEST_SENTINEL"),
             Some(OsStr::new("preserved"))
+        );
+    }
+
+    /// A child of this PTY draws into a cell-only emulator, so it must not be
+    /// told it has a graphics terminal.
+    ///
+    /// The case this exists for: the reader runs the desktop inside kitty, opens
+    /// a terminal tab, and starts the TUI there. The tab inherits kitty's
+    /// identity, the TUI believes it can place brand marks as pictures, and
+    /// every mark — the new-session sentence's, the composer's, the session
+    /// list's — comes out as blank cells because the emulator drops the APC.
+    #[test]
+    fn a_pty_child_is_not_told_it_has_a_graphics_terminal() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.env("TERM", "xterm-kitty");
+        command.env("KITTY_WINDOW_ID", "1");
+        command.env("KITTY_PUBLIC_KEY", "1:abc");
+        command.env("TERM_PROGRAM", "iTerm.app");
+        command.env("LC_TERMINAL", "WezTerm");
+        command.env("WT_SESSION", "session");
+        command.env("VIBEX_TUI_IMAGE", "kitty");
+        command.env("COLORTERM", "truecolor");
+        command.env("VIBEX_TEST_SENTINEL", "preserved");
+
+        declare_pty_terminal_environment(&mut command);
+
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(OsStr::new("xterm-256color")),
+            "a cell-only emulator must not claim the outer terminal's name"
+        );
+        assert_eq!(
+            command.get_env("VIBEX_TUI_IMAGE"),
+            Some(OsStr::new("off")),
+            "the TUI's own override is the one variable this sets, not clears"
+        );
+        for key in [
+            "KITTY_WINDOW_ID",
+            "KITTY_PUBLIC_KEY",
+            "TERM_PROGRAM",
+            "LC_TERMINAL",
+            "WT_SESSION",
+        ] {
+            assert_eq!(
+                command.get_env(key),
+                None,
+                "{key} describes the outer terminal, not this PTY"
+            );
+        }
+        // Colour does survive the emulator, and so does everything the reader
+        // exported for their own reasons. The reader's `COLORTERM` is left as it
+        // was; an unset one is filled in, because `xterm-256color` alone would
+        // drop the client to the 256-colour cube.
+        assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
+        assert_eq!(
+            command.get_env("VIBEX_TEST_SENTINEL"),
+            Some(OsStr::new("preserved"))
+        );
+    }
+
+    #[test]
+    fn a_pty_child_gets_a_colour_tier_its_plain_name_would_hide() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.env("TERM", "xterm-kitty");
+
+        declare_pty_terminal_environment(&mut command);
+
+        assert_eq!(
+            command.get_env("COLORTERM"),
+            Some(OsStr::new("truecolor")),
+            "a cell emulator draws 24-bit, whatever its TERM name spells"
+        );
+    }
+
+    /// The same claim, measured through a real child rather than a builder: the
+    /// shell spawned in a tab must agree with what the emulator will draw.
+    ///
+    /// The request deliberately asks for the outer terminal's identity, which is
+    /// what an integration that hard-codes its own spawn environment does. The
+    /// declaration is applied after the caller's variables for exactly this
+    /// case, so the child must still report a cell terminal.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_shell_reports_a_cell_terminal_to_its_programs() {
+        let manager = TerminalManager::new();
+        let session = manager
+            .create_command(
+                std::env::temp_dir(),
+                TerminalCommandRequest {
+                    workspace_id: WorkspaceId::new(),
+                    title: None,
+                    command: "sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        // Print the three values the declaration is about, then
+                        // the two names it must have cleared.
+                        "printf 'term=%s colorterm=%s image=%s program=%s kitty=%s\\n' \
+                         \"$TERM\" \"$COLORTERM\" \"$VIBEX_TUI_IMAGE\" \
+                         \"${TERM_PROGRAM:-}\" \"${KITTY_WINDOW_ID:-}\""
+                            .to_string(),
+                    ],
+                    cwd: Some(std::env::temp_dir().display().to_string()),
+                    env: vec![
+                        ("TERM".to_string(), "xterm-kitty".to_string()),
+                        ("TERM_PROGRAM".to_string(), "iTerm.app".to_string()),
+                        ("KITTY_WINDOW_ID".to_string(), "1".to_string()),
+                        ("VIBEX_TUI_IMAGE".to_string(), "kitty".to_string()),
+                    ],
+                    rows: 24,
+                    cols: 80,
+                },
+            )
+            .unwrap();
+
+        let mut output = String::new();
+        for _ in 0..300 {
+            output = manager
+                .snapshot(&session.id)
+                .map(|snapshot| {
+                    snapshot
+                        .chunks
+                        .iter()
+                        .map(|chunk| chunk.data.as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if output.contains("kitty=") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = manager.release(&session.id);
+
+        assert!(
+            output.contains("term=xterm-256color"),
+            "the child was not told what the emulator is: {output:?}"
+        );
+        assert!(
+            output.contains("image=off"),
+            "the client's picture override did not reach the child: {output:?}"
+        );
+        assert!(
+            output.contains("program= kitty="),
+            "a caller-supplied graphics claim reached the child: {output:?}"
         );
     }
 

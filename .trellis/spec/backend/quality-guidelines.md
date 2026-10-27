@@ -1200,6 +1200,112 @@ sanitize_terminal_environment(&mut command); // child-only host environment
 pair.slave.spawn_command(command)?;
 ```
 
+## Scenario: A PTY Child Must Be Told What The Emulator Is
+
+### 1. Scope / Trigger
+
+- Trigger: a program started inside a Vibex terminal tab reads the *outer*
+  terminal's identity from the inherited environment and draws for a terminal
+  that is not there.
+- Concretely: the desktop runs inside kitty, a tab is opened, and the Vibex TUI
+  is started in it. `TERM=xterm-kitty` and `KITTY_WINDOW_ID` survive into the
+  child, picture detection concludes it can place images, and every Agent brand
+  mark is drawn as blank cells because the PTY emulator has no pixel layer and
+  drops the APC the picture travels in.
+
+### 2. Signatures
+
+```text
+vibex_terminal_ui::child_environment() -> ChildEnvironment
+  ChildEnvironment::removed() -> impl Iterator<Item = &'static str>
+  ChildEnvironment::written() -> impl Iterator<Item = (&'static str, &'static str)>
+
+TerminalManager::spawn_runtime(cwd, session) -> TerminalSession
+TerminalManager::create_command(workspace_root, request) -> TerminalSession
+declare_pty_terminal_environment(&mut portable_pty::CommandBuilder)
+
+Written: TERM=xterm-256color, COLORTERM=truecolor, VIBEX_TUI_IMAGE=off
+Removed: KITTY_WINDOW_ID, KITTY_PID, KITTY_PUBLIC_KEY, KITTY_LISTEN_ON,
+  TERM_PROGRAM, TERM_PROGRAM_VERSION, LC_TERMINAL, LC_TERMINAL_VERSION,
+  GHOSTTY_RESOURCES_DIR, WEZTERM_EXECUTABLE, WEZTERM_PANE,
+  WT_SESSION, WT_PROFILE_ID
+```
+
+### 3. Contracts
+
+- The emulator states what it can draw; the PTY host only applies it. The claim
+  lives in `vibex-terminal-ui::capability` because the grid is what a child
+  writes into, and another host that forgot it would reintroduce the bug from a
+  different file.
+- The emulator has no pixel layer (`DRAWS_PICTURES == false`): the native core
+  drops the APC an image protocol travels in, and the WASM fallback keeps even
+  less. `TERM` must therefore not name a graphics terminal.
+- `COLORTERM=truecolor` is stated, not inferred: the emulator resolves `Rgb`
+  cells faithfully, while `xterm-256color` is a name that does not promise
+  24-bit colour. Leaving it out drops the page to the 256-colour cube.
+- `VIBEX_TUI_IMAGE=off` is the TUI's own override and outranks detection, so a
+  mark falls back to the Agent's name even if another pixel claim leaks back in
+  later. It is set *after* the clears; it is not itself cleared.
+- A caller-supplied `request.env` cannot override these three: the declaration
+  is applied last in `create_command`.
+- Everything else the reader exported is preserved byte-for-byte, including
+  `PATH`, locale, SSH agent, and unrelated `VIBEX_*`.
+
+### 4. Validation & Error Matrix
+
+- Child inherits `TERM=xterm-kitty` -> child sees `xterm-256color`.
+- Child inherits `KITTY_WINDOW_ID` / `KITTY_PUBLIC_KEY` -> both absent, so the
+  kitty OSC 5522 clipboard probe is not attempted either.
+- Child inherits no `COLORTERM` -> `truecolor` is filled in.
+- Caller passes `TERM_PROGRAM=iTerm.app` in `request.env` -> resolution still
+  ends with the declared values.
+- Caller passes an unrelated variable -> preserved.
+- Explicit command terminal (`create_command`) -> same declaration applied.
+
+### 5. Good/Base/Bad Cases
+
+- Good: the TUI started in a tab names the Agent in the new-session sentence,
+  the composer's info line, and the session list, instead of leaving those cells
+  blank.
+- Base: a shell in a tab still resolves a normal 24-bit palette and a name every
+  tool recognises.
+- Bad: inherit the outer terminal's environment unchanged — the client spends
+  cells on escapes the emulator discards and reports success.
+- Bad: clear the whole environment, which loses PATH, locale, and the reader's
+  own tooling.
+- Bad: keep the variable list in the PTY host rather than the emulator, so a
+  second host (remote seat, new spawn path) silently keeps the bug.
+
+### 6. Tests Required
+
+- `vibex-terminal-ui` asserts `DRAWS_PICTURES` is false, `TERM_NAME` names no
+  graphics terminal, and the override is neither in the clear list nor written
+  twice.
+- `vibex-terminal-ui` asserts an image-protocol APC leaves the cells it would
+  have covered empty — the evidence that the declaration is necessary.
+- `vibex-terminal` asserts the builder ends with `TERM=xterm-256color`,
+  `COLORTERM=truecolor`, `VIBEX_TUI_IMAGE=off`, no outer-terminal names, and the
+  reader's sentinel preserved.
+- `vibex-terminal` spawns a real shell and asserts the same values from inside
+  it, so the test covers the spawn path and not only the builder.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+// The desktop's own environment says "kitty"; the child believes it.
+let command = CommandBuilder::new(shell);
+```
+
+#### Correct
+
+```rust
+let mut command = CommandBuilder::new(shell);
+sanitize_terminal_environment(&mut command);
+declare_pty_terminal_environment(&mut command); // the emulator's own claim
+```
+
 ## Scenario: Advanced Git And Managed Worktrees
 
 ### 1. Scope / Trigger

@@ -497,6 +497,39 @@ mod tests {
         assert_eq!((emulator.rows(), emulator.columns()), (30, 100));
     }
 
+    /// The bug this crate now declares its way out of: an image-protocol escape
+    /// writes nothing this grid can draw.
+    ///
+    /// A client that believes it is talking to kitty places a brand mark with
+    /// `ESC _ G … ESC \` and then paints the cells it reserved blank, because
+    /// the picture is supposed to stand over them. The emulator consumes the
+    /// APC — correctly, it has no pixel layer — so those cells stay empty. The
+    /// declaration in [`crate::capability`] is what stops a child from asking,
+    /// and this test is the evidence that asking would have failed.
+    #[test]
+    fn an_image_protocol_escape_leaves_the_cells_it_would_have_covered_empty() {
+        let mut emulator = TerminalEmulator::new(2, 10);
+        // The kitty transmit-and-display sequence, as the TUI writes it for a
+        // mark: park the cursor, carry a PNG under an id, then paint the two
+        // cells blank so the picture can show through.
+        emulator.advance(
+            b"\x1b7\x1b[1;1H\x1b_Ga=T,f=100,t=d,q=2,i=100,p=100,c=2,r=1;AAAA\x1b\\\x1b8  ",
+        );
+
+        let frame = emulator.frame();
+        let row = frame
+            .cells
+            .iter()
+            .filter(|cell| cell.row == 0)
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+        assert!(
+            row.trim().is_empty(),
+            "the emulator drew the escape instead of dropping it: {row:?}"
+        );
+        assert_eq!(emulator.visible_text().trim(), "");
+    }
+
     #[test]
     fn rejects_selection_outside_the_viewport() {
         let mut emulator = TerminalEmulator::new(2, 2);
