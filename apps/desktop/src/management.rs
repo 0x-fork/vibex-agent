@@ -1169,6 +1169,10 @@ pub struct ManagementCenter {
     provider_models_filter: ProviderModelsFilter,
     provider_models_page: usize,
     traffic_range: TrafficRange,
+    provider_model_edit_id: Option<String>,
+    provider_model_edit_context: Option<Entity<InputState>>,
+    provider_model_edit_output: Option<Entity<InputState>>,
+    provider_model_edit_error: Option<String>,
     shared_provider_advanced_target: Option<vibex_core::ModelProviderProfileId>,
     shared_provider_advanced_input: Option<Entity<TextareaState>>,
     shared_provider_advanced_error: Option<String>,
@@ -2422,6 +2426,10 @@ impl ManagementCenter {
             provider_models_filter: ProviderModelsFilter::All,
             provider_models_page: 0,
             traffic_range: TrafficRange::Day,
+            provider_model_edit_id: None,
+            provider_model_edit_context: None,
+            provider_model_edit_output: None,
+            provider_model_edit_error: None,
             shared_provider_advanced_target: None,
             shared_provider_advanced_input: None,
             shared_provider_advanced_error: None,
@@ -13355,14 +13363,30 @@ impl ManagementCenter {
             let mut model_rows = v_flex().w_full().gap_1();
             for model in matched.iter().skip(page * page_size).take(page_size) {
                 let is_default = profile.default_model_id.as_deref() == Some(model.id.as_str());
+                let expanded = self.provider_model_edit_id.as_deref() == Some(model.id.as_str());
                 let model_id = model.id.clone();
                 let profile_id = profile.id.clone();
-                model_rows = model_rows.child(
+                let open_profile = profile.clone();
+                let open_model = (*model).clone();
+                let mut entry = v_flex().w_full().child(
                     h_flex()
+                        .id(SharedString::from(format!(
+                            "management-provider-model-row-{}",
+                            model.id
+                        )))
                         .w_full()
                         .items_center()
                         .gap_2()
                         .py_1()
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.toggle_shared_provider_model_editor(
+                                &open_profile,
+                                &open_model,
+                                window,
+                                cx,
+                            )
+                        }))
                         .child(
                             div()
                                 .text_xs()
@@ -13401,6 +13425,7 @@ impl ManagementCenter {
                             .disabled(!model.enabled || self.mutation.is_some())
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
+                                    cx.stop_propagation();
                                     this.set_shared_provider_default_model(
                                         profile_id.clone(),
                                         model_id.clone(),
@@ -13416,6 +13441,11 @@ impl ManagementCenter {
                                 .child(management_model_limits_label(&model.capabilities)),
                         ),
                 );
+                if expanded {
+                    entry =
+                        entry.child(self.render_shared_provider_model_inline(profile, model, cx));
+                }
+                model_rows = model_rows.child(entry);
             }
             if matched.is_empty() {
                 model_rows = model_rows.child(compact_empty_state(
@@ -15863,6 +15893,147 @@ impl ManagementCenter {
                 "Advanced settings updated",
                 "高级设置已更新",
                 "進階設定已更新",
+            ),
+            cx,
+        );
+    }
+
+    fn toggle_shared_provider_model_editor(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfile,
+        model: &vibex_core::ModelProviderCatalogEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.provider_model_edit_id.as_deref() == Some(model.id.as_str()) {
+            self.provider_model_edit_id = None;
+            self.provider_model_edit_context = None;
+            self.provider_model_edit_output = None;
+            self.provider_model_edit_error = None;
+            cx.notify();
+            return;
+        }
+        self.provider_model_edit_id = Some(model.id.clone());
+        self.provider_model_edit_error = None;
+        let context = model
+            .capabilities
+            .context_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let output = model
+            .capabilities
+            .output_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        self.provider_model_edit_context =
+            Some(cx.new(|cx| InputState::new(window, cx).default_value(context)));
+        self.provider_model_edit_output =
+            Some(cx.new(|cx| InputState::new(window, cx).default_value(output)));
+        let _ = profile;
+        cx.notify();
+    }
+
+    fn save_shared_provider_model_inline(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        model_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let context = self
+            .provider_model_edit_context
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
+        let output = self
+            .provider_model_edit_output
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
+        let context = match parse_optional_limit(&context) {
+            Ok(value) => value,
+            Err(message) => {
+                self.provider_model_edit_error = Some(message.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let output = match parse_optional_limit(&output) {
+            Ok(value) => value,
+            Err(message) => {
+                self.provider_model_edit_error = Some(message.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let Some(mut profile) = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(model) = profile
+            .configured_models
+            .iter_mut()
+            .find(|model| model.id == model_id)
+        else {
+            return;
+        };
+        model.capabilities.context_tokens = context;
+        model.capabilities.output_tokens = output;
+        self.provider_model_edit_id = None;
+        self.provider_model_edit_context = None;
+        self.provider_model_edit_output = None;
+        self.provider_model_edit_error = None;
+        self.update_shared_provider(
+            profile,
+            management_locale_text("Model settings updated", "模型设置已更新", "模型設定已更新"),
+            cx,
+        );
+    }
+
+    fn set_shared_provider_model_capability(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        model_id: String,
+        field: &'static str,
+        value: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut profile) = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(model) = profile
+            .configured_models
+            .iter_mut()
+            .find(|model| model.id == model_id)
+        else {
+            return;
+        };
+        match field {
+            "image" => model.capabilities.image_input = value,
+            "pdf" => model.capabilities.pdf_input = value,
+            "temperature" => model.capabilities.temperature = value,
+            "reasoning" => {
+                model.capabilities.reasoning = value;
+                if value != Some(true) {
+                    model.capabilities.reasoning_efforts = None;
+                }
+            }
+            _ => return,
+        }
+        self.update_shared_provider(
+            profile,
+            management_locale_text(
+                "Model capability updated",
+                "模型能力已更新",
+                "模型能力已更新",
             ),
             cx,
         );
@@ -18472,6 +18643,189 @@ impl ManagementCenter {
             management_locale_text("Key policy updated", "Key 策略已更新", "Key 策略已更新"),
             cx,
         );
+    }
+
+    fn render_shared_provider_model_inline(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfile,
+        model: &vibex_core::ModelProviderCatalogEntry,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(context) = self.provider_model_edit_context.clone() else {
+            return div().into_any_element();
+        };
+        let Some(output) = self.provider_model_edit_output.clone() else {
+            return div().into_any_element();
+        };
+        let error = self.provider_model_edit_error.clone();
+        let profile_id = profile.id.clone();
+        let model_id = model.id.clone();
+        let mut capabilities = h_flex().w_full().flex_wrap().gap_2();
+        for (field, label, value) in [
+            (
+                "image",
+                management_locale_text("Image input", "图片输入", "圖片輸入"),
+                model.capabilities.image_input,
+            ),
+            (
+                "pdf",
+                management_locale_text("PDF input", "PDF 输入", "PDF 輸入"),
+                model.capabilities.pdf_input,
+            ),
+            (
+                "temperature",
+                management_locale_text("Temperature", "温度参数", "溫度參數"),
+                model.capabilities.temperature,
+            ),
+            (
+                "reasoning",
+                management_locale_text("Reasoning", "推理", "推理"),
+                model.capabilities.reasoning,
+            ),
+        ] {
+            let mut chips = h_flex().items_center().gap_1().child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(label),
+            );
+            for (choice, choice_label) in [
+                (None, management_locale_text("Inherit", "继承", "繼承")),
+                (Some(true), management_locale_text("Yes", "是", "是")),
+                (Some(false), management_locale_text("No", "否", "否")),
+            ] {
+                let selected = value == choice;
+                let profile_id = profile_id.clone();
+                let model_id = model_id.clone();
+                chips = chips.child(
+                    Button::new(SharedString::from(format!(
+                        "management-provider-model-{field}-{}-{}",
+                        model.id,
+                        match choice {
+                            None => "inherit",
+                            Some(true) => "yes",
+                            Some(false) => "no",
+                        }
+                    )))
+                    .xsmall()
+                    .when(selected, |button| button.primary())
+                    .when(!selected, |button| button.ghost())
+                    .label(choice_label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_shared_provider_model_capability(
+                            profile_id.clone(),
+                            model_id.clone(),
+                            field,
+                            choice,
+                            cx,
+                        )
+                    })),
+                );
+            }
+            capabilities = capabilities.child(chips);
+        }
+        v_flex()
+            .w_full()
+            .gap_2()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted.opacity(0.20))
+            .p_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .text_xs()
+                            .font_medium()
+                            .child(model.id.clone()),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-provider-model-inline-close-{}",
+                            model.id
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .icon(IconName::Close)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.provider_model_edit_id = None;
+                            this.provider_model_edit_context = None;
+                            this.provider_model_edit_output = None;
+                            this.provider_model_edit_error = None;
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "Context tokens",
+                                        "上下文字数",
+                                        "上下文字數",
+                                    )),
+                            )
+                            .child(Input::new(&context).small().w_full()),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "Output tokens",
+                                        "输出字数",
+                                        "輸出字數",
+                                    )),
+                            )
+                            .child(Input::new(&output).small().w_full()),
+                    ),
+            )
+            .child(capabilities)
+            .children(
+                error.map(|message| div().text_xs().text_color(cx.theme().danger).child(message)),
+            )
+            .child(
+                h_flex().w_full().justify_end().child(
+                    Button::new(SharedString::from(format!(
+                        "management-provider-model-inline-save-{}",
+                        model.id
+                    )))
+                    .xsmall()
+                    .primary()
+                    .label(management_locale_text("Save model", "保存模型", "儲存模型"))
+                    .disabled(self.mutation.is_some())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.save_shared_provider_model_inline(
+                            profile_id.clone(),
+                            model_id.clone(),
+                            cx,
+                        )
+                    })),
+                ),
+            )
+            .into_any_element()
     }
 
     fn render_gateway_key_policy(
@@ -44286,6 +44640,8 @@ mod gateway_surface_tests {
             "management-provider-models-page-prev",
             "management-provider-models-page-next",
             "page_size = 50usize",
+            "management-provider-model-row-",
+            "management-provider-model-inline-save-",
             "management-provider-section-list",
             "on_key_down(cx.listener(|this, event: &KeyDownEvent",
             "\"home\" => 0",
