@@ -1224,6 +1224,12 @@ pub struct GatewayKeySummary {
     /// This Key's concurrency and rate limits, when it has any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<GatewayAccountLimits>,
+    /// Optional model ids this Key may serve. Empty means every model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    /// Optional per-Key proxy URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
 }
 
 /// The retired per-Agent gateway switch, kept only so an older client that
@@ -1925,6 +1931,9 @@ mod tests {
             status: crate::AgentCredentialStatus::Ready,
             credential: crate::AgentCredential::Local { runtime: None },
             revision: 1,
+
+            models: Vec::new(),
+            proxy_url: None,
         };
         let profile = ModelProviderProfile {
             id: profile_id.clone(),

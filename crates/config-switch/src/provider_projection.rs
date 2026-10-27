@@ -1158,6 +1158,9 @@ impl ProviderConfigService {
                 target_hint: None,
             },
             revision: 1,
+
+            models: Vec::new(),
+            proxy_url: None,
         });
         let expected = profile.revision;
         profile.revision = expected.saturating_add(1);
@@ -6923,6 +6926,9 @@ mod tests {
                     target_hint: Some(interface.wire_protocol_id.clone()),
                 },
                 revision: 1,
+
+                models: Vec::new(),
+                proxy_url: None,
             }],
             configured_models: vec![ModelProviderCatalogEntry {
                 id: "provider-model".to_string(),
@@ -8093,6 +8099,9 @@ mod tests {
                 target_hint: None,
             },
             revision: 1,
+
+            models: Vec::new(),
+            proxy_url: None,
         }];
         binding.configured_models = [
             (
@@ -8671,6 +8680,9 @@ mod tests {
                 target_hint: Some("FAKE_API_KEY".to_string()),
             },
             revision: 1,
+
+            models: Vec::new(),
+            proxy_url: None,
         }];
         descriptor.credential_control = AgentCredentialControl::Environment {
             secret_env_key: "FAKE_API_KEY".to_string(),

@@ -6473,3 +6473,16 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
   pause the gateway, compute cost, or show a balance.
 - The desktop editor keeps unrelated policy edits carrying the stored values
   forward, like account limits and translation.
+
+### Per-Key model scope and proxy
+
+- A shared Provider credential may carry `models` (empty means every model) and
+  `proxyUrl` (empty inherits the Provider/gateway proxy).
+- The fields live inside the Provider's `credentials` JSON, so an older record
+  reads empty/default fields and no schema migration is needed.
+- The gateway skips a Key whose non-empty model scope does not contain the bare
+  requested model, before it evaluates cooldown or limits.
+- A per-Key proxy builds a one-attempt HTTP client; an unusable URL is logged and
+  falls back to the gateway client rather than failing the request.
+- The Keys tab edits both fields through a small JSON object and writes them in
+  the same v2 profile update as the rest of the shared Provider.

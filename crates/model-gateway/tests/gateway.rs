@@ -315,6 +315,9 @@ fn seed_upstream(
             target_hint: None,
         },
         revision: 1,
+
+        models: Vec::new(),
+        proxy_url: None,
     };
     let profile = vibex_core::ModelProviderProfileCreateRequest {
         display_name: "DeepSeek".to_string(),
@@ -402,6 +405,9 @@ fn seed_untyped_upstream(
             target_hint: None,
         },
         revision: 1,
+
+        models: Vec::new(),
+        proxy_url: None,
     };
     let profile = vibex_core::ModelProviderProfileCreateRequest {
         display_name: "Untyped".to_string(),
@@ -885,6 +891,9 @@ async fn an_invalid_key_is_marked_and_the_next_key_answers() {
             status: AgentCredentialStatus::Missing,
             credential: AgentCredential::Local { runtime: None },
             revision: 1,
+
+            models: Vec::new(),
+            proxy_url: None,
         });
         let revision = profile.revision;
         profile.revision = revision + 1;
@@ -957,6 +966,9 @@ async fn a_preferred_key_is_tried_before_the_provider_order() {
                 target_hint: None,
             },
             revision: 1,
+
+            models: Vec::new(),
+            proxy_url: None,
         };
         let id = credential.id.clone();
         profile.credentials.push(credential);
@@ -1142,6 +1154,9 @@ async fn a_cooling_key_is_skipped_and_the_second_key_answers() {
                 target_hint: None,
             },
             revision: 1,
+
+            models: Vec::new(),
+            proxy_url: None,
         };
         profile.credentials.insert(0, credential.clone());
         let revision = profile.revision;
@@ -1231,6 +1246,9 @@ async fn a_failover_records_the_refused_key_and_why_it_moved_on() {
                 target_hint: None,
             },
             revision: 1,
+
+            models: Vec::new(),
+            proxy_url: None,
         };
         profile.credentials.push(credential.clone());
         let revision = profile.revision;
@@ -1323,6 +1341,9 @@ async fn a_first_try_success_on_a_multi_key_provider_is_not_a_failover() {
                 target_hint: None,
             },
             revision: 1,
+
+            models: Vec::new(),
+            proxy_url: None,
         });
         let revision = profile.revision;
         profile.revision = revision + 1;

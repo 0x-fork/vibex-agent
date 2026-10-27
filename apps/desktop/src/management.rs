@@ -1070,6 +1070,9 @@ pub struct ManagementCenter {
     gateway_key_batch_target: Option<String>,
     gateway_key_batch_drafts: BTreeMap<String, Entity<TextareaState>>,
     gateway_key_batch_error: Option<String>,
+    gateway_key_policy_target: Option<(vibex_core::ModelProviderProfileId, vibex_core::RequestId)>,
+    gateway_key_policy_input: Option<Entity<TextareaState>>,
+    gateway_key_policy_error: Option<String>,
     /// Which Provider the add-key field belongs to.
     gateway_key_add_target: Option<String>,
     gateway_key_add_error: Option<String>,
@@ -2340,6 +2343,9 @@ impl ManagementCenter {
             gateway_key_batch_target: None,
             gateway_key_batch_drafts: BTreeMap::new(),
             gateway_key_batch_error: None,
+            gateway_key_policy_target: None,
+            gateway_key_policy_input: None,
+            gateway_key_policy_error: None,
             gateway_key_add_target: None,
             gateway_key_add_error: None,
             shared_provider_name_editing: false,
@@ -16668,6 +16674,8 @@ impl ManagementCenter {
                 window,
                 cx,
             ));
+            key_rows =
+                key_rows.child(self.render_gateway_key_policy(profile, credential, window, cx));
             if let Some(key) = key_summary.as_ref() {
                 key_rows = key_rows.child(self.render_gateway_key_limits(key, window, cx));
             }
@@ -17896,6 +17904,218 @@ impl ManagementCenter {
     /// The API adds one credential per call, so the loop is sequential on
     /// purpose: a partial failure keeps the lines that already landed and
     /// reports the first failure instead of pretending the batch was atomic.
+    fn open_gateway_key_policy_editor(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfileId,
+        credential: &vibex_core::RequestId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(key) = self
+            .providers
+            .iter()
+            .find(|candidate| &candidate.id == profile)
+            .and_then(|profile| {
+                profile
+                    .credentials
+                    .iter()
+                    .find(|candidate| &candidate.id == credential)
+            })
+        else {
+            return;
+        };
+        let value = serde_json::json!({
+            "models": key.models,
+            "proxyUrl": key.proxy_url,
+        });
+        let text = serde_json::to_string_pretty(&value).unwrap_or_default();
+        self.gateway_key_policy_target = Some((profile.clone(), credential.clone()));
+        self.gateway_key_policy_error = None;
+        let input = self
+            .gateway_key_policy_input
+            .get_or_insert_with(|| cx.new(|cx| TextareaState::new(window, cx).rows(5)))
+            .clone();
+        input.update(cx, |state, cx| state.set_value(text, window, cx));
+        cx.notify();
+    }
+
+    fn save_gateway_key_policy(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        credential_id: vibex_core::RequestId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.gateway_key_policy_input.clone() else {
+            return;
+        };
+        let raw = input.read(cx).value().to_string();
+        let value = match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => value,
+            Err(error) => {
+                self.gateway_key_policy_error = Some(format!(
+                    "{}: {error}",
+                    management_locale_text(
+                        "Key policy JSON is invalid",
+                        "Key 策略 JSON 无效",
+                        "Key 策略 JSON 無效",
+                    )
+                ));
+                cx.notify();
+                return;
+            }
+        };
+        let Some(object) = value.as_object() else {
+            self.gateway_key_policy_error = Some(
+                management_locale_text(
+                    "Key policy must be a JSON object",
+                    "Key 策略必须是 JSON 对象",
+                    "Key 策略必須是 JSON 物件",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let models = object
+            .get("models")
+            .and_then(serde_json::Value::as_array)
+            .map(|models| {
+                models
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let proxy_url = object
+            .get("proxyUrl")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let Some(mut profile) = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(credential) = profile
+            .credentials
+            .iter_mut()
+            .find(|credential| credential.id == credential_id)
+        else {
+            return;
+        };
+        credential.models = models;
+        credential.proxy_url = proxy_url;
+        self.gateway_key_policy_target = None;
+        self.gateway_key_policy_error = None;
+        self.update_shared_provider(
+            profile,
+            management_locale_text("Key policy updated", "Key 策略已更新", "Key 策略已更新"),
+            cx,
+        );
+    }
+
+    fn render_gateway_key_policy(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfile,
+        credential: &vibex_core::ModelProviderCredentialReference,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = self.gateway_key_policy_target.as_ref().is_some_and(
+            |(target_profile, target_credential)| {
+                target_profile == &profile.id && target_credential == &credential.id
+            },
+        );
+        if !active {
+            return Button::new(SharedString::from(format!(
+                "management-shared-provider-key-policy-{}",
+                credential.id.as_str()
+            )))
+            .xsmall()
+            .ghost()
+            .label(management_locale_text("Scope", "范围", "範圍"))
+            .disabled(self.mutation.is_some())
+            .on_click(cx.listener({
+                let profile = profile.id.clone();
+                let credential = credential.id.clone();
+                move |this, _, window, cx| {
+                    this.open_gateway_key_policy_editor(&profile, &credential, window, cx)
+                }
+            }))
+            .into_any_element();
+        }
+        let input = self
+            .gateway_key_policy_input
+            .get_or_insert_with(|| cx.new(|cx| TextareaState::new(window, cx).rows(5)))
+            .clone();
+        let error = self.gateway_key_policy_error.clone();
+        let profile_id = profile.id.clone();
+        let credential_id = credential.id.clone();
+        v_flex()
+            .w_full()
+            .gap_1()
+            .pl_3()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Optional: models this Key may serve, and a per-Key proxy URL.",
+                        "可选：该 Key 可服务的模型，以及单独的代理地址。",
+                        "選填：該 Key 可服務的模型，以及單獨的代理位址。",
+                    )),
+            )
+            .child(Textarea::new(&input).small().w_full().h(px(100.0)))
+            .children(
+                error.map(|message| div().text_xs().text_color(cx.theme().danger).child(message)),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-shared-provider-key-policy-save-{}",
+                            credential.id.as_str()
+                        )))
+                        .xsmall()
+                        .primary()
+                        .label(management_locale_text("Save scope", "保存范围", "儲存範圍"))
+                        .disabled(self.mutation.is_some())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.save_gateway_key_policy(
+                                profile_id.clone(),
+                                credential_id.clone(),
+                                cx,
+                            )
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-shared-provider-key-policy-cancel-{}",
+                            credential.id.as_str()
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text("Cancel", "取消", "取消"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.gateway_key_policy_target = None;
+                            this.gateway_key_policy_error = None;
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn save_gateway_key_batch(
         &mut self,
         profile: vibex_core::ModelProviderProfileId,
@@ -43173,6 +43393,9 @@ mod gateway_surface_tests {
             state,
             used_tokens: 0,
             limits: None,
+
+            models: Vec::new(),
+            proxy_url: None,
         };
         let mut snapshot = vibex_core::GatewaySnapshot::default();
         snapshot.upstreams.push(vibex_core::GatewayUpstreamSummary {
@@ -43219,6 +43442,9 @@ mod gateway_surface_tests {
             state,
             used_tokens: 0,
             limits: None,
+
+            models: Vec::new(),
+            proxy_url: None,
         };
         let upstream = vibex_core::GatewayUpstreamSummary {
             model_provider_profile_id: profile.id.clone(),
@@ -43369,6 +43595,21 @@ mod gateway_surface_tests {
         assert!(source.contains("management-provider-agent-default-"));
         assert!(source.contains("management-route-group-agent-default-"));
         assert!(source.contains("set_agent_default_model_source("));
+    }
+
+    #[test]
+    fn keys_can_carry_a_model_scope_and_proxy() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "management-shared-provider-key-policy-",
+            "management-shared-provider-key-policy-save-",
+            "open_gateway_key_policy_editor(",
+            "save_gateway_key_policy(",
+            "credential.models = models",
+            "credential.proxy_url = proxy_url",
+        ] {
+            assert!(source.contains(marker), "Key scope must keep {marker}");
+        }
     }
 
     #[test]
@@ -43756,6 +43997,9 @@ mod gateway_surface_tests {
                     state: vibex_core::GatewayKeyState::Ready,
                     used_tokens: 0,
                     limits: None,
+
+                    models: Vec::new(),
+                    proxy_url: None,
                 },
                 vibex_core::GatewayKeySummary {
                     credential_id: vibex_core::RequestId::new(),
@@ -43766,6 +44010,9 @@ mod gateway_surface_tests {
                     },
                     used_tokens: 0,
                     limits: None,
+
+                    models: Vec::new(),
+                    proxy_url: None,
                 },
                 vibex_core::GatewayKeySummary {
                     credential_id: vibex_core::RequestId::new(),
@@ -43773,6 +44020,9 @@ mod gateway_surface_tests {
                     state: vibex_core::GatewayKeyState::Invalid,
                     used_tokens: 0,
                     limits: None,
+
+                    models: Vec::new(),
+                    proxy_url: None,
                 },
             ],
         };
@@ -43880,6 +44130,9 @@ mod gateway_surface_tests {
                 },
                 used_tokens: 0,
                 limits: None,
+
+                models: Vec::new(),
+                proxy_url: None,
             }],
         });
         assert_eq!(snapshot.ready_key_count(), 0);

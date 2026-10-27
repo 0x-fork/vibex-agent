@@ -1140,6 +1140,8 @@ fn read_gateway_snapshot(
                 state: vibex_core::GatewayKeyState::Ready,
                 used_tokens: 0,
                 limits: settings.policy.account_limits.get(&credential.id).copied(),
+                models: credential.models.clone(),
+                proxy_url: credential.proxy_url.clone(),
             })
             .collect::<Vec<_>>();
         upstreams.push(vibex_core::GatewayUpstreamSummary {

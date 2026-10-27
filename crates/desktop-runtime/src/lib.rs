@@ -1395,6 +1395,8 @@ fn assemble_gateway_snapshot(
                     state,
                     used_tokens: 0,
                     limits: settings.policy.account_limits.get(&credential.id).copied(),
+                    models: credential.models.clone(),
+                    proxy_url: credential.proxy_url.clone(),
                 }
             })
             .collect::<Vec<_>>();

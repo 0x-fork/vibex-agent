@@ -346,6 +346,26 @@ pub struct ModelProviderCredentialReference {
     pub status: AgentCredentialStatus,
     pub credential: AgentCredential,
     pub revision: i64,
+    /// Optional model ids this Key may serve. Empty means every model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    /// Optional per-Key proxy URL; empty inherits the Provider/gateway proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+}
+
+impl Default for ModelProviderCredentialReference {
+    fn default() -> Self {
+        Self {
+            id: RequestId::new(),
+            display_name: String::new(),
+            status: AgentCredentialStatus::Missing,
+            credential: AgentCredential::Local { runtime: None },
+            revision: 1,
+            models: Vec::new(),
+            proxy_url: None,
+        }
+    }
 }
 
 /// Provider metadata that is not part of the launch contract.
@@ -2964,5 +2984,23 @@ mod advanced_metadata_tests {
         assert!(!encoded.contains("quota"));
         let decoded: ModelProviderMetadata = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, metadata);
+    }
+}
+
+#[cfg(test)]
+mod key_policy_tests {
+    use super::*;
+
+    #[test]
+    fn per_key_model_scope_and_proxy_round_trip() {
+        let credential = ModelProviderCredentialReference {
+            display_name: "Primary".to_string(),
+            models: vec!["gpt-4.1".to_string(), "gpt-4.1-mini".to_string()],
+            proxy_url: Some("http://127.0.0.1:7890".to_string()),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_string(&credential).unwrap();
+        let decoded: ModelProviderCredentialReference = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, credential);
     }
 }

@@ -2110,6 +2110,9 @@ fn legacy_credentials(profile: &ProviderProfile) -> Vec<ModelProviderCredentialR
                 status,
                 credential,
                 revision: secret.updated_at_ms.max(1),
+
+                models: Vec::new(),
+                proxy_url: None,
             }
         })
         .collect()

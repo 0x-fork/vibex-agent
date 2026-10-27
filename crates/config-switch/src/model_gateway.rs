@@ -1550,6 +1550,9 @@ mod fingerprint_tests {
                         target_hint: None,
                     },
                     revision: 1,
+
+                    models: Vec::new(),
+                    proxy_url: None,
                 }],
                 configured_models: vec![vibex_core::ModelProviderCatalogEntry {
                     id: "deepseek-chat".to_string(),

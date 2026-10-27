@@ -1083,6 +1083,9 @@ mod shared_projection_tests {
                         target_hint: None,
                     },
                     revision: 1,
+
+                    models: Vec::new(),
+                    proxy_url: None,
                 })
                 .collect(),
             configured_models: (0..models)

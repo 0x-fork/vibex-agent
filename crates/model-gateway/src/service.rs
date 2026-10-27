@@ -63,6 +63,8 @@ pub struct GatewayKeySummary {
     pub display_name: String,
     pub state: vibex_core::GatewayKeyState,
     pub used_tokens: u64,
+    pub models: Vec<String>,
+    pub proxy_url: Option<String>,
 }
 
 impl GatewayUpstream {
@@ -584,6 +586,8 @@ impl ModelGatewayService {
                         display_name: credential.display_name.clone(),
                         state: state.visibility_at(now),
                         used_tokens: used,
+                        models: credential.models.clone(),
+                        proxy_url: credential.proxy_url.clone(),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -1541,7 +1545,15 @@ impl ModelGatewayService {
 
         let mut candidates = Vec::new();
         let preferred = policy.preferred_keys.get(&profile_id);
+        let bare_model = bare_model_name(&request.model);
         for (index, credential) in upstream.credentials.iter().enumerate() {
+            // A Key with a model scope serves only those ids. An empty scope
+            // keeps the pre-existing "this Key serves the Provider" meaning.
+            if !credential.models.is_empty()
+                && !credential.models.iter().any(|model| model == &bare_model)
+            {
+                continue;
+            }
             let state = state_by_key
                 .get(&credential.id)
                 .cloned()
@@ -1980,6 +1992,26 @@ impl ModelGatewayService {
     /// Returns the response and the credential that produced it. The caller
     /// owns the decision to move to another member, so this function never
     /// retries across members itself.
+    fn client_for_key(&self, proxy: Option<&str>) -> reqwest::Client {
+        let Some(proxy) = proxy.map(str::trim).filter(|value| !value.is_empty()) else {
+            return self.client.clone();
+        };
+        let Ok(proxy) = reqwest::Proxy::all(proxy) else {
+            tracing::warn!(
+                target: "vibex.model_gateway",
+                "ignoring an unusable per-Key proxy url"
+            );
+            return self.client.clone();
+        };
+        reqwest::Client::builder()
+            .connect_timeout(self.limits.connect_timeout)
+            .timeout(std::time::Duration::from_secs(600))
+            .user_agent("vibex-model-gateway/1")
+            .proxy(proxy)
+            .build()
+            .unwrap_or_else(|_| self.client.clone())
+    }
+
     async fn open_member_attempt(
         &self,
         prepared: &PreparedCall,
@@ -2081,11 +2113,8 @@ impl ModelGatewayService {
                     &member.model,
                     prepared.stream,
                 )?;
-                let mut wire = apply_auth(
-                    self.client.post(&url).json(&call.body),
-                    call.target,
-                    &secret,
-                );
+                let client = self.client_for_key(credential.proxy_url.as_deref());
+                let mut wire = apply_auth(client.post(&url).json(&call.body), call.target, &secret);
                 if let Some(beta) = beta_header(&call.target, &call.body) {
                     wire = wire.header("anthropic-beta", beta);
                 }
