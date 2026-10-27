@@ -7437,6 +7437,111 @@ impl ManagementCenter {
         }));
     }
 
+    fn detect_provider_apis(&mut self, agent_id: String, cx: &mut Context<Self>) {
+        let Ok(agent_id) = AgentId::parse(agent_id) else {
+            return;
+        };
+        let base_url = self.profile_base_url.read(cx).value().trim().to_string();
+        let api_key = self.profile_api_key.read(cx).value().trim().to_string();
+        if base_url.is_empty() || api_key.is_empty() {
+            self.error = Some(
+                management_error_text(
+                    "Enter a request URL and a key before detecting",
+                    "请先填写接口地址和 Key 再检测",
+                    "請先填寫介面位址和 Key 再偵測",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::ProviderProbe(format!(
+            "detect:{}",
+            agent_id.as_str()
+        )));
+        self.error = None;
+        self.notice = None;
+        let provider_options = Some(self.profile_provider_options.clone());
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let candidates = [
+                vibex_core::ProviderModelWireApi::OpenaiChatCompletions,
+                vibex_core::ProviderModelWireApi::OpenaiResponses,
+                vibex_core::ProviderModelWireApi::AnthropicMessages,
+                vibex_core::ProviderModelWireApi::GoogleGenerativeAi,
+            ];
+            for wire_api in candidates {
+                let probe = vibex_core::ProviderConfiguredModel {
+                    id: "__vibex_probe__".to_string(),
+                    display_name: None,
+                    enabled: true,
+                    wire_api: Some(wire_api),
+                    capabilities: Default::default(),
+                };
+                let outcome = backend
+                    .management()
+                    .fetch_agent_model_provider_draft_models(
+                        vibex_core::AgentModelProviderDraftFetchModelsRequest {
+                            agent_id: agent_id.clone(),
+                            base_url: base_url.clone(),
+                            api_key: api_key.clone(),
+                            configured_models: vec![probe],
+                            provider_options: provider_options.clone(),
+                        },
+                    )
+                    .await;
+                if let Ok(response) = outcome {
+                    return Ok((wire_api, response.models.len()));
+                }
+            }
+            Err(management_error_text(
+                "No supported API answered",
+                "没有受支持的 API 响应",
+                "沒有受支援的 API 回應",
+            )
+            .to_string())
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(Ok((wire_api, count))) => {
+                        this.profile_provider_options = with_provider_option(
+                            this.profile_provider_options.clone(),
+                            "wireApi",
+                            Some(wire_api.wire_protocol_id().to_string()),
+                        );
+                        this.notice = Some(format!(
+                            "{} · {} · {}",
+                            management_locale_text("Detected", "已检测", "已偵測"),
+                            wire_api.wire_protocol_id(),
+                            management_model_count(count)
+                        ));
+                    }
+                    Ok(Err(message)) => this.error = Some(message),
+                    Err(error) => {
+                        this.error = Some(format!(
+                            "{}: {error}",
+                            management_error_text(
+                                "API detection failed",
+                                "API 检测失败",
+                                "API 偵測失敗"
+                            )
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     fn test_provider_profile(
         &mut self,
         profile_id: String,
@@ -22782,6 +22887,12 @@ impl ManagementCenter {
                 Some(ManagementMutation::ProviderProbe(action))
                     if action.starts_with("draft-test:")
             );
+        let detecting_apis = self.editing_profile_id.is_none()
+            && matches!(
+                &self.mutation,
+                Some(ManagementMutation::ProviderProbe(action))
+                    if action.starts_with("detect:")
+            );
         // A probe is not a reason to trap the user in the dialog: it can take a
         // while, and closing only discards the draft.
         let cancel_disabled =
@@ -22945,6 +23056,23 @@ impl ManagementCenter {
                                     let agent_id =
                                         this.selected_agent_id.clone().unwrap_or_default();
                                     this.test_provider_draft(agent_id, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("provider-profile-detect-apis")
+                                .small()
+                                .ghost()
+                                .label(if detecting_apis {
+                                    management_locale_text("Detecting...", "检测中...", "偵測中...")
+                                } else {
+                                    management_locale_text("Detect APIs", "检测 API", "偵測 API")
+                                })
+                                .loading(detecting_apis)
+                                .disabled(pending)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let agent_id =
+                                        this.selected_agent_id.clone().unwrap_or_default();
+                                    this.detect_provider_apis(agent_id, cx)
                                 })),
                         )
                     })

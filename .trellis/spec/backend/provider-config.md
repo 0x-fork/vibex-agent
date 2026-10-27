@@ -6431,3 +6431,15 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
   model count, latency diagnostics, and a typed failure.
 - A failed test leaves the draft intact and does not clear the key field.
 - The saved-Provider Test still uses the saved credential and model-list probe.
+
+### Detect APIs
+
+- Detect APIs tries the four supported wire protocols in order against the
+  draft URL and key: OpenAI Chat Completions, OpenAI Responses, Anthropic
+  Messages, Gemini.
+- The first protocol whose model-list request succeeds is written into the
+  draft's `wireApi` option; the dialog is not saved.
+- All four failing is a typed "No supported API answered" error; the draft and
+  key remain.
+- Detection is a sequence of draft fetches, so it uses the draft fetch API and
+  never persists a transient Profile.
