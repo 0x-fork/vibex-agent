@@ -1003,6 +1003,11 @@ pub struct ManagementCenter {
     catalog_status: Option<vibex_core::ModelCatalogStatus>,
     /// The global Providers list status filter.
     provider_list_filter: ProviderListFilter,
+    /// The global Providers list ordering.
+    provider_sort: ProviderSort,
+    /// Providers the user starred, persisted beside the other desktop UI state.
+    provider_favorites: BTreeSet<String>,
+    provider_favorites_path: Option<PathBuf>,
     /// Which half of the Providers page the left column is showing.
     ///
     /// Providers and route groups are two kinds of record the same page owns,
@@ -1081,6 +1086,9 @@ pub struct ManagementCenter {
     shared_provider_edit_proxy_disabled: bool,
     shared_provider_edit_only_through_groups: bool,
     shared_provider_edit_error: Option<String>,
+    shared_provider_edit_name_error: Option<String>,
+    shared_provider_edit_base_url_error: Option<String>,
+    shared_provider_edit_models_error: Option<String>,
     /// The preset the editor's draft started from, until it is saved.
     ///
     /// It is kept beside the draft rather than inside it because a preset is a
@@ -2317,6 +2325,9 @@ impl ManagementCenter {
             shared_provider_edit_proxy_disabled: false,
             shared_provider_edit_only_through_groups: false,
             shared_provider_edit_error: None,
+            shared_provider_edit_name_error: None,
+            shared_provider_edit_base_url_error: None,
+            shared_provider_edit_models_error: None,
             provider_preset_draft: None,
             provider_preset_region: None,
             provider_preset_picker: false,
@@ -2341,6 +2352,9 @@ impl ManagementCenter {
             provider_search,
             catalog_status: None,
             provider_list_filter: ProviderListFilter::All,
+            provider_sort: ProviderSort::Name,
+            provider_favorites: BTreeSet::new(),
+            provider_favorites_path: None,
             providers_sidebar_tab: ProviderSidebarTab::Providers,
             selected_global_route_id: None,
             profile_editor_open: false,
@@ -4845,6 +4859,7 @@ impl ManagementCenter {
         self.agent_model_route_bindings = snapshot.agent_model_route_bindings;
         self.agent_model_source_defaults = snapshot.agent_model_source_defaults;
         self.catalog_status = snapshot.catalog_status;
+        self.ensure_provider_favorites_loaded();
         self.provider_profiles = snapshot.provider_profiles;
         self.provider_display_order = snapshot.provider_display_order;
         self.provider_display_order_drag_state = None;
@@ -11928,8 +11943,31 @@ impl ManagementCenter {
                             .iter()
                             .any(|model| model.enabled)
                 }
+                ProviderListFilter::Shared => row.agents.len() > 1,
+                ProviderListFilter::AgentOnly => row.agents.len() == 1,
             })
             .collect::<Vec<_>>();
+        let mut rows = rows;
+        rows.sort_by(|left, right| {
+            let left_favorite = self.provider_favorites.contains(left.profile.id.as_str());
+            let right_favorite = self.provider_favorites.contains(right.profile.id.as_str());
+            right_favorite
+                .cmp(&left_favorite)
+                .then_with(|| match self.provider_sort {
+                    ProviderSort::Name => left
+                        .profile
+                        .display_name
+                        .to_lowercase()
+                        .cmp(&right.profile.display_name.to_lowercase()),
+                    ProviderSort::RecentlyUpdated => {
+                        right.profile.updated_at_ms.cmp(&left.profile.updated_at_ms)
+                    }
+                    ProviderSort::MostAgents => right.agents.len().cmp(&left.agents.len()),
+                    ProviderSort::Health => self
+                        .provider_health_rank(&right.profile)
+                        .cmp(&self.provider_health_rank(&left.profile)),
+                })
+        });
         let selected = self.selected_global_provider_id.clone();
         let locale = locale::current_locale();
         let mut gateway_section = v_flex().w_full().min_w_0().flex_none().gap_2().child(
@@ -12081,11 +12119,42 @@ impl ManagementCenter {
             let is_selected = selected.as_deref() == Some(id.as_str());
             let key_summary =
                 shared_provider_key_summary(&row.profile, &self.gateway.upstreams, locale);
-            let used = if row.agents.is_empty() {
-                management_locale_text("not used yet", "未被使用", "未被使用").to_string()
-            } else {
-                row.agents.iter().cloned().collect::<Vec<_>>().join(" · ")
+            let is_favorite = self.provider_favorites.contains(id.as_str());
+            let enabled_models = row
+                .profile
+                .configured_models
+                .iter()
+                .filter(|model| model.enabled)
+                .count();
+            let ready_keys = row
+                .profile
+                .credentials
+                .iter()
+                .filter(|credential| credential.status == vibex_core::AgentCredentialStatus::Ready)
+                .count();
+            let (health_label, health_status) = self.shared_provider_health_label(&row.profile);
+            let health_color = match health_status {
+                vibex_core::ProviderHealthStatus::Fail => cx.theme().danger,
+                vibex_core::ProviderHealthStatus::Warn => cx.theme().warning,
+                vibex_core::ProviderHealthStatus::Pass => cx.theme().success,
+                _ => cx.theme().muted_foreground,
             };
+            let agent_count = row.agents.len();
+            let agent_stack = row
+                .agents
+                .iter()
+                .take(5)
+                .map(|agent_id| {
+                    let label = self
+                        .snapshot
+                        .agents
+                        .iter()
+                        .find(|agent| agent.id.as_str() == agent_id)
+                        .map(|agent| agent.label.clone())
+                        .unwrap_or_else(|| agent_id.clone());
+                    (agent_id.clone(), label)
+                })
+                .collect::<Vec<_>>();
             let select_id = id.clone();
             list = list.child(
                 v_flex()
@@ -12128,15 +12197,90 @@ impl ManagementCenter {
                                             .text_sm()
                                             .font_medium()
                                             .child(row.profile.display_name.clone()),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "management-provider-favorite-{id}"
+                                        )))
+                                        .xsmall()
+                                        .ghost()
+                                        .icon(if is_favorite {
+                                            IconName::StarFill
+                                        } else {
+                                            IconName::Star
+                                        })
+                                        .tooltip(if is_favorite {
+                                            management_locale_text(
+                                                "Remove favorite",
+                                                "取消收藏",
+                                                "取消收藏",
+                                            )
+                                        } else {
+                                            management_locale_text("Favorite", "收藏", "收藏")
+                                        })
+                                        .on_click(
+                                            cx.listener({
+                                                let favorite_id = id.clone();
+                                                move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.toggle_provider_favorite(
+                                                        favorite_id.clone(),
+                                                        cx,
+                                                    )
+                                                }
+                                            }),
+                                        ),
                                     ),
                             )
                             .child(gateway_provider_status_badge(&row.profile, cx)),
                     )
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{key_summary} · {used}")),
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "{enabled_models} {} · {ready_keys}/{} {} · {key_summary}",
+                                        management_locale_text("models", "个模型", "個模型"),
+                                        row.profile.credentials.len(),
+                                        management_locale_text(
+                                            "keys ready",
+                                            "Key 就绪",
+                                            "Key 就緒"
+                                        ),
+                                    )),
+                            )
+                            .child(div().text_xs().text_color(health_color).child(health_label)),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_1()
+                            .children(agent_stack.into_iter().map(|(agent_id, label)| {
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(agent_brand_icon(&agent_id, px(14.0), None))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(label),
+                                    )
+                            }))
+                            .when(agent_count > 5, |stack| {
+                                stack.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!("+{}", agent_count - 5)),
+                                )
+                            }),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_global_provider_id = Some(select_id.clone());
@@ -13324,11 +13468,101 @@ impl ManagementCenter {
         }));
     }
 
+    fn ensure_provider_favorites_loaded(&mut self) {
+        if self.provider_favorites_path.is_some() {
+            return;
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        let path = runtime
+            .config()
+            .home_dir
+            .join("management-provider-favorites.json");
+        if let Ok(bytes) = std::fs::read(&path)
+            && let Ok(ids) = serde_json::from_slice::<Vec<String>>(&bytes)
+        {
+            self.provider_favorites = ids.into_iter().collect();
+        }
+        self.provider_favorites_path = Some(path);
+    }
+
+    fn save_provider_favorites(&self) {
+        let Some(path) = self.provider_favorites_path.as_ref() else {
+            return;
+        };
+        if let Ok(bytes) =
+            serde_json::to_vec_pretty(&self.provider_favorites.iter().cloned().collect::<Vec<_>>())
+        {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+
+    fn toggle_provider_favorite(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        if !self.provider_favorites.remove(&profile_id) {
+            self.provider_favorites.insert(profile_id);
+        }
+        self.save_provider_favorites();
+        cx.notify();
+    }
+
+    fn provider_health_rank(&self, profile: &vibex_core::ModelProviderProfile) -> u8 {
+        let mut rank = 0;
+        for binding in self
+            .provider_bindings
+            .iter()
+            .filter(|binding| binding.model_provider_profile_id.as_ref() == Some(&profile.id))
+        {
+            let Some(legacy_id) = binding.legacy_provider_profile_id.as_ref() else {
+                continue;
+            };
+            for summary in &self.health_summaries {
+                if &summary.profile.id != legacy_id {
+                    continue;
+                }
+                rank = rank.max(match summary.overall_status {
+                    vibex_core::ProviderHealthStatus::Fail => 4,
+                    vibex_core::ProviderHealthStatus::Warn => 3,
+                    vibex_core::ProviderHealthStatus::Pass => 2,
+                    vibex_core::ProviderHealthStatus::Skipped
+                    | vibex_core::ProviderHealthStatus::Unsupported => 1,
+                    vibex_core::ProviderHealthStatus::Unknown => 0,
+                });
+            }
+        }
+        rank
+    }
+
+    fn shared_provider_health_label(
+        &self,
+        profile: &vibex_core::ModelProviderProfile,
+    ) -> (&'static str, vibex_core::ProviderHealthStatus) {
+        let rank = self.provider_health_rank(profile);
+        match rank {
+            4 => (
+                management_locale_text("Failing", "异常", "異常"),
+                vibex_core::ProviderHealthStatus::Fail,
+            ),
+            3 => (
+                management_locale_text("Warning", "警告", "警告"),
+                vibex_core::ProviderHealthStatus::Warn,
+            ),
+            2 => (
+                management_locale_text("Healthy", "健康", "健康"),
+                vibex_core::ProviderHealthStatus::Pass,
+            ),
+            _ => (
+                management_locale_text("Unchecked", "未检查", "未檢查"),
+                vibex_core::ProviderHealthStatus::Unknown,
+            ),
+        }
+    }
+
     fn render_provider_filter_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let mut row = h_flex().w_full().flex_wrap().gap_1();
+        let mut filters = h_flex().w_full().flex_wrap().gap_1();
         for filter in ProviderListFilter::ALL {
             let selected = filter == self.provider_list_filter;
-            row = row.child(
+            filters = filters.child(
                 Button::new(SharedString::from(format!(
                     "management-provider-filter-{:?}",
                     filter
@@ -13343,7 +13577,35 @@ impl ManagementCenter {
                 })),
             );
         }
-        row.into_any_element()
+        let mut sorts = h_flex().w_full().items_center().flex_wrap().gap_1().child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text("Sort", "排序", "排序")),
+        );
+        for sort in ProviderSort::ALL {
+            let selected = sort == self.provider_sort;
+            sorts = sorts.child(
+                Button::new(SharedString::from(format!(
+                    "management-provider-sort-{:?}",
+                    sort
+                )))
+                .xsmall()
+                .when(selected, |button| button.secondary())
+                .when(!selected, |button| button.ghost())
+                .label(sort.label())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.provider_sort = sort;
+                    cx.notify();
+                })),
+            );
+        }
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(filters)
+            .child(sorts)
+            .into_any_element()
     }
 
     fn render_catalog_status_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -13356,6 +13618,9 @@ impl ManagementCenter {
                     }
                     vibex_core::ModelCatalogAvailability::Stale => {
                         management_locale_text("Stale", "已过期", "已過期")
+                    }
+                    vibex_core::ModelCatalogAvailability::Bundled => {
+                        management_locale_text("Bundled", "内置", "內建")
                     }
                     vibex_core::ModelCatalogAvailability::Missing => {
                         management_locale_text("Missing", "不可用", "不可用")
@@ -13595,6 +13860,13 @@ impl ManagementCenter {
         }));
     }
 
+    fn open_agent_page(&mut self, agent_id: String, cx: &mut Context<Self>) {
+        self.navigation.active = ManagementSection::Agents;
+        self.selected_agent_id = Some(agent_id);
+        self.close_shared_provider_editor(cx);
+        cx.notify();
+    }
+
     fn open_shared_provider_editor_by_id(
         &mut self,
         profile_id: vibex_core::ModelProviderProfileId,
@@ -13738,7 +14010,7 @@ impl ManagementCenter {
             .trim()
             .to_string();
         if name.is_empty() {
-            self.shared_provider_edit_error = Some(
+            self.shared_provider_edit_name_error = Some(
                 management_locale_text(
                     "A Provider needs a name",
                     "请填写供应商名称",
@@ -13756,7 +14028,7 @@ impl ManagementCenter {
             .trim()
             .to_string();
         if base_url.is_empty() {
-            self.shared_provider_edit_error = Some(
+            self.shared_provider_edit_base_url_error = Some(
                 management_locale_text(
                     "A Provider needs at least one request URL",
                     "请至少填写一个接口地址",
@@ -13781,7 +14053,7 @@ impl ManagementCenter {
                 ids
             });
         if model_ids.is_empty() {
-            self.shared_provider_edit_error = Some(
+            self.shared_provider_edit_models_error = Some(
                 management_locale_text(
                     "Add at least one model id",
                     "请至少填写一个模型 ID",
@@ -14003,6 +14275,9 @@ impl ManagementCenter {
         profile.metadata.catalog_id = (!catalog_id.is_empty()).then_some(catalog_id);
         profile.metadata.icon = (!icon.is_empty()).then_some(icon);
         profile.headers = headers;
+        self.shared_provider_edit_name_error = None;
+        self.shared_provider_edit_base_url_error = None;
+        self.shared_provider_edit_models_error = None;
         profile.metadata.category = self.shared_provider_edit_category.clone();
         profile.metadata.only_through_route_groups = self.shared_provider_edit_only_through_groups;
         profile.proxy_policy = if self.shared_provider_edit_proxy_disabled {
@@ -14030,6 +14305,21 @@ impl ManagementCenter {
         let proxy_disabled = self.shared_provider_edit_proxy_disabled;
         let selected_category = self.shared_provider_edit_category.clone();
         let profile_id = profile.id.clone();
+        let bound_agents = self
+            .provider_bindings
+            .iter()
+            .filter(|binding| binding.model_provider_profile_id.as_ref() == Some(&profile.id))
+            .map(|binding| {
+                let label = self
+                    .snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id == binding.agent_id)
+                    .map(|agent| agent.label.clone())
+                    .unwrap_or_else(|| binding.agent_id.as_str().to_string());
+                (binding.agent_id.clone(), label)
+            })
+            .collect::<Vec<_>>();
         management_card_dynamic(
             management_locale_text("Edit shared Provider", "编辑共享供应商", "編輯共用供應商")
                 .to_string(),
@@ -14041,32 +14331,88 @@ impl ManagementCenter {
             v_flex()
                 .w_full()
                 .gap_2p5()
-                .child(management_input_field(
-                    management_locale_text("Provider name", "供应商名称", "供應商名稱"),
-                    &self.shared_provider_edit_name,
-                    false,
-                    cx,
-                ))
-                .child(management_input_field(
-                    management_locale_text(
-                        "Default API request URL",
-                        "默认 API 请求地址",
-                        "預設 API 請求位址",
-                    ),
-                    &self.shared_provider_edit_base_url,
-                    false,
-                    cx,
-                ))
-                .child(management_input_field(
-                    management_locale_text(
-                        "Enabled models (comma separated)",
-                        "启用的模型（逗号分隔）",
-                        "啟用的模型（逗號分隔）",
-                    ),
-                    &self.shared_provider_edit_models,
-                    false,
-                    cx,
-                ))
+                .when(!bound_agents.is_empty(), |body| {
+                    body.child(
+                        v_flex()
+                            .w_full()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "Agent-only settings stay on each Agent page:",
+                                        "Agent 专属设置仍在各 Agent 页面：",
+                                        "Agent 專屬設定仍在各 Agent 頁面：",
+                                    )),
+                            )
+                            .children(bound_agents.iter().map(|(agent_id, label)| {
+                                Button::new(SharedString::from(format!(
+                                    "management-shared-provider-agent-{}",
+                                    agent_id.as_str()
+                                )))
+                                .xsmall()
+                                .ghost()
+                                .label(label.clone())
+                                .on_click(cx.listener({
+                                    let agent_id = agent_id.clone();
+                                    move |this, _, _, cx| {
+                                        this.open_agent_page(agent_id.as_str().to_string(), cx)
+                                    }
+                                }))
+                            })),
+                    )
+                })
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .child(management_input_field(
+                            management_locale_text("Provider name", "供应商名称", "供應商名稱"),
+                            &self.shared_provider_edit_name,
+                            false,
+                            cx,
+                        ))
+                        .children(self.shared_provider_edit_name_error.clone().map(|error| {
+                            div().text_xs().text_color(cx.theme().danger).child(error)
+                        })),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .child(management_input_field(
+                            management_locale_text(
+                                "Default API request URL",
+                                "默认 API 请求地址",
+                                "預設 API 請求位址",
+                            ),
+                            &self.shared_provider_edit_base_url,
+                            false,
+                            cx,
+                        ))
+                        .children(self.shared_provider_edit_base_url_error.clone().map(|error| {
+                            div().text_xs().text_color(cx.theme().danger).child(error)
+                        })),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .child(management_input_field(
+                            management_locale_text(
+                                "Enabled models (comma separated)",
+                                "启用的模型（逗号分隔）",
+                                "啟用的模型（逗號分隔）",
+                            ),
+                            &self.shared_provider_edit_models,
+                            false,
+                            cx,
+                        ))
+                        .children(self.shared_provider_edit_models_error.clone().map(|error| {
+                            div().text_xs().text_color(cx.theme().danger).child(error)
+                        })),
+                )
                 .child(management_input_field(
                     management_locale_text("Default model", "默认模型", "預設模型"),
                     &self.shared_provider_edit_default_model,
@@ -31045,21 +31391,51 @@ enum ProviderSidebarTab {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderSort {
+    Name,
+    RecentlyUpdated,
+    MostAgents,
+    Health,
+}
+
+impl ProviderSort {
+    const ALL: [Self; 4] = [
+        Self::Name,
+        Self::RecentlyUpdated,
+        Self::MostAgents,
+        Self::Health,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Name => management_locale_text("Name", "名称", "名稱"),
+            Self::RecentlyUpdated => management_locale_text("Updated", "最近更新", "最近更新"),
+            Self::MostAgents => management_locale_text("Agents", "Agent 数", "Agent 數"),
+            Self::Health => management_locale_text("Health", "健康", "健康"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderListFilter {
     All,
     Enabled,
     Disabled,
     NeedsKey,
     Warning,
+    Shared,
+    AgentOnly,
 }
 
 impl ProviderListFilter {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 7] = [
         Self::All,
         Self::Enabled,
         Self::Disabled,
         Self::NeedsKey,
         Self::Warning,
+        Self::Shared,
+        Self::AgentOnly,
     ];
 
     fn label(self) -> &'static str {
@@ -31069,6 +31445,8 @@ impl ProviderListFilter {
             Self::Disabled => management_locale_text("Disabled", "已停用", "已停用"),
             Self::NeedsKey => management_locale_text("Needs key", "缺 Key", "缺 Key"),
             Self::Warning => management_locale_text("Needs attention", "需关注", "需關注"),
+            Self::Shared => management_locale_text("Shared", "共享", "共用"),
+            Self::AgentOnly => management_locale_text("One Agent", "仅一个 Agent", "僅一個 Agent"),
         }
     }
 }
@@ -40162,6 +40540,26 @@ mod gateway_surface_tests {
         assert!(save.contains("profile.headers = headers"));
         assert!(source.contains("provider-shared-edit-"));
         assert!(source.contains("open_shared_provider_editor_by_id"));
+    }
+
+    #[test]
+    fn the_provider_list_can_favorite_filter_and_sort() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "management-provider-favorite-",
+            "ProviderSort::RecentlyUpdated",
+            "ProviderSort::MostAgents",
+            "ProviderSort::Health",
+            "ProviderListFilter::Shared",
+            "ProviderListFilter::AgentOnly",
+            "management-provider-sort-",
+            "management-provider-favorites.json",
+        ] {
+            assert!(
+                source.contains(marker),
+                "the Providers list must keep {marker}"
+            );
+        }
     }
 
     #[test]

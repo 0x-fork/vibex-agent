@@ -3087,6 +3087,7 @@ mod tests {
 pub enum ModelCatalogAvailability {
     Fresh,
     Stale,
+    Bundled,
     Missing,
 }
 

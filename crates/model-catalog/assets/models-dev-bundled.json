@@ -1,0 +1,86 @@
+{
+  "deepseek": {
+    "id": "deepseek",
+    "name": "DeepSeek",
+    "api": "https://api.deepseek.com/v1",
+    "doc": "https://api-docs.deepseek.com",
+    "models": {
+      "deepseek-chat": {
+        "name": "DeepSeek Chat",
+        "family": "deepseek",
+        "limit": {"context": 128000, "output": 8192},
+        "tool_call": true,
+        "temperature": true,
+        "modalities": {"input": ["text"], "output": ["text"]}
+      },
+      "deepseek-reasoner": {
+        "name": "DeepSeek Reasoner",
+        "family": "deepseek",
+        "limit": {"context": 64000, "output": 8192},
+        "reasoning": true,
+        "tool_call": true,
+        "modalities": {"input": ["text"], "output": ["text"]}
+      }
+    }
+  },
+  "openai": {
+    "id": "openai",
+    "name": "OpenAI",
+    "api": "https://api.openai.com/v1",
+    "doc": "https://platform.openai.com/docs",
+    "models": {
+      "gpt-4.1": {
+        "name": "GPT-4.1",
+        "family": "gpt",
+        "limit": {"context": 1047576, "output": 32768},
+        "tool_call": true,
+        "structured_output": true,
+        "temperature": true,
+        "modalities": {"input": ["text", "image"], "output": ["text"]}
+      },
+      "gpt-4.1-mini": {
+        "name": "GPT-4.1 mini",
+        "family": "gpt",
+        "limit": {"context": 1047576, "output": 32768},
+        "tool_call": true,
+        "structured_output": true,
+        "temperature": true,
+        "modalities": {"input": ["text", "image"], "output": ["text"]}
+      }
+    }
+  },
+  "anthropic": {
+    "id": "anthropic",
+    "name": "Anthropic",
+    "api": "https://api.anthropic.com",
+    "doc": "https://docs.anthropic.com",
+    "models": {
+      "claude-sonnet-4-20250514": {
+        "name": "Claude Sonnet 4",
+        "family": "claude",
+        "limit": {"context": 200000, "output": 64000},
+        "reasoning": true,
+        "tool_call": true,
+        "temperature": true,
+        "modalities": {"input": ["text", "image"], "output": ["text"]}
+      }
+    }
+  },
+  "google": {
+    "id": "google",
+    "name": "Google",
+    "api": "https://generativelanguage.googleapis.com/v1beta",
+    "doc": "https://ai.google.dev/gemini-api/docs",
+    "models": {
+      "gemini-2.5-pro": {
+        "name": "Gemini 2.5 Pro",
+        "family": "gemini",
+        "limit": {"context": 1048576, "output": 65536},
+        "reasoning": true,
+        "tool_call": true,
+        "temperature": true,
+        "modalities": {"input": ["text", "image"], "output": ["text"]}
+      }
+    }
+  }
+}

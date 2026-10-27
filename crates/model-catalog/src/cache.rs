@@ -19,14 +19,16 @@ pub enum CatalogState {
     Fresh(Box<Catalog>),
     /// A document exists but is older than the TTL.
     Stale(Box<Catalog>),
-    /// Nothing usable is stored.
+    /// Nothing usable is stored, so the compiled fallback is used.
+    Bundled(Box<Catalog>),
+    /// Nothing usable is stored and the fallback did not parse.
     Missing,
 }
 
 impl CatalogState {
     pub fn catalog(&self) -> Option<&Catalog> {
         match self {
-            Self::Fresh(catalog) | Self::Stale(catalog) => Some(catalog),
+            Self::Fresh(catalog) | Self::Stale(catalog) | Self::Bundled(catalog) => Some(catalog),
             Self::Missing => None,
         }
     }
@@ -43,6 +45,12 @@ struct Envelope {
     schema_version: u32,
     fetched_at_ms: i64,
     catalog: Catalog,
+}
+
+fn bundled_state() -> CatalogState {
+    parse_catalog(include_str!("../assets/models-dev-bundled.json"))
+        .map(|catalog| CatalogState::Bundled(Box::new(catalog)))
+        .unwrap_or(CatalogState::Missing)
 }
 
 /// A catalogue cache rooted at one directory.
@@ -69,13 +77,13 @@ impl CatalogCache {
     /// Reads the cache. Every failure reads as `Missing`.
     pub fn load(&self, now_ms: i64) -> CatalogState {
         let Ok(encoded) = std::fs::read_to_string(&self.path) else {
-            return CatalogState::Missing;
+            return bundled_state();
         };
         let Ok(envelope) = serde_json::from_str::<Envelope>(&encoded) else {
-            return CatalogState::Missing;
+            return bundled_state();
         };
         if envelope.schema_version != CATALOG_SCHEMA_VERSION {
-            return CatalogState::Missing;
+            return bundled_state();
         }
         let age = now_ms.saturating_sub(envelope.fetched_at_ms);
         if age <= CATALOG_TTL_MS {
@@ -91,19 +99,19 @@ impl CatalogCache {
     pub fn status(&self, now_ms: i64) -> vibex_core::ModelCatalogStatus {
         let Ok(encoded) = std::fs::read_to_string(&self.path) else {
             return vibex_core::ModelCatalogStatus {
-                availability: vibex_core::ModelCatalogAvailability::Missing,
+                availability: vibex_core::ModelCatalogAvailability::Bundled,
                 fetched_at_ms: None,
             };
         };
         let Ok(envelope) = serde_json::from_str::<Envelope>(&encoded) else {
             return vibex_core::ModelCatalogStatus {
-                availability: vibex_core::ModelCatalogAvailability::Missing,
+                availability: vibex_core::ModelCatalogAvailability::Bundled,
                 fetched_at_ms: None,
             };
         };
         if envelope.schema_version != CATALOG_SCHEMA_VERSION {
             return vibex_core::ModelCatalogStatus {
-                availability: vibex_core::ModelCatalogAvailability::Missing,
+                availability: vibex_core::ModelCatalogAvailability::Bundled,
                 fetched_at_ms: None,
             };
         }
@@ -209,19 +217,19 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_cache_reads_as_missing_not_an_error() {
+    fn a_missing_cache_reads_the_bundled_fallback_not_an_error() {
         let (directory, cache) = cache();
-        assert_eq!(cache.load(1), CatalogState::Missing);
-        assert!(cache.suggest("deepseek", "deepseek-chat", 1).is_none());
+        assert!(matches!(cache.load(1), CatalogState::Bundled(_)));
+        assert!(cache.suggest("deepseek", "deepseek-chat", 1).is_some());
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn status_reports_missing_fresh_and_stale_with_the_fetch_time() {
+    fn status_reports_bundled_fresh_and_stale_with_the_fetch_time() {
         let (directory, cache) = cache();
         assert_eq!(
             cache.status(1_000).availability,
-            vibex_core::ModelCatalogAvailability::Missing
+            vibex_core::ModelCatalogAvailability::Bundled
         );
         let catalog = parse_catalog(document()).unwrap();
         cache.store(&catalog, 1_000).unwrap();
@@ -272,18 +280,18 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_or_older_schema_reads_as_missing() {
+    fn a_corrupt_or_older_schema_reads_the_bundled_fallback() {
         let (directory, cache) = cache();
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(cache.path(), "{not json").unwrap();
-        assert_eq!(cache.load(1), CatalogState::Missing);
+        assert!(matches!(cache.load(1), CatalogState::Bundled(_)));
 
         std::fs::write(
             cache.path(),
             r#"{"schema_version":0,"fetched_at_ms":1,"catalog":{"providers":{}}}"#,
         )
         .unwrap();
-        assert_eq!(cache.load(1), CatalogState::Missing);
+        assert!(matches!(cache.load(1), CatalogState::Bundled(_)));
         let _ = std::fs::remove_dir_all(directory);
     }
 

@@ -6221,7 +6221,7 @@ ModelProviderFetchModelsResponse { model_provider_profile_id, models, diagnostic
 ModelProviderTestRequest { model_provider_profile_id }
 ModelProviderTestResult { model_provider_profile_id, status, code, message, diagnostics, checked_at_ms }
 
-ModelCatalogStatus { availability: Fresh|Stale|Missing, fetched_at_ms? }
+ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 ```
 
 ### 3. Contracts
@@ -6233,9 +6233,11 @@ ModelCatalogStatus { availability: Fresh|Stale|Missing, fetched_at_ms? }
   Secret without sending a prompt or spending completion tokens.
 - Existing configured Models are carried over by id when a refresh returns
   them, so capabilities and provenance survive.
-- The catalogue status is advisory: `Missing` and `Stale` are normal states and
-  never block Provider editing. A manual refresh failure leaves the previous
-  document in place and reports the failure to the caller.
+- The catalogue status is advisory: `Bundled`, `Missing`, and `Stale` are normal
+  states and never block Provider editing. A missing/corrupt cache reads the
+  compiled fallback (`Bundled`) rather than returning no suggestions. A manual
+  refresh failure leaves the previous document in place and reports the failure
+  to the caller.
 - The catalogue never carries a price, cost, currency, or quota field.
 
 ### 4. Tests Required
@@ -6246,3 +6248,33 @@ ModelCatalogStatus { availability: Fresh|Stale|Missing, fetched_at_ms? }
   error.
 - `vibex-desktop`: shared detail exposes Test and Refresh models; the Providers
   page shows catalogue freshness and a refresh control.
+
+
+## Scenario: Provider List Favorites, Filters, and Sort
+
+### 1. Scope / Trigger
+
+- Trigger: the global Providers list is filtered, sorted, or a Provider is
+  starred.
+
+### 2. Contracts
+
+- Search matches display name, endpoint URL, configured model id, and Key
+  display name.
+- Status filters: all, enabled, disabled, needs key, needs attention, shared
+  (two or more Agents), and one Agent.
+- Sort: name, recently updated, Agent count, and health. Favorites sort before
+  every other key.
+- Favorites are persisted as a JSON string array in
+  `management-provider-favorites.json` beside the desktop UI state; a read or
+  write failure is non-fatal.
+- Health is the worst summary across the Provider's bound legacy Profiles; an
+  unchecked Provider reads `Unchecked`, not `Healthy`.
+- Row counts and Agent icons are read-only; binding changes stay on the Agent
+  page.
+
+### 3. Tests Required
+
+- `vibex-desktop`: the favorite control, status filters, sort controls, and
+  favorite file name remain wired; a 10+ Agent row wraps without changing the
+  page width.
