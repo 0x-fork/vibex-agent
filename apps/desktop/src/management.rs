@@ -1071,6 +1071,9 @@ pub struct ManagementCenter {
     shared_provider_edit_models: Entity<InputState>,
     shared_provider_edit_default_model: Entity<InputState>,
     shared_provider_edit_models_url: Entity<InputState>,
+    shared_provider_edit_auth_url: Entity<InputState>,
+    shared_provider_edit_proxy_endpoint_url: Entity<InputState>,
+    shared_provider_edit_headers: Entity<TextareaState>,
     shared_provider_edit_catalog_id: Entity<InputState>,
     shared_provider_edit_icon: Entity<InputState>,
     shared_provider_edit_category: Option<String>,
@@ -1624,6 +1627,27 @@ impl ManagementCenter {
                 "models endpoint",
                 "模型列表地址",
                 "模型清單位址",
+            ))
+        });
+        let shared_provider_edit_auth_url = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "auth endpoint",
+                "认证地址",
+                "認證位址",
+            ))
+        });
+        let shared_provider_edit_proxy_endpoint_url = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "proxy endpoint",
+                "代理服务地址",
+                "代理服務位址",
+            ))
+        });
+        let shared_provider_edit_headers = cx.new(|cx| {
+            TextareaState::new(window, cx).placeholder(management_locale_text(
+                "{\n  \"X-Header\": \"value\"\n}",
+                "{\n  \"X-Header\": \"值\"\n}",
+                "{\n  \"X-Header\": \"值\"\n}",
             ))
         });
         let shared_provider_edit_catalog_id = cx.new(|cx| {
@@ -2283,6 +2307,9 @@ impl ManagementCenter {
             shared_provider_edit_models,
             shared_provider_edit_default_model,
             shared_provider_edit_models_url,
+            shared_provider_edit_auth_url,
+            shared_provider_edit_proxy_endpoint_url,
+            shared_provider_edit_headers,
             shared_provider_edit_catalog_id,
             shared_provider_edit_icon,
             shared_provider_edit_category: None,
@@ -12477,7 +12504,41 @@ impl ManagementCenter {
                 ),
             );
         }
-        if row.agents.is_empty() {
+        let configurable = vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
+        let unbound = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+            .filter(|agent| configurable.contains(&agent.id))
+            .filter(|agent| !row.agents.contains(agent.id.as_str()))
+            .collect::<Vec<_>>();
+        if !unbound.is_empty() {
+            agent_rows = agent_rows.child(
+                div()
+                    .w_full()
+                    .pt_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Available to enable from the Agent page",
+                        "可在 Agent 页面启用",
+                        "可在 Agent 頁面啟用",
+                    )),
+            );
+            for agent in &unbound {
+                agent_rows = agent_rows.child(
+                    Tag::secondary().child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(agent_brand_icon(agent.id.as_str(), px(14.0), None))
+                            .child(agent.label.clone()),
+                    ),
+                );
+            }
+        }
+        if row.agents.is_empty() && unbound.is_empty() {
             agent_rows = agent_rows.child(div().text_sm().text_color(cx.theme().warning).child(
                 management_locale_text(
                     "No Agent uses this Provider yet. Point one at it from its own page.",
@@ -12864,7 +12925,41 @@ impl ManagementCenter {
                 ),
             );
         }
-        if row.agents.is_empty() {
+        let configurable = vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
+        let unbound = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+            .filter(|agent| configurable.contains(&agent.id))
+            .filter(|agent| !row.agents.contains(agent.id.as_str()))
+            .collect::<Vec<_>>();
+        if !unbound.is_empty() {
+            agent_rows = agent_rows.child(
+                div()
+                    .w_full()
+                    .pt_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Available to reference from the Agent page",
+                        "可在 Agent 页面引用",
+                        "可在 Agent 頁面引用",
+                    )),
+            );
+            for agent in &unbound {
+                agent_rows = agent_rows.child(
+                    Tag::secondary().child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(agent_brand_icon(agent.id.as_str(), px(14.0), None))
+                            .child(agent.label.clone()),
+                    ),
+                );
+            }
+        }
+        if row.agents.is_empty() && unbound.is_empty() {
             agent_rows = agent_rows.child(div().text_sm().text_color(cx.theme().warning).child(
                 management_locale_text(
                     "No Agent uses this route group yet. Add it from an Agent's page.",
@@ -13519,6 +13614,37 @@ impl ManagementCenter {
             .map(|model| model.id.clone())
             .collect::<Vec<_>>()
             .join(", ");
+        let auth_url = profile
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == vibex_core::ModelProviderEndpointKind::Auth)
+            .map(|endpoint| endpoint.url.clone())
+            .unwrap_or_default();
+        let proxy_endpoint_url = profile
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == vibex_core::ModelProviderEndpointKind::Proxy)
+            .map(|endpoint| endpoint.url.clone())
+            .unwrap_or_default();
+        let mut headers_json = serde_json::Map::new();
+        for header in &profile.headers {
+            match &header.value {
+                vibex_core::ModelProviderHeaderValue::NonSecretLiteral(value) => {
+                    headers_json.insert(
+                        header.name.clone(),
+                        serde_json::Value::String(value.clone()),
+                    );
+                }
+                vibex_core::ModelProviderHeaderValue::DynamicVariable(variable) => {
+                    headers_json.insert(
+                        header.name.clone(),
+                        serde_json::json!({ "variable": variable.id() }),
+                    );
+                }
+                vibex_core::ModelProviderHeaderValue::SecretReference(_) => {}
+            }
+        }
+        let headers_text = serde_json::to_string_pretty(&headers_json).unwrap_or_default();
         let catalog_id = profile.metadata.catalog_id.clone().unwrap_or_default();
         let icon = profile.metadata.icon.clone().unwrap_or_default();
         let category = profile.metadata.category.clone();
@@ -13546,6 +13672,11 @@ impl ManagementCenter {
                 profile.default_model_id.clone().unwrap_or_default(),
             ),
             (&self.shared_provider_edit_models_url, models_url),
+            (&self.shared_provider_edit_auth_url, auth_url),
+            (
+                &self.shared_provider_edit_proxy_endpoint_url,
+                proxy_endpoint_url,
+            ),
             (&self.shared_provider_edit_catalog_id, catalog_id),
             (&self.shared_provider_edit_icon, icon),
             (&self.shared_provider_edit_proxy_url, proxy_url),
@@ -13553,6 +13684,8 @@ impl ManagementCenter {
             input.update(cx, |state, cx| state.set_value(value, window, cx));
         }
         self.shared_provider_edit_proxy_disabled = proxy_disabled;
+        self.shared_provider_edit_headers
+            .update(cx, |state, cx| state.set_value(headers_text, window, cx));
         self.shared_provider_edit_only_through_groups = only_through_groups;
         self.shared_provider_edit_category = category;
         cx.notify();
@@ -13662,6 +13795,95 @@ impl ManagementCenter {
             .value()
             .trim()
             .to_string();
+        let auth_url = self
+            .shared_provider_edit_auth_url
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let proxy_endpoint_url = self
+            .shared_provider_edit_proxy_endpoint_url
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let headers_text = self
+            .shared_provider_edit_headers
+            .read(cx)
+            .value()
+            .to_string();
+        let parsed_headers = match serde_json::from_str::<serde_json::Value>(&headers_text) {
+            Ok(serde_json::Value::Object(headers)) => headers,
+            Ok(_) => {
+                self.shared_provider_edit_error = Some(
+                    management_locale_text(
+                        "Headers must be a JSON object",
+                        "请求头必须是 JSON 对象",
+                        "請求標頭必須是 JSON 物件",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+                return;
+            }
+            Err(error) if headers_text.trim().is_empty() => {
+                let _ = error;
+                serde_json::Map::new()
+            }
+            Err(error) => {
+                self.shared_provider_edit_error = Some(format!("Headers JSON: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let mut headers = profile
+            .headers
+            .iter()
+            .filter(|header| {
+                matches!(
+                    header.value,
+                    vibex_core::ModelProviderHeaderValue::SecretReference(_)
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for (name, value) in parsed_headers {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let value = match value {
+                serde_json::Value::String(value) => {
+                    vibex_core::ModelProviderHeaderValue::NonSecretLiteral(value)
+                }
+                serde_json::Value::Object(object) => {
+                    let variable = object
+                        .get("variable")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(vibex_core::ModelProviderHeaderVariable::from_id);
+                    let Some(variable) = variable else {
+                        self.shared_provider_edit_error = Some(format!(
+                            "Header {name} must be a string or a known variable"
+                        ));
+                        cx.notify();
+                        return;
+                    };
+                    vibex_core::ModelProviderHeaderValue::DynamicVariable(variable)
+                }
+                _ => {
+                    self.shared_provider_edit_error = Some(format!(
+                        "Header {name} must be a string or a known variable"
+                    ));
+                    cx.notify();
+                    return;
+                }
+            };
+            headers.push(vibex_core::ModelProviderHeaderReference {
+                name,
+                value,
+                redacted_hint: "edited".to_string(),
+            });
+        }
         let proxy_url = self
             .shared_provider_edit_proxy_url
             .read(cx)
@@ -13718,7 +13940,12 @@ impl ManagementCenter {
                 || endpoint.wire_protocol_id.is_some()
         });
         profile.endpoints.retain(|endpoint| {
-            endpoint.kind != vibex_core::ModelProviderEndpointKind::ModelCatalog
+            !matches!(
+                endpoint.kind,
+                vibex_core::ModelProviderEndpointKind::ModelCatalog
+                    | vibex_core::ModelProviderEndpointKind::Auth
+                    | vibex_core::ModelProviderEndpointKind::Proxy
+            )
         });
         profile.endpoints.push(vibex_core::ModelProviderEndpoint {
             id: "api".to_string(),
@@ -13726,16 +13953,35 @@ impl ManagementCenter {
             url: base_url,
             wire_protocol_id: None,
         });
-        if !models_url.is_empty() {
-            profile.endpoints.push(vibex_core::ModelProviderEndpoint {
-                id: "models".to_string(),
-                kind: vibex_core::ModelProviderEndpointKind::ModelCatalog,
-                url: models_url,
-                wire_protocol_id: None,
-            });
+        for (id, kind, url) in [
+            (
+                "models",
+                vibex_core::ModelProviderEndpointKind::ModelCatalog,
+                models_url,
+            ),
+            (
+                "auth",
+                vibex_core::ModelProviderEndpointKind::Auth,
+                auth_url,
+            ),
+            (
+                "proxy",
+                vibex_core::ModelProviderEndpointKind::Proxy,
+                proxy_endpoint_url,
+            ),
+        ] {
+            if !url.is_empty() {
+                profile.endpoints.push(vibex_core::ModelProviderEndpoint {
+                    id: id.to_string(),
+                    kind,
+                    url,
+                    wire_protocol_id: None,
+                });
+            }
         }
         profile.metadata.catalog_id = (!catalog_id.is_empty()).then_some(catalog_id);
         profile.metadata.icon = (!icon.is_empty()).then_some(icon);
+        profile.headers = headers;
         profile.metadata.category = self.shared_provider_edit_category.clone();
         profile.metadata.only_through_route_groups = self.shared_provider_edit_only_through_groups;
         profile.proxy_policy = if self.shared_provider_edit_proxy_disabled {
@@ -13830,6 +14076,28 @@ impl ManagementCenter {
                         .items_start()
                         .gap_2()
                         .child(div().min_w_0().flex_1().child(management_input_field(
+                            management_locale_text("Auth URL", "认证地址", "認證位址"),
+                            &self.shared_provider_edit_auth_url,
+                            false,
+                            cx,
+                        )))
+                        .child(div().min_w_0().flex_1().child(management_input_field(
+                            management_locale_text(
+                                "Proxy endpoint",
+                                "代理服务地址",
+                                "代理服務位址",
+                            ),
+                            &self.shared_provider_edit_proxy_endpoint_url,
+                            false,
+                            cx,
+                        ))),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_start()
+                        .gap_2()
+                        .child(div().min_w_0().flex_1().child(management_input_field(
                             management_locale_text("Icon key", "图标 key", "圖示 key"),
                             &self.shared_provider_edit_icon,
                             false,
@@ -13864,6 +14132,30 @@ impl ManagementCenter {
                                 }),
                             ),
                         ),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .child(management_field_label(management_locale_text(
+                            "Request headers (JSON)",
+                            "请求头（JSON）",
+                            "請求標頭（JSON）",
+                        )))
+                        .child(
+                            Textarea::new(&self.shared_provider_edit_headers)
+                                .small()
+                                .w_full()
+                                .h(px(92.0)),
+                        )
+                        .child(management_field_hint(
+                            management_locale_text(
+                                "A JSON object of header names to values. Secret headers are preserved but not shown.",
+                                "JSON 对象，键为请求头名称。Secret 请求头会保留但不会显示。",
+                                "JSON 物件，鍵為請求標頭名稱。Secret 請求標頭會保留但不會顯示。",
+                            ),
+                            cx,
+                        )),
                 )
                 .child(
                     h_flex()
@@ -14119,9 +14411,14 @@ impl ManagementCenter {
                 .to_string(),
             cx,
         ));
+        let ready_keys = profile
+            .credentials
+            .iter()
+            .filter(|credential| credential.status == vibex_core::AgentCredentialStatus::Ready)
+            .count();
         details = details.child(stat_line(
             management_locale_text("Keys", "Key", "Key"),
-            profile.credentials.len().to_string(),
+            format!("{ready_keys}/{}", profile.credentials.len()),
             cx,
         ));
         if let Some(endpoint) = profile.primary_api_endpoint() {
@@ -39803,6 +40100,7 @@ mod gateway_surface_tests {
         assert!(save.contains("proxy_policy"));
         assert!(save.contains("metadata.catalog_id"));
         assert!(save.contains("metadata.only_through_route_groups"));
+        assert!(save.contains("profile.headers = headers"));
     }
 
     #[test]
