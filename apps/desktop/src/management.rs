@@ -12693,15 +12693,54 @@ impl ManagementCenter {
                     .find(|agent| agent.id.as_str() == agent_id)
                     .map(|agent| agent.label.clone())
                     .unwrap_or_else(|| agent_id.clone());
-                agent_rows = agent_rows.child(
-                    Tag::secondary().child(
-                        h_flex()
-                            .items_center()
-                            .gap_1()
-                            .child(agent_brand_icon(agent_id, px(14.0), None))
-                            .child(label),
-                    ),
-                );
+                let Some(legacy_id) = self
+                    .provider_bindings
+                    .iter()
+                    .find(|binding| {
+                        binding.agent_id.as_str() == agent_id
+                            && binding.model_provider_profile_id.as_ref() == Some(&profile.id)
+                    })
+                    .and_then(|binding| binding.legacy_provider_profile_id.clone())
+                else {
+                    continue;
+                };
+                let default_source = vibex_core::AgentModelSourceRef::Provider(legacy_id);
+                let is_default =
+                    self.resolved_agent_default_source(agent_id).as_ref() == Some(&default_source);
+                let click_agent = agent_id.clone();
+                let click_source = default_source;
+                agent_rows =
+                    agent_rows.child(
+                        Tag::secondary().child(
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(agent_brand_icon(agent_id, px(14.0), None))
+                                .child(label)
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "management-provider-agent-default-{}",
+                                        agent_id
+                                    )))
+                                    .xsmall()
+                                    .ghost()
+                                    .icon(if is_default {
+                                        IconName::StarFill
+                                    } else {
+                                        IconName::Star
+                                    })
+                                    .tooltip(management_set_default_label())
+                                    .disabled(self.mutation.is_some())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_agent_default_model_source(
+                                            click_agent.clone(),
+                                            click_source.clone(),
+                                            cx,
+                                        )
+                                    })),
+                                ),
+                        ),
+                    );
             }
             let configurable =
                 vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
@@ -13534,15 +13573,43 @@ impl ManagementCenter {
                     .find(|agent| agent.id.as_str() == agent_id)
                     .map(|agent| agent.label.clone())
                     .unwrap_or_else(|| agent_id.clone());
-                agent_rows = agent_rows.child(
-                    Tag::secondary().child(
-                        h_flex()
-                            .items_center()
-                            .gap_1()
-                            .child(agent_brand_icon(agent_id, px(14.0), None))
-                            .child(label),
-                    ),
-                );
+                let default_source = vibex_core::AgentModelSourceRef::RouteGroup(route.id.clone());
+                let is_default =
+                    self.resolved_agent_default_source(agent_id).as_ref() == Some(&default_source);
+                let click_agent = agent_id.clone();
+                let click_source = default_source;
+                agent_rows =
+                    agent_rows.child(
+                        Tag::secondary().child(
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(agent_brand_icon(agent_id, px(14.0), None))
+                                .child(label)
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "management-route-group-agent-default-{}",
+                                        agent_id
+                                    )))
+                                    .xsmall()
+                                    .ghost()
+                                    .icon(if is_default {
+                                        IconName::StarFill
+                                    } else {
+                                        IconName::Star
+                                    })
+                                    .tooltip(management_set_default_label())
+                                    .disabled(self.mutation.is_some())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_agent_default_model_source(
+                                            click_agent.clone(),
+                                            click_source.clone(),
+                                            cx,
+                                        )
+                                    })),
+                                ),
+                        ),
+                    );
             }
             let configurable =
                 vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
@@ -14087,6 +14154,58 @@ impl ManagementCenter {
     /// is shared through the Keys and the address, not through one launch
     /// contract. The new Profile becomes the Agent's default, because choosing
     /// "use this Provider for this Agent" is the whole gesture.
+    fn set_agent_default_model_source(
+        &mut self,
+        agent_id: String,
+        source: vibex_core::AgentModelSourceRef,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let Ok(agent_id) = vibex_core::AgentId::parse(agent_id) else {
+            return;
+        };
+        self.mutation = Some(ManagementMutation::Gateway);
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .set_agent_model_source_default(vibex_backend::MutationRequest::new(
+                    vibex_core::SetAgentModelSourceDefaultRequest {
+                        scope: management_provider_default_scope(None),
+                        agent_id,
+                        source,
+                    },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(_) => {
+                        this.notice = Some(
+                            management_locale_text(
+                                "Default model source updated",
+                                "默认模型来源已更新",
+                                "預設模型來源已更新",
+                            )
+                            .to_string(),
+                        );
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
     fn bind_provider_to_agent(
         &mut self,
         agent_id: vibex_core::AgentId,
@@ -41975,6 +42094,9 @@ mod gateway_surface_tests {
         }
         assert!(source.contains("management-provider-detail-tabs"));
         assert!(source.contains("management_model_limits_label"));
+        assert!(source.contains("management-provider-agent-default-"));
+        assert!(source.contains("management-route-group-agent-default-"));
+        assert!(source.contains("set_agent_default_model_source("));
     }
 
     #[test]

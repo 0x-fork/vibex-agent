@@ -6388,3 +6388,12 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - Direct Provider edges are omitted; route-group membership is the drawn path.
 - The card never animates traffic and never shows prompt, reply, Key value, cost,
   or quota.
+
+### Agent default stars in binding pills
+
+- A bound Agent pill on a shared Provider or route group carries a star.
+- The star writes the unified `AgentModelSourceDefault` for that Agent; it does
+  not change the object-level default and does not bind or unbind.
+- A Provider source uses the Agent's legacy v1 Profile id, not the shared v2 id.
+- A missing legacy Profile means no star is offered for that Agent.
+- The star is read-only when a mutation is already in flight.
