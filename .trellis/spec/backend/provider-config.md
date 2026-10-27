@@ -6350,3 +6350,13 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - `vibex-desktop`: the six tab labels and tab bar remain wired; Delete is only
   rendered in Advanced; Models has no price header; Traffic has no cost/quota
   control.
+
+### Models tab controls
+
+- The Models tab owns a search field, filters (all/enabled/disabled/reasoning/
+  vision), bulk enable/disable, and a per-row default star.
+- A bulk visibility write goes through the same v2 update as an inline edit; a
+  disabled default is replaced by the first enabled model, or cleared when none
+  remain.
+- The table never renders price, cost, quota, or balance. It may render model
+  capability declarations and the default marker.

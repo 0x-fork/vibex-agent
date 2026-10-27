@@ -1120,6 +1120,8 @@ pub struct ManagementCenter {
     provider_preset_picker: bool,
     provider_source_categories: BTreeSet<ProviderPresetCategory>,
     provider_detail_tab: ProviderDetailTab,
+    provider_models_search: Entity<InputState>,
+    provider_models_filter: ProviderModelsFilter,
     /// The picker's filter. It matches id, name, and address, because those
     /// are the three things a user remembers about a vendor.
     provider_preset_query: Entity<InputState>,
@@ -1597,6 +1599,13 @@ impl ManagementCenter {
                 "Search vendors",
                 "搜索厂商",
                 "搜尋廠商",
+            ))
+        });
+        let provider_models_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Filter models",
+                "筛选模型",
+                "篩選模型",
             ))
         });
         let provider_search = cx.new(|cx| {
@@ -2337,6 +2346,8 @@ impl ManagementCenter {
             provider_preset_picker: false,
             provider_source_categories: ProviderPresetCategory::ALL.into_iter().collect(),
             provider_detail_tab: ProviderDetailTab::Overview,
+            provider_models_search,
+            provider_models_filter: ProviderModelsFilter::All,
             provider_editor_shared: false,
             provider_preset_query,
             route_group_editor_open: false,
@@ -12842,9 +12853,81 @@ impl ManagementCenter {
         // controls: it is the one action here that cannot be undone, and putting
         // it beside Save or Test is how it gets clicked by accident.
         if self.provider_detail_tab == ProviderDetailTab::Models {
+            let query = self
+                .provider_models_search
+                .read(cx)
+                .value()
+                .trim()
+                .to_lowercase();
+            let mut controls = h_flex().w_full().items_center().flex_wrap().gap_1();
+            for filter in ProviderModelsFilter::ALL {
+                let selected = filter == self.provider_models_filter;
+                controls = controls.child(
+                    Button::new(SharedString::from(format!(
+                        "management-provider-models-filter-{:?}",
+                        filter
+                    )))
+                    .xsmall()
+                    .when(selected, |button| button.primary())
+                    .when(!selected, |button| button.ghost())
+                    .label(filter.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.provider_models_filter = filter;
+                        cx.notify();
+                    })),
+                );
+            }
+            let profile_id = profile.id.clone();
+            controls = controls
+                .child(
+                    Button::new("management-provider-models-enable-all")
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text("Enable all", "全部启用", "全部啟用"))
+                        .disabled(self.mutation.is_some() || profile.configured_models.is_empty())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_shared_provider_models_enabled(profile_id.clone(), true, cx)
+                        })),
+                )
+                .child(
+                    Button::new("management-provider-models-disable-all")
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text(
+                            "Disable all",
+                            "全部停用",
+                            "全部停用",
+                        ))
+                        .disabled(self.mutation.is_some() || profile.configured_models.is_empty())
+                        .on_click(cx.listener({
+                            let profile_id = profile.id.clone();
+                            move |this, _, _, cx| {
+                                this.set_shared_provider_models_enabled(
+                                    profile_id.clone(),
+                                    false,
+                                    cx,
+                                )
+                            }
+                        })),
+                );
             let mut model_rows = v_flex().w_full().gap_1();
+            let mut visible = 0usize;
             for model in &profile.configured_models {
+                let matches_query = query.is_empty() || model.id.to_lowercase().contains(&query);
+                let matches_filter = match self.provider_models_filter {
+                    ProviderModelsFilter::All => true,
+                    ProviderModelsFilter::Enabled => model.enabled,
+                    ProviderModelsFilter::Disabled => !model.enabled,
+                    ProviderModelsFilter::Reasoning => model.capabilities.reasoning == Some(true),
+                    ProviderModelsFilter::Vision => model.capabilities.image_input == Some(true),
+                };
+                if !matches_query || !matches_filter {
+                    continue;
+                }
+                visible += 1;
                 let is_default = profile.default_model_id.as_deref() == Some(model.id.as_str());
+                let model_id = model.id.clone();
+                let profile_id = profile.id.clone();
                 model_rows = model_rows.child(
                     h_flex()
                         .w_full()
@@ -12869,13 +12952,34 @@ impl ManagementCenter {
                                 .text_sm()
                                 .child(model.id.clone()),
                         )
-                        .when(is_default, |row| {
-                            row.child(
-                                Tag::secondary()
-                                    .xsmall()
-                                    .child(management_locale_text("Default", "默认", "預設")),
-                            )
-                        })
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "management-provider-model-default-{}",
+                                model.id
+                            )))
+                            .xsmall()
+                            .ghost()
+                            .icon(if is_default {
+                                IconName::StarFill
+                            } else {
+                                IconName::Star
+                            })
+                            .tooltip(management_locale_text(
+                                "Set as default",
+                                "设为默认",
+                                "設為預設",
+                            ))
+                            .disabled(!model.enabled || self.mutation.is_some())
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.set_shared_provider_default_model(
+                                        profile_id.clone(),
+                                        model_id.clone(),
+                                        cx,
+                                    )
+                                },
+                            )),
+                        )
                         .child(
                             div()
                                 .text_xs()
@@ -12884,13 +12988,17 @@ impl ManagementCenter {
                         ),
                 );
             }
-            if profile.configured_models.is_empty() {
+            if visible == 0 {
                 model_rows = model_rows.child(compact_empty_state(
-                    management_locale_text("No models yet", "还没有模型", "還沒有模型"),
                     management_locale_text(
-                        "Edit this Provider to add or fetch models.",
-                        "编辑该供应商以添加或拉取模型。",
-                        "編輯該供應商以新增或拉取模型。",
+                        "No matching models",
+                        "没有匹配的模型",
+                        "沒有符合的模型",
+                    ),
+                    management_locale_text(
+                        "Clear the filter, or edit this Provider to add models.",
+                        "清除筛选，或编辑该供应商添加模型。",
+                        "清除篩選，或編輯該供應商新增模型。",
                     ),
                     cx,
                 ));
@@ -12903,7 +13011,13 @@ impl ManagementCenter {
                     "該供應商向所有綁定它的 Agent 提供的模型。",
                 ),
                 "icons/vibex/brain.svg",
-                model_rows.into_any_element(),
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(management_search_input(&self.provider_models_search, cx))
+                    .child(controls)
+                    .child(model_rows)
+                    .into_any_element(),
                 cx,
             ));
         }
@@ -14214,6 +14328,78 @@ impl ManagementCenter {
         self.selected_agent_id = Some(agent_id);
         self.close_shared_provider_editor(cx);
         cx.notify();
+    }
+
+    fn set_shared_provider_default_model(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        model_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut profile) = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        if !profile
+            .configured_models
+            .iter()
+            .any(|model| model.enabled && model.id == model_id)
+        {
+            return;
+        }
+        profile.default_model_id = Some(model_id);
+        self.update_shared_provider(
+            profile,
+            management_locale_text("Default model updated", "默认模型已更新", "預設模型已更新"),
+            cx,
+        );
+    }
+
+    fn set_shared_provider_models_enabled(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut profile) = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        if profile.configured_models.is_empty() {
+            return;
+        }
+        for model in &mut profile.configured_models {
+            model.enabled = enabled;
+        }
+        if profile.default_model_id.as_ref().is_none_or(|default| {
+            !profile
+                .configured_models
+                .iter()
+                .any(|model| model.enabled && &model.id == default)
+        }) {
+            profile.default_model_id = profile
+                .configured_models
+                .iter()
+                .find(|model| model.enabled)
+                .map(|model| model.id.clone());
+        }
+        self.update_shared_provider(
+            profile,
+            management_locale_text(
+                "Model visibility updated",
+                "模型可见性已更新",
+                "模型可見性已更新",
+            ),
+            cx,
+        );
     }
 
     fn open_shared_provider_editor_by_id(
@@ -31947,6 +32133,35 @@ impl ProviderSort {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderModelsFilter {
+    All,
+    Enabled,
+    Disabled,
+    Reasoning,
+    Vision,
+}
+
+impl ProviderModelsFilter {
+    const ALL: [Self; 5] = [
+        Self::All,
+        Self::Enabled,
+        Self::Disabled,
+        Self::Reasoning,
+        Self::Vision,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => management_locale_text("All", "全部", "全部"),
+            Self::Enabled => management_locale_text("Enabled", "已启用", "已啟用"),
+            Self::Disabled => management_locale_text("Disabled", "已停用", "已停用"),
+            Self::Reasoning => management_locale_text("Reasoning", "推理", "推理"),
+            Self::Vision => management_locale_text("Vision", "视觉", "視覺"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderDetailTab {
     Overview,
     Models,
@@ -41235,6 +41450,23 @@ mod gateway_surface_tests {
         }
         assert!(source.contains("management-provider-detail-tabs"));
         assert!(source.contains("management_model_limits_label"));
+    }
+
+    #[test]
+    fn the_models_tab_searches_filters_and_sets_defaults() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "management-provider-models-filter-",
+            "management-provider-models-enable-all",
+            "management-provider-models-disable-all",
+            "management-provider-model-default-",
+            "set_shared_provider_models_enabled(",
+            "set_shared_provider_default_model(",
+            "ProviderModelsFilter::Reasoning",
+            "ProviderModelsFilter::Vision",
+        ] {
+            assert!(source.contains(marker), "the Models tab must keep {marker}");
+        }
     }
 
     #[test]
