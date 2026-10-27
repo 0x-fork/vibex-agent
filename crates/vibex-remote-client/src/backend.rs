@@ -5062,22 +5062,52 @@ impl ManagementBackend for WebRemoteBackend {
 
     fn fetch_model_provider_profile_models(
         &self,
-        _request: vibex_core::ModelProviderFetchModelsRequest,
+        request: vibex_core::ModelProviderFetchModelsRequest,
     ) -> BackendFuture<'_, vibex_core::ModelProviderFetchModelsResponse> {
-        self.unsupported(
-            "model_provider_profile_test_remote_unsupported",
-            "this runtime does not serve shared Provider model discovery over the remote protocol yet",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::FetchModelProviderProfileModels(
+                vibex_core::RemoteModelProviderFetchModelsRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteModelProviderFetchModelsResponse>(value)?.response)
+        })
     }
 
     fn test_model_provider_profile(
         &self,
-        _request: vibex_core::ModelProviderTestRequest,
+        request: vibex_core::ModelProviderTestRequest,
     ) -> BackendFuture<'_, vibex_core::ModelProviderTestResult> {
-        self.unsupported(
-            "model_provider_profile_test_remote_unsupported",
-            "this runtime does not serve shared Provider tests over the remote protocol yet",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::TestModelProviderProfile(
+                vibex_core::RemoteModelProviderTestRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteModelProviderTestResponse>(value)?.result)
+        })
     }
 
     fn fetch_agent_model_provider_draft_models(

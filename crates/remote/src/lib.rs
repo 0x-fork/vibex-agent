@@ -4744,6 +4744,30 @@ async fn dispatch_provider_request(
             serde_json::to_value(vibex_core::RemoteClearAgentModelSourceDefaultResponse { cleared })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::FetchModelProviderProfileModels(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let response = service.fetch_model_provider_profile_models(request.request)?;
+            serde_json::to_value(vibex_core::RemoteModelProviderFetchModelsResponse { response })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::TestModelProviderProfile(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = service.test_model_provider_profile(request.request)?;
+            serde_json::to_value(vibex_core::RemoteModelProviderTestResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
     }
 }
 

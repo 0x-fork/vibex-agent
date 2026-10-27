@@ -2312,6 +2312,8 @@ pub enum RemoteProviderOperationKind {
     GetAgentModelSourceDefault,
     SetAgentModelSourceDefault,
     ClearAgentModelSourceDefault,
+    FetchModelProviderProfileModels,
+    TestModelProviderProfile,
     DeleteAgentModelProviderProfile,
     BindAgentModelProvider,
     CreateAgentModelProviderProfile,
@@ -3810,6 +3812,32 @@ pub struct RemoteClearAgentModelSourceDefaultResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelProviderFetchModelsRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::ModelProviderFetchModelsRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelProviderFetchModelsResponse {
+    pub response: crate::ModelProviderFetchModelsResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelProviderTestRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::ModelProviderTestRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelProviderTestResponse {
+    pub result: crate::ModelProviderTestResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum RemoteProviderRequest {
     ListAgentSummaries(RemoteAgentConfigSummaryListRequest),
@@ -3851,6 +3879,8 @@ pub enum RemoteProviderRequest {
     GetAgentModelSourceDefault(RemoteAgentModelSourceDefaultRequest),
     SetAgentModelSourceDefault(RemoteSetAgentModelSourceDefaultRequest),
     ClearAgentModelSourceDefault(RemoteClearAgentModelSourceDefaultRequest),
+    FetchModelProviderProfileModels(RemoteModelProviderFetchModelsRequest),
+    TestModelProviderProfile(RemoteModelProviderTestRequest),
     DeleteAgentModelProviderProfile(RemoteAgentModelProviderProfileDeleteRequest),
     BindAgentModelProvider(RemoteAgentModelProviderBindRequest),
     CreateAgentModelProviderProfile(RemoteAgentModelProviderProfileCreateRequest),
@@ -4040,6 +4070,12 @@ impl RemoteProviderRequest {
             }
             Self::ClearAgentModelSourceDefault(_) => {
                 RemoteProviderOperationKind::ClearAgentModelSourceDefault
+            }
+            Self::FetchModelProviderProfileModels(_) => {
+                RemoteProviderOperationKind::FetchModelProviderProfileModels
+            }
+            Self::TestModelProviderProfile(_) => {
+                RemoteProviderOperationKind::TestModelProviderProfile
             }
             Self::DeleteAgentModelProviderProfile(_) => {
                 RemoteProviderOperationKind::DeleteAgentModelProviderProfile
