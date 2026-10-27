@@ -25585,6 +25585,17 @@ impl ManagementCenter {
         let mut tile_grid = h_flex().w_full().flex_wrap().gap_2();
         for preset in &preset_tiles {
             let preset_id = preset.id.clone();
+            let badge = if preset.plan_note.is_some() {
+                Some(management_locale_text("Plan", "套餐", "套餐"))
+            } else if !preset.regions.is_empty() {
+                Some(management_locale_text("Region", "地区", "地區"))
+            } else if preset.no_key {
+                Some(management_locale_text("Local", "本机", "本機"))
+            } else if preset.catalog_id.is_some() {
+                Some(management_locale_text("Official", "官方", "官方"))
+            } else {
+                None
+            };
             let detail = if preset.no_key {
                 management_locale_text("No key needed", "无需 Key", "無需 Key").to_string()
             } else {
@@ -25650,12 +25661,7 @@ impl ManagementCenter {
                                     .text_color(cx.theme().muted_foreground)
                                     .child(detail),
                             )
-                            .children(
-                                preset
-                                    .plan_note
-                                    .clone()
-                                    .map(|note| Tag::secondary().xsmall().child(note)),
-                            ),
+                            .children(badge.map(|badge| Tag::secondary().xsmall().child(badge))),
                     ),
             );
         }

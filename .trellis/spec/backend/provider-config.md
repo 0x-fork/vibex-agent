@@ -6572,3 +6572,9 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - The gateway request ledger renders through `v_virtual_list` with a fixed
   collapsed row height and a larger expanded trace height; filtering happens
   before the list, and the clear action still clears the whole ledger.
+
+### Source tile badges
+
+- A source tile shows one badge derived from its shape: Plan, Region, Local,
+  or Official. The badge is separate from the three category chips and never
+  becomes a fourth category.
