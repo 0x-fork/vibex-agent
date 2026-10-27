@@ -6360,3 +6360,14 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
   remain.
 - The table never renders price, cost, quota, or balance. It may render model
   capability declarations and the default marker.
+
+## Scenario: Route Group Workbench Tabs
+
+- Tabs: Overview / Members / Policy / Traffic.
+- Overview owns the Agent pills, bind-another-Agent offer, and Delete.
+- Members lists the attempt order, Provider, model, enabled state, and fixed
+  effort; editing still opens the group editor.
+- Policy lists strategy, pin, failover, first-token timeout, context, and the
+  local token ceiling. It never shows a remaining-token percentage.
+- Traffic aggregates only observed Gateway requests across the group's member
+  Providers; it shows request/success/token counts and no cost or quota.

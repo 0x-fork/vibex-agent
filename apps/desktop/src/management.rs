@@ -1120,6 +1120,7 @@ pub struct ManagementCenter {
     provider_preset_picker: bool,
     provider_source_categories: BTreeSet<ProviderPresetCategory>,
     provider_detail_tab: ProviderDetailTab,
+    route_group_detail_tab: RouteGroupDetailTab,
     provider_models_search: Entity<InputState>,
     provider_models_filter: ProviderModelsFilter,
     /// The picker's filter. It matches id, name, and address, because those
@@ -2346,6 +2347,7 @@ impl ManagementCenter {
             provider_preset_picker: false,
             provider_source_categories: ProviderPresetCategory::ALL.into_iter().collect(),
             provider_detail_tab: ProviderDetailTab::Overview,
+            route_group_detail_tab: RouteGroupDetailTab::Overview,
             provider_models_search,
             provider_models_filter: ProviderModelsFilter::All,
             provider_editor_shared: false,
@@ -13488,157 +13490,383 @@ impl ManagementCenter {
             cx,
         ));
 
-        // The Agents that reference it. Naming them is what makes the delete at
-        // the bottom of this page a consequence rather than a surprise.
-        let mut agent_rows = h_flex().w_full().flex_wrap().gap_1p5();
-        for agent_id in &row.agents {
-            let label = self
-                .snapshot
-                .agents
-                .iter()
-                .find(|agent| agent.id.as_str() == agent_id)
-                .map(|agent| agent.label.clone())
-                .unwrap_or_else(|| agent_id.clone());
-            agent_rows = agent_rows.child(
-                Tag::secondary().child(
-                    h_flex()
-                        .items_center()
-                        .gap_1()
-                        .child(agent_brand_icon(agent_id, px(14.0), None))
-                        .child(label),
-                ),
-            );
-        }
-        let configurable = vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
-        let unbound = self
-            .snapshot
-            .agents
+        let selected_tab_index = RouteGroupDetailTab::ALL
             .iter()
-            .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
-            .filter(|agent| configurable.contains(&agent.id))
-            .filter(|agent| !row.agents.contains(agent.id.as_str()))
-            .collect::<Vec<_>>();
-        if !unbound.is_empty() {
-            agent_rows = agent_rows.child(
-                div()
-                    .w_full()
-                    .pt_1()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Available to reference from the Agent page",
-                        "可在 Agent 页面引用",
-                        "可在 Agent 頁面引用",
-                    )),
-            );
-            for agent in &unbound {
+            .position(|tab| *tab == self.route_group_detail_tab)
+            .unwrap_or(0);
+        body = body.child(
+            TabBar::new("management-route-group-detail-tabs")
+                .w_full()
+                .pill()
+                .selected_index(selected_tab_index)
+                .children(RouteGroupDetailTab::ALL.into_iter().map(|tab| {
+                    Tab::new()
+                        .flex_1()
+                        .aria_label(tab.label())
+                        .child(div().text_sm().child(tab.label()))
+                }))
+                .on_click(cx.listener(|this, index: &usize, _, cx| {
+                    if let Some(tab) = RouteGroupDetailTab::ALL.get(*index) {
+                        this.route_group_detail_tab = *tab;
+                        cx.notify();
+                    }
+                })),
+        );
+        if self.route_group_detail_tab == RouteGroupDetailTab::Overview {
+            // The Agents that reference it. Naming them is what makes the delete at
+            // the bottom of this page a consequence rather than a surprise.
+            let mut agent_rows = h_flex().w_full().flex_wrap().gap_1p5();
+            for agent_id in &row.agents {
+                let label = self
+                    .snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id.as_str() == agent_id)
+                    .map(|agent| agent.label.clone())
+                    .unwrap_or_else(|| agent_id.clone());
                 agent_rows = agent_rows.child(
                     Tag::secondary().child(
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .child(agent_brand_icon(agent.id.as_str(), px(14.0), None))
-                            .child(agent.label.clone()),
+                            .child(agent_brand_icon(agent_id, px(14.0), None))
+                            .child(label),
                     ),
                 );
             }
-        }
-        if row.agents.is_empty() && unbound.is_empty() {
-            agent_rows = agent_rows.child(div().text_sm().text_color(cx.theme().warning).child(
+            let configurable =
+                vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
+            let unbound = self
+                .snapshot
+                .agents
+                .iter()
+                .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+                .filter(|agent| configurable.contains(&agent.id))
+                .filter(|agent| !row.agents.contains(agent.id.as_str()))
+                .collect::<Vec<_>>();
+            if !unbound.is_empty() {
+                agent_rows = agent_rows.child(
+                    div()
+                        .w_full()
+                        .pt_1()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "Available to reference from the Agent page",
+                            "可在 Agent 页面引用",
+                            "可在 Agent 頁面引用",
+                        )),
+                );
+                for agent in &unbound {
+                    agent_rows = agent_rows.child(
+                        Tag::secondary().child(
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(agent_brand_icon(agent.id.as_str(), px(14.0), None))
+                                .child(agent.label.clone()),
+                        ),
+                    );
+                }
+            }
+            if row.agents.is_empty() && unbound.is_empty() {
+                agent_rows =
+                    agent_rows.child(div().text_sm().text_color(cx.theme().warning).child(
+                        management_locale_text(
+                            "No Agent uses this route group yet. Add it from an Agent's page.",
+                            "还没有 Agent 使用该路由组，可在某个 Agent 的页面中引用。",
+                            "還沒有 Agent 使用該路由組，可在某個 Agent 的頁面中引用。",
+                        ),
+                    ));
+            }
+            body = body.child(management_card_with_icon(
+                management_locale_text("Used by", "被哪些 Agent 使用", "被哪些 Agent 使用"),
                 management_locale_text(
-                    "No Agent uses this route group yet. Add it from an Agent's page.",
-                    "还没有 Agent 使用该路由组，可在某个 Agent 的页面中引用。",
-                    "還沒有 Agent 使用該路由組，可在某個 Agent 的頁面中引用。",
+                    "Deleting this group would remove these models from the Agents listed here.",
+                    "删除该路由组会让下面这些 Agent 失去这些模型。",
+                    "刪除該路由組會讓下面這些 Agent 失去這些模型。",
                 ),
+                "icons/vibex/cpu.svg",
+                agent_rows.into_any_element(),
+                cx,
+            ));
+
+            // Offering it to a further Agent, the same way a shared Provider does.
+            let offered = row.agents.clone();
+            let configurable = vibex_core::model_provider_configurable_agent_ids().ok();
+            let bindable = self
+                .snapshot
+                .agents
+                .iter()
+                .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+                .filter(|agent| {
+                    configurable
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(&agent.id))
+                })
+                .filter(|agent| !offered.contains(agent.id.as_str()))
+                .map(|agent| (agent.id.clone(), agent.label.clone()))
+                .collect::<Vec<_>>();
+            let bindable_count = bindable.len();
+            let mut bind_rows = v_flex().w_full().gap_1();
+            for (agent_id, label) in bindable {
+                let bind_agent = agent_id.clone();
+                let bind_route = route.id.clone();
+                bind_rows = bind_rows.child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .py_1()
+                        .child(div().min_w_0().truncate().text_sm().child(label))
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "management-route-group-bind-{}",
+                                agent_id.as_str()
+                            )))
+                            .xsmall()
+                            .outline()
+                            .label(management_locale_text(
+                                "Use for this Agent",
+                                "让此 Agent 使用",
+                                "讓此 Agent 使用",
+                            ))
+                            .disabled(pending)
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.bind_route_group(
+                                        bind_agent.clone(),
+                                        bind_route.clone(),
+                                        cx,
+                                    )
+                                },
+                            )),
+                        ),
+                );
+            }
+            if bindable_count == 0 {
+                bind_rows = bind_rows.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "Every Agent that can use a route group already does.",
+                            "所有能使用路由组的 Agent 都已在使用。",
+                            "所有能使用路由組的 Agent 都已在使用。",
+                        )),
+                );
+            }
+            body = body.child(management_card_with_icon(
+                management_locale_text(
+                    "Use for another Agent",
+                    "让其他 Agent 使用",
+                    "讓其他 Agent 使用",
+                ),
+                management_locale_text(
+                    "The group stays one record; each Agent gets a reference to it.",
+                    "路由组仍然只有一份记录，每个 Agent 获得一条对它的引用。",
+                    "路由組仍然只有一份記錄，每個 Agent 獲得一條對它的引用。",
+                ),
+                "icons/vibex/file-plus.svg",
+                bind_rows.into_any_element(),
+                cx,
             ));
         }
-        body = body.child(management_card_with_icon(
-            management_locale_text("Used by", "被哪些 Agent 使用", "被哪些 Agent 使用"),
-            management_locale_text(
-                "Deleting this group would remove these models from the Agents listed here.",
-                "删除该路由组会让下面这些 Agent 失去这些模型。",
-                "刪除該路由組會讓下面這些 Agent 失去這些模型。",
-            ),
-            "icons/vibex/cpu.svg",
-            agent_rows.into_any_element(),
-            cx,
-        ));
 
-        // Offering it to a further Agent, the same way a shared Provider does.
-        let offered = row.agents.clone();
-        let configurable = vibex_core::model_provider_configurable_agent_ids().ok();
-        let bindable = self
-            .snapshot
-            .agents
-            .iter()
-            .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
-            .filter(|agent| {
-                configurable
-                    .as_ref()
-                    .is_none_or(|ids| ids.contains(&agent.id))
-            })
-            .filter(|agent| !offered.contains(agent.id.as_str()))
-            .map(|agent| (agent.id.clone(), agent.label.clone()))
-            .collect::<Vec<_>>();
-        let bindable_count = bindable.len();
-        let mut bind_rows = v_flex().w_full().gap_1();
-        for (agent_id, label) in bindable {
-            let bind_agent = agent_id.clone();
-            let bind_route = route.id.clone();
-            bind_rows = bind_rows.child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .py_1()
-                    .child(div().min_w_0().truncate().text_sm().child(label))
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "management-route-group-bind-{}",
-                            agent_id.as_str()
-                        )))
-                        .xsmall()
-                        .outline()
-                        .label(management_locale_text(
-                            "Use for this Agent",
-                            "让此 Agent 使用",
-                            "讓此 Agent 使用",
-                        ))
-                        .disabled(pending)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.bind_route_group(bind_agent.clone(), bind_route.clone(), cx)
-                        })),
-                    ),
-            );
+        if self.route_group_detail_tab == RouteGroupDetailTab::Members {
+            let mut member_rows = v_flex().w_full().gap_1();
+            for member in &route.members {
+                let provider_name = self
+                    .providers
+                    .iter()
+                    .find(|profile| profile.id == member.model_provider_profile_id)
+                    .map(|profile| profile.display_name.clone())
+                    .unwrap_or_else(|| member.model_provider_profile_id.as_str().to_string());
+                member_rows = member_rows.child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .child(
+                            div()
+                                .w(px(22.0))
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child((member.order_index + 1).to_string()),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_sm()
+                                .child(provider_name),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(member.model_id.clone()),
+                        )
+                        .when(!member.enabled, |row| {
+                            row.child(Tag::secondary().xsmall().child(management_locale_text(
+                                "Disabled",
+                                "已停用",
+                                "已停用",
+                            )))
+                        })
+                        .when_some(member.reasoning_effort.clone(), |row, effort| {
+                            row.child(Tag::secondary().xsmall().child(effort))
+                        }),
+                );
+            }
+            body = body.child(management_card_with_icon(
+                management_locale_text("Members", "成员", "成員"),
+                management_locale_text(
+                    "The attempt order, each member's model, and its fixed effort.",
+                    "尝试顺序、每个成员的模型和固定推理档位。",
+                    "嘗試順序、每個成員的模型和固定推理檔位。",
+                ),
+                "icons/vibex/list.svg",
+                member_rows.into_any_element(),
+                cx,
+            ));
         }
-        if bindable_count == 0 {
-            bind_rows = bind_rows.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Every Agent that can use a route group already does.",
-                        "所有能使用路由组的 Agent 都已在使用。",
-                        "所有能使用路由組的 Agent 都已在使用。",
-                    )),
-            );
+
+        if self.route_group_detail_tab == RouteGroupDetailTab::Policy {
+            let pin_label = match route.pin {
+                vibex_core::GatewayPinScope::Off => {
+                    management_locale_text("Per request", "每次请求", "每次請求")
+                }
+                vibex_core::GatewayPinScope::Conversation => {
+                    management_locale_text("Conversation", "会话", "會話")
+                }
+            };
+            let failover_label = match route.failover {
+                vibex_core::GatewayFailover::Auto => management_locale_text("Auto", "自动", "自動"),
+                vibex_core::GatewayFailover::Ask => management_locale_text("Ask", "询问", "詢問"),
+            };
+            let first_token = route
+                .first_token_timeout_ms
+                .map(|value| format!("{} ms", value))
+                .unwrap_or_else(|| management_locale_text("Inherit", "继承", "繼承").to_string());
+            let context = route
+                .context_tokens
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| {
+                    management_locale_text("Smallest member", "最小成员", "最小成員").to_string()
+                });
+            let token_limit = route
+                .token_limit
+                .as_ref()
+                .map(|limit| format!("{} · {:?}", limit.tokens, limit.window))
+                .unwrap_or_else(|| {
+                    management_locale_text("No local ceiling", "无本地上限", "無本地上限")
+                        .to_string()
+                });
+            let policy = h_flex()
+                .w_full()
+                .flex_wrap()
+                .gap_4()
+                .child(stat_line(
+                    management_locale_text("Strategy", "策略", "策略"),
+                    management_route_strategy_label(route.strategy),
+                    cx,
+                ))
+                .child(stat_line(
+                    management_locale_text("Pin", "会话固定", "會話固定"),
+                    pin_label.to_string(),
+                    cx,
+                ))
+                .child(stat_line(
+                    management_locale_text("Failover", "故障转移", "容錯移轉"),
+                    failover_label.to_string(),
+                    cx,
+                ))
+                .child(stat_line(
+                    management_locale_text("First token", "首 Token", "首 Token"),
+                    first_token,
+                    cx,
+                ))
+                .child(stat_line(
+                    management_locale_text("Context", "上下文", "上下文"),
+                    context,
+                    cx,
+                ))
+                .child(stat_line(
+                    management_locale_text("Local ceiling", "本地上限", "本地上限"),
+                    token_limit,
+                    cx,
+                ));
+            body = body.child(management_card_with_icon(
+                management_locale_text("Policy", "策略", "策略"),
+                management_locale_text(
+                    "How the gateway chooses and when it steps aside.",
+                    "网关如何选择成员，以及何时让路。",
+                    "閘道如何選擇成員，以及何時讓路。",
+                ),
+                "icons/vibex/git-branch.svg",
+                policy.into_any_element(),
+                cx,
+            ));
         }
-        body = body.child(management_card_with_icon(
-            management_locale_text(
-                "Use for another Agent",
-                "让其他 Agent 使用",
-                "讓其他 Agent 使用",
-            ),
-            management_locale_text(
-                "The group stays one record; each Agent gets a reference to it.",
-                "路由组仍然只有一份记录，每个 Agent 获得一条对它的引用。",
-                "路由組仍然只有一份記錄，每個 Agent 獲得一條對它的引用。",
-            ),
-            "icons/vibex/file-plus.svg",
-            bind_rows.into_any_element(),
-            cx,
-        ));
+
+        if self.route_group_detail_tab == RouteGroupDetailTab::Traffic {
+            let member_ids = route
+                .members
+                .iter()
+                .map(|member| member.model_provider_profile_id.clone())
+                .collect::<BTreeSet<_>>();
+            let requests = self
+                .gateway_requests
+                .iter()
+                .filter(|request| member_ids.contains(&request.model_provider_profile_id))
+                .collect::<Vec<_>>();
+            let total = requests.len();
+            let succeeded = requests
+                .iter()
+                .filter(|request| request.status.is_some_and(|status| status < 400))
+                .count();
+            let tokens = requests
+                .iter()
+                .map(|request| request.total_tokens)
+                .sum::<u64>();
+            let traffic = h_flex()
+                .w_full()
+                .flex_wrap()
+                .gap_4()
+                .child(stat_line(
+                    management_locale_text("Requests", "请求", "請求"),
+                    total.to_string(),
+                    cx,
+                ))
+                .child(stat_line(
+                    management_locale_text("Succeeded", "成功", "成功"),
+                    succeeded.to_string(),
+                    cx,
+                ))
+                .child(stat_line(
+                    management_locale_text("Tokens", "Token", "Token"),
+                    tokens.to_string(),
+                    cx,
+                ));
+            body = body.child(management_card_with_icon(
+                management_locale_text("Traffic & Health", "流量与健康", "流量與健康"),
+                management_locale_text(
+                    "Observed requests across this group's members; no cost or quota.",
+                    "该组成员产生的观测请求；不包含成本或配额。",
+                    "該組成員產生的觀測請求；不包含成本或配額。",
+                ),
+                "icons/vibex/activity.svg",
+                traffic.into_any_element(),
+                cx,
+            ));
+        }
 
         let delete_id = route.id.clone();
         let users = row.agents.len();
@@ -32133,6 +32361,27 @@ impl ProviderSort {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteGroupDetailTab {
+    Overview,
+    Members,
+    Policy,
+    Traffic,
+}
+
+impl RouteGroupDetailTab {
+    const ALL: [Self; 4] = [Self::Overview, Self::Members, Self::Policy, Self::Traffic];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overview => management_locale_text("Overview", "概览", "概覽"),
+            Self::Members => management_locale_text("Members", "成员", "成員"),
+            Self::Policy => management_locale_text("Policy", "策略", "策略"),
+            Self::Traffic => management_locale_text("Traffic", "流量", "流量"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderModelsFilter {
     All,
     Enabled,
@@ -41450,6 +41699,25 @@ mod gateway_surface_tests {
         }
         assert!(source.contains("management-provider-detail-tabs"));
         assert!(source.contains("management_model_limits_label"));
+    }
+
+    #[test]
+    fn the_route_group_workbench_has_four_tabs() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "management-route-group-detail-tabs",
+            "RouteGroupDetailTab::Overview",
+            "RouteGroupDetailTab::Members",
+            "RouteGroupDetailTab::Policy",
+            "RouteGroupDetailTab::Traffic",
+            "member.order_index",
+            "management_route_strategy_label(route.strategy)",
+        ] {
+            assert!(
+                source.contains(marker),
+                "the route workbench must keep {marker}"
+            );
+        }
     }
 
     #[test]
