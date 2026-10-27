@@ -6486,3 +6486,14 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
   falls back to the gateway client rather than failing the request.
 - The Keys tab edits both fields through a small JSON object and writes them in
   the same v2 profile update as the rest of the shared Provider.
+
+### Single-Key Test
+
+- A per-Key Test resolves that credential's own Secret and reuses the shared
+  Provider's transient probe Profile.
+- It is a model-list request: status, discovered model count, and latency; it
+  never sends a prompt.
+- A missing/expired Secret reports the normal missing-secret failure and leaves
+  the Key in place.
+- The result is correlated by the clicked credential in the UI; the backend
+  result keeps the existing profile-level shape.

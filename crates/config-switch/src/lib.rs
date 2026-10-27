@@ -1052,6 +1052,68 @@ impl ProviderConfigService {
         }
     }
 
+    pub fn test_model_provider_credential(
+        &self,
+        request: vibex_core::ModelProviderKeyTestRequest,
+    ) -> VibexResult<vibex_core::ModelProviderTestResult> {
+        let conn = self.open_connection()?;
+        let profile = vibex_db::ModelProviderProfileRepository::get(
+            &conn,
+            &request.model_provider_profile_id,
+        )?
+        .ok_or_else(|| {
+            VibexError::validation(
+                "model_provider_profile_not_found",
+                "the shared Provider was not found",
+            )
+        })?;
+        let credential = profile
+            .credentials
+            .iter()
+            .find(|credential| credential.id == request.credential_id)
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "model_provider_key_not_found",
+                    "the shared Provider does not have this Key",
+                )
+                .with_diagnostic("credentialId", request.credential_id.as_str())
+            })?;
+        let checked_at_ms = unix_timestamp_ms();
+        let secret = shared_provider_credential_secret(credential)?;
+        let probe = shared_provider_probe_profile(&profile)?;
+        match fetch_provider_models_with_secret(&probe, secret.as_deref()) {
+            Ok((models, mut diagnostics)) => {
+                diagnostics.push(vibex_core::ProviderBindingMetadata {
+                    key: "modelCount".to_string(),
+                    value: models.len().to_string(),
+                });
+                Ok(vibex_core::ModelProviderTestResult {
+                    model_provider_profile_id: profile.id,
+                    status: AgentModelProviderTestStatus::Pass,
+                    code: "model_provider_key_test_passed".to_string(),
+                    message: "Key model-list request succeeded".to_string(),
+                    diagnostics,
+                    checked_at_ms,
+                })
+            }
+            Err(error) => Ok(vibex_core::ModelProviderTestResult {
+                model_provider_profile_id: profile.id,
+                status: AgentModelProviderTestStatus::Fail,
+                code: error.code.clone(),
+                message: error.message.clone(),
+                diagnostics: error
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| vibex_core::ProviderBindingMetadata {
+                        key: diagnostic.key.clone(),
+                        value: diagnostic.value.clone(),
+                    })
+                    .collect(),
+                checked_at_ms,
+            }),
+        }
+    }
+
     pub fn test_agent_model_provider_profile(
         &self,
         request: AgentModelProviderProfileTestRequest,
@@ -6701,6 +6763,19 @@ fn shared_provider_api_key(
         }
     }
     Ok(None)
+}
+
+fn shared_provider_credential_secret(
+    credential: &vibex_core::ModelProviderCredentialReference,
+) -> VibexResult<Option<String>> {
+    let Some(reference) = credential.credential.secret_reference() else {
+        return Ok(None);
+    };
+    crate::secrets::resolve_provider_secret_reference(
+        reference.backend,
+        reference.setup_state,
+        &reference.lookup_key,
+    )
 }
 
 /// Builds the transient v1 Profile a shared Provider's fetch/test reuses.

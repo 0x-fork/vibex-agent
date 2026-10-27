@@ -2948,6 +2948,13 @@ pub struct ModelProviderTestRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ModelProviderKeyTestRequest {
+    pub model_provider_profile_id: ModelProviderProfileId,
+    pub credential_id: RequestId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelProviderTestResult {
     pub model_provider_profile_id: ModelProviderProfileId,
     pub status: crate::provider::AgentModelProviderTestStatus,

@@ -1640,6 +1640,13 @@ mod tests {
             error_future()
         }
 
+        fn test_model_provider_credential(
+            &self,
+            _request: vibex_core::ModelProviderKeyTestRequest,
+        ) -> BackendFuture<'_, vibex_core::ModelProviderTestResult> {
+            error_future()
+        }
+
         fn fetch_model_provider_profile_models(
             &self,
             _request: vibex_core::ModelProviderFetchModelsRequest,

@@ -5060,6 +5060,16 @@ impl ManagementBackend for WebRemoteBackend {
         )
     }
 
+    fn test_model_provider_credential(
+        &self,
+        _request: vibex_core::ModelProviderKeyTestRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderTestResult> {
+        self.unsupported(
+            "model_provider_key_test_remote_unsupported",
+            "this runtime does not serve a single shared Provider Key test over the remote protocol yet",
+        )
+    }
+
     fn fetch_model_provider_profile_models(
         &self,
         request: vibex_core::ModelProviderFetchModelsRequest,

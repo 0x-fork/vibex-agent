@@ -15039,6 +15039,62 @@ impl ManagementCenter {
         }));
     }
 
+    fn test_shared_provider_key(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        credential_id: vibex_core::RequestId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::ProviderProbe(format!(
+            "key-test:{}",
+            credential_id.as_str()
+        )));
+        self.error = None;
+        self.notice = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .test_model_provider_credential(vibex_core::ModelProviderKeyTestRequest {
+                    model_provider_profile_id: profile_id,
+                    credential_id,
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(result) => {
+                        let latency = result
+                            .diagnostics
+                            .iter()
+                            .find(|diagnostic| diagnostic.key == "latencyMs")
+                            .map(|diagnostic| format!(" · {} ms", diagnostic.value))
+                            .unwrap_or_default();
+                        let models = result
+                            .diagnostics
+                            .iter()
+                            .find(|diagnostic| diagnostic.key == "modelCount")
+                            .map(|diagnostic| format!(" · {} models", diagnostic.value))
+                            .unwrap_or_default();
+                        if result.status == vibex_core::AgentModelProviderTestStatus::Pass {
+                            this.notice = Some(format!("{}{models}{latency}", result.message));
+                        } else {
+                            this.error = Some(format!("{}: {}", result.code, result.message));
+                        }
+                    }
+                    Err(error) => this.error = Some(format!("{}: {}", error.code, error.message)),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     fn refresh_shared_provider_models(
         &mut self,
         profile_id: vibex_core::ModelProviderProfileId,
@@ -16507,6 +16563,11 @@ impl ManagementCenter {
             let key_enabled = key_summary
                 .as_ref()
                 .is_none_or(|key| key.state != vibex_core::GatewayKeyState::Disabled);
+            let key_testing = matches!(
+                &self.mutation,
+                Some(ManagementMutation::ProviderProbe(action))
+                    if action == &format!("key-test:{}", credential.id.as_str())
+            );
             let state = match credential.status {
                 vibex_core::AgentCredentialStatus::Ready => Tag::success()
                     .xsmall()
@@ -16556,6 +16617,32 @@ impl ManagementCenter {
                             .items_center()
                             .gap_2()
                             .child(state)
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "management-shared-provider-test-key-{}",
+                                    credential.id.as_str()
+                                )))
+                                .xsmall()
+                                .ghost()
+                                .label(if key_testing {
+                                    management_locale_text("Testing...", "测试中...", "測試中...")
+                                } else {
+                                    management_locale_text("Test", "测试", "測試")
+                                })
+                                .loading(key_testing)
+                                .disabled(pending)
+                                .on_click(cx.listener({
+                                    let profile_id = profile.id.clone();
+                                    let credential_id = credential.id.clone();
+                                    move |this, _, _, cx| {
+                                        this.test_shared_provider_key(
+                                            profile_id.clone(),
+                                            credential_id.clone(),
+                                            cx,
+                                        )
+                                    }
+                                })),
+                            )
                             .child(
                                 Button::new(SharedString::from(format!(
                                     "management-shared-provider-toggle-key-{}",
@@ -43607,6 +43694,9 @@ mod gateway_surface_tests {
             "save_gateway_key_policy(",
             "credential.models = models",
             "credential.proxy_url = proxy_url",
+            "management-shared-provider-test-key-",
+            "test_shared_provider_key(",
+            "test_model_provider_credential(",
         ] {
             assert!(source.contains(marker), "Key scope must keep {marker}");
         }

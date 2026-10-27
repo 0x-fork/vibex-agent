@@ -450,6 +450,12 @@ pub trait ManagementBackend: BackendBound {
         request: AgentModelProviderProfileFetchModelsRequest,
     ) -> BackendFuture<'_, AgentModelProviderProfileFetchModelsResponse>;
 
+    /// Probes one shared Provider Key by its credential id.
+    fn test_model_provider_credential(
+        &self,
+        request: vibex_core::ModelProviderKeyTestRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderTestResult>;
+
     /// Fetches the model catalogue a saved shared Provider exposes.
     fn fetch_model_provider_profile_models(
         &self,
