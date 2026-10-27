@@ -410,6 +410,39 @@ pub(crate) fn apply_agent_model_source_defaults(
             "agent_model_source_default_migration_transaction_failed",
             "failed to start the agent model source defaults migration",
         ))?;
+    // The source-default backfill reads Provider profiles through the normal
+    // repository. A database that predates migration 82 has no `metadata_json`
+    // column yet, so add it here before the backfill; migration 82 then records
+    // itself without trying a duplicate ALTER.
+    let has_metadata = transaction
+        .prepare("PRAGMA table_info(model_provider_profiles)")
+        .map_err(storage_err(
+            "agent_model_source_metadata_inspect_failed",
+            "failed to inspect the Provider profile table",
+        ))?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage_err(
+            "agent_model_source_metadata_inspect_failed",
+            "failed to inspect the Provider profile table",
+        ))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(storage_err(
+            "agent_model_source_metadata_inspect_failed",
+            "failed to inspect the Provider profile table",
+        ))?
+        .iter()
+        .any(|column| column == "metadata_json");
+    if !has_metadata {
+        transaction
+            .execute_batch(
+                "ALTER TABLE model_provider_profiles
+                     ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}';",
+            )
+            .map_err(storage_err(
+                "agent_model_source_metadata_apply_failed",
+                "failed to add the Provider metadata column",
+            ))?;
+    }
     transaction
         .execute_batch(
             "

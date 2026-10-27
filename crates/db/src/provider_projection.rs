@@ -3707,6 +3707,44 @@ mod real_database_upgrade_tests {
 ///
 /// The column is appended rather than replacing `vendor_hint`: older rows
 /// read as `{}`, and the launch projection never reads it.
+/// Adds the Provider metadata column when the table predates it.
+///
+/// The compatibility backfill and the source-default backfill both read through
+/// the normal repository, which selects the column. Running this before them is
+/// what lets an older database migrate instead of failing with a missing-column
+/// lookup error.
+pub(crate) fn ensure_provider_metadata_column(conn: &Connection) -> VibexResult<()> {
+    let has_metadata = conn
+        .prepare("PRAGMA table_info(model_provider_profiles)")
+        .map_err(storage_err(
+            "model_provider_metadata_inspect_failed",
+            "failed to inspect the Provider profile table",
+        ))?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage_err(
+            "model_provider_metadata_inspect_failed",
+            "failed to inspect the Provider profile table",
+        ))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(storage_err(
+            "model_provider_metadata_inspect_failed",
+            "failed to inspect the Provider profile table",
+        ))?
+        .iter()
+        .any(|column| column == "metadata_json");
+    if !has_metadata {
+        conn.execute_batch(
+            "ALTER TABLE model_provider_profiles
+                 ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}';",
+        )
+        .map_err(storage_err(
+            "model_provider_metadata_apply_failed",
+            "failed to add the Provider metadata column",
+        ))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn migrate_provider_metadata(
     conn: &mut Connection,
     applied: &mut Vec<String>,

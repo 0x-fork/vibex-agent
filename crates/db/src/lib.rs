@@ -12489,6 +12489,9 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // so a caller always had a Provider id to fall back on. They are gone: a missing
     // Provider is reported as missing rather than stood in for by a row with no
     // address and no Key.
+    // An older database may predate the metadata column, but the backfill reads
+    // through the repository that selects it; add it before the read.
+    provider_projection::ensure_provider_metadata_column(conn)?;
     ProviderProjectionCompatibilityRepository::backfill_legacy_profiles(conn)?;
     // Describes each Agent's direct Provider as a single-member route, so the
     // route graph can show direct connections beside gateway ones.
@@ -26404,5 +26407,42 @@ mod tests {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("db-wal"));
         let _ = fs::remove_file(path.with_extension("db-shm"));
+    }
+}
+
+#[cfg(test)]
+mod migration_regression_tests {
+    use super::*;
+
+    #[test]
+    fn a_v80_database_without_the_metadata_column_still_migrates() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_migrations(&mut conn).unwrap();
+        // Rewind the recorded tail and remove the column: this is the shape of
+        // a database created before the metadata migration.
+        conn.execute("DELETE FROM schema_migrations WHERE version > 80", [])
+            .unwrap();
+        conn.execute_batch("ALTER TABLE model_provider_profiles DROP COLUMN metadata_json;")
+            .unwrap();
+        let applied = apply_migrations(&mut conn).unwrap();
+        assert!(
+            applied
+                .iter()
+                .any(|migration| migration == "81:agent_model_source_defaults")
+        );
+        assert!(
+            applied
+                .iter()
+                .any(|migration| migration == "82:model_provider_metadata")
+        );
+        let columns = conn
+            .prepare("PRAGMA table_info(model_provider_profiles)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "metadata_json"));
     }
 }
