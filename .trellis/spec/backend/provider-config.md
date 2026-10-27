@@ -6451,3 +6451,14 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
   empty sample renders `—`.
 - The calculation is nearest-rank over observed values, not a vendor report or
   a money/cost projection.
+
+### Interactive binding pills and removal guards
+
+- Clicking a bound Agent pill removes that binding; clicking an unbound Agent
+  pill binds the shared Provider or route group for that Agent.
+- The default star stops propagation and writes only the default source.
+- Removing the Agent's only model source is refused with a blocking message.
+- Removing the current default source asks first and says the source record is
+  not deleted; the Agent needs a new default afterwards.
+- Provider unbinding deletes the Agent's legacy v1 Profile; the shared v2 record
+  survives for every other Agent. Route unbinding removes only the reference.

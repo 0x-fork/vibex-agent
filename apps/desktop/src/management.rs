@@ -12908,43 +12908,68 @@ impl ManagementCenter {
                 else {
                     continue;
                 };
-                let default_source = vibex_core::AgentModelSourceRef::Provider(legacy_id);
+                let default_source = vibex_core::AgentModelSourceRef::Provider(legacy_id.clone());
                 let is_default =
                     self.resolved_agent_default_source(agent_id).as_ref() == Some(&default_source);
                 let click_agent = agent_id.clone();
                 let click_source = default_source;
-                agent_rows =
-                    agent_rows.child(
-                        Tag::secondary().child(
-                            h_flex()
-                                .items_center()
-                                .gap_1()
-                                .child(agent_brand_icon(agent_id, px(14.0), None))
-                                .child(label)
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "management-provider-agent-default-{}",
-                                        agent_id
-                                    )))
-                                    .xsmall()
-                                    .ghost()
-                                    .icon(if is_default {
-                                        IconName::StarFill
-                                    } else {
-                                        IconName::Star
-                                    })
-                                    .tooltip(management_set_default_label())
-                                    .disabled(self.mutation.is_some())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.set_agent_default_model_source(
-                                            click_agent.clone(),
-                                            click_source.clone(),
-                                            cx,
-                                        )
-                                    })),
-                                ),
+                let unbind_agent = agent_id.clone();
+                let unbind_legacy = legacy_id.clone();
+                let unbind_label = label.clone();
+                agent_rows = agent_rows.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "management-provider-agent-pill-{agent_id}"
+                        )))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let Ok(agent_id) = AgentId::parse(unbind_agent.clone()) else {
+                                return;
+                            };
+                            this.try_unbind_model_source(
+                                agent_id,
+                                vibex_core::AgentModelSourceRef::Provider(unbind_legacy.clone()),
+                                UnbindModelSource::Provider(unbind_legacy.clone()),
+                                unbind_label.clone(),
+                                window,
+                                cx,
+                            )
+                        }))
+                        .child(
+                            Tag::secondary().child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(agent_brand_icon(agent_id, px(14.0), None))
+                                    .child(label)
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "management-provider-agent-default-{}",
+                                            agent_id
+                                        )))
+                                        .xsmall()
+                                        .ghost()
+                                        .icon(if is_default {
+                                            IconName::StarFill
+                                        } else {
+                                            IconName::Star
+                                        })
+                                        .tooltip(management_set_default_label())
+                                        .disabled(self.mutation.is_some())
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.set_agent_default_model_source(
+                                                    click_agent.clone(),
+                                                    click_source.clone(),
+                                                    cx,
+                                                )
+                                            }),
+                                        ),
+                                    ),
+                            ),
                         ),
-                    );
+                );
             }
             let configurable =
                 vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
@@ -12970,14 +12995,36 @@ impl ManagementCenter {
                         )),
                 );
                 for agent in &unbound {
+                    let bind_agent = agent.id.clone();
+                    let bind_profile = profile
+                        .legacy_provider_profile_id
+                        .clone()
+                        .unwrap_or_else(vibex_core::ProviderProfileId::new);
+                    let bind_shared = Some(profile.id.clone());
                     agent_rows = agent_rows.child(
-                        Tag::secondary().child(
-                            h_flex()
-                                .items_center()
-                                .gap_1()
-                                .child(agent_brand_icon(agent.id.as_str(), px(14.0), None))
-                                .child(agent.label.clone()),
-                        ),
+                        div()
+                            .id(SharedString::from(format!(
+                                "management-provider-unbound-agent-{}",
+                                agent.id.as_str()
+                            )))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.bind_provider_to_agent(
+                                    bind_agent.clone(),
+                                    bind_profile.clone(),
+                                    bind_shared.clone(),
+                                    cx,
+                                )
+                            }))
+                            .child(
+                                Tag::secondary().child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(agent_brand_icon(agent.id.as_str(), px(14.0), None))
+                                        .child(agent.label.clone()),
+                                ),
+                            ),
                     );
                 }
             }
@@ -13795,38 +13842,63 @@ impl ManagementCenter {
                     self.resolved_agent_default_source(agent_id).as_ref() == Some(&default_source);
                 let click_agent = agent_id.clone();
                 let click_source = default_source;
-                agent_rows =
-                    agent_rows.child(
-                        Tag::secondary().child(
-                            h_flex()
-                                .items_center()
-                                .gap_1()
-                                .child(agent_brand_icon(agent_id, px(14.0), None))
-                                .child(label)
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "management-route-group-agent-default-{}",
-                                        agent_id
-                                    )))
-                                    .xsmall()
-                                    .ghost()
-                                    .icon(if is_default {
-                                        IconName::StarFill
-                                    } else {
-                                        IconName::Star
-                                    })
-                                    .tooltip(management_set_default_label())
-                                    .disabled(self.mutation.is_some())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.set_agent_default_model_source(
-                                            click_agent.clone(),
-                                            click_source.clone(),
-                                            cx,
-                                        )
-                                    })),
-                                ),
+                let unbind_agent = agent_id.clone();
+                let unbind_route = route.id.clone();
+                let unbind_label = label.clone();
+                agent_rows = agent_rows.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "management-route-group-agent-pill-{agent_id}"
+                        )))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let Ok(agent_id) = AgentId::parse(unbind_agent.clone()) else {
+                                return;
+                            };
+                            this.try_unbind_model_source(
+                                agent_id,
+                                vibex_core::AgentModelSourceRef::RouteGroup(unbind_route.clone()),
+                                UnbindModelSource::Route(unbind_route.clone()),
+                                unbind_label.clone(),
+                                window,
+                                cx,
+                            )
+                        }))
+                        .child(
+                            Tag::secondary().child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(agent_brand_icon(agent_id, px(14.0), None))
+                                    .child(label)
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "management-route-group-agent-default-{}",
+                                            agent_id
+                                        )))
+                                        .xsmall()
+                                        .ghost()
+                                        .icon(if is_default {
+                                            IconName::StarFill
+                                        } else {
+                                            IconName::Star
+                                        })
+                                        .tooltip(management_set_default_label())
+                                        .disabled(self.mutation.is_some())
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.set_agent_default_model_source(
+                                                    click_agent.clone(),
+                                                    click_source.clone(),
+                                                    cx,
+                                                )
+                                            }),
+                                        ),
+                                    ),
+                            ),
                         ),
-                    );
+                );
             }
             let configurable =
                 vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
@@ -13852,14 +13924,27 @@ impl ManagementCenter {
                         )),
                 );
                 for agent in &unbound {
+                    let bind_agent = agent.id.clone();
+                    let bind_route = route.id.clone();
                     agent_rows = agent_rows.child(
-                        Tag::secondary().child(
-                            h_flex()
-                                .items_center()
-                                .gap_1()
-                                .child(agent_brand_icon(agent.id.as_str(), px(14.0), None))
-                                .child(agent.label.clone()),
-                        ),
+                        div()
+                            .id(SharedString::from(format!(
+                                "management-route-group-unbound-agent-{}",
+                                agent.id.as_str()
+                            )))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.bind_route_group(bind_agent.clone(), bind_route.clone(), cx)
+                            }))
+                            .child(
+                                Tag::secondary().child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(agent_brand_icon(agent.id.as_str(), px(14.0), None))
+                                        .child(agent.label.clone()),
+                                ),
+                            ),
                     );
                 }
             }
@@ -14383,6 +14468,141 @@ impl ManagementCenter {
     /// is shared through the Keys and the address, not through one launch
     /// contract. The new Profile becomes the Agent's default, because choosing
     /// "use this Provider for this Agent" is the whole gesture.
+    fn agent_model_source_count(&self, agent_id: &str) -> usize {
+        self.provider_bindings
+            .iter()
+            .filter(|binding| binding.agent_id.as_str() == agent_id)
+            .count()
+            + self
+                .agent_model_route_bindings
+                .iter()
+                .filter(|binding| binding.agent_id.as_str() == agent_id)
+                .count()
+    }
+
+    fn try_unbind_model_source(
+        &mut self,
+        agent_id: vibex_core::AgentId,
+        source_ref: vibex_core::AgentModelSourceRef,
+        source: UnbindModelSource,
+        label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent_model_source_count(agent_id.as_str()) <= 1 {
+            self.error = Some(
+                management_locale_text(
+                    "This is the Agent's only model source. Add another before removing it.",
+                    "这是该 Agent 唯一的模型来源，请先添加另一个再移除。",
+                    "這是該 Agent 唯一的模型來源，請先新增另一個再移除。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        if self
+            .resolved_agent_default_source(agent_id.as_str())
+            .as_ref()
+            == Some(&source_ref)
+        {
+            let entity = cx.weak_entity();
+            let active_locale = locale::current_locale();
+            let title = match active_locale {
+                ResolvedLocale::En => format!("Remove the default source {label}?"),
+                ResolvedLocale::ZhCn => format!("移除默认模型来源“{label}”？"),
+                ResolvedLocale::ZhTw => format!("移除預設模型來源「{label}」？"),
+            };
+            let agent = agent_id.as_str().to_string();
+            window.open_dialog(cx, move |dialog, _, _| {
+                let entity = entity.clone();
+                let agent_id = agent_id.clone();
+                let source = source.clone();
+                dialog
+                    .title(title.clone())
+                    .child(management_locale_text(
+                        "This Agent will start new sessions on another source only after you choose one. The source record itself is not deleted.",
+                        "移除后，该 Agent 的新会话需要你重新选择默认来源；来源记录本身不会被删除。",
+                        "移除後，該 Agent 的新會話需要你重新選擇預設來源；來源記錄本身不會被刪除。",
+                    ))
+                    .footer(
+                        gpui_component::dialog::DialogFooter::new()
+                            .child(gpui_component::dialog::DialogClose::new().child(
+                                Button::new("cancel-unbind-default-source")
+                                    .outline()
+                                    .label(management_locale_text("Cancel", "取消", "取消")),
+                            ))
+                            .child(gpui_component::dialog::DialogAction::new().child(
+                                Button::new("confirm-unbind-default-source")
+                                    .danger()
+                                    .label(management_locale_text("Remove source", "移除来源", "移除來源")),
+                            )),
+                    )
+                    .on_ok(move |_, _, cx| {
+                        let _ = entity.update(cx, |this, cx| {
+                            this.unbind_model_source(agent_id.clone(), source.clone(), cx)
+                        });
+                        true
+                    })
+            });
+            let _ = agent;
+            return;
+        }
+        self.unbind_model_source(agent_id, source, cx);
+    }
+
+    fn unbind_model_source(
+        &mut self,
+        agent_id: vibex_core::AgentId,
+        source: UnbindModelSource,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::Gateway);
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = match source {
+                UnbindModelSource::Provider(provider_profile_id) => backend
+                    .management()
+                    .delete_agent_model_provider_profile(vibex_backend::MutationRequest::new(
+                        vibex_core::AgentModelProviderProfileDeleteRequest {
+                            agent_id: agent_id.clone(),
+                            provider_profile_id,
+                        },
+                    ))
+                    .await
+                    .map(|_| true),
+                UnbindModelSource::Route(model_route_id) => {
+                    backend
+                        .management()
+                        .unbind_agent_model_route(vibex_backend::MutationRequest::new(
+                            vibex_core::AgentModelRouteUnbindRequest {
+                                agent_id: agent_id.clone(),
+                                model_route_id,
+                            },
+                        ))
+                        .await
+                }
+            };
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(_) => this.refresh(cx),
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
     fn set_agent_default_model_source(
         &mut self,
         agent_id: String,
@@ -33645,6 +33865,12 @@ impl ProviderModelsFilter {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UnbindModelSource {
+    Provider(vibex_core::ProviderProfileId),
+    Route(vibex_core::ModelRouteId),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderDetailTab {
     Overview,
@@ -42946,6 +43172,22 @@ mod gateway_surface_tests {
         assert!(source.contains("management-provider-agent-default-"));
         assert!(source.contains("management-route-group-agent-default-"));
         assert!(source.contains("set_agent_default_model_source("));
+    }
+
+    #[test]
+    fn binding_pills_toggle_and_guard_the_last_source() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "management-provider-agent-pill-",
+            "management-route-group-agent-pill-",
+            "management-provider-unbound-agent-",
+            "management-route-group-unbound-agent-",
+            "try_unbind_model_source(",
+            "UnbindModelSource::Route",
+            "This is the Agent's only model source",
+        ] {
+            assert!(source.contains(marker), "binding pills must keep {marker}");
+        }
     }
 
     #[test]
