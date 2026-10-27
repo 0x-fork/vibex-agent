@@ -19,6 +19,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 #[path = "message_schedule.rs"]
 mod message_schedule;
 use message_schedule::{MessageSchedule, MessageScheduleEditor, MessageScheduleTarget};
+#[path = "session_images.rs"]
+mod session_images;
 #[path = "timeline_activity.rs"]
 mod timeline_activity;
 #[path = "timeline_disclosure.rs"]
@@ -44,6 +46,7 @@ use gpui::{
     WindowId, WindowKind, WindowOptions, div, img, linear_color_stop, linear_gradient, point,
     prelude::*, px, relative, rgb, size,
 };
+use gpui_base::text::MarkdownExtensions;
 use gpui_component::{
     ActiveTheme as _, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
     InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _, Theme,
@@ -30973,6 +30976,55 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Open a workspace image from a session transcript in the full-window
+    /// preview used by attachments.
+    fn open_session_image_preview(
+        &mut self,
+        path: PathBuf,
+        label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(image_format) = attachment_preview_image_format(&path, None) else {
+            return;
+        };
+        let label = if label.trim().is_empty() {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Image".to_string())
+        } else {
+            label
+        };
+        let attachment = ComposerAttachment {
+            id: format!("session-image:{}", path.display()),
+            label,
+            path: Some(path.to_string_lossy().into_owned()),
+            mime_type: Some(image_format.mime_type().to_string()),
+        };
+        self.open_attachment_preview(attachment, false, window, cx);
+    }
+
+    /// The Markdown plugin that lets one session's transcript show images from
+    /// its workspace. `None` when there is no workspace to resolve against.
+    fn session_image_plugin(
+        &self,
+        entity: WeakEntity<Self>,
+    ) -> Option<session_images::SessionImagePlugin> {
+        let workspace_root = self.view_session()?.workspace_root.trim();
+        if workspace_root.is_empty() {
+            return None;
+        }
+        let open: session_images::SessionImageOpen = Arc::new(move |path, label, window, cx| {
+            let _ = entity.update(cx, |this, cx| {
+                this.open_session_image_preview(path, label, window, cx);
+            });
+        });
+        Some(session_images::SessionImagePlugin::new(
+            PathBuf::from(workspace_root),
+            open,
+        ))
+    }
+
     fn toggle_attachment_editor(&mut self, cx: &mut Context<Self>) {
         let Some(preview) = self.attachment_image_preview.as_ref() else {
             return;
@@ -58940,11 +58992,19 @@ impl VibexWorkbench {
                         false,
                         cx,
                     );
+                    let image_plugin = this.session_image_plugin(build_entity.clone());
                     let link_entity = build_entity.clone();
-                    markdown_text_view(&state, presentation, cx, move |url, _, window, cx| {
-                        let _ = link_entity
-                            .update(cx, |this, cx| this.open_markdown_link(url, "", window, cx));
-                    })
+                    session_markdown_text_view(
+                        &state,
+                        presentation,
+                        cx,
+                        image_plugin,
+                        move |url, _, window, cx| {
+                            let _ = link_entity.update(cx, |this, cx| {
+                                this.open_markdown_link(url, "", window, cx)
+                            });
+                        },
+                    )
                     .w_full()
                     .min_w_0()
                     .into_any_element()
@@ -60582,6 +60642,7 @@ impl VibexWorkbench {
         .then(|| self.timeline_body_reveal_control(row, hidden_body_bytes, cx));
         let markdown_view = (!body_windowed).then(|| {
             let arriving = self.row_is_arriving(row);
+            let image_plugin = self.session_image_plugin(cx.weak_entity());
             let markdown_state = self.markdown_text_state(
                 &format!("markdown:{}", row.id),
                 &markdown_source,
@@ -60590,10 +60651,11 @@ impl VibexWorkbench {
                 cx,
             );
             let markdown_entity = cx.weak_entity();
-            markdown_text_view(
+            session_markdown_text_view(
                 &markdown_state,
                 MarkdownPresentation::Agent,
                 cx,
+                image_plugin,
                 move |url, _, window, cx| {
                     let _ = markdown_entity
                         .update(cx, |this, cx| this.open_markdown_link(url, "", window, cx));
@@ -60882,6 +60944,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> TextView {
         let markdown_entity = cx.weak_entity();
+        let image_plugin = self.session_image_plugin(markdown_entity.clone());
         let id: ElementId = id.into();
         let state = self.markdown_text_state(
             &format!("{id}"),
@@ -60890,10 +60953,11 @@ impl VibexWorkbench {
             false,
             cx,
         );
-        markdown_text_view(
+        session_markdown_text_view(
             &state,
             MarkdownPresentation::Thought,
             cx,
+            image_plugin,
             move |url, _, window, cx| {
                 let _ = markdown_entity
                     .update(cx, |this, cx| this.open_markdown_link(url, "", window, cx));
@@ -61202,6 +61266,7 @@ impl VibexWorkbench {
         let search_highlight = self.session_search_highlight_for_rows(std::slice::from_ref(row));
         let (markdown_source, _) = self.timeline_markdown_source(row);
         let markdown_entity = cx.weak_entity();
+        let image_plugin = self.session_image_plugin(markdown_entity.clone());
         let markdown_state = self.markdown_text_state(
             &format!("thought:{}", row.id),
             &markdown_source,
@@ -61209,10 +61274,11 @@ impl VibexWorkbench {
             row.streaming,
             cx,
         );
-        let markdown_view = markdown_text_view(
+        let markdown_view = session_markdown_text_view(
             &markdown_state,
             MarkdownPresentation::Thought,
             cx,
+            image_plugin,
             move |url, _, window, cx| {
                 let _ = markdown_entity
                     .update(cx, |this, cx| this.open_markdown_link(url, "", window, cx));
@@ -86411,6 +86477,26 @@ fn markdown_text_view(
         view = view.style(style);
     }
     view.on_link_click(on_link_click)
+}
+
+/// A session Markdown view that also claims workspace image embeds.
+fn session_markdown_text_view(
+    state: &Entity<TextViewState>,
+    presentation: MarkdownPresentation,
+    cx: &App,
+    image_plugin: Option<session_images::SessionImagePlugin>,
+    on_link_click: impl Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync + 'static,
+) -> TextView {
+    let view = markdown_text_view(state, presentation, cx, on_link_click);
+    let Some(plugin) = image_plugin else {
+        return view;
+    };
+    let parser_revision = plugin.parser_revision();
+    view.markdown_extensions(
+        MarkdownExtensions::default()
+            .plugin(plugin)
+            .parser_revision(parser_revision),
+    )
 }
 
 fn agent_file_operation_preview_path(path: &str, workspace_root: Option<&str>) -> Option<String> {
