@@ -6380,3 +6380,11 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
   the existing per-row trace detail.
 - Clearing still deletes the whole ledger, not the filtered view; the button and
   its retention copy sit at the foot of the unfiltered list.
+
+### Static gateway topology
+
+- The topology card has three columns: Agents, Gateway, Route groups/Providers.
+- Edges are static text/columns; the only live number is `gateway_inflight.len()`.
+- Direct Provider edges are omitted; route-group membership is the drawn path.
+- The card never animates traffic and never shows prompt, reply, Key value, cost,
+  or quota.

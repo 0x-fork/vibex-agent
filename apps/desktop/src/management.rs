@@ -16397,6 +16397,182 @@ impl ManagementCenter {
     ///
     /// Clearing is not reversible, so it asks first; and it says what it does
     /// not remove, so the wording cannot be mistaken for resetting usage.
+    fn render_gateway_topology(&self, cx: &mut Context<Self>) -> AnyElement {
+        let agent_ids = self
+            .agent_model_route_bindings
+            .iter()
+            .map(|binding| binding.agent_id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        let mut agents = v_flex().w_full().gap_1();
+        for agent_id in &agent_ids {
+            let label = self
+                .snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.id.as_str() == agent_id)
+                .map(|agent| agent.label.clone())
+                .unwrap_or_else(|| agent_id.clone());
+            agents = agents.child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(agent_brand_icon(agent_id, px(14.0), None))
+                    .child(div().min_w_0().truncate().text_xs().child(label)),
+            );
+        }
+        if agent_ids.is_empty() {
+            agents = agents.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "No Agents",
+                        "没有 Agent",
+                        "沒有 Agent",
+                    )),
+            );
+        }
+        let mut providers = v_flex().w_full().gap_1();
+        for route in self.model_routes.iter().take(6) {
+            let names = route
+                .members
+                .iter()
+                .filter_map(|member| {
+                    self.providers
+                        .iter()
+                        .find(|profile| profile.id == member.model_provider_profile_id)
+                        .map(|profile| profile.display_name.clone())
+                })
+                .collect::<Vec<_>>();
+            providers = providers.child(
+                v_flex()
+                    .w_full()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .font_medium()
+                            .child(route.display_name.clone()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(names.join(" + ")),
+                    ),
+            );
+        }
+        if self.model_routes.is_empty() {
+            providers = providers.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "No route groups",
+                        "没有路由组",
+                        "沒有路由組",
+                    )),
+            );
+        }
+        let gateway_state =
+            if self.gateway.runtime.status == vibex_core::ModelGatewayStatus::Running {
+                management_locale_text("Running", "运行中", "執行中")
+            } else {
+                management_locale_text("Stopped", "已停止", "已停止")
+            };
+        let topology = h_flex()
+            .w_full()
+            .items_start()
+            .gap_3()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text("Agents", "Agent", "Agent")),
+                    )
+                    .child(agents),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(cx.theme().primary)
+                            .child(management_locale_text("Gateway", "网关", "閘道")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(gateway_state),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "{} {}",
+                                self.gateway_inflight.len(),
+                                management_locale_text("inflight", "进行中", "進行中")
+                            )),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text("Route groups", "路由组", "路由組")),
+                    )
+                    .child(providers),
+            );
+        management_card_with_icon(
+            management_locale_text("Topology", "静态拓扑", "靜態拓撲"),
+            management_locale_text(
+                "Agents reach Providers through the gateway and its route groups. Direct Providers are not drawn; no live animation.",
+                "Agent 通过网关和路由组到达供应商。直连供应商不绘制；不做实时动画。",
+                "Agent 透過閘道和路由組到達供應商。直連供應商不繪製；不做即時動畫。",
+            ),
+            "icons/vibex/network.svg",
+            v_flex()
+                .w_full()
+                .gap_2()
+                .child(topology)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "Static edges; current inflight is counted at the gateway.",
+                            "静态边；当前进行中的请求按网关计数。",
+                            "靜態邊；目前進行中的請求按閘道計數。",
+                        )),
+                )
+                .into_any_element(),
+            cx,
+        )
+    }
+
     fn confirm_clear_gateway_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entity = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, _| {
@@ -17709,6 +17885,8 @@ impl ManagementCenter {
             member_rows.into_any_element(),
             cx,
         ));
+
+        body = body.child(self.render_gateway_topology(cx));
 
         // Recent requests: which upstream answered, which protocol changed,
         // and how many tokens it took. This is the only view that explains a
@@ -41797,6 +41975,22 @@ mod gateway_surface_tests {
         }
         assert!(source.contains("management-provider-detail-tabs"));
         assert!(source.contains("management_model_limits_label"));
+    }
+
+    #[test]
+    fn the_gateway_page_has_a_static_topology() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "fn render_gateway_topology(",
+            "Static edges; current inflight is counted at the gateway.",
+            "self.gateway_inflight.len()",
+            "icons/vibex/network.svg",
+        ] {
+            assert!(
+                source.contains(marker),
+                "the topology card must keep {marker}"
+            );
+        }
     }
 
     #[test]
