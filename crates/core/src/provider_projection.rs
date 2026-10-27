@@ -2865,3 +2865,44 @@ mod tests {
         );
     }
 }
+
+/// Asks a saved shared Provider for the model list its endpoint serves.
+///
+/// The shared record owns the address and the credential reference; the
+/// service resolves the Secret only for this call and never returns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProviderFetchModelsRequest {
+    pub model_provider_profile_id: ModelProviderProfileId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProviderFetchModelsResponse {
+    pub model_provider_profile_id: ModelProviderProfileId,
+    /// The catalogue as the endpoint listed it, with existing declarations
+    /// carried over so capabilities survive a refresh.
+    pub models: Vec<ModelProviderCatalogEntry>,
+    pub diagnostics: Vec<ProviderBindingMetadata>,
+}
+
+/// Probes a shared Provider's saved address and credential.
+///
+/// The probe is a model-list request: it proves the address, the credential,
+/// and the protocol without sending a prompt or spending completion tokens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProviderTestRequest {
+    pub model_provider_profile_id: ModelProviderProfileId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProviderTestResult {
+    pub model_provider_profile_id: ModelProviderProfileId,
+    pub status: crate::provider::AgentModelProviderTestStatus,
+    pub code: String,
+    pub message: String,
+    pub diagnostics: Vec<ProviderBindingMetadata>,
+    pub checked_at_ms: i64,
+}

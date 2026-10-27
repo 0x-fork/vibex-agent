@@ -3036,6 +3036,22 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn model_catalog_status(&self) -> BackendFuture<'_, vibex_core::ModelCatalogStatus> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            Ok(runtime.model_catalog_status())
+        })
+    }
+
+    fn refresh_model_catalog(&self) -> BackendFuture<'_, vibex_core::ModelCatalogStatus> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime.refresh_model_catalog().await.map_err(Into::into)
+        })
+    }
+
     fn model_gateway_snapshot(&self) -> BackendFuture<'_, GatewaySnapshot> {
         let runtime = self.runtime.clone();
         Box::pin(async move {
@@ -3763,6 +3779,38 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .management()
                 .fetch_agent_model_provider_profile_models(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn fetch_model_provider_profile_models(
+        &self,
+        request: vibex_core::ModelProviderFetchModelsRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderFetchModelsResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .fetch_model_provider_profile_models(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn test_model_provider_profile(
+        &self,
+        request: vibex_core::ModelProviderTestRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderTestResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .test_model_provider_profile(request)
                 .map_err(Into::into)
         })
     }

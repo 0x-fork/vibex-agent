@@ -1632,6 +1632,28 @@ mod tests {
             error_future()
         }
 
+        fn model_catalog_status(&self) -> BackendFuture<'_, vibex_core::ModelCatalogStatus> {
+            error_future()
+        }
+
+        fn refresh_model_catalog(&self) -> BackendFuture<'_, vibex_core::ModelCatalogStatus> {
+            error_future()
+        }
+
+        fn fetch_model_provider_profile_models(
+            &self,
+            _request: vibex_core::ModelProviderFetchModelsRequest,
+        ) -> BackendFuture<'_, vibex_core::ModelProviderFetchModelsResponse> {
+            error_future()
+        }
+
+        fn test_model_provider_profile(
+            &self,
+            _request: vibex_core::ModelProviderTestRequest,
+        ) -> BackendFuture<'_, vibex_core::ModelProviderTestResult> {
+            error_future()
+        }
+
         fn fetch_agent_model_provider_draft_models(
             &self,
             _request: AgentModelProviderDraftFetchModelsRequest,

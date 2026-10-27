@@ -4261,32 +4261,81 @@ impl ManagementBackend for WebRemoteBackend {
 
     fn get_agent_model_source_default(
         &self,
-        _request: vibex_core::AgentModelSourceDefaultRequest,
+        request: vibex_core::AgentModelSourceDefaultRequest,
     ) -> BackendFuture<'_, vibex_core::AgentModelSourceDefault> {
-        self.unsupported(
-            "agent_model_source_remote_unsupported",
-            "this runtime does not serve the unified default model source over the remote protocol yet",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::GetAgentModelSourceDefault(
+                vibex_core::RemoteAgentModelSourceDefaultRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentModelSourceDefaultResponse>(value)?.default_source)
+        })
     }
 
     fn set_agent_model_source_default(
         &self,
-        _request: MutationRequest<vibex_core::SetAgentModelSourceDefaultRequest>,
+        request: MutationRequest<vibex_core::SetAgentModelSourceDefaultRequest>,
     ) -> BackendFuture<'_, vibex_core::AgentModelSourceDefault> {
-        self.unsupported(
-            "agent_model_source_remote_unsupported",
-            "this runtime does not serve the unified default model source over the remote protocol yet",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::SetAgentModelSourceDefault(
+                vibex_core::RemoteSetAgentModelSourceDefaultRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentModelSourceDefaultResponse>(value)?.default_source)
+        })
     }
 
     fn clear_agent_model_source_default(
         &self,
-        _request: MutationRequest<vibex_core::ClearAgentModelSourceDefaultRequest>,
+        request: MutationRequest<vibex_core::ClearAgentModelSourceDefaultRequest>,
     ) -> BackendFuture<'_, bool> {
-        self.unsupported(
-            "agent_model_source_remote_unsupported",
-            "this runtime does not serve the unified default model source over the remote protocol yet",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::ClearAgentModelSourceDefault(
+                vibex_core::RemoteClearAgentModelSourceDefaultRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteClearAgentModelSourceDefaultResponse>(value)?.cleared)
+        })
     }
 
     fn create_model_provider_profile(
@@ -4995,6 +5044,40 @@ impl ManagementBackend for WebRemoteBackend {
                     .response,
             )
         })
+    }
+
+    fn model_catalog_status(&self) -> BackendFuture<'_, vibex_core::ModelCatalogStatus> {
+        self.unsupported(
+            "model_catalog_status_remote_unsupported",
+            "this runtime does not serve the models.dev catalogue status over the remote protocol yet",
+        )
+    }
+
+    fn refresh_model_catalog(&self) -> BackendFuture<'_, vibex_core::ModelCatalogStatus> {
+        self.unsupported(
+            "model_catalog_refresh_remote_unsupported",
+            "this runtime does not refresh the models.dev catalogue over the remote protocol yet",
+        )
+    }
+
+    fn fetch_model_provider_profile_models(
+        &self,
+        _request: vibex_core::ModelProviderFetchModelsRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderFetchModelsResponse> {
+        self.unsupported(
+            "model_provider_profile_test_remote_unsupported",
+            "this runtime does not serve shared Provider model discovery over the remote protocol yet",
+        )
+    }
+
+    fn test_model_provider_profile(
+        &self,
+        _request: vibex_core::ModelProviderTestRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderTestResult> {
+        self.unsupported(
+            "model_provider_profile_test_remote_unsupported",
+            "this runtime does not serve shared Provider tests over the remote protocol yet",
+        )
     }
 
     fn fetch_agent_model_provider_draft_models(

@@ -3080,3 +3080,21 @@ mod tests {
         assert!(super::ProviderModelReasoningEfforts::parse("off, high").is_ok());
     }
 }
+
+/// Whether the advisory models.dev catalogue is fresh, stale, or absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCatalogAvailability {
+    Fresh,
+    Stale,
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogStatus {
+    pub availability: ModelCatalogAvailability,
+    /// When the cached document was fetched, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at_ms: Option<i64>,
+}

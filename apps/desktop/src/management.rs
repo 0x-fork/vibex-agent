@@ -584,6 +584,8 @@ struct ManagementSnapshot {
     agent_model_route_bindings: Vec<vibex_core::AgentModelRouteBinding>,
     /// Explicit unified default-source rows, before legacy fallback.
     agent_model_source_defaults: Vec<vibex_core::AgentModelSourceDefault>,
+    /// The advisory models.dev catalogue's freshness.
+    catalog_status: Option<vibex_core::ModelCatalogStatus>,
     model_provider_agent_ids: BTreeSet<String>,
     acp_configs: Vec<(String, vibex_core::AcpProviderConfig)>,
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
@@ -997,6 +999,10 @@ pub struct ManagementCenter {
     /// The global Providers list filter. Matches name, address, model and Key
     /// name, the four things a user remembers about a Provider.
     provider_search: Entity<InputState>,
+    /// The advisory models.dev catalogue's freshness, for the Providers page.
+    catalog_status: Option<vibex_core::ModelCatalogStatus>,
+    /// The global Providers list status filter.
+    provider_list_filter: ProviderListFilter,
     /// Which half of the Providers page the left column is showing.
     ///
     /// Providers and route groups are two kinds of record the same page owns,
@@ -2306,6 +2312,8 @@ impl ManagementCenter {
             model_capability_suggestion: None,
             selected_global_provider_id: None,
             provider_search,
+            catalog_status: None,
+            provider_list_filter: ProviderListFilter::All,
             providers_sidebar_tab: ProviderSidebarTab::Providers,
             selected_global_route_id: None,
             profile_editor_open: false,
@@ -4809,6 +4817,7 @@ impl ManagementCenter {
         self.model_routes = snapshot.model_routes;
         self.agent_model_route_bindings = snapshot.agent_model_route_bindings;
         self.agent_model_source_defaults = snapshot.agent_model_source_defaults;
+        self.catalog_status = snapshot.catalog_status;
         self.provider_profiles = snapshot.provider_profiles;
         self.provider_display_order = snapshot.provider_display_order;
         self.provider_display_order_drag_state = None;
@@ -11875,6 +11884,24 @@ impl ManagementCenter {
                             .contains(&provider_query)
                     })
             })
+            .filter(|row| match self.provider_list_filter {
+                ProviderListFilter::All => true,
+                ProviderListFilter::Enabled => {
+                    row.profile.status == vibex_core::ModelProviderProfileStatus::Enabled
+                }
+                ProviderListFilter::Disabled => {
+                    row.profile.status == vibex_core::ModelProviderProfileStatus::Disabled
+                }
+                ProviderListFilter::NeedsKey => row.profile.credentials.is_empty(),
+                ProviderListFilter::Warning => {
+                    row.profile.credentials.is_empty()
+                        || !row
+                            .profile
+                            .configured_models
+                            .iter()
+                            .any(|model| model.enabled)
+                }
+            })
             .collect::<Vec<_>>();
         let selected = self.selected_global_provider_id.clone();
         let locale = locale::current_locale();
@@ -12288,6 +12315,10 @@ impl ManagementCenter {
 
         let provider_search_row = (active_tab == ProviderSidebarTab::Providers)
             .then(|| management_search_input(&self.provider_search, cx));
+        let catalog_row = (active_tab == ProviderSidebarTab::Providers)
+            .then(|| self.render_catalog_status_row(cx));
+        let provider_filter_row = (active_tab == ProviderSidebarTab::Providers)
+            .then(|| self.render_provider_filter_row(cx));
         let (section_title, actions, section_body) = match active_tab {
             ProviderSidebarTab::Providers => (
                 management_locale_text("Providers", "供应商", "供應商"),
@@ -12364,6 +12395,8 @@ impl ManagementCenter {
                         cx,
                     ))
                     .children(provider_search_row)
+                    .children(provider_filter_row)
+                    .children(catalog_row)
                     .child(
                         div()
                             .min_h_0()
@@ -13196,6 +13229,277 @@ impl ManagementCenter {
         }));
     }
 
+    fn render_provider_filter_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = h_flex().w_full().flex_wrap().gap_1();
+        for filter in ProviderListFilter::ALL {
+            let selected = filter == self.provider_list_filter;
+            row = row.child(
+                Button::new(SharedString::from(format!(
+                    "management-provider-filter-{:?}",
+                    filter
+                )))
+                .xsmall()
+                .when(selected, |button| button.primary())
+                .when(!selected, |button| button.ghost())
+                .label(filter.label())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.provider_list_filter = filter;
+                    cx.notify();
+                })),
+            );
+        }
+        row.into_any_element()
+    }
+
+    fn render_catalog_status_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let status = self.catalog_status.clone();
+        let (label, color) = match &status {
+            Some(status) => {
+                let freshness = match status.availability {
+                    vibex_core::ModelCatalogAvailability::Fresh => {
+                        management_locale_text("Fresh", "已更新", "已更新")
+                    }
+                    vibex_core::ModelCatalogAvailability::Stale => {
+                        management_locale_text("Stale", "已过期", "已過期")
+                    }
+                    vibex_core::ModelCatalogAvailability::Missing => {
+                        management_locale_text("Missing", "不可用", "不可用")
+                    }
+                };
+                let age = status
+                    .fetched_at_ms
+                    .map(management_catalog_age_label)
+                    .unwrap_or_else(|| management_locale_text("never", "从未", "從未").to_string());
+                (
+                    format!("models.dev · {freshness} · {age}"),
+                    if status.availability == vibex_core::ModelCatalogAvailability::Fresh {
+                        cx.theme().muted_foreground
+                    } else {
+                        cx.theme().warning
+                    },
+                )
+            }
+            None => (
+                management_locale_text(
+                    "models.dev · unavailable",
+                    "models.dev · 不可用",
+                    "models.dev · 不可用",
+                )
+                .to_string(),
+                cx.theme().muted_foreground,
+            ),
+        };
+        h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px_1()
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(color)
+                    .child(label),
+            )
+            .child(
+                Button::new("management-provider-catalog-refresh")
+                    .xsmall()
+                    .ghost()
+                    .label(management_locale_text("Refresh", "刷新", "重新整理"))
+                    .disabled(self.mutation.is_some())
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_catalog(cx))),
+            )
+            .into_any_element()
+    }
+
+    fn refresh_catalog(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::ProviderProbe(
+            "models-catalog-refresh".to_string(),
+        ));
+        self.error = None;
+        self.notice = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend.management().refresh_model_catalog().await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(status) => {
+                        this.catalog_status = Some(status);
+                        this.notice = Some(
+                            management_locale_text(
+                                "models.dev catalogue refreshed",
+                                "models.dev 目录已刷新",
+                                "models.dev 目錄已重新整理",
+                            )
+                            .to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn test_shared_provider(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::ProviderProbe(format!(
+            "shared-test:{}",
+            profile_id.as_str()
+        )));
+        self.error = None;
+        self.notice = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .test_model_provider_profile(vibex_core::ModelProviderTestRequest {
+                    model_provider_profile_id: profile_id,
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(result) => {
+                        let latency = result
+                            .diagnostics
+                            .iter()
+                            .find(|diagnostic| diagnostic.key == "latencyMs")
+                            .map(|diagnostic| format!(" · {} ms", diagnostic.value))
+                            .unwrap_or_default();
+                        if result.status == vibex_core::AgentModelProviderTestStatus::Pass {
+                            this.notice = Some(format!("{}{latency}", result.message));
+                        } else {
+                            this.error = Some(format!("{}: {}", result.code, result.message));
+                        }
+                    }
+                    Err(error) => this.error = Some(format!("{}: {}", error.code, error.message)),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn refresh_shared_provider_models(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::ProviderProbe(format!(
+            "shared-models:{}",
+            profile_id.as_str()
+        )));
+        self.error = None;
+        self.notice = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .fetch_model_provider_profile_models(vibex_core::ModelProviderFetchModelsRequest {
+                    model_provider_profile_id: profile_id,
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(response) => {
+                        let Some(mut profile) = this
+                            .providers
+                            .iter()
+                            .find(|profile| profile.id == response.model_provider_profile_id)
+                            .cloned()
+                        else {
+                            this.error = Some(
+                                management_locale_text(
+                                    "The Provider is no longer listed",
+                                    "该供应商已不在列表中",
+                                    "該供應商已不在清單中",
+                                )
+                                .to_string(),
+                            );
+                            cx.notify();
+                            return;
+                        };
+                        if response.models.is_empty() {
+                            this.error = Some(
+                                management_locale_text(
+                                    "The endpoint returned no models",
+                                    "接口没有返回模型",
+                                    "介面沒有回傳模型",
+                                )
+                                .to_string(),
+                            );
+                            cx.notify();
+                            return;
+                        }
+                        profile.configured_models = response.models;
+                        if profile.default_model_id.as_ref().is_none_or(|default| {
+                            !profile
+                                .configured_models
+                                .iter()
+                                .any(|model| model.enabled && &model.id == default)
+                        }) {
+                            profile.default_model_id = profile
+                                .configured_models
+                                .iter()
+                                .find(|model| model.enabled)
+                                .map(|model| model.id.clone());
+                        }
+                        this.notice = Some(format!(
+                            "{} · {}",
+                            management_locale_text(
+                                "Model list refreshed",
+                                "模型列表已刷新",
+                                "模型清單已重新整理",
+                            ),
+                            profile.configured_models.len()
+                        ));
+                        this.update_shared_provider(
+                            profile,
+                            management_locale_text(
+                                "Model list refreshed",
+                                "模型列表已刷新",
+                                "模型清單已重新整理",
+                            ),
+                            cx,
+                        );
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
     fn open_shared_provider_editor(
         &mut self,
         profile: &vibex_core::ModelProviderProfile,
@@ -13726,6 +14030,34 @@ impl ManagementCenter {
                             let profile = profile.clone();
                             move |this, _, window, cx| {
                                 this.open_shared_provider_name_editor(&profile, window, cx)
+                            }
+                        })),
+                )
+                .child(
+                    Button::new("management-shared-provider-test")
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text("Test", "测试", "測試"))
+                        .disabled(pending)
+                        .on_click(cx.listener({
+                            let profile_id = profile.id.clone();
+                            move |this, _, _, cx| this.test_shared_provider(profile_id.clone(), cx)
+                        })),
+                )
+                .child(
+                    Button::new("management-shared-provider-refresh-models")
+                        .xsmall()
+                        .ghost()
+                        .label(management_locale_text(
+                            "Refresh models",
+                            "刷新模型",
+                            "重新整理模型",
+                        ))
+                        .disabled(pending)
+                        .on_click(cx.listener({
+                            let profile_id = profile.id.clone();
+                            move |this, _, _, cx| {
+                                this.refresh_shared_provider_models(profile_id.clone(), cx)
                             }
                         })),
                 )
@@ -30356,6 +30688,35 @@ enum ProviderSidebarTab {
     RouteGroups,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderListFilter {
+    All,
+    Enabled,
+    Disabled,
+    NeedsKey,
+    Warning,
+}
+
+impl ProviderListFilter {
+    const ALL: [Self; 5] = [
+        Self::All,
+        Self::Enabled,
+        Self::Disabled,
+        Self::NeedsKey,
+        Self::Warning,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => management_locale_text("All", "全部", "全部"),
+            Self::Enabled => management_locale_text("Enabled", "已启用", "已啟用"),
+            Self::Disabled => management_locale_text("Disabled", "已停用", "已停用"),
+            Self::NeedsKey => management_locale_text("Needs key", "缺 Key", "缺 Key"),
+            Self::Warning => management_locale_text("Needs attention", "需关注", "需關注"),
+        }
+    }
+}
+
 impl ProviderSidebarTab {
     const ALL: [Self; 2] = [Self::Providers, Self::RouteGroups];
 
@@ -33639,13 +34000,47 @@ fn management_route_group_users_label(count: usize) -> String {
 }
 
 /// How a route picks among its members, in the reader's terms.
-fn route_group_effort_label(value: &str) -> String {
-    let value = value.trim();
-    if value.is_empty() {
-        return management_locale_text("Inherit effort", "继承推理档位", "繼承推理檔位")
-            .to_string();
+fn management_catalog_age_label(fetched_at_ms: i64) -> String {
+    let age = vibex_core::unix_timestamp_ms().saturating_sub(fetched_at_ms);
+    let minutes = age / 60_000;
+    if minutes < 1 {
+        management_locale_text("just now", "刚刚", "剛剛").to_string()
+    } else if minutes < 60 {
+        match locale::current_locale() {
+            ResolvedLocale::En => format!("{minutes}m ago"),
+            ResolvedLocale::ZhCn => format!("{minutes} 分钟前"),
+            ResolvedLocale::ZhTw => format!("{minutes} 分鐘前"),
+        }
+    } else if minutes < 24 * 60 {
+        let hours = minutes / 60;
+        match locale::current_locale() {
+            ResolvedLocale::En => format!("{hours}h ago"),
+            ResolvedLocale::ZhCn => format!("{hours} 小时前"),
+            ResolvedLocale::ZhTw => format!("{hours} 小時前"),
+        }
+    } else {
+        let days = minutes / (24 * 60);
+        match locale::current_locale() {
+            ResolvedLocale::En => format!("{days}d ago"),
+            ResolvedLocale::ZhCn => format!("{days} 天前"),
+            ResolvedLocale::ZhTw => format!("{days} 天前"),
+        }
     }
-    value.to_string()
+}
+
+fn route_group_effort_label(value: &str) -> String {
+    match value.trim() {
+        "" => management_locale_text("Inherit effort", "继承推理档位", "繼承推理檔位"),
+        "off" => management_locale_text("Off", "关闭", "關閉"),
+        "minimal" => management_locale_text("Minimal", "最低", "最低"),
+        "low" => management_locale_text("Low", "低", "低"),
+        "medium" => management_locale_text("Medium", "中", "中"),
+        "high" => management_locale_text("High", "高", "高"),
+        "xhigh" => management_locale_text("Extra high", "极高", "極高"),
+        "max" => management_locale_text("Max", "最高", "最高"),
+        other => other,
+    }
+    .to_string()
 }
 
 fn management_route_strategy_label(strategy: vibex_core::RouteStrategy) -> String {
@@ -34607,6 +35002,7 @@ async fn load_snapshot(
         })
         .await
         .map_err(crate::app::remote_error_into_vibex)?;
+    let catalog_status = backend.management().model_catalog_status().await.ok();
 
     let agents = bundle.agents;
     let mut catalog = bundle.catalog;
@@ -34721,6 +35117,7 @@ async fn load_snapshot(
         model_routes,
         agent_model_route_bindings,
         agent_model_source_defaults: bundle.agent_model_source_defaults,
+        catalog_status,
     })
 }
 

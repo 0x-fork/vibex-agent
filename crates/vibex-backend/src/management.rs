@@ -212,6 +212,12 @@ pub trait ManagementBackend: BackendBound {
         request: MutationRequest<vibex_core::ClearAgentModelSourceDefaultRequest>,
     ) -> BackendFuture<'_, bool>;
 
+    /// Reports the advisory models.dev catalogue's freshness.
+    fn model_catalog_status(&self) -> BackendFuture<'_, vibex_core::ModelCatalogStatus>;
+
+    /// Refreshes the advisory models.dev catalogue, returning its new status.
+    fn refresh_model_catalog(&self) -> BackendFuture<'_, vibex_core::ModelCatalogStatus>;
+
     /// The catalogue's suggestion for one model, when a catalogue is cached.
     ///
     /// This never blocks on the network: a missing or stale catalogue answers
@@ -443,6 +449,18 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: AgentModelProviderProfileFetchModelsRequest,
     ) -> BackendFuture<'_, AgentModelProviderProfileFetchModelsResponse>;
+
+    /// Fetches the model catalogue a saved shared Provider exposes.
+    fn fetch_model_provider_profile_models(
+        &self,
+        request: vibex_core::ModelProviderFetchModelsRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderFetchModelsResponse>;
+
+    /// Probes a saved shared Provider's address and credential.
+    fn test_model_provider_profile(
+        &self,
+        request: vibex_core::ModelProviderTestRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderTestResult>;
 
     /// Fetches the model catalogue an endpoint the editor has not saved yet
     /// exposes. The request carries the typed address and key; nothing is

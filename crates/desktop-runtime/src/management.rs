@@ -386,6 +386,20 @@ impl ProviderManagementFacade {
         self.service.delete_agent_model_provider_profile(request)
     }
 
+    pub fn fetch_model_provider_profile_models(
+        &self,
+        request: vibex_core::ModelProviderFetchModelsRequest,
+    ) -> VibexResult<vibex_core::ModelProviderFetchModelsResponse> {
+        self.service.fetch_model_provider_profile_models(request)
+    }
+
+    pub fn test_model_provider_profile(
+        &self,
+        request: vibex_core::ModelProviderTestRequest,
+    ) -> VibexResult<vibex_core::ModelProviderTestResult> {
+        self.service.test_model_provider_profile(request)
+    }
+
     pub fn fetch_agent_model_provider_profile_models(
         &self,
         request: vibex_core::AgentModelProviderProfileFetchModelsRequest,

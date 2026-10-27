@@ -4682,6 +4682,68 @@ async fn dispatch_provider_request(
             serde_json::to_value(vibex_core::RemoteAgentModelProviderDefaultResponse { selection })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::GetAgentModelSourceDefault(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let default_source = service.get_agent_model_source_default(request.request)?;
+            serde_json::to_value(vibex_core::RemoteAgentModelSourceDefaultResponse {
+                default_source,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SetAgentModelSourceDefault(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let agent_id = request.request.agent_id.clone();
+            let result = service.set_agent_model_source_default(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("agent_model_source_default:{agent_id}"),
+                "Agent default model source selected from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let default_source = result?;
+            serde_json::to_value(vibex_core::RemoteAgentModelSourceDefaultResponse {
+                default_source,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ClearAgentModelSourceDefault(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let agent_id = request.request.agent_id.clone();
+            let result = service.clear_agent_model_source_default(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("agent_model_source_default:{agent_id}"),
+                "Agent default model source cleared from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let cleared = result?;
+            serde_json::to_value(vibex_core::RemoteClearAgentModelSourceDefaultResponse { cleared })
+                .map_err(remote_payload_encode_error)
+        }
     }
 }
 

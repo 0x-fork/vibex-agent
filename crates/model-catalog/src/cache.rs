@@ -85,6 +85,39 @@ impl CatalogCache {
         }
     }
 
+    /// Reports the cache's freshness and fetch time without returning the
+    /// document. This is what the Config Center shows beside its refresh
+    /// control; a missing or unreadable cache is `Missing`, not an error.
+    pub fn status(&self, now_ms: i64) -> vibex_core::ModelCatalogStatus {
+        let Ok(encoded) = std::fs::read_to_string(&self.path) else {
+            return vibex_core::ModelCatalogStatus {
+                availability: vibex_core::ModelCatalogAvailability::Missing,
+                fetched_at_ms: None,
+            };
+        };
+        let Ok(envelope) = serde_json::from_str::<Envelope>(&encoded) else {
+            return vibex_core::ModelCatalogStatus {
+                availability: vibex_core::ModelCatalogAvailability::Missing,
+                fetched_at_ms: None,
+            };
+        };
+        if envelope.schema_version != CATALOG_SCHEMA_VERSION {
+            return vibex_core::ModelCatalogStatus {
+                availability: vibex_core::ModelCatalogAvailability::Missing,
+                fetched_at_ms: None,
+            };
+        }
+        let age = now_ms.saturating_sub(envelope.fetched_at_ms);
+        vibex_core::ModelCatalogStatus {
+            availability: if age <= CATALOG_TTL_MS {
+                vibex_core::ModelCatalogAvailability::Fresh
+            } else {
+                vibex_core::ModelCatalogAvailability::Stale
+            },
+            fetched_at_ms: Some(envelope.fetched_at_ms),
+        }
+    }
+
     /// Writes the cache, creating its directory. A failed write is ignored:
     /// a cache that cannot be written is not a reason to fail a refresh.
     pub fn store(&self, catalog: &Catalog, fetched_at_ms: i64) -> std::io::Result<()> {
@@ -180,6 +213,30 @@ mod tests {
         let (directory, cache) = cache();
         assert_eq!(cache.load(1), CatalogState::Missing);
         assert!(cache.suggest("deepseek", "deepseek-chat", 1).is_none());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn status_reports_missing_fresh_and_stale_with_the_fetch_time() {
+        let (directory, cache) = cache();
+        assert_eq!(
+            cache.status(1_000).availability,
+            vibex_core::ModelCatalogAvailability::Missing
+        );
+        let catalog = parse_catalog(document()).unwrap();
+        cache.store(&catalog, 1_000).unwrap();
+        let fresh = cache.status(1_000 + CATALOG_TTL_MS);
+        assert_eq!(
+            fresh.availability,
+            vibex_core::ModelCatalogAvailability::Fresh
+        );
+        assert_eq!(fresh.fetched_at_ms, Some(1_000));
+        let stale = cache.status(1_000 + CATALOG_TTL_MS + 1);
+        assert_eq!(
+            stale.availability,
+            vibex_core::ModelCatalogAvailability::Stale
+        );
+        assert_eq!(stale.fetched_at_ms, Some(1_000));
         let _ = std::fs::remove_dir_all(directory);
     }
 

@@ -2556,6 +2556,37 @@ impl ManagementHandle {
         Arc::clone(&self.model_catalog)
     }
 
+    pub fn model_catalog_status(&self) -> vibex_core::ModelCatalogStatus {
+        self.model_catalog.status(vibex_core::unix_timestamp_ms())
+    }
+
+    /// Refreshes the advisory catalogue with the same timeout the bootstrap
+    /// refresh uses. A failure is reported to the caller that asked; the
+    /// editor's suggestions stay on the previous document.
+    pub async fn refresh_model_catalog(&self) -> VibexResult<vibex_core::ModelCatalogStatus> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|error| {
+                VibexError::capability(
+                    "model_catalog_client_failed",
+                    "failed to build the catalogue request",
+                )
+                .with_diagnostic("error", error.to_string())
+            })?;
+        self.model_catalog
+            .refresh(&client, vibex_core::unix_timestamp_ms())
+            .await
+            .map_err(|error| {
+                VibexError::capability(
+                    "model_catalog_refresh_failed",
+                    format!("the model catalogue could not be refreshed: {error}"),
+                )
+            })?;
+        Ok(self.model_catalog_status())
+    }
+
     pub fn diagnostics_destination(&self) -> PathBuf {
         self.home_dir.join("diagnostics.json")
     }
@@ -4385,6 +4416,37 @@ impl DesktopRuntime {
     /// answers "no suggestion" for every reason it cannot help.
     pub fn model_catalog(&self) -> Arc<CatalogCache> {
         Arc::clone(&self.model_catalog)
+    }
+
+    pub fn model_catalog_status(&self) -> vibex_core::ModelCatalogStatus {
+        self.model_catalog.status(vibex_core::unix_timestamp_ms())
+    }
+
+    /// Refreshes the advisory catalogue with the same timeout the bootstrap
+    /// refresh uses. A failure is reported to the caller that asked; the
+    /// editor's suggestions stay on the previous document.
+    pub async fn refresh_model_catalog(&self) -> VibexResult<vibex_core::ModelCatalogStatus> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|error| {
+                VibexError::capability(
+                    "model_catalog_client_failed",
+                    "failed to build the catalogue request",
+                )
+                .with_diagnostic("error", error.to_string())
+            })?;
+        self.model_catalog
+            .refresh(&client, vibex_core::unix_timestamp_ms())
+            .await
+            .map_err(|error| {
+                VibexError::capability(
+                    "model_catalog_refresh_failed",
+                    format!("the model catalogue could not be refreshed: {error}"),
+                )
+            })?;
+        Ok(self.model_catalog_status())
     }
 
     pub fn usage(&self) -> AgentUsageService {

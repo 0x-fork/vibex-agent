@@ -953,6 +953,105 @@ impl ProviderConfigService {
         })
     }
 
+    /// Fetches the model list a saved shared Provider's endpoint serves.
+    ///
+    /// The v2 record owns the address and the credential reference. A transient
+    /// v1 Profile is built only to reuse the existing protocol-specific fetch
+    /// path; it is never persisted.
+    pub fn fetch_model_provider_profile_models(
+        &self,
+        request: vibex_core::ModelProviderFetchModelsRequest,
+    ) -> VibexResult<vibex_core::ModelProviderFetchModelsResponse> {
+        let conn = self.open_connection()?;
+        let profile = vibex_db::ModelProviderProfileRepository::get(
+            &conn,
+            &request.model_provider_profile_id,
+        )?
+        .ok_or_else(|| {
+            VibexError::validation(
+                "model_provider_profile_not_found",
+                "the shared Provider was not found",
+            )
+            .with_diagnostic(
+                "modelProviderProfileId",
+                request.model_provider_profile_id.as_str(),
+            )
+        })?;
+        let probe = shared_provider_probe_profile(&profile)?;
+        let secret = shared_provider_api_key(&profile)?;
+        let (models, mut diagnostics) =
+            fetch_provider_models_with_secret(&probe, secret.as_deref())?;
+        let existing = profile
+            .configured_models
+            .iter()
+            .map(|model| (model.id.clone(), model.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let models = models
+            .into_iter()
+            .map(|id| {
+                existing
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or(vibex_core::ModelProviderCatalogEntry {
+                        id,
+                        display_name: None,
+                        enabled: true,
+                        metadata: Vec::new(),
+                        capabilities: Default::default(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        diagnostics.push(vibex_core::ProviderBindingMetadata {
+            key: "modelCount".to_string(),
+            value: models.len().to_string(),
+        });
+        Ok(vibex_core::ModelProviderFetchModelsResponse {
+            model_provider_profile_id: profile.id,
+            models,
+            diagnostics,
+        })
+    }
+
+    /// Probes a shared Provider's saved address and credential.
+    ///
+    /// The probe is a model-list request. It proves the endpoint, the protocol,
+    /// and the Secret without sending a prompt or spending completion tokens.
+    pub fn test_model_provider_profile(
+        &self,
+        request: vibex_core::ModelProviderTestRequest,
+    ) -> VibexResult<vibex_core::ModelProviderTestResult> {
+        let checked_at_ms = unix_timestamp_ms();
+        match self.fetch_model_provider_profile_models(
+            vibex_core::ModelProviderFetchModelsRequest {
+                model_provider_profile_id: request.model_provider_profile_id.clone(),
+            },
+        ) {
+            Ok(response) => Ok(vibex_core::ModelProviderTestResult {
+                model_provider_profile_id: response.model_provider_profile_id,
+                status: AgentModelProviderTestStatus::Pass,
+                code: "model_provider_profile_test_passed".to_string(),
+                message: "Model list request succeeded".to_string(),
+                diagnostics: response.diagnostics,
+                checked_at_ms,
+            }),
+            Err(error) => Ok(vibex_core::ModelProviderTestResult {
+                model_provider_profile_id: request.model_provider_profile_id,
+                status: AgentModelProviderTestStatus::Fail,
+                code: error.code.clone(),
+                message: error.message.clone(),
+                diagnostics: error
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| vibex_core::ProviderBindingMetadata {
+                        key: diagnostic.key.clone(),
+                        value: diagnostic.value.clone(),
+                    })
+                    .collect(),
+                checked_at_ms,
+            }),
+        }
+    }
+
     pub fn test_agent_model_provider_profile(
         &self,
         request: AgentModelProviderProfileTestRequest,
@@ -6586,6 +6685,86 @@ fn fetch_provider_profile_models(
 /// Agent (for the default wire protocol), the typed address and options, and the
 /// Models the draft already configures, because those can pin the protocol
 /// themselves. The credential travels beside this value instead of inside it.
+fn shared_provider_api_key(
+    profile: &vibex_core::ModelProviderProfile,
+) -> VibexResult<Option<String>> {
+    for credential in &profile.credentials {
+        let Some(reference) = credential.credential.secret_reference() else {
+            continue;
+        };
+        if let Some(secret) = crate::secrets::resolve_provider_secret_reference(
+            reference.backend,
+            reference.setup_state,
+            &reference.lookup_key,
+        )? {
+            return Ok(Some(secret));
+        }
+    }
+    Ok(None)
+}
+
+/// Builds the transient v1 Profile a shared Provider's fetch/test reuses.
+fn shared_provider_probe_profile(
+    profile: &vibex_core::ModelProviderProfile,
+) -> VibexResult<ProviderProfile> {
+    let mut probe = ProviderProfile::local_default(ProviderKind::Acp);
+    probe.id = ProviderProfileId::new();
+    probe.agent_id = AgentId::parse("provider_probe").map_err(|_| {
+        VibexError::validation(
+            "model_provider_probe_agent_invalid",
+            "the internal probe Agent id is invalid",
+        )
+    })?;
+    probe.display_name = profile.display_name.clone();
+    probe.status = ProviderProfileStatus::Enabled;
+    probe.base_url = profile
+        .primary_api_endpoint()
+        .map(|endpoint| endpoint.url.clone());
+    probe.default_model = profile.default_model_id.clone();
+    probe.configured_models = profile
+        .configured_models
+        .iter()
+        .map(|model| {
+            let wire_api = model
+                .metadata
+                .iter()
+                .find(|entry| entry.key == "wireApi")
+                .and_then(|entry| {
+                    vibex_core::ProviderModelWireApi::from_wire_protocol_id(&entry.value)
+                });
+            ProviderConfiguredModel {
+                id: model.id.clone(),
+                display_name: model.display_name.clone(),
+                enabled: model.enabled,
+                wire_api,
+                capabilities: model.capabilities.clone(),
+            }
+        })
+        .collect();
+    let mut options = ProviderOptions::empty();
+    for endpoint in &profile.endpoints {
+        if let Some(wire_protocol_id) = endpoint.wire_protocol_id.as_deref()
+            && let Some(wire_api) =
+                vibex_core::ProviderModelWireApi::from_wire_protocol_id(wire_protocol_id)
+        {
+            options.entries.push(vibex_core::ProviderBindingMetadata {
+                key: wire_api.protocol_base_url_option_key(),
+                value: endpoint.url.clone(),
+            });
+        }
+    }
+    if options.entries.is_empty()
+        && let Some(endpoint) = profile.primary_api_endpoint()
+    {
+        options.entries.push(vibex_core::ProviderBindingMetadata {
+            key: "apiRequestUrl".to_string(),
+            value: endpoint.url.clone(),
+        });
+    }
+    probe.provider_options = options;
+    Ok(probe)
+}
+
 fn draft_provider_profile(request: &AgentModelProviderDraftFetchModelsRequest) -> ProviderProfile {
     let mut profile = ProviderProfile::local_default(ProviderKind::Acp);
     profile.id = ProviderProfileId::new();

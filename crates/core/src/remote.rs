@@ -2309,6 +2309,9 @@ pub enum RemoteProviderOperationKind {
     UpdateAgentModelProviderBinding,
     MutateProviderCredentialSecret,
     SetAgentModelProviderDefault,
+    GetAgentModelSourceDefault,
+    SetAgentModelSourceDefault,
+    ClearAgentModelSourceDefault,
     DeleteAgentModelProviderProfile,
     BindAgentModelProvider,
     CreateAgentModelProviderProfile,
@@ -3774,6 +3777,39 @@ pub struct RemoteAgentModelProviderDefaultResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelSourceDefaultRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentModelSourceDefaultRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSetAgentModelSourceDefaultRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::SetAgentModelSourceDefaultRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteClearAgentModelSourceDefaultRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::ClearAgentModelSourceDefaultRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelSourceDefaultResponse {
+    pub default_source: crate::AgentModelSourceDefault,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteClearAgentModelSourceDefaultResponse {
+    pub cleared: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum RemoteProviderRequest {
     ListAgentSummaries(RemoteAgentConfigSummaryListRequest),
@@ -3812,6 +3848,9 @@ pub enum RemoteProviderRequest {
     UpdateAgentModelProviderBinding(RemoteAgentModelProviderBindingUpdateRequest),
     MutateProviderCredentialSecret(RemoteProviderCredentialSecretMutationRequest),
     SetAgentModelProviderDefault(RemoteAgentModelProviderDefaultRequest),
+    GetAgentModelSourceDefault(RemoteAgentModelSourceDefaultRequest),
+    SetAgentModelSourceDefault(RemoteSetAgentModelSourceDefaultRequest),
+    ClearAgentModelSourceDefault(RemoteClearAgentModelSourceDefaultRequest),
     DeleteAgentModelProviderProfile(RemoteAgentModelProviderProfileDeleteRequest),
     BindAgentModelProvider(RemoteAgentModelProviderBindRequest),
     CreateAgentModelProviderProfile(RemoteAgentModelProviderProfileCreateRequest),
@@ -3902,6 +3941,8 @@ impl RemoteProviderRequest {
                 | Self::UpdateAgentModelProviderBinding(_)
                 | Self::MutateProviderCredentialSecret(_)
                 | Self::SetAgentModelProviderDefault(_)
+                | Self::SetAgentModelSourceDefault(_)
+                | Self::ClearAgentModelSourceDefault(_)
                 | Self::RefreshDetectedAgentVersions(_)
                 | Self::UpdateAcpProfileConfig(_)
                 | Self::CreateProfileFromImport(_)
@@ -3990,6 +4031,15 @@ impl RemoteProviderRequest {
             }
             Self::SetAgentModelProviderDefault(_) => {
                 RemoteProviderOperationKind::SetAgentModelProviderDefault
+            }
+            Self::GetAgentModelSourceDefault(_) => {
+                RemoteProviderOperationKind::GetAgentModelSourceDefault
+            }
+            Self::SetAgentModelSourceDefault(_) => {
+                RemoteProviderOperationKind::SetAgentModelSourceDefault
+            }
+            Self::ClearAgentModelSourceDefault(_) => {
+                RemoteProviderOperationKind::ClearAgentModelSourceDefault
             }
             Self::DeleteAgentModelProviderProfile(_) => {
                 RemoteProviderOperationKind::DeleteAgentModelProviderProfile

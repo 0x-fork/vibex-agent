@@ -6205,3 +6205,44 @@ the empty value. The table keeps the column out of the launch contract.
 - `vibex-core`: serde defaults and no money field.
 - `vibex-desktop`: shared editor writes the metadata through the v2 update; a
   Provider marked only-through-groups is absent from the direct picker.
+
+## Scenario: Shared Provider Discovery and Catalogue Status
+
+### 1. Scope / Trigger
+
+- Trigger: a shared Provider's detail page runs `Test` or `Refresh models`.
+- Trigger: the Providers page shows or refreshes the advisory models.dev catalogue.
+
+### 2. Signatures
+
+```rust
+ModelProviderFetchModelsRequest { model_provider_profile_id }
+ModelProviderFetchModelsResponse { model_provider_profile_id, models, diagnostics }
+ModelProviderTestRequest { model_provider_profile_id }
+ModelProviderTestResult { model_provider_profile_id, status, code, message, diagnostics, checked_at_ms }
+
+ModelCatalogStatus { availability: Fresh|Stale|Missing, fetched_at_ms? }
+```
+
+### 3. Contracts
+
+- Shared discovery resolves the first API-credential Secret from the v2
+  credential references and builds a transient v1 Profile only to reuse the
+  protocol-specific fetch path. The transient Profile is never persisted.
+- A shared test is a model-list probe: it proves the endpoint, protocol, and
+  Secret without sending a prompt or spending completion tokens.
+- Existing configured Models are carried over by id when a refresh returns
+  them, so capabilities and provenance survive.
+- The catalogue status is advisory: `Missing` and `Stale` are normal states and
+  never block Provider editing. A manual refresh failure leaves the previous
+  document in place and reports the failure to the caller.
+- The catalogue never carries a price, cost, currency, or quota field.
+
+### 4. Tests Required
+
+- `vibex-model-catalog`: status reports missing/fresh/stale and its fetch time.
+- `vibex-config-switch`: shared discovery maps credentials/endpoints and carries
+  existing model metadata; a missing Secret reports the normal missing-secret
+  error.
+- `vibex-desktop`: shared detail exposes Test and Refresh models; the Providers
+  page shows catalogue freshness and a refresh control.
