@@ -13595,6 +13595,27 @@ impl ManagementCenter {
         }));
     }
 
+    fn open_shared_provider_editor_by_id(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        self.navigation.active = ManagementSection::Providers;
+        self.providers_sidebar_tab = ProviderSidebarTab::Providers;
+        self.selected_global_provider_id = Some(profile_id.as_str().to_string());
+        self.selected_global_route_id = None;
+        self.open_shared_provider_editor(&profile, window, cx);
+    }
+
     fn open_shared_provider_editor(
         &mut self,
         profile: &vibex_core::ModelProviderProfile,
@@ -25154,6 +25175,16 @@ impl ManagementCenter {
             let default_agent = agent_id.clone();
             let delete_id = id.clone();
             let delete_label = profile.display_name.clone();
+            let shared_provider_id = self
+                .provider_bindings
+                .iter()
+                .find(|binding| {
+                    binding
+                        .legacy_provider_profile_id
+                        .as_ref()
+                        .is_some_and(|legacy| legacy.as_str() == profile.id)
+                })
+                .and_then(|binding| binding.model_provider_profile_id.clone());
             let profile_state = self
                 .agent_profile_states
                 .iter()
@@ -25259,6 +25290,34 @@ impl ManagementCenter {
                             )
                         })),
                     management_set_default_label(),
+                ));
+            }
+            if let Some(shared_provider_id) = shared_provider_id.clone() {
+                actions = actions.child(button_with_aria_label(
+                    Button::new(SharedString::from(format!("provider-shared-edit-{id}")))
+                        .with_size(Size::Medium)
+                        .secondary()
+                        .compact()
+                        .size(px(MANAGEMENT_PROVIDER_ROW_ACTION_SIZE))
+                        .icon(Icon::default().path("icons/vibex/database.svg"))
+                        .disabled(pending)
+                        .tooltip(management_locale_text(
+                            "Edit shared Provider",
+                            "编辑共享供应商",
+                            "編輯共用供應商",
+                        ))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_shared_provider_editor_by_id(
+                                shared_provider_id.clone(),
+                                window,
+                                cx,
+                            )
+                        })),
+                    management_locale_text(
+                        "Edit shared Provider",
+                        "编辑共享供应商",
+                        "編輯共用供應商",
+                    ),
                 ));
             }
             actions = actions
@@ -40101,6 +40160,8 @@ mod gateway_surface_tests {
         assert!(save.contains("metadata.catalog_id"));
         assert!(save.contains("metadata.only_through_route_groups"));
         assert!(save.contains("profile.headers = headers"));
+        assert!(source.contains("provider-shared-edit-"));
+        assert!(source.contains("open_shared_provider_editor_by_id"));
     }
 
     #[test]
