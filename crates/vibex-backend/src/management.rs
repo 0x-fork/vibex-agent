@@ -227,6 +227,17 @@ pub trait ManagementBackend: BackendBound {
         request: ModelCapabilitySuggestionRequest,
     ) -> BackendFuture<'_, Option<GatewayCapabilitySuggestion>>;
 
+    /// The catalogue's vendor-independent id for several models at once.
+    ///
+    /// A same-model suggestion compares every configured model across
+    /// Providers, so this answers the whole list in one call and in the
+    /// request's order. A model the catalogue does not know comes back with
+    /// `canonical_model_id: None`.
+    fn model_canonical_ids(
+        &self,
+        request: vibex_core::ModelCanonicalIdsRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::ModelCanonicalId>>;
+
     /// Reads the whole gateway surface: its settings, the listener state, and
     /// the Providers and Keys its enabled route groups name.
     ///

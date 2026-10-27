@@ -2327,6 +2327,7 @@ pub enum RemoteProviderOperationKind {
     FetchAgentModelProviderProfileModels,
     FetchAgentModelProviderDraftModels,
     ModelCapabilitySuggestion,
+    ModelCanonicalIds,
     ModelGatewaySnapshot,
     UpdateModelGatewaySettings,
     AddModelProviderCredential,
@@ -2804,6 +2805,19 @@ pub struct RemoteModelCapabilitySuggestionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteModelCapabilitySuggestionResponse {
     pub suggestion: Option<crate::GatewayCapabilitySuggestion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelCanonicalIdsRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::ModelCanonicalIdsRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelCanonicalIdsResponse {
+    pub models: Vec<crate::ModelCanonicalId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3908,6 +3922,7 @@ pub enum RemoteProviderRequest {
     FetchAgentModelProviderProfileModels(RemoteAgentModelProviderProfileFetchModelsRequest),
     FetchAgentModelProviderDraftModels(RemoteAgentModelProviderDraftFetchModelsRequest),
     ModelCapabilitySuggestion(RemoteModelCapabilitySuggestionRequest),
+    ModelCanonicalIds(RemoteModelCanonicalIdsRequest),
     ModelGatewaySnapshot(RemoteModelGatewaySnapshotRequest),
     UpdateModelGatewaySettings(RemoteModelGatewaySettingsUpdateRequest),
     AddModelProviderCredential(RemoteAddModelProviderCredentialRequest),
@@ -4129,6 +4144,7 @@ impl RemoteProviderRequest {
             Self::ModelCapabilitySuggestion(_) => {
                 RemoteProviderOperationKind::ModelCapabilitySuggestion
             }
+            Self::ModelCanonicalIds(_) => RemoteProviderOperationKind::ModelCanonicalIds,
             Self::ModelGatewaySnapshot(_) => RemoteProviderOperationKind::ModelGatewaySnapshot,
             Self::UpdateModelGatewaySettings(_) => {
                 RemoteProviderOperationKind::UpdateModelGatewaySettings
@@ -5470,8 +5486,8 @@ pub struct RemoteServiceInfo {
 mod tests {
     use super::*;
     use crate::{
-        AgentId, ProviderProfileId, RuntimeSelectionInteraction, RuntimeSwitchId,
-        SessionRuntimeSelection, WorkspaceMode,
+        AgentId, ModelCanonicalIdLookup, ModelCanonicalIdsRequest, ProviderProfileId,
+        RuntimeSelectionInteraction, RuntimeSwitchId, SessionRuntimeSelection, WorkspaceMode,
     };
 
     #[test]
@@ -5594,6 +5610,35 @@ mod tests {
             "auth-token-returned-once"
         );
         assert!(!format!("{request:?}").contains("auth-token-returned-once"));
+    }
+
+    #[test]
+    fn remote_model_canonical_ids_uses_a_stable_tag_and_operation_kind() {
+        let request = RemoteProviderRequest::ModelCanonicalIds(RemoteModelCanonicalIdsRequest {
+            auth: RemoteAuthProof {
+                device_id: DeviceId::new(),
+                auth_token: "canonical-id-token".to_string(),
+            },
+            request: ModelCanonicalIdsRequest {
+                models: vec![ModelCanonicalIdLookup {
+                    provider_id: "deepseek".to_string(),
+                    model_id: "deepseek-chat".to_string(),
+                }],
+            },
+        });
+
+        let json = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(
+            request.operation_kind(),
+            RemoteProviderOperationKind::ModelCanonicalIds
+        );
+        assert_eq!(json["type"], "model_canonical_ids");
+        assert_eq!(
+            json["data"]["request"]["models"][0]["providerId"],
+            "deepseek"
+        );
+        assert!(!format!("{request:?}").contains("canonical-id-token"));
     }
 
     #[test]

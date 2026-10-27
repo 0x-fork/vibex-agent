@@ -893,6 +893,13 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn model_canonical_ids(
+        &self,
+        _request: vibex_core::ModelCanonicalIdsRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::ModelCanonicalId>> {
+        disconnected_future!()
+    }
+
     fn model_gateway_snapshot(&self) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
         disconnected_future!()
     }

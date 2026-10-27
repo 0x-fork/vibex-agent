@@ -1590,6 +1590,33 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
             }))
     }
 
+    async fn model_canonical_ids(
+        &self,
+        request: vibex_core::ModelCanonicalIdsRequest,
+    ) -> VibexResult<Vec<vibex_core::ModelCanonicalId>> {
+        let management = self.management.get().ok_or_else(|| {
+            VibexError::process(
+                "desktop_management_handle_unavailable",
+                "the runtime management handle is not installed yet",
+            )
+        })?;
+        let state = management
+            .model_catalog()
+            .load(vibex_core::unix_timestamp_ms());
+        let catalog = state.catalog();
+        Ok(request
+            .models
+            .into_iter()
+            .map(|lookup| vibex_core::ModelCanonicalId {
+                canonical_model_id: catalog.and_then(|catalog| {
+                    catalog.canonical_model_id(&lookup.provider_id, &lookup.model_id)
+                }),
+                provider_id: lookup.provider_id,
+                model_id: lookup.model_id,
+            })
+            .collect())
+    }
+
     async fn model_gateway_snapshot(&self) -> VibexResult<vibex_core::GatewaySnapshot> {
         let management = self.management.get().ok_or_else(|| {
             VibexError::process(

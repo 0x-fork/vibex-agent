@@ -3038,6 +3038,31 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn model_canonical_ids(
+        &self,
+        request: vibex_core::ModelCanonicalIdsRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::ModelCanonicalId>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let state = runtime
+                .model_catalog()
+                .load(vibex_core::unix_timestamp_ms());
+            let catalog = state.catalog();
+            Ok(request
+                .models
+                .into_iter()
+                .map(|lookup| vibex_core::ModelCanonicalId {
+                    canonical_model_id: catalog.and_then(|catalog| {
+                        catalog.canonical_model_id(&lookup.provider_id, &lookup.model_id)
+                    }),
+                    provider_id: lookup.provider_id,
+                    model_id: lookup.model_id,
+                })
+                .collect())
+        })
+    }
+
     fn model_catalog_status(&self) -> BackendFuture<'_, vibex_core::ModelCatalogStatus> {
         let runtime = self.runtime.clone();
         Box::pin(async move {

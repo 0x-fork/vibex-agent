@@ -6145,6 +6145,12 @@ GatewayRouteDecisionTrace {
   addressable through the group: accepting it would let a caller bypass the
   composition. The id may not contain `/`, because the gateway splits the model
   path on the first slash.
+- **"Same model" is a catalogue identity, not a spelling.** When the builder
+  opens it asks for the canonical id of every enabled model in one batched
+  lookup; the template groups by that id and keeps each Provider's own upstream
+  id as the member. A model the catalogue does not know falls back to its model
+  id, and a catalogue-less install therefore keeps the old same-id suggestion.
+  One member per Provider, because the same Provider twice is not a failover.
 - **A local model alias is a member handle, not a second catalogue row.** The
   Provider metadata `modelAliases` maps an agent-facing alias to one upstream
   entry id. A model-group member may name either id; the gateway resolves the
@@ -6389,6 +6395,10 @@ optional on a read because a read is a resolution, not a row lookup.
   needs the answer calls the read API; it must not invent a row.
 - A disabled or deleted source is never promoted by fallback. An explicit row
   that later becomes unusable is a data-repair case, not a new default.
+- Repair deletes the stale unified row, never rewrites the legacy row: the
+  Agent card offers "Clear saved default" for the Agent it describes, and the
+  Advanced page lists every stale row in the current scope with the same
+  action. Clearing lets the resolver fall back; it does not invent a new source.
 
 ### 4. Tests Required
 

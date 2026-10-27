@@ -1253,6 +1253,14 @@ pub struct ManagementCenter {
     /// presses the field's own adopt control, and a failed or missing lookup
     /// simply leaves this empty.
     model_capability_suggestion: Option<vibex_core::GatewayCapabilitySuggestion>,
+    /// Catalogue identities for the Models the open model-group draft can
+    /// name, keyed by `(catalogue provider id, upstream model id)`.
+    ///
+    /// The same-model template is the only reader. It is fetched when the
+    /// builder opens, because that is the first moment the draft needs
+    /// cross-Provider identity and the last moment the round trip is off the
+    /// click's critical path.
+    model_canonical_ids: BTreeMap<(String, String), String>,
     native_exports: Vec<vibex_core::ProviderNativeExportRecordSummary>,
     #[allow(dead_code)]
     native_export_source: vibex_core::ProviderNativeExportSource,
@@ -1429,6 +1437,8 @@ pub struct ManagementCenter {
     profile_secret_loaded: Option<String>,
     /// The in-flight read that fills the API key field.
     profile_secret_task: Option<Task<()>>,
+    /// The in-flight catalogue lookup behind the same-model template.
+    model_canonical_task: Option<Task<()>>,
     /// Set only by the explicit Clear command, so an empty field on its own
     /// never deletes a stored Secret.
     profile_secret_clear: bool,
@@ -2525,6 +2535,7 @@ impl ManagementCenter {
             route_group_token_limit_window: vibex_core::GatewayTokenWindow::Day,
             route_group_member_efforts: BTreeMap::new(),
             model_capability_suggestion: None,
+            model_canonical_ids: BTreeMap::new(),
             selected_global_provider_id: None,
             provider_search,
             catalog_status: None,
@@ -2541,6 +2552,7 @@ impl ManagementCenter {
             profile_secret_configured: false,
             profile_secret_loaded: None,
             profile_secret_task: None,
+            model_canonical_task: None,
             profile_secret_clear: false,
             profile_name_error: None,
             profile_configured_models: Vec::new(),
@@ -6468,6 +6480,71 @@ impl ManagementCenter {
                 .flatten();
             let _ = entity.update(cx, |this, cx| {
                 this.model_capability_suggestion = suggestion;
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Fills [`Self::model_canonical_ids`] for the draft's current Providers.
+    ///
+    /// Best effort: a missing catalogue, a failed call, or a Provider without a
+    /// catalogue id simply leaves the map short, and the same-model template
+    /// falls back to comparing model ids.
+    fn request_model_canonical_ids(&mut self, cx: &mut Context<Self>) {
+        self.model_canonical_ids.clear();
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let mut seen = BTreeSet::new();
+        let mut models = Vec::new();
+        for profile in self
+            .providers
+            .iter()
+            .filter(|profile| profile.status == vibex_core::ModelProviderProfileStatus::Enabled)
+        {
+            let Some(catalog_id) = profile
+                .metadata
+                .catalog_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|catalog_id| !catalog_id.is_empty())
+            else {
+                continue;
+            };
+            for entry in profile
+                .configured_models
+                .iter()
+                .filter(|entry| entry.enabled)
+            {
+                if seen.insert((catalog_id.to_string(), entry.id.clone())) {
+                    models.push(vibex_core::ModelCanonicalIdLookup {
+                        provider_id: catalog_id.to_string(),
+                        model_id: entry.id.clone(),
+                    });
+                }
+            }
+        }
+        if models.is_empty() {
+            return;
+        }
+        let entity = cx.weak_entity();
+        self.model_canonical_task = Some(cx.spawn(async move |_, cx| {
+            let Ok(models) = backend
+                .management()
+                .model_canonical_ids(vibex_core::ModelCanonicalIdsRequest { models })
+                .await
+            else {
+                return;
+            };
+            let _ = entity.update(cx, |this, cx| {
+                this.model_canonical_ids = models
+                    .into_iter()
+                    .filter_map(|model| {
+                        model
+                            .canonical_model_id
+                            .map(|canonical| ((model.provider_id, model.model_id), canonical))
+                    })
+                    .collect();
                 cx.notify();
             });
         }));
@@ -15087,6 +15164,10 @@ impl ManagementCenter {
         let Ok(agent_id) = vibex_core::AgentId::parse(agent_id) else {
             return;
         };
+        // The page resolves the default in the scope it is showing, so the
+        // write has to use that same scope. A workspace-scoped page that wrote
+        // a global row would show the old answer forever.
+        let scope = management_provider_default_scope(self.pairing_workspace_id.clone());
         self.mutation = Some(ManagementMutation::Gateway);
         self.error = None;
         let this = cx.entity();
@@ -15095,7 +15176,7 @@ impl ManagementCenter {
                 .management()
                 .set_agent_model_source_default(vibex_backend::MutationRequest::new(
                     vibex_core::SetAgentModelSourceDefaultRequest {
-                        scope: management_provider_default_scope(None),
+                        scope,
                         agent_id,
                         source,
                     },
@@ -15113,6 +15194,63 @@ impl ManagementCenter {
                             )
                             .to_string(),
                         );
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    /// Clears an explicit default source that no longer resolves.
+    ///
+    /// The migration already repaired the anomalies it could see. This is the
+    /// later case: a source was deleted or disabled after the migration, so the
+    /// resolver ignores it and the Agent falls back. Clearing the stored row
+    /// makes the page say the same thing the resolver does, instead of showing
+    /// a warning forever.
+    fn clear_agent_default_model_source(&mut self, agent_id: String, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        let Ok(agent_id) = vibex_core::AgentId::parse(agent_id) else {
+            return;
+        };
+        let scope = management_provider_default_scope(self.pairing_workspace_id.clone());
+        self.mutation = Some(ManagementMutation::Gateway);
+        self.error = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .clear_agent_model_source_default(vibex_backend::MutationRequest::new(
+                    vibex_core::ClearAgentModelSourceDefaultRequest { scope, agent_id },
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(cleared) => {
+                        this.notice = Some(if cleared {
+                            management_locale_text(
+                                "Saved default source cleared; the Agent now uses its next default.",
+                                "已清除保存的默认模型源；该 Agent 现在使用下一个默认来源。",
+                                "已清除儲存的預設模型來源；該 Agent 現在使用下一個預設來源。",
+                            )
+                        } else {
+                            management_locale_text(
+                                "There was no saved default source to clear.",
+                                "没有可清除的已保存默认模型源。",
+                                "沒有可清除的已儲存預設模型來源。",
+                            )
+                        }
+                        .to_string());
                         this.refresh(cx);
                     }
                     Err(error) => {
@@ -28703,6 +28841,7 @@ impl ManagementCenter {
                 cx,
             )
         });
+        self.request_model_canonical_ids(cx);
         self.present_route_group_dialog(window, cx);
         cx.notify();
     }
@@ -28815,6 +28954,7 @@ impl ManagementCenter {
         self.route_group_name.update(cx, |state, cx| {
             state.set_value(route.display_name.clone(), window, cx)
         });
+        self.request_model_canonical_ids(cx);
         self.present_route_group_dialog(window, cx);
         cx.notify();
     }
@@ -28959,31 +29099,32 @@ impl ManagementCenter {
     fn apply_model_group_template(&mut self, template: ModelGroupTemplate, cx: &mut Context<Self>) {
         let mut candidates = Vec::<(vibex_core::ModelProviderProfileId, String, i64)>::new();
         if template == ModelGroupTemplate::SameModel {
-            // The most widely served model is the best "same model" suggestion:
-            // adding all of its Providers is what a canonical-model grouping
-            // would do once models.dev supplies the canonical id.
-            let mut by_model = BTreeMap::<String, Vec<vibex_core::ModelProviderProfileId>>::new();
-            for profile in &self.providers {
-                if profile.status != vibex_core::ModelProviderProfileStatus::Enabled {
-                    continue;
-                }
-                for entry in profile
-                    .configured_models
-                    .iter()
-                    .filter(|entry| entry.enabled)
-                {
-                    by_model
-                        .entry(entry.id.clone())
-                        .or_default()
-                        .push(profile.id.clone());
-                }
-            }
-            if let Some((model, providers)) = by_model
-                .into_iter()
-                .max_by_key(|(_, providers)| providers.len())
-            {
-                for (index, provider) in providers.into_iter().enumerate() {
-                    candidates.push((provider, model.clone(), index as i64));
+            // "Same model" means the same catalogue identity, not the same
+            // spelling. Providers often resell one model under different ids,
+            // and models.dev's canonical id is the only cross-Provider name
+            // for it. A model the catalogue does not know falls back to its own
+            // id, which is the pre-canonical behaviour rather than a guess.
+            let entries = self
+                .providers
+                .iter()
+                .filter(|profile| profile.status == vibex_core::ModelProviderProfileStatus::Enabled)
+                .flat_map(|profile| {
+                    let catalog_id = profile.metadata.catalog_id.clone();
+                    let provider_id = profile.id.as_str().to_string();
+                    profile
+                        .configured_models
+                        .iter()
+                        .filter(|entry| entry.enabled)
+                        .map(move |entry| {
+                            (provider_id.clone(), entry.id.clone(), catalog_id.clone())
+                        })
+                });
+            if let Some(providers) = same_model_group(entries, &self.model_canonical_ids) {
+                for (index, (provider, model)) in providers.into_iter().enumerate() {
+                    let Ok(provider) = vibex_core::ModelProviderProfileId::parse(provider) else {
+                        continue;
+                    };
+                    candidates.push((provider, model, index as i64));
                 }
             }
         } else {
@@ -29743,41 +29884,7 @@ impl ManagementCenter {
     ) -> AnyElement {
         let source = self.resolved_agent_default_source(agent_id);
         let label = match source {
-            Some(vibex_core::AgentModelSourceRef::Provider(provider_id)) => {
-                let name = self
-                    .providers
-                    .iter()
-                    .find(|provider| {
-                        provider
-                            .legacy_provider_profile_id
-                            .as_ref()
-                            .is_some_and(|legacy| legacy == &provider_id)
-                    })
-                    .map(|provider| provider.display_name.clone())
-                    .or_else(|| {
-                        self.provider_profiles
-                            .iter()
-                            .find(|profile| profile.id == provider_id)
-                            .map(|profile| profile.display_name.clone())
-                    })
-                    .unwrap_or_else(|| provider_id.as_str().to_string());
-                format!(
-                    "{} · {name}",
-                    management_locale_text("Provider", "供应商", "供應商")
-                )
-            }
-            Some(vibex_core::AgentModelSourceRef::RouteGroup(route_id)) => {
-                let name = self
-                    .model_routes
-                    .iter()
-                    .find(|route| route.id == route_id)
-                    .map(|route| route.display_name.clone())
-                    .unwrap_or_else(|| route_id.as_str().to_string());
-                format!(
-                    "{} · {name}",
-                    management_locale_text("Route group", "路由组", "路由組")
-                )
-            }
+            Some(source) => self.agent_model_source_display(&source),
             None => management_locale_text(
                 "No default model source",
                 "尚未设置默认模型源",
@@ -29807,15 +29914,40 @@ impl ManagementCenter {
             )
             .child(div().text_sm().child(label))
             .when(self.explicit_default_source_is_stale(agent_id), |card| {
+                let clear_agent = agent_id.to_string();
                 card.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().warning)
-                        .child(management_locale_text(
-                            "The saved default source is unavailable; the fallback below is what a new session uses.",
-                            "已保存的默认模型源不可用；下方回退项才是新会话实际使用的来源。",
-                            "已儲存的預設模型來源不可用；下方回退項才是新工作階段實際使用的來源。",
-                        )),
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .text_xs()
+                                .text_color(cx.theme().warning)
+                                .child(management_locale_text(
+                                    "The saved default source is unavailable; the fallback below is what a new session uses.",
+                                    "已保存的默认模型源不可用；下方回退项才是新会话实际使用的来源。",
+                                    "已儲存的預設模型來源不可用；下方回退項才是新工作階段實際使用的來源。",
+                                )),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "management-agent-default-source-clear-{agent_id}"
+                            )))
+                            .xsmall()
+                            .ghost()
+                            .label(management_locale_text(
+                                "Clear saved default",
+                                "清除已保存默认",
+                                "清除已儲存預設",
+                            ))
+                            .disabled(self.mutation.is_some())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.clear_agent_default_model_source(clear_agent.clone(), cx)
+                            })),
+                        ),
                 )
             })
             .child(
@@ -29823,12 +29955,86 @@ impl ManagementCenter {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(management_locale_text(
-                        "A new session starts here. Editing this choice arrives in the next wave.",
-                        "新会话从这里开始；修改将在下一波开放。",
-                        "新工作階段從這裡開始；修改將在下一波開放。",
+                        "A new session starts here. Use the star beside a Provider or route group to change it.",
+                        "新会话从这里开始；用供应商或路由组旁的星标即可修改。",
+                        "新工作階段從這裡開始；用供應商或路由群組旁的星標即可修改。",
                     )),
             )
             .into_any_element()
+    }
+
+    /// One default source, said the way both the summary and the repair list
+    /// read it. The two surfaces describe the same record, so they must not
+    /// spell it two ways.
+    fn agent_model_source_display(&self, source: &vibex_core::AgentModelSourceRef) -> String {
+        match source {
+            vibex_core::AgentModelSourceRef::Provider(provider_id) => {
+                let name = self
+                    .providers
+                    .iter()
+                    .find(|provider| {
+                        provider
+                            .legacy_provider_profile_id
+                            .as_ref()
+                            .is_some_and(|legacy| legacy == provider_id)
+                    })
+                    .map(|provider| provider.display_name.clone())
+                    .or_else(|| {
+                        self.provider_profiles
+                            .iter()
+                            .find(|profile| profile.id == *provider_id)
+                            .map(|profile| profile.display_name.clone())
+                    })
+                    .unwrap_or_else(|| provider_id.as_str().to_string());
+                format!(
+                    "{} · {name}",
+                    management_locale_text("Provider", "供应商", "供應商")
+                )
+            }
+            vibex_core::AgentModelSourceRef::RouteGroup(route_id) => {
+                let name = self
+                    .model_routes
+                    .iter()
+                    .find(|route| route.id == *route_id)
+                    .map(|route| route.display_name.clone())
+                    .unwrap_or_else(|| route_id.as_str().to_string());
+                format!(
+                    "{} · {name}",
+                    management_locale_text("Route group", "路由组", "路由組")
+                )
+            }
+        }
+    }
+
+    /// Every explicit default row that no longer resolves, oldest Agent first.
+    ///
+    /// This is the repair queue: the migration handled the anomalies present
+    /// when it ran, and this list covers a source deleted or disabled after it.
+    fn stale_agent_default_sources(
+        &self,
+    ) -> Vec<(vibex_core::AgentId, vibex_core::AgentModelSourceRef)> {
+        let scope = management_provider_default_scope(self.pairing_workspace_id.clone());
+        let mut rows = self
+            .agent_model_source_defaults
+            .iter()
+            .filter(|default| default.scope == scope)
+            .filter_map(|default| {
+                let source = default.source.clone()?;
+                (!self.default_source_is_usable(&source))
+                    .then(|| (default.agent_id.clone(), source))
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        rows
+    }
+
+    fn agent_label_or_id(&self, agent_id: &str) -> String {
+        self.snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.id.as_str() == agent_id)
+            .map(|agent| agent.label.clone())
+            .unwrap_or_else(|| agent_id.to_string())
     }
 
     fn render_agent_route_groups(
@@ -34389,9 +34595,84 @@ impl ManagementCenter {
         )
     }
 
+    /// The management-wide repair card for saved default sources.
+    ///
+    /// One Agent's card can clear its own stale row; this list exists because a
+    /// deleted Provider can leave several Agents in that state, and finding
+    /// them one Agent page at a time is not a repair path.
+    fn render_default_source_repairs(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let rows = self.stale_agent_default_sources();
+        let pending = self.mutation.is_some();
+        let mut body = v_flex().w_full().gap_1();
+        if rows.is_empty() {
+            body = body.child(compact_empty_state(
+                management_locale_text("No repairs needed", "无需修复", "無需修復"),
+                management_locale_text(
+                    "Every saved default source still points at an enabled target.",
+                    "所有已保存的默认模型源仍指向可用的目标。",
+                    "所有已儲存的預設模型來源仍指向可用的目標。",
+                ),
+                cx,
+            ));
+        } else {
+            for (agent_id, source) in rows {
+                let label = self.agent_label_or_id(agent_id.as_str());
+                let source_label = self.agent_model_source_display(&source);
+                let clear_agent = agent_id.as_str().to_string();
+                body = body.child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .py_2()
+                        .child(div().min_w_0().flex_1().child(div().text_sm().child(label)))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(source_label),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "management-default-source-repair-clear-{}",
+                                agent_id.as_str()
+                            )))
+                            .xsmall()
+                            .outline()
+                            .label(management_locale_text(
+                                "Clear saved default",
+                                "清除已保存默认",
+                                "清除已儲存預設",
+                            ))
+                            .disabled(pending)
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.clear_agent_default_model_source(clear_agent.clone(), cx)
+                                },
+                            )),
+                        ),
+                );
+            }
+        }
+        management_card(
+            management_locale_text("Default model sources", "默认模型源", "預設模型來源"),
+            management_locale_text(
+                "The source each Agent starts from. A source that was deleted or disabled is cleared here; the Agent then uses its next default.",
+                "每个 Agent 的起始模型来源。已删除或停用的来源可在此清除；之后该 Agent 会使用下一个默认来源。",
+                "每個 Agent 的起始模型來源。已刪除或停用的來源可在此清除；之後該 Agent 會使用下一個預設來源。",
+            ),
+            body.into_any_element(),
+            cx,
+        )
+    }
+
     fn render_advanced(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let extra_wide = f32::from(window.viewport_size().width) >= 1536.0;
         let acp_card = self.render_acp_config_card(window, cx);
+        let repair_card = self.render_default_source_repairs(cx);
         let hooks_card = self.render_hooks_card(cx);
         let pending = self.mutation.is_some();
         let mut health_rows = v_flex().w_full().gap_1();
@@ -34560,6 +34841,7 @@ impl ManagementCenter {
             cx,
         ))
         .child(top_cards)
+        .child(repair_card)
         .child(status_cards)
         .child(hooks_card)
         .into_any_element()
@@ -38054,6 +38336,36 @@ impl ModelGroupTemplate {
             Self::SameModel => management_locale_text("Same model", "同类聚合", "同類聚合"),
         }
     }
+}
+
+/// The largest group of Provider models that are really the same model.
+///
+/// `entries` is `(provider id, model id, catalogue provider id)` for every
+/// enabled model of every enabled Provider. The group key is the catalogue's
+/// canonical id when it knows the model, and the model id itself otherwise, so
+/// a catalogue-less install keeps the old "same spelling" suggestion.
+///
+/// One member per Provider: a draft that lists the same Provider twice would
+/// spend two attempts on one upstream, which is not a failover.
+fn same_model_group(
+    entries: impl IntoIterator<Item = (String, String, Option<String>)>,
+    canonical_ids: &BTreeMap<(String, String), String>,
+) -> Option<Vec<(String, String)>> {
+    let mut by_model = BTreeMap::<String, BTreeMap<String, String>>::new();
+    for (provider_id, model_id, catalog_id) in entries {
+        let key = catalog_id
+            .and_then(|catalog_id| canonical_ids.get(&(catalog_id, model_id.clone())))
+            .cloned()
+            .unwrap_or_else(|| model_id.clone());
+        by_model
+            .entry(key)
+            .or_default()
+            .insert(provider_id, model_id);
+    }
+    by_model
+        .into_iter()
+        .max_by_key(|(_, providers)| providers.len())
+        .map(|(_, providers)| providers.into_iter().collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47962,6 +48274,132 @@ mod gateway_surface_tests {
         assert!(summary.contains("default_source_is_usable"));
         assert!(summary.contains("explicit_default_source_is_stale"));
         assert!(summary.contains("saved default source is unavailable"));
+    }
+
+    /// A stale saved default can be cleared without opening another page.
+    #[test]
+    fn the_agent_default_source_warning_can_clear_the_stale_row() {
+        let source = include_str!("management.rs");
+        let card = source
+            .split_once("    fn render_agent_default_source_summary(")
+            .and_then(|(_, tail)| tail.split_once("    fn agent_model_source_display("))
+            .map(|(body, _)| body)
+            .expect("the Agent default-source card should remain inspectable");
+        assert!(card.contains("management-agent-default-source-clear-"));
+        assert!(card.contains("clear_agent_default_model_source"));
+        assert!(card.contains("Clear saved default"));
+        assert!(card.contains("Use the star beside a Provider or route group"));
+    }
+
+    /// The repair queue lives on Advanced because it spans Agents, and it
+    /// reads the same stale-row predicate as the per-Agent warning.
+    #[test]
+    fn the_advanced_page_repairs_stale_default_sources() {
+        let source = include_str!("management.rs");
+        let repairs = source
+            .split_once("    fn render_default_source_repairs(")
+            .and_then(|(_, tail)| tail.split_once("    fn render_advanced("))
+            .map(|(body, _)| body)
+            .expect("the default-source repair card should remain inspectable");
+        assert!(repairs.contains("stale_agent_default_sources"));
+        assert!(repairs.contains("management-default-source-repair-clear-"));
+        assert!(repairs.contains("clear_agent_default_model_source"));
+        assert!(repairs.contains("No repairs needed"));
+
+        let advanced = source
+            .split_once("    fn render_advanced(")
+            .and_then(|(_, tail)| tail.split_once("    fn clear_scheduled_editor("))
+            .map(|(body, _)| body)
+            .expect("the Advanced page should remain inspectable");
+        assert!(advanced.contains("render_default_source_repairs"));
+        assert!(advanced.contains("repair_card"));
+    }
+
+    /// Two Providers that resell one model under different ids still group,
+    /// because the catalogue's canonical id is the identity that matches.
+    #[test]
+    fn same_model_groups_by_canonical_id_before_spelling() {
+        let canonical = BTreeMap::from([
+            (
+                ("deepseek".to_string(), "deepseek-chat".to_string()),
+                "vendor/deepseek-chat".to_string(),
+            ),
+            (
+                ("relay".to_string(), "ds-chat".to_string()),
+                "vendor/deepseek-chat".to_string(),
+            ),
+        ]);
+        let group = same_model_group(
+            vec![
+                (
+                    "p1".to_string(),
+                    "deepseek-chat".to_string(),
+                    Some("deepseek".to_string()),
+                ),
+                (
+                    "p2".to_string(),
+                    "ds-chat".to_string(),
+                    Some("relay".to_string()),
+                ),
+                ("p3".to_string(), "other".to_string(), None),
+            ],
+            &canonical,
+        )
+        .expect("the canonical pair should form a group");
+        assert_eq!(
+            group,
+            vec![
+                ("p1".to_string(), "deepseek-chat".to_string()),
+                ("p2".to_string(), "ds-chat".to_string()),
+            ]
+        );
+    }
+
+    /// Without a catalogue answer the old behaviour survives: the same model id
+    /// is the only evidence available, and it still makes a suggestion.
+    #[test]
+    fn same_model_falls_back_to_the_model_id_without_a_catalogue() {
+        let group = same_model_group(
+            vec![
+                ("p1".to_string(), "same".to_string(), None),
+                ("p2".to_string(), "same".to_string(), None),
+                (
+                    "p3".to_string(),
+                    "same".to_string(),
+                    Some("unknown".to_string()),
+                ),
+            ],
+            &BTreeMap::new(),
+        )
+        .expect("the shared model id should form a group");
+        assert_eq!(group.len(), 3);
+    }
+
+    /// The lookup runs when the builder opens, before a template can be clicked,
+    /// and it asks the catalogue rather than guessing from the id.
+    #[test]
+    fn the_model_group_builder_fetches_canonical_ids_before_a_template_runs() {
+        let source = include_str!("management.rs");
+        let builder = source
+            .split_once("    fn open_route_group_editor(")
+            .and_then(|(_, tail)| tail.split_once("    /// Opens the editor on an existing group"))
+            .map(|(body, _)| body)
+            .expect("the model-group builder should remain inspectable");
+        assert!(builder.contains("request_model_canonical_ids(cx)"));
+
+        let fetch = source
+            .split_once("    fn request_model_canonical_ids(")
+            .and_then(|(_, tail)| tail.split_once("    /// Points the settings pane's fields"))
+            .map(|(body, _)| body)
+            .expect("the canonical-id prefetch should remain inspectable");
+        assert!(fetch.contains("ModelCanonicalIdsRequest"));
+        assert!(fetch.contains("catalog_id"));
+        assert!(fetch.contains("model_canonical_ids"));
+
+        assert!(
+            source.contains("same_model_group(entries, &self.model_canonical_ids)"),
+            "the template should group through the canonical-id helper"
+        );
     }
 
     /// The header edits the name and writes it through the settings command.

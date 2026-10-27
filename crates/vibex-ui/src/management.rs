@@ -1967,6 +1967,13 @@ mod tests {
             error_future()
         }
 
+        fn model_canonical_ids(
+            &self,
+            _request: vibex_core::ModelCanonicalIdsRequest,
+        ) -> BackendFuture<'_, Vec<vibex_core::ModelCanonicalId>> {
+            error_future()
+        }
+
         fn model_gateway_snapshot(&self) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
             error_future()
         }

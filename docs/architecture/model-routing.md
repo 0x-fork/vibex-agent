@@ -103,7 +103,10 @@ The Providers page's model-group editor exposes:
   overrides;
 - policy: strategy, pin, failover, patience, token ceiling, Unlists/Sink;
 - templates (stable first, lightweight, low latency, same model) and
-  same-model suggestions, all as drafts until Save;
+  same-model suggestions, all as drafts until Save. "Same model" compares the
+  catalogue's canonical id, so Providers that resell one model under different
+  upstream ids still group; a model the catalogue does not know falls back to
+  its own id;
 - a simulator that reads the draft and recent observations and reports the
   candidate order, cooling markers, matched rule, estimated p50, and the
   fallback after a chosen member is assumed down. It never sends a request.

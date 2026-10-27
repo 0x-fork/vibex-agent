@@ -1698,6 +1698,38 @@ pub struct ModelCapabilitySuggestionRequest {
     pub model_id: String,
 }
 
+/// One model the caller wants the catalogue to identify.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCanonicalIdLookup {
+    /// The catalogue's provider id, such as `deepseek`.
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+/// The same-model question for several models at once.
+///
+/// A "same model" suggestion has to compare every configured model across
+/// Providers, so one round trip per model would be the wrong shape. The answer
+/// keeps the request's order, which is what lets the caller pair them up.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCanonicalIdsRequest {
+    pub models: Vec<ModelCanonicalIdLookup>,
+}
+
+/// One model's catalogue identity, when the catalogue names one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCanonicalId {
+    pub provider_id: String,
+    pub model_id: String,
+    /// The vendor-independent id. `None` means the model is not in the
+    /// catalogue, which must read as "no suggestion", not as "unique".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_model_id: Option<String>,
+}
+
 /// One suggested field, with how the match was made.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -144,6 +144,17 @@ impl Catalog {
             source: SuggestSource::Approximate,
         })
     }
+
+    /// The vendor-independent id a model is known by, when the catalogue names
+    /// one.
+    ///
+    /// This is the only cross-Provider identity the catalogue publishes, so it
+    /// is what a "same model" suggestion groups by. An unknown model is
+    /// `None`, never a guess built from the id's spelling.
+    pub fn canonical_model_id(&self, provider_id: &str, model_id: &str) -> Option<String> {
+        self.suggestion(provider_id, model_id)
+            .and_then(|suggestion| suggestion.model.canonical_model_id)
+    }
 }
 
 /// How a suggestion was matched.
@@ -361,6 +372,23 @@ mod tests {
         // Agent's declared level table.
         assert!(suggestion.model.reasoning_efforts.is_none());
         assert!(suggestion.adopt_all().reasoning_efforts.is_none());
+    }
+
+    #[test]
+    fn canonical_model_ids_come_from_the_catalogue_only() {
+        let catalog =
+            parse_catalog(r#"{"p":{"models":{"m":{"canonical_model_id":"vendor/m"}}}}"#).unwrap();
+        assert_eq!(
+            catalog.canonical_model_id("p", "m").as_deref(),
+            Some("vendor/m")
+        );
+        // The suffix match that recovers `m-thinking` also carries its identity.
+        assert_eq!(
+            catalog.canonical_model_id("p", "m-thinking").as_deref(),
+            Some("vendor/m")
+        );
+        assert_eq!(catalog.canonical_model_id("p", "mystery"), None);
+        assert_eq!(catalog.canonical_model_id("unknown", "m"), None);
     }
 
     #[test]

@@ -3989,6 +3989,24 @@ impl ManagementBackend for WebRemoteBackend {
         )
     }
 
+    fn model_canonical_ids(
+        &self,
+        request: vibex_core::ModelCanonicalIdsRequest,
+    ) -> BackendFuture<'_, Vec<vibex_core::ModelCanonicalId>> {
+        self.gateway_rpc(
+            vibex_core::RemoteProviderRequest::ModelCanonicalIds(
+                vibex_core::RemoteModelCanonicalIdsRequest {
+                    auth: self.auth(),
+                    request,
+                },
+            ),
+            |value| {
+                decode::<vibex_core::RemoteModelCanonicalIdsResponse>(value)
+                    .map(|response| response.models)
+            },
+        )
+    }
+
     fn model_gateway_snapshot(&self) -> BackendFuture<'_, vibex_core::GatewaySnapshot> {
         self.gateway_rpc(
             vibex_core::RemoteProviderRequest::ModelGatewaySnapshot(

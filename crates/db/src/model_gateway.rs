@@ -1559,6 +1559,64 @@ mod tests {
         cleanup(path);
     }
 
+    /// The ledger is the one table that grows without a user action: one row per
+    /// gateway request. Ten thousand rows is a heavy weak of use, and the
+    /// request list must still page from the index instead of loading them all.
+    #[test]
+    fn ten_thousand_request_rows_stay_pageable_in_order() {
+        let (path, mut conn) = database();
+        let upstream = profile(&conn);
+        let now = unix_timestamp_ms();
+        let transaction = conn.transaction().unwrap();
+        for index in 0..10_000i64 {
+            ModelGatewayRequestLogRepository::insert(
+                &transaction,
+                &ModelGatewayRequestLog {
+                    request_id: RequestId::new(),
+                    agent_id: Some("codex".to_string()),
+                    model_provider_profile_id: upstream.clone(),
+                    credential_id: None,
+                    model_requested: "deepseek/deepseek-chat".to_string(),
+                    model_served: Some("deepseek-chat".to_string()),
+                    wire_in: vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    wire_out: vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+                    status: Some(200),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_read_tokens: 0,
+                    cached_write_tokens: 0,
+                    reasoning_tokens: 0,
+                    latency_ms: Some(10),
+                    outcome: GatewayRequestOutcome::Ok,
+                    route: None,
+                    created_at_ms: now - index,
+                },
+            )
+            .unwrap();
+        }
+        transaction.commit().unwrap();
+
+        let page = ModelGatewayRequestLogRepository::recent(&conn, 100).unwrap();
+        assert_eq!(page.len(), 100);
+        assert_eq!(page[0].created_at_ms, now);
+        assert!(
+            page.windows(2)
+                .all(|pair| pair[0].created_at_ms > pair[1].created_at_ms),
+            "the newest page must be ordered by recency"
+        );
+        assert!(
+            ModelGatewayRequestLogRepository::recent(&conn, 10_001)
+                .unwrap()
+                .len()
+                == 10_000
+        );
+        assert_eq!(
+            ModelGatewayRequestLogRepository::clear(&conn).unwrap(),
+            10_000
+        );
+        cleanup(path);
+    }
+
     #[test]
     fn gateway_state_cannot_outlive_its_upstream_profile() {
         let (path, conn) = database();

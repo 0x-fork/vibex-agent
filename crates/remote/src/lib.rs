@@ -578,6 +578,12 @@ pub trait RemoteManagementSnapshotSource: Send + Sync {
         request: vibex_core::ModelCapabilitySuggestionRequest,
     ) -> VibexResult<Option<vibex_core::GatewayCapabilitySuggestion>>;
 
+    /// The catalogue's canonical id for each requested model, in order.
+    async fn model_canonical_ids(
+        &self,
+        request: vibex_core::ModelCanonicalIdsRequest,
+    ) -> VibexResult<Vec<vibex_core::ModelCanonicalId>>;
+
     /// Reads the local model gateway's surface.
     async fn model_gateway_snapshot(&self) -> VibexResult<vibex_core::GatewaySnapshot>;
 
@@ -4456,6 +4462,24 @@ async fn dispatch_provider_request(
             })?;
             let suggestion = source.model_capability_suggestion(request.request).await?;
             serde_json::to_value(vibex_core::RemoteModelCapabilitySuggestionResponse { suggestion })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ModelCanonicalIds(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let source = state.management_snapshot.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "remote_model_catalog_unavailable",
+                    "the model catalogue is not available on this service",
+                )
+            })?;
+            let models = source.model_canonical_ids(request.request).await?;
+            serde_json::to_value(vibex_core::RemoteModelCanonicalIdsResponse { models })
                 .map_err(remote_payload_encode_error)
         }
         RemoteProviderRequest::ModelGatewaySnapshot(request) => {
