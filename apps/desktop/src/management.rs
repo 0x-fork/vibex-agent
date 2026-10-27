@@ -29669,21 +29669,66 @@ impl ManagementCenter {
             .agent_model_source_defaults
             .iter()
             .find(|default| default.agent_id.as_str() == agent_id && default.scope == scope)
-            .and_then(|default| default.source.clone());
+            .and_then(|default| default.source.clone())
+            .filter(|source| self.default_source_is_usable(source));
         let route_default = self
             .agent_model_route_bindings
             .iter()
             .find(|binding| binding.agent_id.as_str() == agent_id && binding.is_default)
             .map(|binding| {
                 vibex_core::AgentModelSourceRef::RouteGroup(binding.model_route_id.clone())
-            });
+            })
+            .filter(|source| self.default_source_is_usable(source));
         let provider_default = self
             .agent_profile_states
             .iter()
             .find(|state| state.agent_id == agent_id && state.is_default)
             .and_then(|state| vibex_core::ProviderProfileId::parse(state.profile_id.clone()).ok())
-            .map(vibex_core::AgentModelSourceRef::Provider);
+            .map(vibex_core::AgentModelSourceRef::Provider)
+            .filter(|source| self.default_source_is_usable(source));
         explicit.or(route_default).or(provider_default)
+    }
+
+    /// Whether a default source still points at an enabled, existing target.
+    ///
+    /// The resolver ignores a stale explicit row rather than promoting it; the
+    /// page mirrors that rule and shows the fallback plus a warning.
+    fn default_source_is_usable(&self, source: &vibex_core::AgentModelSourceRef) -> bool {
+        match source {
+            vibex_core::AgentModelSourceRef::Provider(provider_id) => {
+                self.provider_profiles
+                    .iter()
+                    .find(|profile| &profile.id == provider_id)
+                    .is_some_and(|profile| {
+                        profile.status == vibex_core::ProviderProfileStatus::Enabled
+                    })
+                    || self.providers.iter().any(|provider| {
+                        provider
+                            .legacy_provider_profile_id
+                            .as_ref()
+                            .is_some_and(|legacy| legacy == provider_id)
+                            && provider.status == vibex_core::ModelProviderProfileStatus::Enabled
+                    })
+            }
+            vibex_core::AgentModelSourceRef::RouteGroup(route_id) => self
+                .model_routes
+                .iter()
+                .find(|route| &route.id == route_id)
+                .is_some_and(|route| {
+                    route.status == vibex_core::RouteStatus::Enabled
+                        && route.enabled_members().next().is_some()
+                }),
+        }
+    }
+
+    /// Whether the Agent's explicit unified row points at a stale target.
+    fn explicit_default_source_is_stale(&self, agent_id: &str) -> bool {
+        let scope = management_provider_default_scope(self.pairing_workspace_id.clone());
+        self.agent_model_source_defaults
+            .iter()
+            .find(|default| default.agent_id.as_str() == agent_id && default.scope == scope)
+            .and_then(|default| default.source.as_ref())
+            .is_some_and(|source| !self.default_source_is_usable(source))
     }
 
     /// The Agent's resolved default model source, read-only in this wave.
@@ -29761,6 +29806,18 @@ impl ManagementCenter {
                     )),
             )
             .child(div().text_sm().child(label))
+            .when(self.explicit_default_source_is_stale(agent_id), |card| {
+                card.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().warning)
+                        .child(management_locale_text(
+                            "The saved default source is unavailable; the fallback below is what a new session uses.",
+                            "已保存的默认模型源不可用；下方回退项才是新会话实际使用的来源。",
+                            "已儲存的預設模型來源不可用；下方回退項才是新工作階段實際使用的來源。",
+                        )),
+                )
+            })
             .child(
                 div()
                     .text_xs()
@@ -47902,6 +47959,9 @@ mod gateway_surface_tests {
         assert!(summary.contains("model_route_id"));
         assert!(summary.contains("is_default"));
         assert!(summary.contains("Default model source"));
+        assert!(summary.contains("default_source_is_usable"));
+        assert!(summary.contains("explicit_default_source_is_stale"));
+        assert!(summary.contains("saved default source is unavailable"));
     }
 
     /// The header edits the name and writes it through the settings command.
