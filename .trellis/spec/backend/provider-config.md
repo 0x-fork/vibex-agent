@@ -6522,3 +6522,15 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - The probe carries no credential, prompt, or response body.
 - The proxy policy editor validates the URL scheme and offers System / 7890 /
   1080 shortcuts; the test always uses the saved value, not the unsaved draft.
+
+### No export entry, traffic ranges, request paging
+
+- The Advanced page no longer hosts a native export card. The native export
+  functions remain unreachable from this surface; the product exposes import
+  only.
+- Provider and route-group Traffic cards share a 1h/24h/7d range and show the
+  most frequent HTTP error status in the window, alongside request/success/
+  token/p50/p95 values.
+- The Gateway request ledger is filtered first, then paginated at 50 rows with a
+  range label and previous/next controls; the clear action still clears the
+  whole ledger, not the page.

@@ -597,6 +597,7 @@ struct ManagementSnapshot {
     usage_summaries: Vec<vibex_core::ProviderUsageSummary>,
     /// The local model gateway surface as the authority last reported it.
     gateway: vibex_core::GatewaySnapshot,
+    #[allow(dead_code)]
     native_exports: Vec<vibex_core::ProviderNativeExportRecordSummary>,
     scheduled_runs: Vec<ScheduledTaskRun>,
     scheduled_attention: Vec<vibex_core::ScheduledTaskAttentionSummary>,
@@ -1055,6 +1056,7 @@ pub struct ManagementCenter {
     gateway_requests: Vec<vibex_core::GatewayRequestSummary>,
     gateway_request_search: Entity<InputState>,
     gateway_request_filter: GatewayRequestFilter,
+    gateway_request_page: usize,
     /// Requests the gateway is serving right now, newest last.
     ///
     /// The ledger draws them ahead of finished rows: a request that is still
@@ -1166,6 +1168,7 @@ pub struct ManagementCenter {
     provider_models_search: Entity<InputState>,
     provider_models_filter: ProviderModelsFilter,
     provider_models_page: usize,
+    traffic_range: TrafficRange,
     shared_provider_advanced_target: Option<vibex_core::ModelProviderProfileId>,
     shared_provider_advanced_input: Option<Entity<TextareaState>>,
     shared_provider_advanced_error: Option<String>,
@@ -1219,8 +1222,11 @@ pub struct ManagementCenter {
     /// simply leaves this empty.
     model_capability_suggestion: Option<vibex_core::GatewayCapabilitySuggestion>,
     native_exports: Vec<vibex_core::ProviderNativeExportRecordSummary>,
+    #[allow(dead_code)]
     native_export_source: vibex_core::ProviderNativeExportSource,
+    #[allow(dead_code)]
     native_export_mode: vibex_core::ProviderNativeExportMode,
+    #[allow(dead_code)]
     native_export_preview: Option<vibex_core::ProviderNativeExportPreview>,
     graph_draft: AutomationGraphDraft,
     pairing: PairingContextProjection,
@@ -2356,6 +2362,7 @@ impl ManagementCenter {
                 ))
             }),
             gateway_request_filter: GatewayRequestFilter::All,
+            gateway_request_page: 0,
             gateway_inflight: Vec::new(),
             gateway_failover_prompt: None,
             gateway_request_detail: None,
@@ -2414,6 +2421,7 @@ impl ManagementCenter {
             provider_models_search,
             provider_models_filter: ProviderModelsFilter::All,
             provider_models_page: 0,
+            traffic_range: TrafficRange::Day,
             shared_provider_advanced_target: None,
             shared_provider_advanced_input: None,
             shared_provider_advanced_error: None,
@@ -11838,6 +11846,7 @@ impl ManagementCenter {
         );
     }
 
+    #[allow(dead_code)]
     fn preview_native_export(&mut self, profile_id: String, cx: &mut Context<Self>) {
         let (Ok(provider_profile_id), Some(backend)) = (
             vibex_core::ProviderProfileId::parse(profile_id.clone()),
@@ -11928,6 +11937,7 @@ impl ManagementCenter {
         }));
     }
 
+    #[allow(dead_code)]
     fn apply_native_export(&mut self, export_id: String, cx: &mut Context<Self>) {
         let (Ok(export_id), Some(backend)) = (
             vibex_core::RequestId::parse(export_id),
@@ -11956,6 +11966,7 @@ impl ManagementCenter {
         );
     }
 
+    #[allow(dead_code)]
     fn rollback_native_export(&mut self, export_id: String, cx: &mut Context<Self>) {
         let (Ok(export_id), Some(backend)) = (
             vibex_core::RequestId::parse(export_id),
@@ -13559,10 +13570,14 @@ impl ManagementCenter {
         }
 
         if self.provider_detail_tab == ProviderDetailTab::Traffic {
+            let cutoff = vibex_core::unix_timestamp_ms() - self.traffic_range.window_ms();
             let requests = self
                 .gateway_requests
                 .iter()
-                .filter(|request| request.model_provider_profile_id == profile.id)
+                .filter(|request| {
+                    request.model_provider_profile_id == profile.id
+                        && request.created_at_ms >= cutoff
+                })
                 .collect::<Vec<_>>();
             let total = requests.len();
             let succeeded = requests
@@ -13584,7 +13599,36 @@ impl ManagementCenter {
                 .map(|value| format!("{value} ms"))
                 .unwrap_or_else(|| "—".to_string());
             let (health_label, _) = self.shared_provider_health_label(profile);
-            let mut traffic = v_flex().w_full().gap_2();
+            let mut error_counts = BTreeMap::<u16, usize>::new();
+            for request in &requests {
+                if let Some(status) = request.status.filter(|status| *status >= 400) {
+                    *error_counts.entry(status).or_default() += 1;
+                }
+            }
+            let top_error = error_counts
+                .into_iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(status, count)| format!("{status} · {count}"))
+                .unwrap_or_else(|| "—".to_string());
+            let mut range_row = h_flex().w_full().gap_1();
+            for range in TrafficRange::ALL {
+                let selected = range == self.traffic_range;
+                range_row = range_row.child(
+                    Button::new(SharedString::from(format!(
+                        "management-provider-traffic-range-{:?}",
+                        range
+                    )))
+                    .xsmall()
+                    .when(selected, |button| button.primary())
+                    .when(!selected, |button| button.ghost())
+                    .label(range.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.traffic_range = range;
+                        cx.notify();
+                    })),
+                );
+            }
+            let mut traffic = v_flex().w_full().gap_2().child(range_row);
             traffic = traffic.child(
                 h_flex()
                     .w_full()
@@ -13611,7 +13655,12 @@ impl ManagementCenter {
                         cx,
                     ))
                     .child(stat_line("p50", p50, cx))
-                    .child(stat_line("p95", p95, cx)),
+                    .child(stat_line("p95", p95, cx))
+                    .child(stat_line(
+                        management_locale_text("Top error", "错误 Top", "錯誤 Top"),
+                        top_error,
+                        cx,
+                    )),
             );
             if total == 0 {
                 traffic = traffic.child(compact_empty_state(
@@ -14367,10 +14416,14 @@ impl ManagementCenter {
                 .iter()
                 .map(|member| member.model_provider_profile_id.clone())
                 .collect::<BTreeSet<_>>();
+            let cutoff = vibex_core::unix_timestamp_ms() - self.traffic_range.window_ms();
             let requests = self
                 .gateway_requests
                 .iter()
-                .filter(|request| member_ids.contains(&request.model_provider_profile_id))
+                .filter(|request| {
+                    member_ids.contains(&request.model_provider_profile_id)
+                        && request.created_at_ms >= cutoff
+                })
                 .collect::<Vec<_>>();
             let total = requests.len();
             let succeeded = requests
@@ -14391,6 +14444,35 @@ impl ManagementCenter {
             let p95 = management_percentile(latencies, 0.95)
                 .map(|value| format!("{value} ms"))
                 .unwrap_or_else(|| "—".to_string());
+            let mut error_counts = BTreeMap::<u16, usize>::new();
+            for request in &requests {
+                if let Some(status) = request.status.filter(|status| *status >= 400) {
+                    *error_counts.entry(status).or_default() += 1;
+                }
+            }
+            let top_error = error_counts
+                .into_iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(status, count)| format!("{status} · {count}"))
+                .unwrap_or_else(|| "—".to_string());
+            let mut range_row = h_flex().w_full().gap_1();
+            for range in TrafficRange::ALL {
+                let selected = range == self.traffic_range;
+                range_row = range_row.child(
+                    Button::new(SharedString::from(format!(
+                        "management-route-traffic-range-{:?}",
+                        range
+                    )))
+                    .xsmall()
+                    .when(selected, |button| button.primary())
+                    .when(!selected, |button| button.ghost())
+                    .label(range.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.traffic_range = range;
+                        cx.notify();
+                    })),
+                );
+            }
             let traffic = h_flex()
                 .w_full()
                 .flex_wrap()
@@ -14411,7 +14493,12 @@ impl ManagementCenter {
                     cx,
                 ))
                 .child(stat_line("p50", p50, cx))
-                .child(stat_line("p95", p95, cx));
+                .child(stat_line("p95", p95, cx))
+                .child(stat_line(
+                    management_locale_text("Top error", "错误 Top", "錯誤 Top"),
+                    top_error,
+                    cx,
+                ));
             body = body.child(management_card_with_icon(
                 management_locale_text("Traffic & Health", "流量与健康", "流量與健康"),
                 management_locale_text(
@@ -14420,7 +14507,12 @@ impl ManagementCenter {
                     "該組成員產生的觀測請求；不包含成本或配額。",
                 ),
                 "icons/vibex/activity.svg",
-                traffic.into_any_element(),
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(range_row)
+                    .child(traffic)
+                    .into_any_element(),
                 cx,
             ));
         }
@@ -19925,8 +20017,7 @@ impl ManagementCenter {
             .gap_1()
             .child(management_search_input(&self.gateway_request_search, cx))
             .child(request_controls);
-        let mut visible_requests = 0usize;
-        for request in self
+        let filtered_requests = self
             .gateway_requests
             .iter()
             .filter(|request| {
@@ -19962,9 +20053,16 @@ impl ManagementCenter {
                         .is_some_and(|agent| agent.to_lowercase().contains(&request_query));
                 status_ok && query_ok
             })
-            .take(50)
+            .collect::<Vec<_>>();
+        let page_size = 50usize;
+        let page_count = filtered_requests.len().div_ceil(page_size).max(1);
+        let page = self.gateway_request_page.min(page_count - 1);
+        self.gateway_request_page = page;
+        for request in filtered_requests
+            .iter()
+            .skip(page * page_size)
+            .take(page_size)
         {
-            visible_requests += 1;
             let outcome = match request.outcome {
                 vibex_core::GatewayRequestOutcome::Ok => Tag::success()
                     .xsmall()
@@ -20044,7 +20142,57 @@ impl ManagementCenter {
             }
             request_rows = request_rows.child(entry);
         }
-        if visible_requests == 0 {
+        request_rows = request_rows.child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{}-{} / {}",
+                            if filtered_requests.is_empty() {
+                                0
+                            } else {
+                                page * page_size + 1
+                            },
+                            (page * page_size + page_size).min(filtered_requests.len()),
+                            filtered_requests.len()
+                        )),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("management-gateway-request-page-prev")
+                                .xsmall()
+                                .ghost()
+                                .icon(IconName::ChevronLeft)
+                                .disabled(page == 0)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.gateway_request_page =
+                                        this.gateway_request_page.saturating_sub(1);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("management-gateway-request-page-next")
+                                .xsmall()
+                                .ghost()
+                                .icon(IconName::ChevronRight)
+                                .disabled(page + 1 >= page_count)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.gateway_request_page =
+                                        this.gateway_request_page.saturating_add(1);
+                                    cx.notify();
+                                })),
+                        ),
+                ),
+        );
+        if filtered_requests.is_empty() {
             request_rows = request_rows.child(compact_empty_state(
                 management_locale_text(
                     "No requests yet",
@@ -30719,6 +30867,7 @@ impl ManagementCenter {
         )
     }
 
+    #[allow(dead_code)]
     fn render_native_export_card(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let selected_profile = self.selected_management_provider_profile();
         let selected_profile_id = selected_profile
@@ -31075,7 +31224,6 @@ impl ManagementCenter {
     fn render_advanced(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let extra_wide = f32::from(window.viewport_size().width) >= 1536.0;
         let acp_card = self.render_acp_config_card(window, cx);
-        let native_export_card = self.render_native_export_card(cx);
         let hooks_card = self.render_hooks_card(cx);
         let pending = self.mutation.is_some();
         let mut health_rows = v_flex().w_full().gap_1();
@@ -31205,22 +31353,7 @@ impl ManagementCenter {
             compatibility_rows.into_any_element(),
             cx,
         );
-        let top_cards = if extra_wide {
-            h_flex()
-                .w_full()
-                .items_start()
-                .gap_4()
-                .child(div().min_w_0().flex_1().child(acp_card))
-                .child(div().min_w_0().flex_1().child(native_export_card))
-                .into_any_element()
-        } else {
-            v_flex()
-                .w_full()
-                .gap_4()
-                .child(acp_card)
-                .child(native_export_card)
-                .into_any_element()
-        };
+        let top_cards = v_flex().w_full().gap_4().child(acp_card).into_any_element();
         let status_cards = if extra_wide {
             h_flex()
                 .w_full()
@@ -33274,6 +33407,7 @@ fn management_default_updated_message(
     }
 }
 
+#[allow(dead_code)]
 fn native_export_preview_matches(
     preview: &vibex_core::ProviderNativeExportPreview,
     selected_profile_id: Option<&str>,
@@ -33522,6 +33656,7 @@ fn management_textarea_field(
 /// `AgentDefault` comes first because MCP servers and Skills belong to the
 /// Agent the selected profile runs; the concrete Agent entries only exist so an
 /// explicit target can be chosen and checked.
+#[allow(dead_code)]
 fn management_native_export_sources() -> Vec<(vibex_core::ProviderNativeExportSource, &'static str)>
 {
     vec![
@@ -34747,6 +34882,33 @@ impl RouteGroupDetailTab {
             Self::Members => management_locale_text("Members", "成员", "成員"),
             Self::Policy => management_locale_text("Policy", "策略", "策略"),
             Self::Traffic => management_locale_text("Traffic", "流量", "流量"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrafficRange {
+    Hour,
+    Day,
+    Week,
+}
+
+impl TrafficRange {
+    const ALL: [Self; 3] = [Self::Hour, Self::Day, Self::Week];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hour => management_locale_text("1h", "1 小时", "1 小時"),
+            Self::Day => management_locale_text("24h", "24 小时", "24 小時"),
+            Self::Week => management_locale_text("7d", "7 天", "7 天"),
+        }
+    }
+
+    fn window_ms(self) -> i64 {
+        match self {
+            Self::Hour => 60 * 60 * 1000,
+            Self::Day => 24 * 60 * 60 * 1000,
+            Self::Week => 7 * 24 * 60 * 60 * 1000,
         }
     }
 }
@@ -44093,6 +44255,28 @@ mod gateway_surface_tests {
         assert!(source.contains("management-provider-agent-default-"));
         assert!(source.contains("management-route-group-agent-default-"));
         assert!(source.contains("set_agent_default_model_source("));
+    }
+
+    #[test]
+    fn traffic_ranges_requests_paging_and_no_export_entry() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "management-provider-traffic-range-",
+            "management-route-traffic-range-",
+            "Top error",
+            "management-gateway-request-page-prev",
+            "management-gateway-request-page-next",
+        ] {
+            assert!(
+                source.contains(marker),
+                "traffic/requests must keep {marker}"
+            );
+        }
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(
+            !production.contains("self.render_native_export_card(cx)"),
+            "the Advanced page must not render an export card"
+        );
     }
 
     #[test]
