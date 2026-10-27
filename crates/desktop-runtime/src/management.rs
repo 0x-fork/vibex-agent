@@ -400,6 +400,13 @@ impl ProviderManagementFacade {
         self.service.test_model_provider_proxy(request)
     }
 
+    pub fn probe_model_provider_endpoints(
+        &self,
+        request: vibex_core::ModelProviderEndpointProbeRequest,
+    ) -> VibexResult<vibex_core::ModelProviderEndpointProbeResponse> {
+        self.service.probe_model_provider_endpoints(request)
+    }
+
     pub fn fetch_model_provider_profile_models(
         &self,
         request: vibex_core::ModelProviderFetchModelsRequest,

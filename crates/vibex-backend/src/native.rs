@@ -3817,6 +3817,22 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn probe_model_provider_endpoints(
+        &self,
+        request: vibex_core::ModelProviderEndpointProbeRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderEndpointProbeResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .probe_model_provider_endpoints(request)
+                .map_err(Into::into)
+        })
+    }
+
     fn fetch_model_provider_profile_models(
         &self,
         request: vibex_core::ModelProviderFetchModelsRequest,

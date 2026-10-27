@@ -462,6 +462,12 @@ pub trait ManagementBackend: BackendBound {
         request: vibex_core::ModelProviderProxyTestRequest,
     ) -> BackendFuture<'_, vibex_core::ModelProviderTestResult>;
 
+    /// Probes every saved Provider endpoint, ordered fastest first.
+    fn probe_model_provider_endpoints(
+        &self,
+        request: vibex_core::ModelProviderEndpointProbeRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderEndpointProbeResponse>;
+
     /// Fetches the model catalogue a saved shared Provider exposes.
     fn fetch_model_provider_profile_models(
         &self,

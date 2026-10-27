@@ -1560,6 +1560,13 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn probe_model_provider_endpoints(
+        &self,
+        _request: vibex_core::ModelProviderEndpointProbeRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderEndpointProbeResponse> {
+        disconnected_future!()
+    }
+
     fn fetch_model_provider_profile_models(
         &self,
         _request: vibex_core::ModelProviderFetchModelsRequest,

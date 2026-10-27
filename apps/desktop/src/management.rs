@@ -6,7 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::num::IntErrorKind;
+use std::ops::Range;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,8 +16,9 @@ use crate::typography::code_font_weight;
 use gpui::{
     AccessibleAction, Anchor, AnyElement, App, ClickEvent, Context, DragMoveEvent, Empty, Entity,
     EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    Orientation, Rems, Render, Role, ScrollHandle, SharedString, StatefulInteractiveElement as _,
-    Subscription, Task, WeakEntity, Window, div, prelude::*, px, rems,
+    Orientation, Rems, Render, Role, ScrollHandle, SharedString, Size as GpuiSize,
+    StatefulInteractiveElement as _, Subscription, Task, WeakEntity, Window, div, prelude::*, px,
+    rems, size as gpui_size,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size,
@@ -42,7 +45,7 @@ use gpui_component::{
     tab::{Tab, TabBar},
     tag::Tag,
     tooltip::Tooltip,
-    v_flex,
+    v_flex, v_virtual_list,
 };
 use vibex_backend::{
     AgentModelOwnedCatalogRequest, BackendFacade, ManagementProfileSelectionRequest,
@@ -1167,12 +1170,13 @@ pub struct ManagementCenter {
     route_group_detail_tab: RouteGroupDetailTab,
     provider_models_search: Entity<InputState>,
     provider_models_filter: ProviderModelsFilter,
-    provider_models_page: usize,
     traffic_range: TrafficRange,
     provider_model_edit_id: Option<String>,
     provider_model_edit_context: Option<Entity<InputState>>,
     provider_model_edit_output: Option<Entity<InputState>>,
     provider_model_edit_error: Option<String>,
+    provider_endpoint_probes: Option<Vec<vibex_core::ModelProviderEndpointProbe>>,
+    provider_endpoint_probes_profile: Option<vibex_core::ModelProviderProfileId>,
     shared_provider_advanced_target: Option<vibex_core::ModelProviderProfileId>,
     shared_provider_advanced_input: Option<Entity<TextareaState>>,
     shared_provider_advanced_error: Option<String>,
@@ -2424,12 +2428,13 @@ impl ManagementCenter {
             route_group_detail_tab: RouteGroupDetailTab::Overview,
             provider_models_search,
             provider_models_filter: ProviderModelsFilter::All,
-            provider_models_page: 0,
             traffic_range: TrafficRange::Day,
             provider_model_edit_id: None,
             provider_model_edit_context: None,
             provider_model_edit_output: None,
             provider_model_edit_error: None,
+            provider_endpoint_probes: None,
+            provider_endpoint_probes_profile: None,
             shared_provider_advanced_target: None,
             shared_provider_advanced_input: None,
             shared_provider_advanced_error: None,
@@ -13355,180 +13360,85 @@ impl ManagementCenter {
                     };
                     matches_query && matches_filter
                 })
+                .cloned()
                 .collect::<Vec<_>>();
-            let page_size = 50usize;
-            let page_count = matched.len().div_ceil(page_size).max(1);
-            let page = self.provider_models_page.min(page_count - 1);
-            self.provider_models_page = page;
-            let mut model_rows = v_flex().w_full().gap_1();
-            for model in matched.iter().skip(page * page_size).take(page_size) {
-                let is_default = profile.default_model_id.as_deref() == Some(model.id.as_str());
-                let expanded = self.provider_model_edit_id.as_deref() == Some(model.id.as_str());
-                let model_id = model.id.clone();
-                let profile_id = profile.id.clone();
-                let open_profile = profile.clone();
-                let open_model = (*model).clone();
-                let mut entry = v_flex().w_full().child(
-                    h_flex()
-                        .id(SharedString::from(format!(
-                            "management-provider-model-row-{}",
-                            model.id
-                        )))
-                        .w_full()
-                        .items_center()
-                        .gap_2()
-                        .py_1()
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.toggle_shared_provider_model_editor(
-                                &open_profile,
-                                &open_model,
-                                window,
-                                cx,
-                            )
-                        }))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(if model.enabled {
-                                    cx.theme().success
-                                } else {
-                                    cx.theme().muted_foreground
-                                })
-                                .child(if model.enabled { "●" } else { "○" }),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .truncate()
-                                .text_sm()
-                                .child(model.id.clone()),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!(
-                                "management-provider-model-default-{}",
-                                model.id
-                            )))
-                            .xsmall()
-                            .ghost()
-                            .icon(if is_default {
-                                IconName::StarFill
-                            } else {
-                                IconName::Star
-                            })
-                            .tooltip(management_locale_text(
-                                "Set as default",
-                                "设为默认",
-                                "設為預設",
-                            ))
-                            .disabled(!model.enabled || self.mutation.is_some())
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.set_shared_provider_default_model(
-                                        profile_id.clone(),
-                                        model_id.clone(),
-                                        cx,
-                                    )
-                                },
-                            )),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_model_limits_label(&model.capabilities)),
-                        ),
-                );
-                if expanded {
-                    entry =
-                        entry.child(self.render_shared_provider_model_inline(profile, model, cx));
-                }
-                model_rows = model_rows.child(entry);
-            }
             if matched.is_empty() {
-                model_rows = model_rows.child(compact_empty_state(
+                body = body.child(management_card_with_icon(
+                    management_locale_text("Models", "模型", "模型"),
                     management_locale_text(
-                        "No matching models",
-                        "没有匹配的模型",
-                        "沒有符合的模型",
+                        "The models this Provider offers to every Agent that binds it.",
+                        "该供应商向所有绑定它的 Agent 提供的模型。",
+                        "該供應商向所有綁定它的 Agent 提供的模型。",
                     ),
-                    management_locale_text(
-                        "Clear the filter, or edit this Provider to add models.",
-                        "清除筛选，或编辑该供应商添加模型。",
-                        "清除篩選，或編輯該供應商新增模型。",
+                    "icons/vibex/brain.svg",
+                    compact_empty_state(
+                        management_locale_text(
+                            "No matching models",
+                            "没有匹配的模型",
+                            "沒有符合的模型",
+                        ),
+                        management_locale_text(
+                            "Clear the filter, or edit this Provider to add models.",
+                            "清除筛选，或编辑该供应商添加模型。",
+                            "清除篩選，或編輯該供應商新增模型。",
+                        ),
+                        cx,
                     ),
                     cx,
                 ));
+            } else {
+                let profile_rc = Rc::new(profile.clone());
+                let models_rc = Rc::new(matched.clone());
+                let expanded_id = self.provider_model_edit_id.clone();
+                let row_sizes = Rc::new(
+                    models_rc
+                        .iter()
+                        .map(|model| {
+                            let height = if expanded_id.as_deref() == Some(model.id.as_str()) {
+                                340.0
+                            } else {
+                                52.0
+                            };
+                            gpui_size(px(0.0), px(height))
+                        })
+                        .collect::<Vec<GpuiSize<gpui::Pixels>>>(),
+                );
+                let list = v_virtual_list(
+                    cx.entity(),
+                    SharedString::from(format!("management-provider-models-{}", profile.id)),
+                    row_sizes,
+                    move |this, range: Range<usize>, window, cx| {
+                        range
+                            .filter_map(|index| {
+                                let model = models_rc.get(index)?;
+                                Some(this.render_shared_provider_model_row(
+                                    &profile_rc,
+                                    model,
+                                    window,
+                                    cx,
+                                ))
+                            })
+                            .collect()
+                    },
+                );
+                body = body.child(management_card_with_icon(
+                    management_locale_text("Models", "模型", "模型"),
+                    management_locale_text(
+                        "The models this Provider offers to every Agent that binds it.",
+                        "该供应商向所有绑定它的 Agent 提供的模型。",
+                        "該供應商向所有綁定它的 Agent 提供的模型。",
+                    ),
+                    "icons/vibex/brain.svg",
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(management_search_input(&self.provider_models_search, cx))
+                        .child(controls)
+                        .child(div().w_full().h(px(520.0)).min_h_0().child(list))
+                        .into_any_element(),
+                    cx,
+                ));
             }
-            body = body.child(management_card_with_icon(
-                management_locale_text("Models", "模型", "模型"),
-                management_locale_text(
-                    "The models this Provider offers to every Agent that binds it.",
-                    "该供应商向所有绑定它的 Agent 提供的模型。",
-                    "該供應商向所有綁定它的 Agent 提供的模型。",
-                ),
-                "icons/vibex/brain.svg",
-                v_flex()
-                    .w_full()
-                    .gap_2()
-                    .child(management_search_input(&self.provider_models_search, cx))
-                    .child(controls)
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!(
-                                        "{}-{} / {}",
-                                        if matched.is_empty() {
-                                            0
-                                        } else {
-                                            page * page_size + 1
-                                        },
-                                        (page * page_size + page_size).min(matched.len()),
-                                        matched.len()
-                                    )),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .child(
-                                        Button::new("management-provider-models-page-prev")
-                                            .xsmall()
-                                            .ghost()
-                                            .icon(IconName::ChevronLeft)
-                                            .disabled(page == 0)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.provider_models_page =
-                                                    this.provider_models_page.saturating_sub(1);
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("management-provider-models-page-next")
-                                            .xsmall()
-                                            .ghost()
-                                            .icon(IconName::ChevronRight)
-                                            .disabled(page + 1 >= page_count)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.provider_models_page =
-                                                    this.provider_models_page.saturating_add(1);
-                                                cx.notify();
-                                            })),
-                                    ),
-                            ),
-                    )
-                    .child(model_rows)
-                    .into_any_element(),
-                cx,
-            ));
         }
 
         if self.provider_detail_tab == ProviderDetailTab::Routing {
@@ -13786,7 +13696,184 @@ impl ManagementCenter {
                             "僅透過路由組使用",
                         ),
                     ))
-                });
+                })
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_start()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text("Auth header", "认证头", "認證標頭")),
+                        )
+                        .children(
+                            [
+                                ("auto", management_locale_text("Auto", "自动", "自動")),
+                                (
+                                    "x-api-key",
+                                    management_locale_text("x-api-key", "x-api-key", "x-api-key"),
+                                ),
+                                (
+                                    "bearer",
+                                    management_locale_text("Bearer", "Bearer", "Bearer"),
+                                ),
+                                ("both", management_locale_text("Both", "两者", "兩者")),
+                            ]
+                            .into_iter()
+                            .map(|(value, label)| {
+                                let selected = profile
+                                    .metadata
+                                    .auth_header_mode
+                                    .as_deref()
+                                    .unwrap_or("auto")
+                                    == value;
+                                let profile_id = profile.id.clone();
+                                Button::new(SharedString::from(format!(
+                                    "management-shared-provider-auth-mode-{value}"
+                                )))
+                                .xsmall()
+                                .when(selected, |button| button.primary())
+                                .when(!selected, |button| button.ghost())
+                                .label(label)
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.update_shared_provider_metadata(
+                                            profile_id.clone(),
+                                            move |metadata| {
+                                                metadata.auth_header_mode =
+                                                    (value != "auto").then(|| value.to_string());
+                                            },
+                                            cx,
+                                        )
+                                    },
+                                ))
+                            }),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text(
+                                    "User-Agent",
+                                    "User-Agent",
+                                    "User-Agent",
+                                )),
+                        )
+                        .children(
+                            [
+                                ("default", management_locale_text("Default", "默认", "預設")),
+                                (
+                                    "pass_through",
+                                    management_locale_text("Pass through", "透传", "透傳"),
+                                ),
+                            ]
+                            .into_iter()
+                            .map(|(value, label)| {
+                                let selected = profile
+                                    .metadata
+                                    .user_agent_mode
+                                    .as_deref()
+                                    .unwrap_or("default")
+                                    == value;
+                                let profile_id = profile.id.clone();
+                                Button::new(SharedString::from(format!(
+                                    "management-shared-provider-ua-mode-{value}"
+                                )))
+                                .xsmall()
+                                .when(selected, |button| button.primary())
+                                .when(!selected, |button| button.ghost())
+                                .label(label)
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.update_shared_provider_metadata(
+                                            profile_id.clone(),
+                                            move |metadata| {
+                                                metadata.user_agent_mode =
+                                                    (value != "default").then(|| value.to_string());
+                                            },
+                                            cx,
+                                        )
+                                    },
+                                ))
+                            }),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text(
+                                    "Auto-refresh models",
+                                    "自动刷新模型",
+                                    "自動重新整理模型",
+                                )),
+                        )
+                        .child(
+                            Switch::new("management-shared-provider-auto-refresh")
+                                .small()
+                                .checked(profile.metadata.auto_refresh_models)
+                                .on_click(cx.listener({
+                                    let profile_id = profile.id.clone();
+                                    move |this, checked, _, cx| {
+                                        this.update_shared_provider_metadata(
+                                            profile_id.clone(),
+                                            move |metadata| metadata.auto_refresh_models = *checked,
+                                            cx,
+                                        )
+                                    }
+                                })),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text(
+                                    "Allow self-signed TLS",
+                                    "允许自签 TLS",
+                                    "允許自簽 TLS",
+                                )),
+                        )
+                        .child(
+                            Switch::new("management-shared-provider-tls-invalid")
+                                .small()
+                                .checked(profile.metadata.tls_accept_invalid)
+                                .disabled(
+                                    profile.metadata.catalog_id.is_some()
+                                        && profile.metadata.category.as_deref() != Some("local"),
+                                )
+                                .on_click(cx.listener({
+                                    let profile_id = profile.id.clone();
+                                    move |this, checked, _, cx| {
+                                        this.update_shared_provider_metadata(
+                                            profile_id.clone(),
+                                            move |metadata| metadata.tls_accept_invalid = *checked,
+                                            cx,
+                                        )
+                                    }
+                                })),
+                        ),
+                );
             body = body.child(management_card_with_icon(
                 management_locale_text("Advanced", "高级", "進階"),
                 management_locale_text(
@@ -13798,6 +13885,7 @@ impl ManagementCenter {
                 advanced.into_any_element(),
                 cx,
             ));
+            body = body.child(self.render_shared_provider_endpoint_probes(profile, cx));
             body = body.child(self.render_shared_provider_advanced_editor(profile, window, cx));
         }
 
@@ -15582,6 +15670,114 @@ impl ManagementCenter {
         cx.notify();
     }
 
+    fn render_shared_provider_endpoint_probes(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let active = self.provider_endpoint_probes_profile.as_ref() == Some(&profile.id);
+        let probes = active
+            .then(|| self.provider_endpoint_probes.clone())
+            .flatten()
+            .unwrap_or_default();
+        let mut content = v_flex().w_full().gap_1();
+        for probe in &probes {
+            let passed = probe.status == vibex_core::AgentModelProviderTestStatus::Pass;
+            content = content.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .child(Tag::secondary().xsmall().child(format!("{:?}", probe.kind)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(probe.url.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(if passed {
+                                cx.theme().success
+                            } else {
+                                cx.theme().danger
+                            })
+                            .child(format!(
+                                "{}{}",
+                                probe
+                                    .latency_ms
+                                    .map(|value| format!("{value} ms · "))
+                                    .unwrap_or_default(),
+                                probe.message
+                            )),
+                    ),
+            );
+        }
+        let profile_id = profile.id.clone();
+        content = content.child(
+            h_flex()
+                .w_full()
+                .justify_end()
+                .gap_2()
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "management-provider-endpoint-probe-{}",
+                        profile.id.as_str()
+                    )))
+                    .xsmall()
+                    .outline()
+                    .label(if pending && active {
+                        management_locale_text("Probing...", "测速中...", "測速中...")
+                    } else if probes.is_empty() {
+                        management_locale_text("Probe endpoints", "端点测速", "端點測速")
+                    } else {
+                        management_locale_text("Re-probe endpoints", "重新测速", "重新測速")
+                    })
+                    .disabled(pending || profile.credentials.is_empty())
+                    .on_click(cx.listener({
+                        let profile = profile.clone();
+                        move |this, _, _, cx| this.probe_shared_provider_endpoints(&profile, cx)
+                    })),
+                )
+                .when(!probes.is_empty(), |row| {
+                    row.child(
+                        Button::new(SharedString::from(format!(
+                            "management-provider-endpoint-fastest-{}",
+                            profile.id.as_str()
+                        )))
+                        .xsmall()
+                        .primary()
+                        .label(management_locale_text(
+                            "Use fastest",
+                            "使用最快",
+                            "使用最快",
+                        ))
+                        .disabled(pending)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.use_fastest_provider_endpoint(profile_id.clone(), cx)
+                        })),
+                    )
+                }),
+        );
+        management_card_with_icon(
+            management_locale_text("Endpoint latency", "端点延迟", "端點延遲"),
+            management_locale_text(
+                "Probe each saved endpoint and optionally put the fastest API endpoint first.",
+                "测试每个已保存端点，并可把最快的 API 端点排到最前。",
+                "測試每個已儲存端點，並可把最快的 API 端點排到最前。",
+            ),
+            "icons/vibex/activity.svg",
+            content.into_any_element(),
+            cx,
+        )
+    }
+
     fn render_shared_provider_advanced_editor(
         &mut self,
         profile: &vibex_core::ModelProviderProfile,
@@ -15678,6 +15874,32 @@ impl ManagementCenter {
                     ),
             )
             .into_any_element()
+    }
+
+    fn update_shared_provider_metadata(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        update: impl FnOnce(&mut vibex_core::ModelProviderMetadata),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut profile) = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        update(&mut profile.metadata);
+        self.update_shared_provider(
+            profile,
+            management_locale_text(
+                "Advanced settings updated",
+                "高级设置已更新",
+                "進階設定已更新",
+            ),
+            cx,
+        );
     }
 
     fn open_shared_provider_advanced_editor(
@@ -18645,6 +18867,213 @@ impl ManagementCenter {
         );
     }
 
+    fn probe_shared_provider_endpoints(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfile,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(credential) = profile.credentials.first() else {
+            self.error = Some(
+                management_locale_text(
+                    "Add a Key before probing endpoints",
+                    "请先添加 Key 再测速",
+                    "請先新增 Key 再測速",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::ProviderProbe(format!(
+            "endpoint-probe:{}",
+            profile.id.as_str()
+        )));
+        self.error = None;
+        self.notice = None;
+        let profile_id = profile.id.clone();
+        let probe_profile_id = profile_id.clone();
+        let credential_id = credential.id.clone();
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .probe_model_provider_endpoints(vibex_core::ModelProviderEndpointProbeRequest {
+                    model_provider_profile_id: profile_id,
+                    credential_id,
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(response) => {
+                        this.notice = Some(format!(
+                            "{} · {}",
+                            management_locale_text(
+                                "Endpoint probes finished",
+                                "端点测速完成",
+                                "端點測速完成"
+                            ),
+                            response.probes.len()
+                        ));
+                        this.provider_endpoint_probes = Some(response.probes);
+                        this.provider_endpoint_probes_profile = Some(probe_profile_id);
+                    }
+                    Err(error) => this.error = Some(format!("{}: {}", error.code, error.message)),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn use_fastest_provider_endpoint(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(fastest) = self.provider_endpoint_probes.as_ref().and_then(|probes| {
+            probes.iter().find(|probe| {
+                probe.kind == vibex_core::ModelProviderEndpointKind::Api
+                    && probe.status == vibex_core::AgentModelProviderTestStatus::Pass
+            })
+        }) else {
+            return;
+        };
+        let endpoint_id = fastest.endpoint_id.clone();
+        let Some(mut profile) = self
+            .providers
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(index) = profile
+            .endpoints
+            .iter()
+            .position(|endpoint| endpoint.id == endpoint_id)
+        else {
+            return;
+        };
+        let endpoint = profile.endpoints.remove(index);
+        profile.endpoints.insert(0, endpoint);
+        self.update_shared_provider(
+            profile,
+            management_locale_text(
+                "Fastest endpoint selected",
+                "已选择最快端点",
+                "已選擇最快端點",
+            ),
+            cx,
+        );
+    }
+
+    fn render_shared_provider_model_row(
+        &mut self,
+        profile: &vibex_core::ModelProviderProfile,
+        model: &vibex_core::ModelProviderCatalogEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_default = profile.default_model_id.as_deref() == Some(model.id.as_str());
+        let expanded = self.provider_model_edit_id.as_deref() == Some(model.id.as_str());
+        let model_id = model.id.clone();
+        let profile_id = profile.id.clone();
+        let open_profile = profile.clone();
+        let open_model = model.clone();
+        let key_profile = profile.clone();
+        let key_model = model.clone();
+        let mut entry = v_flex().w_full().child(
+            h_flex()
+                .id(SharedString::from(format!(
+                    "management-provider-model-row-{}",
+                    model.id
+                )))
+                .w_full()
+                .items_center()
+                .gap_2()
+                .py_1()
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.toggle_shared_provider_model_editor(&open_profile, &open_model, window, cx)
+                }))
+                .focusable()
+                .tab_index(0)
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "enter" {
+                        this.toggle_shared_provider_model_editor(
+                            &key_profile,
+                            &key_model,
+                            window,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    }
+                }))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(if model.enabled {
+                            cx.theme().success
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .child(if model.enabled { "●" } else { "○" }),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_sm()
+                        .child(model.id.clone()),
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "management-provider-model-default-{}",
+                        model.id
+                    )))
+                    .xsmall()
+                    .ghost()
+                    .icon(if is_default {
+                        IconName::StarFill
+                    } else {
+                        IconName::Star
+                    })
+                    .tooltip(management_locale_text(
+                        "Set as default",
+                        "设为默认",
+                        "設為預設",
+                    ))
+                    .disabled(!model.enabled || self.mutation.is_some())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_shared_provider_default_model(
+                            profile_id.clone(),
+                            model_id.clone(),
+                            cx,
+                        )
+                    })),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_model_limits_label(&model.capabilities)),
+                ),
+        );
+        if expanded {
+            entry = entry.child(self.render_shared_provider_model_inline(profile, model, cx));
+        }
+        let _ = window;
+        entry.into_any_element()
+    }
+
     fn render_shared_provider_model_inline(
         &mut self,
         profile: &vibex_core::ModelProviderProfile,
@@ -20443,6 +20872,7 @@ impl ManagementCenter {
             let request_id = request.request_id.clone();
             let expanded = self.gateway_request_detail.as_ref() == Some(&request_id);
             let toggle_id = request_id.clone();
+            let key_id = request_id.clone();
             let row = h_flex()
                 .id(SharedString::from(format!(
                     "management-gateway-request-row-{}",
@@ -20458,6 +20888,14 @@ impl ManagementCenter {
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle_gateway_request_detail(toggle_id.clone(), cx)
+                }))
+                .focusable()
+                .tab_index(0)
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "enter" {
+                        this.toggle_gateway_request_detail(key_id.clone(), cx);
+                        cx.stop_propagation();
+                    }
                 }))
                 .child(
                     v_flex()
@@ -44612,6 +45050,23 @@ mod gateway_surface_tests {
     }
 
     #[test]
+    fn endpoint_probes_advanced_controls_and_row_keyboard_are_wired() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "management-provider-endpoint-probe-",
+            "management-provider-endpoint-fastest-",
+            "probe_shared_provider_endpoints(",
+            "use_fastest_provider_endpoint(",
+            "management-shared-provider-auth-mode-",
+            "management-shared-provider-ua-mode-",
+            "management-shared-provider-tls-invalid",
+            "on_key_down(cx.listener(move |this, event: &KeyDownEvent",
+        ] {
+            assert!(source.contains(marker), "workbench must keep {marker}");
+        }
+    }
+
+    #[test]
     fn traffic_ranges_requests_paging_and_no_export_entry() {
         let source = include_str!("management.rs");
         for marker in [
@@ -44637,11 +45092,10 @@ mod gateway_surface_tests {
     fn large_model_lists_page_and_the_list_is_keyboard_navigable() {
         let source = include_str!("management.rs");
         for marker in [
-            "management-provider-models-page-prev",
-            "management-provider-models-page-next",
-            "page_size = 50usize",
             "management-provider-model-row-",
             "management-provider-model-inline-save-",
+            "v_virtual_list(",
+            "Range<usize>",
             "management-provider-section-list",
             "on_key_down(cx.listener(|this, event: &KeyDownEvent",
             "\"home\" => 0",

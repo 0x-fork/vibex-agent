@@ -6534,3 +6534,27 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - The Gateway request ledger is filtered first, then paginated at 50 rows with a
   range label and previous/next controls; the clear action still clears the
   whole ledger, not the page.
+
+### Inline Model editor
+
+- Clicking a Models-tab row expands an inline editor; the default star stops
+  propagation and does not toggle the row.
+- The editor edits context/output tokens and four tri-state capabilities
+  (image, PDF, temperature, reasoning); there is no price/cost field.
+- Context/output are parsed as optional positive whole numbers and written into
+  the same v2 profile update as the rest of the shared record.
+- Reasoning off also clears fixed reasoning efforts, matching the Agent model
+  editor's declaration rule.
+
+### Virtual Models table, endpoint probes, field controls, row keyboard
+
+- The Models tab renders through `v_virtual_list` with fixed row heights and an
+  expanded row height for the inline editor. It no longer pages.
+- Endpoint latency probes GET each saved endpoint through the first Key's proxy,
+  order passing probes by latency, and `Use fastest` moves the fastest API
+  endpoint to the front of the profile before a v2 update.
+- Advanced exposes auth-header, User-Agent, TLS, and auto-refresh as direct
+  controls; timeouts, extra body, and aliases remain in the JSON editor. TLS is
+  disabled for catalogued non-local Providers.
+- Provider, Model, and Gateway Request rows are focusable; Enter opens the same
+  detail the click opens, while the default star stops propagation.

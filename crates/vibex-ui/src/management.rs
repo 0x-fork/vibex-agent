@@ -1654,6 +1654,13 @@ mod tests {
             error_future()
         }
 
+        fn probe_model_provider_endpoints(
+            &self,
+            _request: vibex_core::ModelProviderEndpointProbeRequest,
+        ) -> BackendFuture<'_, vibex_core::ModelProviderEndpointProbeResponse> {
+            error_future()
+        }
+
         fn fetch_model_provider_profile_models(
             &self,
             _request: vibex_core::ModelProviderFetchModelsRequest,

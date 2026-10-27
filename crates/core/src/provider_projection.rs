@@ -2955,6 +2955,31 @@ pub struct ModelProviderKeyTestRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ModelProviderEndpointProbeRequest {
+    pub model_provider_profile_id: ModelProviderProfileId,
+    pub credential_id: RequestId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProviderEndpointProbe {
+    pub endpoint_id: String,
+    pub url: String,
+    pub kind: ModelProviderEndpointKind,
+    pub status: crate::provider::AgentModelProviderTestStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<i64>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProviderEndpointProbeResponse {
+    pub probes: Vec<ModelProviderEndpointProbe>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelProviderProxyTestRequest {
     pub model_provider_profile_id: ModelProviderProfileId,
     pub credential_id: RequestId,

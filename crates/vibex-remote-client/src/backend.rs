@@ -5095,6 +5095,16 @@ impl ManagementBackend for WebRemoteBackend {
         )
     }
 
+    fn probe_model_provider_endpoints(
+        &self,
+        _request: vibex_core::ModelProviderEndpointProbeRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderEndpointProbeResponse> {
+        self.unsupported(
+            "model_provider_endpoint_probe_remote_unsupported",
+            "this runtime does not serve endpoint latency probes over the remote protocol yet",
+        )
+    }
+
     fn fetch_model_provider_profile_models(
         &self,
         request: vibex_core::ModelProviderFetchModelsRequest,

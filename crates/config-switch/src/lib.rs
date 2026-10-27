@@ -1234,6 +1234,86 @@ impl ProviderConfigService {
         }
     }
 
+    pub fn probe_model_provider_endpoints(
+        &self,
+        request: vibex_core::ModelProviderEndpointProbeRequest,
+    ) -> VibexResult<vibex_core::ModelProviderEndpointProbeResponse> {
+        let conn = self.open_connection()?;
+        let profile = vibex_db::ModelProviderProfileRepository::get(
+            &conn,
+            &request.model_provider_profile_id,
+        )?
+        .ok_or_else(|| {
+            VibexError::validation(
+                "model_provider_profile_not_found",
+                "the shared Provider was not found",
+            )
+        })?;
+        let credential = profile
+            .credentials
+            .iter()
+            .find(|credential| credential.id == request.credential_id)
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "model_provider_key_not_found",
+                    "the shared Provider does not have this Key",
+                )
+            })?;
+        let proxy = credential
+            .proxy_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let mut probes = Vec::new();
+        for endpoint in &profile.endpoints {
+            let started = std::time::Instant::now();
+            let mut builder = reqwest::blocking::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(8))
+                .timeout(std::time::Duration::from_secs(12));
+            if let Some(proxy) = proxy {
+                if let Ok(proxy) = reqwest::Proxy::all(proxy) {
+                    builder = builder.proxy(proxy);
+                } else {
+                    probes.push(vibex_core::ModelProviderEndpointProbe {
+                        endpoint_id: endpoint.id.clone(),
+                        url: endpoint.url.clone(),
+                        kind: endpoint.kind,
+                        status: AgentModelProviderTestStatus::Fail,
+                        latency_ms: None,
+                        message: "the per-Key proxy URL is not usable".to_string(),
+                    });
+                    continue;
+                }
+            }
+            let result = builder
+                .build()
+                .and_then(|client| client.get(&endpoint.url).send());
+            let latency_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+            let (status, message) = match result {
+                Ok(response) => (
+                    AgentModelProviderTestStatus::Pass,
+                    format!("HTTP {}", response.status().as_u16()),
+                ),
+                Err(error) => (AgentModelProviderTestStatus::Fail, error.to_string()),
+            };
+            probes.push(vibex_core::ModelProviderEndpointProbe {
+                endpoint_id: endpoint.id.clone(),
+                url: endpoint.url.clone(),
+                kind: endpoint.kind,
+                status,
+                latency_ms: Some(latency_ms),
+                message,
+            });
+        }
+        probes.sort_by_key(|probe| {
+            (
+                probe.status != AgentModelProviderTestStatus::Pass,
+                probe.latency_ms.unwrap_or(i64::MAX),
+            )
+        });
+        Ok(vibex_core::ModelProviderEndpointProbeResponse { probes })
+    }
+
     pub fn test_agent_model_provider_profile(
         &self,
         request: AgentModelProviderProfileTestRequest,
