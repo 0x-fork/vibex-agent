@@ -2314,6 +2314,7 @@ pub enum RemoteProviderOperationKind {
     ClearAgentModelSourceDefault,
     FetchModelProviderProfileModels,
     TestModelProviderProfile,
+    TestModelProviderCredential,
     DeleteAgentModelProviderProfile,
     BindAgentModelProvider,
     CreateAgentModelProviderProfile,
@@ -3838,6 +3839,19 @@ pub struct RemoteModelProviderTestResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelProviderKeyTestRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::ModelProviderKeyTestRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteModelProviderKeyTestResponse {
+    pub result: crate::ModelProviderTestResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum RemoteProviderRequest {
     ListAgentSummaries(RemoteAgentConfigSummaryListRequest),
@@ -3881,6 +3895,7 @@ pub enum RemoteProviderRequest {
     ClearAgentModelSourceDefault(RemoteClearAgentModelSourceDefaultRequest),
     FetchModelProviderProfileModels(RemoteModelProviderFetchModelsRequest),
     TestModelProviderProfile(RemoteModelProviderTestRequest),
+    TestModelProviderCredential(RemoteModelProviderKeyTestRequest),
     DeleteAgentModelProviderProfile(RemoteAgentModelProviderProfileDeleteRequest),
     BindAgentModelProvider(RemoteAgentModelProviderBindRequest),
     CreateAgentModelProviderProfile(RemoteAgentModelProviderProfileCreateRequest),
@@ -4076,6 +4091,9 @@ impl RemoteProviderRequest {
             }
             Self::TestModelProviderProfile(_) => {
                 RemoteProviderOperationKind::TestModelProviderProfile
+            }
+            Self::TestModelProviderCredential(_) => {
+                RemoteProviderOperationKind::TestModelProviderCredential
             }
             Self::DeleteAgentModelProviderProfile(_) => {
                 RemoteProviderOperationKind::DeleteAgentModelProviderProfile

@@ -5062,12 +5062,27 @@ impl ManagementBackend for WebRemoteBackend {
 
     fn test_model_provider_credential(
         &self,
-        _request: vibex_core::ModelProviderKeyTestRequest,
+        request: vibex_core::ModelProviderKeyTestRequest,
     ) -> BackendFuture<'_, vibex_core::ModelProviderTestResult> {
-        self.unsupported(
-            "model_provider_key_test_remote_unsupported",
-            "this runtime does not serve a single shared Provider Key test over the remote protocol yet",
-        )
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::TestModelProviderCredential(
+                vibex_core::RemoteModelProviderKeyTestRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteModelProviderKeyTestResponse>(value)?.result)
+        })
     }
 
     fn fetch_model_provider_profile_models(

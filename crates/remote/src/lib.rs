@@ -4768,6 +4768,18 @@ async fn dispatch_provider_request(
             serde_json::to_value(vibex_core::RemoteModelProviderTestResponse { result })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::TestModelProviderCredential(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = service.test_model_provider_credential(request.request)?;
+            serde_json::to_value(vibex_core::RemoteModelProviderKeyTestResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
     }
 }
 

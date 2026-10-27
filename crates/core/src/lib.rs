@@ -478,6 +478,7 @@ pub use remote::{
     RemoteModelGatewayRequestListResponse, RemoteModelGatewaySettingsUpdateRequest,
     RemoteModelGatewaySnapshotRequest, RemoteModelGatewaySnapshotResponse,
     RemoteModelProviderFetchModelsRequest, RemoteModelProviderFetchModelsResponse,
+    RemoteModelProviderKeyTestRequest, RemoteModelProviderKeyTestResponse,
     RemoteModelProviderProfileCreateRequest, RemoteModelProviderProfileListRequest,
     RemoteModelProviderProfileListResponse, RemoteModelProviderProfileResponse,
     RemoteModelProviderProfileUpdateRequest, RemoteModelProviderTestRequest,
