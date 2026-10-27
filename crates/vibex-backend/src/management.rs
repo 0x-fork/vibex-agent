@@ -456,6 +456,12 @@ pub trait ManagementBackend: BackendBound {
         request: vibex_core::ModelProviderKeyTestRequest,
     ) -> BackendFuture<'_, vibex_core::ModelProviderTestResult>;
 
+    /// Probes a per-Key proxy's route to the Provider endpoint.
+    fn test_model_provider_proxy(
+        &self,
+        request: vibex_core::ModelProviderProxyTestRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderTestResult>;
+
     /// Fetches the model catalogue a saved shared Provider exposes.
     fn fetch_model_provider_profile_models(
         &self,

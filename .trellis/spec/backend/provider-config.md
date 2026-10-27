@@ -6497,3 +6497,28 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
   the Key in place.
 - The result is correlated by the clicked credential in the UI; the backend
   result keeps the existing profile-level shape.
+
+### Import preview, model paging, and list keyboard
+
+- The source step can run a native import scan before importing; the scan stores
+  the preview, the panel shows the importable count, and Apply runs the existing
+  import path. A successful import leaves a dismissible report with imported
+  and missing-secret counts.
+- The shared Provider Models tab is windowed to 50 filtered rows with previous/
+  next controls and a `first-last / total` range. This is bounded rendering, not
+  a nested virtual scroll; filters clamp the page.
+- The Provider list container is focusable: Up/Down move the selection,
+  Home/End jump to the edges, and Enter leaves the current selection. Escape and
+  search shortcuts keep their existing paths.
+- Per-Key proxy URLs are validated for http/https/socks5/socks5h; the policy
+  editor offers System, 7890, and 1080 shortcuts that rewrite only `proxyUrl`.
+
+### Per-Key proxy connectivity preview
+
+- `Test saved proxy` resolves the Key's saved proxy URL and sends a GET to the
+  Provider's primary API endpoint through it.
+- Any HTTP response proves the proxy reached the endpoint; status code and
+  latency are reported. A transport failure reports a failed proxy test.
+- The probe carries no credential, prompt, or response body.
+- The proxy policy editor validates the URL scheme and offers System / 7890 /
+  1080 shortcuts; the test always uses the saved value, not the unsaved draft.

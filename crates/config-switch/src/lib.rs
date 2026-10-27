@@ -1114,6 +1114,126 @@ impl ProviderConfigService {
         }
     }
 
+    pub fn test_model_provider_proxy(
+        &self,
+        request: vibex_core::ModelProviderProxyTestRequest,
+    ) -> VibexResult<vibex_core::ModelProviderTestResult> {
+        let conn = self.open_connection()?;
+        let profile = vibex_db::ModelProviderProfileRepository::get(
+            &conn,
+            &request.model_provider_profile_id,
+        )?
+        .ok_or_else(|| {
+            VibexError::validation(
+                "model_provider_profile_not_found",
+                "the shared Provider was not found",
+            )
+        })?;
+        let credential = profile
+            .credentials
+            .iter()
+            .find(|credential| credential.id == request.credential_id)
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "model_provider_key_not_found",
+                    "the shared Provider does not have this Key",
+                )
+            })?;
+        let Some(endpoint) = profile.primary_api_endpoint() else {
+            return Ok(vibex_core::ModelProviderTestResult {
+                model_provider_profile_id: profile.id,
+                status: AgentModelProviderTestStatus::Fail,
+                code: "model_provider_endpoint_missing".to_string(),
+                message: "Provider has no API endpoint to probe".to_string(),
+                diagnostics: Vec::new(),
+                checked_at_ms: unix_timestamp_ms(),
+            });
+        };
+        let Some(proxy_url) = credential
+            .proxy_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(vibex_core::ModelProviderTestResult {
+                model_provider_profile_id: profile.id,
+                status: AgentModelProviderTestStatus::Warn,
+                code: "model_provider_proxy_not_configured".to_string(),
+                message: "This Key has no proxy to test".to_string(),
+                diagnostics: Vec::new(),
+                checked_at_ms: unix_timestamp_ms(),
+            });
+        };
+        let mut builder = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(20));
+        match reqwest::Proxy::all(proxy_url) {
+            Ok(proxy) => builder = builder.proxy(proxy),
+            Err(_) => {
+                return Ok(vibex_core::ModelProviderTestResult {
+                    model_provider_profile_id: profile.id,
+                    status: AgentModelProviderTestStatus::Fail,
+                    code: "model_provider_proxy_invalid".to_string(),
+                    message: "The per-Key proxy URL is not usable".to_string(),
+                    diagnostics: vec![vibex_core::ProviderBindingMetadata {
+                        key: "proxy".to_string(),
+                        value: proxy_url.to_string(),
+                    }],
+                    checked_at_ms: unix_timestamp_ms(),
+                });
+            }
+        }
+        let started = std::time::Instant::now();
+        let result = builder
+            .build()
+            .and_then(|client| client.get(&endpoint.url).send());
+        let latency_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+        let mut diagnostics = vec![
+            vibex_core::ProviderBindingMetadata {
+                key: "proxy".to_string(),
+                value: proxy_url.to_string(),
+            },
+            vibex_core::ProviderBindingMetadata {
+                key: "latencyMs".to_string(),
+                value: latency_ms.to_string(),
+            },
+            vibex_core::ProviderBindingMetadata {
+                key: "endpoint".to_string(),
+                value: endpoint.url.clone(),
+            },
+        ];
+        match result {
+            Ok(response) => {
+                diagnostics.push(vibex_core::ProviderBindingMetadata {
+                    key: "httpStatus".to_string(),
+                    value: response.status().as_u16().to_string(),
+                });
+                Ok(vibex_core::ModelProviderTestResult {
+                    model_provider_profile_id: profile.id,
+                    status: AgentModelProviderTestStatus::Pass,
+                    code: "model_provider_proxy_test_passed".to_string(),
+                    message: "The proxy reached the Provider endpoint".to_string(),
+                    diagnostics,
+                    checked_at_ms: unix_timestamp_ms(),
+                })
+            }
+            Err(error) => {
+                diagnostics.push(vibex_core::ProviderBindingMetadata {
+                    key: "error".to_string(),
+                    value: error.to_string(),
+                });
+                Ok(vibex_core::ModelProviderTestResult {
+                    model_provider_profile_id: profile.id,
+                    status: AgentModelProviderTestStatus::Fail,
+                    code: "model_provider_proxy_test_failed".to_string(),
+                    message: "The proxy could not reach the Provider endpoint".to_string(),
+                    diagnostics,
+                    checked_at_ms: unix_timestamp_ms(),
+                })
+            }
+        }
+    }
+
     pub fn test_agent_model_provider_profile(
         &self,
         request: AgentModelProviderProfileTestRequest,

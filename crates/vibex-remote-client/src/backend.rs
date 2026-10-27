@@ -5085,6 +5085,16 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn test_model_provider_proxy(
+        &self,
+        _request: vibex_core::ModelProviderProxyTestRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderTestResult> {
+        self.unsupported(
+            "model_provider_proxy_test_remote_unsupported",
+            "this runtime does not serve a per-Key proxy test over the remote protocol yet",
+        )
+    }
+
     fn fetch_model_provider_profile_models(
         &self,
         request: vibex_core::ModelProviderFetchModelsRequest,

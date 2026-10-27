@@ -15303,6 +15303,56 @@ impl ManagementCenter {
         }));
     }
 
+    fn test_shared_provider_proxy(
+        &mut self,
+        profile_id: vibex_core::ModelProviderProfileId,
+        credential_id: vibex_core::RequestId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::ProviderProbe(format!(
+            "key-proxy-test:{}",
+            credential_id.as_str()
+        )));
+        self.error = None;
+        self.notice = None;
+        let this = cx.entity();
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = backend
+                .management()
+                .test_model_provider_proxy(vibex_core::ModelProviderProxyTestRequest {
+                    model_provider_profile_id: profile_id,
+                    credential_id,
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(result) => {
+                        let latency = result
+                            .diagnostics
+                            .iter()
+                            .find(|diagnostic| diagnostic.key == "latencyMs")
+                            .map(|diagnostic| format!(" · {} ms", diagnostic.value))
+                            .unwrap_or_default();
+                        if result.status == vibex_core::AgentModelProviderTestStatus::Pass {
+                            this.notice = Some(format!("{}{latency}", result.message));
+                        } else {
+                            this.error = Some(format!("{}: {}", result.code, result.message));
+                        }
+                    }
+                    Err(error) => this.error = Some(format!("{}: {}", error.code, error.message)),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     fn refresh_shared_provider_models(
         &mut self,
         profile_id: vibex_core::ModelProviderProfileId,
@@ -18367,6 +18417,11 @@ impl ManagementCenter {
             .get_or_insert_with(|| cx.new(|cx| TextareaState::new(window, cx).rows(5)))
             .clone();
         let error = self.gateway_key_policy_error.clone();
+        let testing_proxy = matches!(
+            &self.mutation,
+            Some(ManagementMutation::ProviderProbe(action))
+                if action == &format!("key-proxy-test:{}", credential.id.as_str())
+        );
         let profile_id = profile.id.clone();
         let credential_id = credential.id.clone();
         v_flex()
@@ -18456,6 +18511,38 @@ impl ManagementCenter {
                     .w_full()
                     .justify_end()
                     .gap_2()
+                    .when(credential.proxy_url.is_some(), |row| {
+                        let profile_id = profile.id.clone();
+                        let credential_id = credential.id.clone();
+                        row.child(
+                            Button::new(SharedString::from(format!(
+                                "management-shared-provider-test-proxy-{}",
+                                credential.id.as_str()
+                            )))
+                            .xsmall()
+                            .ghost()
+                            .label(if testing_proxy {
+                                management_locale_text("Testing...", "测试中...", "測試中...")
+                            } else {
+                                management_locale_text(
+                                    "Test saved proxy",
+                                    "测试已保存代理",
+                                    "測試已儲存代理",
+                                )
+                            })
+                            .loading(testing_proxy)
+                            .disabled(self.mutation.is_some())
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.test_shared_provider_proxy(
+                                        profile_id.clone(),
+                                        credential_id.clone(),
+                                        cx,
+                                    )
+                                },
+                            )),
+                        )
+                    })
                     .child(
                         Button::new(SharedString::from(format!(
                             "management-shared-provider-key-policy-save-{}",
@@ -44056,6 +44143,9 @@ mod gateway_surface_tests {
             "management-shared-provider-key-proxy-",
             "Proxy suggestions",
             "must start with http://",
+            "management-shared-provider-test-proxy-",
+            "test_shared_provider_proxy(",
+            "test_model_provider_proxy(",
         ] {
             assert!(source.contains(marker), "Key scope must keep {marker}");
         }

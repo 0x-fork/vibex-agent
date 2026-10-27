@@ -1647,6 +1647,13 @@ mod tests {
             error_future()
         }
 
+        fn test_model_provider_proxy(
+            &self,
+            _request: vibex_core::ModelProviderProxyTestRequest,
+        ) -> BackendFuture<'_, vibex_core::ModelProviderTestResult> {
+            error_future()
+        }
+
         fn fetch_model_provider_profile_models(
             &self,
             _request: vibex_core::ModelProviderFetchModelsRequest,

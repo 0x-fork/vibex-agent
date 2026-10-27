@@ -393,6 +393,13 @@ impl ProviderManagementFacade {
         self.service.test_model_provider_credential(request)
     }
 
+    pub fn test_model_provider_proxy(
+        &self,
+        request: vibex_core::ModelProviderProxyTestRequest,
+    ) -> VibexResult<vibex_core::ModelProviderTestResult> {
+        self.service.test_model_provider_proxy(request)
+    }
+
     pub fn fetch_model_provider_profile_models(
         &self,
         request: vibex_core::ModelProviderFetchModelsRequest,

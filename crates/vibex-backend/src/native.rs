@@ -3801,6 +3801,22 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn test_model_provider_proxy(
+        &self,
+        request: vibex_core::ModelProviderProxyTestRequest,
+    ) -> BackendFuture<'_, vibex_core::ModelProviderTestResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .test_model_provider_proxy(request)
+                .map_err(Into::into)
+        })
+    }
+
     fn fetch_model_provider_profile_models(
         &self,
         request: vibex_core::ModelProviderFetchModelsRequest,
