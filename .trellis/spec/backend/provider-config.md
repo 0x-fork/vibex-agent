@@ -6278,3 +6278,35 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - `vibex-desktop`: the favorite control, status filters, sort controls, and
   favorite file name remain wired; a 10+ Agent row wraps without changing the
   page width.
+
+## Scenario: Two-Step Add Provider — Source Step
+
+### 1. Scope / Trigger
+
+- Trigger: the user adds a Provider from the global Providers page or an Agent
+  page.
+
+### 2. Contracts
+
+- Step one is the source step; step two is the existing connection-and-model
+  editor. There is no third step.
+- Category chips are exactly Vendors / Relays / Local, multi-select, all
+  selected by default. There is no "All" chip.
+- A preset tile shows a logo (bundled SVG or monogram fallback), its name, and
+  one detail line. Plan notes are badges, not categories.
+- A local preset is one with `no_key`, a loopback endpoint, or a known local id
+  (`ollama`, `lmstudio`). A relay is one of the reseller presets
+  (`openrouter`, `opencode-go`, `clinepass`, `commandcode`). Every other preset
+  is a vendor.
+- When the step is reached from an Agent page, the scope control offers "Only
+  this Agent" and "Share with Agents"; the choice drives the existing shared-vs-
+  Agent save branch.
+- "Import configuration" opens the existing native import preview for the
+  selected Agent; "Custom provider" opens the empty form. Both stay on step one.
+- Search matches the preset id, name, and endpoint host.
+
+### 3. Tests Required
+
+- `vibex-desktop`: all three categories classify known presets; search filters
+  tiles; category selection never empties the set; the source step keeps the
+  import and custom entries; the picker starts at step one for a new Provider.
