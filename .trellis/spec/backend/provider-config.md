@@ -6320,3 +6320,33 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
   state; a read or write failure is non-fatal and never blocks adding a Provider.
 - A preset choice is recorded before the draft is filled, so a failed save still
   leaves the source in recents.
+
+## Scenario: Shared Provider Workbench Tabs
+
+### 1. Scope / Trigger
+
+- Trigger: a shared Provider is selected on the Providers page.
+
+### 2. Contracts
+
+- The workbench tabs are Overview / Models / Keys / Routing / Traffic /
+  Advanced. The tab state is page state, not persisted per Provider.
+- Overview owns the Agent binding list, the bind-another-Agent offer, and the
+  shared editor entry. It does not duplicate Keys.
+- Models lists the configured catalogue with enable/default/limit labels; it
+  never renders a price column.
+- Keys owns the credential list and per-Key status. Routing lists the route
+  groups whose member set includes this Provider, with the member position.
+- Traffic reads only observed `GatewayRequestSummary` and health rows: request
+  count, success, tokens, and the aggregate health label. It never computes
+  cost, quota, or balance.
+- Advanced lists endpoint roles, proxy policy, header count, and the
+  only-through-route-groups visibility flag; Delete lives only here.
+- Editing remains one shared v2 write; an Agent-only field is reached from the
+  Agent page, not silently written into v2.
+
+### 3. Tests Required
+
+- `vibex-desktop`: the six tab labels and tab bar remain wired; Delete is only
+  rendered in Advanced; Models has no price header; Traffic has no cost/quota
+  control.

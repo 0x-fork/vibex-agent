@@ -1119,6 +1119,7 @@ pub struct ManagementCenter {
     /// from memory, and a blank form hides that the choice existed.
     provider_preset_picker: bool,
     provider_source_categories: BTreeSet<ProviderPresetCategory>,
+    provider_detail_tab: ProviderDetailTab,
     /// The picker's filter. It matches id, name, and address, because those
     /// are the three things a user remembers about a vendor.
     provider_preset_query: Entity<InputState>,
@@ -2335,6 +2336,7 @@ impl ManagementCenter {
             provider_preset_region: None,
             provider_preset_picker: false,
             provider_source_categories: ProviderPresetCategory::ALL.into_iter().collect(),
+            provider_detail_tab: ProviderDetailTab::Overview,
             provider_editor_shared: false,
             provider_preset_query,
             route_group_editor_open: false,
@@ -12633,164 +12635,194 @@ impl ManagementCenter {
         if self.shared_provider_edit_target.as_ref() == Some(&profile.id) {
             body = body.child(self.render_shared_provider_editor(profile, cx));
         }
-        body = body.child(self.render_shared_provider_keys(profile, window, cx));
-
-        let mut agent_rows = h_flex().w_full().flex_wrap().gap_1p5();
-        for agent_id in &row.agents {
-            let label = self
-                .snapshot
-                .agents
-                .iter()
-                .find(|agent| agent.id.as_str() == agent_id)
-                .map(|agent| agent.label.clone())
-                .unwrap_or_else(|| agent_id.clone());
-            agent_rows = agent_rows.child(
-                Tag::secondary().child(
-                    h_flex()
-                        .items_center()
-                        .gap_1()
-                        .child(agent_brand_icon(agent_id, px(14.0), None))
-                        .child(label),
-                ),
-            );
-        }
-        let configurable = vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
-        let unbound = self
-            .snapshot
-            .agents
+        let selected_tab_index = ProviderDetailTab::ALL
             .iter()
-            .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
-            .filter(|agent| configurable.contains(&agent.id))
-            .filter(|agent| !row.agents.contains(agent.id.as_str()))
-            .collect::<Vec<_>>();
-        if !unbound.is_empty() {
-            agent_rows = agent_rows.child(
-                div()
-                    .w_full()
-                    .pt_1()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Available to enable from the Agent page",
-                        "可在 Agent 页面启用",
-                        "可在 Agent 頁面啟用",
-                    )),
-            );
-            for agent in &unbound {
+            .position(|tab| *tab == self.provider_detail_tab)
+            .unwrap_or(0);
+        body = body.child(
+            TabBar::new("management-provider-detail-tabs")
+                .w_full()
+                .pill()
+                .selected_index(selected_tab_index)
+                .children(ProviderDetailTab::ALL.into_iter().map(|tab| {
+                    Tab::new()
+                        .flex_1()
+                        .aria_label(tab.label())
+                        .child(div().text_sm().child(tab.label()))
+                }))
+                .on_click(cx.listener(|this, index: &usize, _, cx| {
+                    if let Some(tab) = ProviderDetailTab::ALL.get(*index) {
+                        this.provider_detail_tab = *tab;
+                        cx.notify();
+                    }
+                })),
+        );
+        if self.provider_detail_tab == ProviderDetailTab::Keys {
+            body = body.child(self.render_shared_provider_keys(profile, window, cx));
+        }
+        if self.provider_detail_tab == ProviderDetailTab::Overview {
+            let mut agent_rows = h_flex().w_full().flex_wrap().gap_1p5();
+            for agent_id in &row.agents {
+                let label = self
+                    .snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id.as_str() == agent_id)
+                    .map(|agent| agent.label.clone())
+                    .unwrap_or_else(|| agent_id.clone());
                 agent_rows = agent_rows.child(
                     Tag::secondary().child(
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .child(agent_brand_icon(agent.id.as_str(), px(14.0), None))
-                            .child(agent.label.clone()),
+                            .child(agent_brand_icon(agent_id, px(14.0), None))
+                            .child(label),
                     ),
                 );
             }
-        }
-        if row.agents.is_empty() && unbound.is_empty() {
-            agent_rows = agent_rows.child(div().text_sm().text_color(cx.theme().warning).child(
+            let configurable =
+                vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
+            let unbound = self
+                .snapshot
+                .agents
+                .iter()
+                .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+                .filter(|agent| configurable.contains(&agent.id))
+                .filter(|agent| !row.agents.contains(agent.id.as_str()))
+                .collect::<Vec<_>>();
+            if !unbound.is_empty() {
+                agent_rows = agent_rows.child(
+                    div()
+                        .w_full()
+                        .pt_1()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "Available to enable from the Agent page",
+                            "可在 Agent 页面启用",
+                            "可在 Agent 頁面啟用",
+                        )),
+                );
+                for agent in &unbound {
+                    agent_rows = agent_rows.child(
+                        Tag::secondary().child(
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(agent_brand_icon(agent.id.as_str(), px(14.0), None))
+                                .child(agent.label.clone()),
+                        ),
+                    );
+                }
+            }
+            if row.agents.is_empty() && unbound.is_empty() {
+                agent_rows =
+                    agent_rows.child(div().text_sm().text_color(cx.theme().warning).child(
+                        management_locale_text(
+                            "No Agent uses this Provider yet. Point one at it from its own page.",
+                            "还没有 Agent 使用该供应商，请到 Agent 页让它接入。",
+                            "還沒有 Agent 使用該供應商，請到 Agent 頁讓它接入。",
+                        ),
+                    ));
+            }
+            body = body.child(management_card_with_icon(
+                management_locale_text("Used by", "被哪些 Agent 使用", "被哪些 Agent 使用"),
                 management_locale_text(
-                    "No Agent uses this Provider yet. Point one at it from its own page.",
-                    "还没有 Agent 使用该供应商，请到 Agent 页让它接入。",
-                    "還沒有 Agent 使用該供應商，請到 Agent 頁讓它接入。",
+                    "Deleting this Provider would remove the model source of these Agents.",
+                    "删除该供应商会让这些 Agent 失去模型来源。",
+                    "刪除該供應商會讓這些 Agent 失去模型來源。",
                 ),
+                "icons/vibex/cpu.svg",
+                agent_rows.into_any_element(),
+                cx,
             ));
-        }
-        body = body.child(management_card_with_icon(
-            management_locale_text("Used by", "被哪些 Agent 使用", "被哪些 Agent 使用"),
-            management_locale_text(
-                "Deleting this Provider would remove the model source of these Agents.",
-                "删除该供应商会让这些 Agent 失去模型来源。",
-                "刪除該供應商會讓這些 Agent 失去模型來源。",
-            ),
-            "icons/vibex/cpu.svg",
-            agent_rows.into_any_element(),
-            cx,
-        ));
 
-        // The other half of "used by": letting a further Agent use it. Without
-        // this the page could only report the sharing, and the user had to go
-        // to the Agent's own page and re-enter the address, the protocol and
-        // the Key to get the same Provider there.
-        //
-        // An Agent that already has it is not offered again, and one that
-        // manages its own provider cannot be pointed at this one at all.
-        let configurable = vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
-        let bindable = self
-            .snapshot
-            .agents
-            .iter()
-            .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
-            .filter(|agent| configurable.contains(&agent.id))
-            .filter(|agent| !row.agents.contains(agent.id.as_str()))
-            .map(|agent| (agent.id.clone(), agent.label.clone()))
-            .collect::<Vec<_>>();
-        // Binding needs a source: either the legacy Profile that already exists
-        // for this shared record, or the shared record itself, which the
-        // authority can materialise into one. A Provider created on this page
-        // has only the latter, and it is exactly the one that most needs the
-        // offer.
-        let bind_profile = profile.legacy_provider_profile_id.clone();
-        let bind_shared = Some(profile.id.clone());
-        let bindable = if bind_profile.is_some() || profile.legacy_provider_profile_id.is_none() {
-            bindable
-        } else {
-            Vec::new()
-        };
-        let bind_count = bindable.len();
-        let mut bind_rows = v_flex().w_full().gap_1();
-        for (agent_id, label) in bindable {
-            let bind_agent = agent_id.clone();
-            let bind_profile = bind_profile
-                .clone()
-                .unwrap_or_else(vibex_core::ProviderProfileId::new);
-            let bind_shared = bind_shared.clone();
-            bind_rows = bind_rows.child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .py_1()
-                    .child(div().min_w_0().truncate().text_sm().child(label))
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "management-provider-bind-{}",
-                            agent_id.as_str()
-                        )))
-                        .xsmall()
-                        .outline()
-                        .label(management_locale_text(
-                            "Use for this Agent",
-                            "让此 Agent 使用",
-                            "讓此 Agent 使用",
-                        ))
-                        .disabled(self.mutation.is_some())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.bind_provider_to_agent(
-                                bind_agent.clone(),
-                                bind_profile.clone(),
-                                bind_shared.clone(),
-                                cx,
-                            )
-                        })),
-                    ),
-            );
-        }
-        if bind_count == 0 {
-            bind_rows = bind_rows.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Every Agent that can use a Provider already uses this one.",
-                        "所有能使用供应商的 Agent 都已经在使用该供应商。",
-                        "所有能使用供應商的 Agent 都已經在使用該供應商。",
-                    )),
-            );
-        }
-        body = body.child(management_card_with_icon(
+            // The other half of "used by": letting a further Agent use it. Without
+            // this the page could only report the sharing, and the user had to go
+            // to the Agent's own page and re-enter the address, the protocol and
+            // the Key to get the same Provider there.
+            //
+            // An Agent that already has it is not offered again, and one that
+            // manages its own provider cannot be pointed at this one at all.
+            let configurable =
+                vibex_core::model_provider_configurable_agent_ids().unwrap_or_default();
+            let bindable = self
+                .snapshot
+                .agents
+                .iter()
+                .filter(|agent| vibex_core::is_user_visible_agent(&agent.id))
+                .filter(|agent| configurable.contains(&agent.id))
+                .filter(|agent| !row.agents.contains(agent.id.as_str()))
+                .map(|agent| (agent.id.clone(), agent.label.clone()))
+                .collect::<Vec<_>>();
+            // Binding needs a source: either the legacy Profile that already exists
+            // for this shared record, or the shared record itself, which the
+            // authority can materialise into one. A Provider created on this page
+            // has only the latter, and it is exactly the one that most needs the
+            // offer.
+            let bind_profile = profile.legacy_provider_profile_id.clone();
+            let bind_shared = Some(profile.id.clone());
+            let bindable = if bind_profile.is_some() || profile.legacy_provider_profile_id.is_none()
+            {
+                bindable
+            } else {
+                Vec::new()
+            };
+            let bind_count = bindable.len();
+            let mut bind_rows = v_flex().w_full().gap_1();
+            for (agent_id, label) in bindable {
+                let bind_agent = agent_id.clone();
+                let bind_profile = bind_profile
+                    .clone()
+                    .unwrap_or_else(vibex_core::ProviderProfileId::new);
+                let bind_shared = bind_shared.clone();
+                bind_rows = bind_rows.child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .py_1()
+                        .child(div().min_w_0().truncate().text_sm().child(label))
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "management-provider-bind-{}",
+                                agent_id.as_str()
+                            )))
+                            .xsmall()
+                            .outline()
+                            .label(management_locale_text(
+                                "Use for this Agent",
+                                "让此 Agent 使用",
+                                "讓此 Agent 使用",
+                            ))
+                            .disabled(self.mutation.is_some())
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.bind_provider_to_agent(
+                                        bind_agent.clone(),
+                                        bind_profile.clone(),
+                                        bind_shared.clone(),
+                                        cx,
+                                    )
+                                },
+                            )),
+                        ),
+                );
+            }
+            if bind_count == 0 {
+                bind_rows = bind_rows.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "Every Agent that can use a Provider already uses this one.",
+                            "所有能使用供应商的 Agent 都已经在使用该供应商。",
+                            "所有能使用供應商的 Agent 都已經在使用該供應商。",
+                        )),
+                );
+            }
+            body = body.child(management_card_with_icon(
             management_locale_text(
                 "Use for another Agent",
                 "让其他 Agent 使用",
@@ -12805,15 +12837,302 @@ impl ManagementCenter {
             bind_rows.into_any_element(),
             cx,
         ));
-
+        }
         // Deletion lives at the bottom of the page, apart from the editing
         // controls: it is the one action here that cannot be undone, and putting
         // it beside Save or Test is how it gets clicked by accident.
-        let delete_id = profile.id.clone();
-        let delete_label = profile.display_name.clone();
-        let used_by = row.agents.len();
-        let pending = self.mutation.is_some();
-        body = body.child(management_card_with_icon(
+        if self.provider_detail_tab == ProviderDetailTab::Models {
+            let mut model_rows = v_flex().w_full().gap_1();
+            for model in &profile.configured_models {
+                let is_default = profile.default_model_id.as_deref() == Some(model.id.as_str());
+                model_rows = model_rows.child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(if model.enabled {
+                                    cx.theme().success
+                                } else {
+                                    cx.theme().muted_foreground
+                                })
+                                .child(if model.enabled { "●" } else { "○" }),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_sm()
+                                .child(model.id.clone()),
+                        )
+                        .when(is_default, |row| {
+                            row.child(
+                                Tag::secondary()
+                                    .xsmall()
+                                    .child(management_locale_text("Default", "默认", "預設")),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_model_limits_label(&model.capabilities)),
+                        ),
+                );
+            }
+            if profile.configured_models.is_empty() {
+                model_rows = model_rows.child(compact_empty_state(
+                    management_locale_text("No models yet", "还没有模型", "還沒有模型"),
+                    management_locale_text(
+                        "Edit this Provider to add or fetch models.",
+                        "编辑该供应商以添加或拉取模型。",
+                        "編輯該供應商以新增或拉取模型。",
+                    ),
+                    cx,
+                ));
+            }
+            body = body.child(management_card_with_icon(
+                management_locale_text("Models", "模型", "模型"),
+                management_locale_text(
+                    "The models this Provider offers to every Agent that binds it.",
+                    "该供应商向所有绑定它的 Agent 提供的模型。",
+                    "該供應商向所有綁定它的 Agent 提供的模型。",
+                ),
+                "icons/vibex/brain.svg",
+                model_rows.into_any_element(),
+                cx,
+            ));
+        }
+
+        if self.provider_detail_tab == ProviderDetailTab::Routing {
+            let member_routes = self
+                .model_routes
+                .iter()
+                .filter_map(|route| {
+                    route
+                        .members
+                        .iter()
+                        .position(|member| member.model_provider_profile_id == profile.id)
+                        .map(|position| (route, position))
+                })
+                .collect::<Vec<_>>();
+            let mut route_rows = v_flex().w_full().gap_1();
+            for (route, position) in &member_routes {
+                route_rows = route_rows.child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .py_1()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .child(route.display_name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "{} {}",
+                                    management_locale_text("member", "成员", "成員"),
+                                    position + 1
+                                )),
+                        ),
+                );
+            }
+            if member_routes.is_empty() {
+                route_rows = route_rows.child(compact_empty_state(
+                    management_locale_text(
+                        "No route group uses it",
+                        "没有路由组使用它",
+                        "沒有路由組使用它",
+                    ),
+                    management_locale_text(
+                        "Add it as a member of a route group to serve failover traffic.",
+                        "把它加入路由组后才会参与故障转移。",
+                        "把它加入路由組後才會參與容錯移轉。",
+                    ),
+                    cx,
+                ));
+            }
+            body = body.child(management_card_with_icon(
+                management_locale_text("Routing", "路由", "路由"),
+                management_locale_text(
+                    "Where this Provider appears in a route group's attempt order.",
+                    "该供应商在路由组尝试顺序中的位置。",
+                    "該供應商在路由組嘗試順序中的位置。",
+                ),
+                "icons/vibex/route.svg",
+                route_rows.into_any_element(),
+                cx,
+            ));
+        }
+
+        if self.provider_detail_tab == ProviderDetailTab::Traffic {
+            let requests = self
+                .gateway_requests
+                .iter()
+                .filter(|request| request.model_provider_profile_id == profile.id)
+                .collect::<Vec<_>>();
+            let total = requests.len();
+            let succeeded = requests
+                .iter()
+                .filter(|request| request.status.is_some_and(|status| status < 400))
+                .count();
+            let tokens = requests
+                .iter()
+                .map(|request| request.total_tokens)
+                .sum::<u64>();
+            let (health_label, _) = self.shared_provider_health_label(profile);
+            let mut traffic = v_flex().w_full().gap_2();
+            traffic = traffic.child(
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .gap_4()
+                    .child(stat_line(
+                        management_locale_text("Health", "健康", "健康"),
+                        health_label.to_string(),
+                        cx,
+                    ))
+                    .child(stat_line(
+                        management_locale_text("Requests", "请求", "請求"),
+                        total.to_string(),
+                        cx,
+                    ))
+                    .child(stat_line(
+                        management_locale_text("Succeeded", "成功", "成功"),
+                        succeeded.to_string(),
+                        cx,
+                    ))
+                    .child(stat_line(
+                        management_locale_text("Tokens", "Token", "Token"),
+                        tokens.to_string(),
+                        cx,
+                    )),
+            );
+            if total == 0 {
+                traffic = traffic.child(compact_empty_state(
+                    management_locale_text("No traffic yet", "还没有流量", "還沒有流量"),
+                    management_locale_text(
+                        "Gateway requests that reach this Provider appear here.",
+                        "经过网关并命中该供应商的请求会显示在这里。",
+                        "經過閘道並命中該供應商的請求會顯示在這裡。",
+                    ),
+                    cx,
+                ));
+            }
+            body = body.child(management_card_with_icon(
+                management_locale_text("Traffic & Health", "流量与健康", "流量與健康"),
+                management_locale_text(
+                    "Observed requests and probe health; no cost or quota is tracked.",
+                    "观测到的请求与探测健康；不追踪成本或配额。",
+                    "觀測到的請求與探測健康；不追蹤成本或配額。",
+                ),
+                "icons/vibex/activity.svg",
+                traffic.into_any_element(),
+                cx,
+            ));
+        }
+
+        if self.provider_detail_tab == ProviderDetailTab::Advanced {
+            let mut advanced = v_flex().w_full().gap_1();
+            for endpoint in &profile.endpoints {
+                advanced = advanced.child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Tag::secondary()
+                                .xsmall()
+                                .child(format!("{:?}", endpoint.kind)),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(endpoint.url.clone()),
+                        ),
+                );
+            }
+            let proxy_label = match profile.proxy_policy {
+                vibex_core::ModelProviderProxyPolicy::InheritSystem => {
+                    management_locale_text("Inherit system proxy", "跟随系统代理", "跟隨系統代理")
+                }
+                vibex_core::ModelProviderProxyPolicy::Disabled => {
+                    management_locale_text("Direct connection", "直连", "直連")
+                }
+                vibex_core::ModelProviderProxyPolicy::Endpoint(_) => {
+                    management_locale_text("Custom proxy", "自定义代理", "自訂代理")
+                }
+            };
+            advanced = advanced
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text("Proxy", "代理", "代理")),
+                        )
+                        .child(div().text_sm().child(proxy_label)),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text("Headers", "请求头", "請求標頭")),
+                        )
+                        .child(div().text_sm().child(profile.headers.len().to_string())),
+                )
+                .when(profile.metadata.only_through_route_groups, |card| {
+                    card.child(div().text_xs().text_color(cx.theme().warning).child(
+                        management_locale_text(
+                            "Only reachable through route groups",
+                            "仅通过路由组使用",
+                            "僅透過路由組使用",
+                        ),
+                    ))
+                });
+            body = body.child(management_card_with_icon(
+                management_locale_text("Advanced", "高级", "進階"),
+                management_locale_text(
+                    "Endpoints and visibility settings that are not part of the model list.",
+                    "不属于模型列表的端点与可见性设置。",
+                    "不屬於模型清單的端點與可見性設定。",
+                ),
+                "icons/vibex/settings.svg",
+                advanced.into_any_element(),
+                cx,
+            ));
+        }
+
+        if self.provider_detail_tab == ProviderDetailTab::Advanced {
+            let delete_id = profile.id.clone();
+            let delete_label = profile.display_name.clone();
+            let used_by = row.agents.len();
+            let pending = self.mutation.is_some();
+            body = body.child(management_card_with_icon(
             management_locale_text("Delete", "删除", "刪除"),
             if used_by == 0 {
                 management_locale_text(
@@ -12865,6 +13184,7 @@ impl ManagementCenter {
                 .into_any_element(),
             cx,
         ));
+        }
 
         v_flex()
             .id("management-provider-page")
@@ -31627,6 +31947,38 @@ impl ProviderSort {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderDetailTab {
+    Overview,
+    Models,
+    Keys,
+    Routing,
+    Traffic,
+    Advanced,
+}
+
+impl ProviderDetailTab {
+    const ALL: [Self; 6] = [
+        Self::Overview,
+        Self::Models,
+        Self::Keys,
+        Self::Routing,
+        Self::Traffic,
+        Self::Advanced,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overview => management_locale_text("Overview", "概览", "概覽"),
+            Self::Models => management_locale_text("Models", "模型", "模型"),
+            Self::Keys => management_locale_text("Keys", "Key", "Key"),
+            Self::Routing => management_locale_text("Routing", "路由", "路由"),
+            Self::Traffic => management_locale_text("Traffic", "流量", "流量"),
+            Self::Advanced => management_locale_text("Advanced", "高级", "進階"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderListFilter {
     All,
     Enabled,
@@ -35064,6 +35416,27 @@ fn management_catalog_age_label(fetched_at_ms: i64) -> String {
             ResolvedLocale::ZhCn => format!("{days} 天前"),
             ResolvedLocale::ZhTw => format!("{days} 天前"),
         }
+    }
+}
+
+fn management_model_limits_label(capabilities: &vibex_core::ProviderModelCapabilities) -> String {
+    let mut parts = Vec::new();
+    if let Some(context) = capabilities.context_tokens {
+        parts.push(format!("ctx {context}"));
+    }
+    if let Some(output) = capabilities.output_tokens {
+        parts.push(format!("out {output}"));
+    }
+    if capabilities.image_input == Some(true) {
+        parts.push(management_locale_text("image", "图片", "圖片").to_string());
+    }
+    if capabilities.pdf_input == Some(true) {
+        parts.push(management_locale_text("PDF", "PDF", "PDF").to_string());
+    }
+    if parts.is_empty() {
+        management_locale_text("No declarations", "未声明", "未宣告").to_string()
+    } else {
+        parts.join(" · ")
     }
 }
 
@@ -40845,6 +41218,23 @@ mod gateway_surface_tests {
         assert!(save.contains("profile.headers = headers"));
         assert!(source.contains("provider-shared-edit-"));
         assert!(source.contains("open_shared_provider_editor_by_id"));
+    }
+
+    #[test]
+    fn the_shared_provider_workbench_has_six_tabs() {
+        let source = include_str!("management.rs");
+        for tab in [
+            "ProviderDetailTab::Overview",
+            "ProviderDetailTab::Models",
+            "ProviderDetailTab::Keys",
+            "ProviderDetailTab::Routing",
+            "ProviderDetailTab::Traffic",
+            "ProviderDetailTab::Advanced",
+        ] {
+            assert!(source.contains(tab), "the workbench must keep {tab}");
+        }
+        assert!(source.contains("management-provider-detail-tabs"));
+        assert!(source.contains("management_model_limits_label"));
     }
 
     #[test]
