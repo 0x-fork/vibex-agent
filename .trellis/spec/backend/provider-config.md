@@ -6423,3 +6423,11 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - `extraBody` must be a JSON object. `modelAliases` is an object of local id to
   upstream id.
 - None of these fields may carry a price, cost, quota, or balance value.
+
+### Pre-save connection test
+
+- Creating a Provider can test the draft's URL and key before any row exists.
+- The test uses the draft model-list request; it returns status, discovered
+  model count, latency diagnostics, and a typed failure.
+- A failed test leaves the draft intact and does not clear the key field.
+- The saved-Provider Test still uses the saved credential and model-list probe.

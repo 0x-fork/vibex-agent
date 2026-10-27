@@ -7350,6 +7350,93 @@ impl ManagementCenter {
         );
     }
 
+    fn test_provider_draft(&mut self, agent_id: String, cx: &mut Context<Self>) {
+        let Ok(agent_id) = AgentId::parse(agent_id) else {
+            self.error = Some(
+                management_error_text(
+                    "Agent identity is invalid",
+                    "Agent 标识无效",
+                    "Agent 識別碼無效",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let base_url = self.profile_base_url.read(cx).value().trim().to_string();
+        let api_key = self.profile_api_key.read(cx).value().trim().to_string();
+        if base_url.is_empty() || api_key.is_empty() {
+            self.error = Some(
+                management_error_text(
+                    "Enter a request URL and a key before testing",
+                    "请先填写接口地址和 Key 再测试",
+                    "請先填寫介面位址和 Key 再測試",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self.mutation.is_some() {
+            return;
+        }
+        self.mutation = Some(ManagementMutation::ProviderProbe(format!(
+            "draft-test:{}",
+            agent_id.as_str()
+        )));
+        self.error = None;
+        self.notice = None;
+        let configured_models = self.profile_configured_models.clone();
+        let provider_options = Some(self.profile_provider_options.clone());
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .fetch_agent_model_provider_draft_models(
+                    vibex_core::AgentModelProviderDraftFetchModelsRequest {
+                        agent_id,
+                        base_url,
+                        api_key,
+                        configured_models,
+                        provider_options,
+                    },
+                )
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let failed =
+                management_error_text("Connection test failed", "连接测试失败", "連線測試失敗");
+            let _ = entity.update(cx, |this, cx| {
+                this.mutation = None;
+                match outcome {
+                    Ok(Ok(response)) => {
+                        let latency = response
+                            .diagnostics
+                            .iter()
+                            .find(|diagnostic| diagnostic.key == "latencyMs")
+                            .map(|diagnostic| format!(" · {} ms", diagnostic.value))
+                            .unwrap_or_default();
+                        this.notice = Some(format!(
+                            "{} · {}{latency}",
+                            management_locale_text("Connection passed", "连接通过", "連線通過"),
+                            management_model_count(response.models.len())
+                        ));
+                    }
+                    Ok(Err(error)) => {
+                        this.error = Some(format!("{failed}: {}: {}", error.code, error.message));
+                    }
+                    Err(error) => this.error = Some(format!("{failed}: {error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     fn test_provider_profile(
         &mut self,
         profile_id: String,
@@ -22689,6 +22776,12 @@ impl ManagementCenter {
         let testing = self.editing_profile_id.as_deref().is_some_and(|profile_id| {
             matches!(&self.mutation, Some(ManagementMutation::ProviderProbe(action)) if action == profile_id)
         });
+        let draft_testing = self.editing_profile_id.is_none()
+            && matches!(
+                &self.mutation,
+                Some(ManagementMutation::ProviderProbe(action))
+                    if action.starts_with("draft-test:")
+            );
         // A probe is not a reason to trap the user in the dialog: it can take a
         // while, and closing only discards the draft.
         let cancel_disabled =
@@ -22828,6 +22921,30 @@ impl ManagementCenter {
                                         agent_id.clone(),
                                         cx,
                                     )
+                                })),
+                        )
+                    })
+                    .when(self.editing_profile_id.is_none(), |row| {
+                        row.child(
+                            Button::new("provider-profile-test-draft")
+                                .small()
+                                .outline()
+                                .icon(IconName::Network)
+                                .label(if draft_testing {
+                                    management_locale_text("Testing...", "测试中...", "測試中...")
+                                } else {
+                                    management_locale_text(
+                                        "Test connection",
+                                        "测试连接",
+                                        "測試連線",
+                                    )
+                                })
+                                .loading(draft_testing)
+                                .disabled(pending)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let agent_id =
+                                        this.selected_agent_id.clone().unwrap_or_default();
+                                    this.test_provider_draft(agent_id, cx)
                                 })),
                         )
                     })
@@ -42668,6 +42785,20 @@ mod gateway_surface_tests {
         assert!(source.contains("management-provider-agent-default-"));
         assert!(source.contains("management-route-group-agent-default-"));
         assert!(source.contains("set_agent_default_model_source("));
+    }
+
+    #[test]
+    fn provider_creation_can_test_before_save() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "provider-profile-test-draft",
+            "fn test_provider_draft(",
+            "draft-test:",
+            "fetch_agent_model_provider_draft_models(",
+            "Connection passed",
+        ] {
+            assert!(source.contains(marker), "draft test must keep {marker}");
+        }
     }
 
     #[test]
