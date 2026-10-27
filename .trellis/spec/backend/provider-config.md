@@ -6462,3 +6462,14 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
   not deleted; the Agent needs a new default afterwards.
 - Provider unbinding deletes the Agent's legacy v1 Profile; the shared v2 record
   survives for every other Agent. Route unbinding removes only the reference.
+
+### Gateway alert thresholds and default timeouts
+
+- `GatewayPolicy` stores an optional error-rate warning percentage, latency
+  warning milliseconds, and default connect/request/stream-idle timeouts.
+- The error threshold is an integer percentage in `0..=100`; a timeout or
+  latency threshold of zero is rejected.
+- These are observability/fallback settings, not a vendor quota. They do not
+  pause the gateway, compute cost, or show a balance.
+- The desktop editor keeps unrelated policy edits carrying the stored values
+  forward, like account limits and translation.

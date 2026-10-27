@@ -2264,6 +2264,11 @@ impl Dispatch {
                         enabled,
                         preferred,
                     }],
+                    error_rate_warn_percent: settings.policy.error_rate_warn_percent,
+                    latency_warn_ms: settings.policy.latency_warn_ms,
+                    default_connect_timeout_ms: settings.policy.default_connect_timeout_ms,
+                    default_request_timeout_ms: settings.policy.default_request_timeout_ms,
+                    default_stream_idle_timeout_ms: settings.policy.default_stream_idle_timeout_ms,
                     expected_revision: settings.revision,
                 };
                 match self
@@ -2303,6 +2308,11 @@ impl Dispatch {
                     account_limits: settings.policy.account_limits.clone(),
                     translate: settings.policy.translate,
                     account_updates: Vec::new(),
+                    error_rate_warn_percent: settings.policy.error_rate_warn_percent,
+                    latency_warn_ms: settings.policy.latency_warn_ms,
+                    default_connect_timeout_ms: settings.policy.default_connect_timeout_ms,
+                    default_request_timeout_ms: settings.policy.default_request_timeout_ms,
+                    default_stream_idle_timeout_ms: settings.policy.default_stream_idle_timeout_ms,
                     expected_revision: settings.revision,
                 };
                 match self

@@ -378,6 +378,21 @@ pub struct GatewayPolicy {
     /// for one. A Provider without an entry keeps its configured Key order.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub preferred_keys: BTreeMap<ModelProviderProfileId, RequestId>,
+    /// Warn when the observed error rate exceeds this percentage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_rate_warn_percent: Option<u16>,
+    /// Warn when observed request latency exceeds this many milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_warn_ms: Option<u64>,
+    /// Default connection timeout for a gateway attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_connect_timeout_ms: Option<u64>,
+    /// Default whole-request timeout for a gateway attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_request_timeout_ms: Option<u64>,
+    /// Default silence timeout before a stream is considered stalled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_stream_idle_timeout_ms: Option<u64>,
 }
 
 impl Default for GatewayPolicy {
@@ -388,6 +403,11 @@ impl Default for GatewayPolicy {
             translate: GatewayTranslatePolicy::default(),
             account_limits: BTreeMap::new(),
             preferred_keys: BTreeMap::new(),
+            error_rate_warn_percent: None,
+            latency_warn_ms: None,
+            default_connect_timeout_ms: None,
+            default_request_timeout_ms: None,
+            default_stream_idle_timeout_ms: None,
         }
     }
 }
@@ -399,6 +419,28 @@ impl GatewayPolicy {
         }
         for limits in self.account_limits.values() {
             limits.validate()?;
+        }
+        if self
+            .error_rate_warn_percent
+            .is_some_and(|value| value > 100)
+        {
+            return Err(VibexError::validation(
+                "model_gateway_error_rate_threshold_invalid",
+                "an error-rate threshold must be between zero and one hundred",
+            ));
+        }
+        for value in [
+            self.latency_warn_ms,
+            self.default_connect_timeout_ms,
+            self.default_request_timeout_ms,
+            self.default_stream_idle_timeout_ms,
+        ] {
+            if value == Some(0) {
+                return Err(VibexError::validation(
+                    "model_gateway_timeout_invalid",
+                    "a timeout or latency threshold must be at least one millisecond",
+                ));
+            }
         }
         Ok(())
     }
@@ -1484,6 +1526,16 @@ pub struct GatewaySettingsUpdateRequest {
     /// cooldown or limits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub account_updates: Vec<GatewayAccountUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_rate_warn_percent: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_warn_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_connect_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_request_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_stream_idle_timeout_ms: Option<u64>,
     pub expected_revision: i64,
 }
 
@@ -2076,6 +2128,47 @@ mod tests {
                 kind: GatewayFailureKind::Proxy,
                 until_ms: 5 + 60_000
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod gateway_defaults_tests {
+    use super::*;
+
+    #[test]
+    fn alert_thresholds_and_default_timeouts_round_trip() {
+        let policy = GatewayPolicy {
+            error_rate_warn_percent: Some(25),
+            latency_warn_ms: Some(2_500),
+            default_connect_timeout_ms: Some(10_000),
+            default_request_timeout_ms: Some(60_000),
+            default_stream_idle_timeout_ms: Some(30_000),
+            ..GatewayPolicy::default()
+        };
+        policy.validate().unwrap();
+        let encoded = serde_json::to_string(&policy).unwrap();
+        let decoded: GatewayPolicy = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, policy);
+    }
+
+    #[test]
+    fn invalid_thresholds_are_rejected() {
+        assert!(
+            GatewayPolicy {
+                error_rate_warn_percent: Some(101),
+                ..GatewayPolicy::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            GatewayPolicy {
+                default_request_timeout_ms: Some(0),
+                ..GatewayPolicy::default()
+            }
+            .validate()
+            .is_err()
         );
     }
 }

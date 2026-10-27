@@ -1052,6 +1052,8 @@ pub struct ManagementCenter {
     gateway_token_limit_window: Option<vibex_core::GatewayTokenWindow>,
     /// A rejected token ceiling, shown under its field.
     gateway_token_limit_error: Option<String>,
+    gateway_default_inputs: Option<Vec<Entity<InputState>>>,
+    gateway_default_error: Option<String>,
     /// The one-shot wake-up for the soonest cooling Key. One at a time: a
     /// second timer would only repeat the first one's read.
     gateway_refresh_task: Option<Task<()>>,
@@ -2325,6 +2327,8 @@ impl ManagementCenter {
             gateway_token_limit_input: None,
             gateway_token_limit_window: None,
             gateway_token_limit_error: None,
+            gateway_default_inputs: None,
+            gateway_default_error: None,
             gateway_refresh_task: None,
             gateway_name_editing: false,
             gateway_name_input: None,
@@ -16726,6 +16730,11 @@ impl ManagementCenter {
             // Account commands are one-shot: an unrelated edit sends none, so
             // it cannot re-apply a toggle the user already made.
             account_updates: Vec::new(),
+            error_rate_warn_percent: snapshot.settings.policy.error_rate_warn_percent,
+            latency_warn_ms: snapshot.settings.policy.latency_warn_ms,
+            default_connect_timeout_ms: snapshot.settings.policy.default_connect_timeout_ms,
+            default_request_timeout_ms: snapshot.settings.policy.default_request_timeout_ms,
+            default_stream_idle_timeout_ms: snapshot.settings.policy.default_stream_idle_timeout_ms,
             expected_revision: snapshot.settings.revision,
         };
         update(&mut request);
@@ -17143,6 +17152,83 @@ impl ManagementCenter {
                 cx.notify();
             }
         }
+    }
+
+    fn save_gateway_defaults(&mut self, cx: &mut Context<Self>) {
+        let Some(inputs) = self.gateway_default_inputs.clone() else {
+            return;
+        };
+        let values = inputs
+            .iter()
+            .map(|input| input.read(cx).value().trim().to_string())
+            .collect::<Vec<_>>();
+        let parse_u64 = |index: usize| -> Result<Option<u64>, String> {
+            let value = values.get(index).map(String::as_str).unwrap_or("");
+            if value.is_empty() {
+                return Ok(None);
+            }
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .map(Some)
+                .ok_or_else(|| {
+                    management_locale_text(
+                        "Timeouts must be positive whole milliseconds",
+                        "超时必须是正整数毫秒",
+                        "逾時必須是正整數毫秒",
+                    )
+                    .to_string()
+                })
+        };
+        let error_rate = {
+            let value = values.first().map(String::as_str).unwrap_or("");
+            if value.is_empty() {
+                Ok(None)
+            } else {
+                value
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|value| *value <= 100)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        management_locale_text(
+                            "The error-rate threshold must be 0-100",
+                            "错误率阈值必须在 0-100 之间",
+                            "錯誤率閾值必須在 0-100 之間",
+                        )
+                        .to_string()
+                    })
+            }
+        };
+        let parsed = (|| {
+            Ok::<_, String>((
+                error_rate?,
+                parse_u64(1)?,
+                parse_u64(2)?,
+                parse_u64(3)?,
+                parse_u64(4)?,
+            ))
+        })();
+        let (error_rate, latency, connect, request_timeout, stream) = match parsed {
+            Ok(values) => values,
+            Err(message) => {
+                self.gateway_default_error = Some(message);
+                cx.notify();
+                return;
+            }
+        };
+        self.gateway_default_error = None;
+        self.update_gateway_settings(
+            move |request| {
+                request.error_rate_warn_percent = error_rate;
+                request.latency_warn_ms = latency;
+                request.default_connect_timeout_ms = connect;
+                request.default_request_timeout_ms = request_timeout;
+                request.default_stream_idle_timeout_ms = stream;
+            },
+            cx,
+        );
     }
 
     /// Asks before removing the token ceiling.
@@ -18722,6 +18808,117 @@ impl ManagementCenter {
             ),
             "icons/vibex/file-cog.svg",
             policy_rows.into_any_element(),
+            cx,
+        ));
+
+        let defaults = self
+            .gateway_default_inputs
+            .get_or_insert_with(|| {
+                let value =
+                    |value: Option<u64>| value.map(|value| value.to_string()).unwrap_or_default();
+                vec![
+                    cx.new(|cx| {
+                        InputState::new(window, cx).default_value(
+                            self.gateway
+                                .settings
+                                .policy
+                                .error_rate_warn_percent
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
+                        )
+                    }),
+                    cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .default_value(value(self.gateway.settings.policy.latency_warn_ms))
+                    }),
+                    cx.new(|cx| {
+                        InputState::new(window, cx).default_value(value(
+                            self.gateway.settings.policy.default_connect_timeout_ms,
+                        ))
+                    }),
+                    cx.new(|cx| {
+                        InputState::new(window, cx).default_value(value(
+                            self.gateway.settings.policy.default_request_timeout_ms,
+                        ))
+                    }),
+                    cx.new(|cx| {
+                        InputState::new(window, cx).default_value(value(
+                            self.gateway.settings.policy.default_stream_idle_timeout_ms,
+                        ))
+                    }),
+                ]
+            })
+            .clone();
+        let default_fields = [
+            (
+                "error-rate",
+                management_locale_text("Error rate %", "错误率 %", "錯誤率 %"),
+            ),
+            (
+                "latency",
+                management_locale_text("Latency alert ms", "延迟告警 ms", "延遲警示 ms"),
+            ),
+            (
+                "connect",
+                management_locale_text("Connect timeout ms", "连接超时 ms", "連線逾時 ms"),
+            ),
+            (
+                "request",
+                management_locale_text("Request timeout ms", "请求超时 ms", "請求逾時 ms"),
+            ),
+            (
+                "stream",
+                management_locale_text("Stream idle ms", "流空闲超时 ms", "流閒置逾時 ms"),
+            ),
+        ];
+        let mut default_rows = h_flex().w_full().flex_wrap().gap_3();
+        for ((_suffix, label), input) in default_fields.into_iter().zip(defaults.iter()) {
+            default_rows = default_rows.child(
+                v_flex()
+                    .w(px(176.0))
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(label),
+                    )
+                    .child(Input::new(input).small().w_full()),
+            );
+        }
+        let defaults_error = self.gateway_default_error.clone();
+        body = body.child(management_card_with_icon(
+            management_locale_text("Alerts and defaults", "告警与默认值", "警示與預設值"),
+            management_locale_text(
+                "Observed thresholds and fallback timeouts. Empty leaves the value unset.",
+                "观测阈值与回退超时；留空表示不设置。",
+                "觀測閾值與回退逾時；留空表示不設定。",
+            ),
+            "icons/vibex/activity.svg",
+            v_flex()
+                .w_full()
+                .gap_2()
+                .child(default_rows)
+                .children(
+                    defaults_error.map(|message| {
+                        div().text_xs().text_color(cx.theme().danger).child(message)
+                    }),
+                )
+                .child(
+                    h_flex().w_full().justify_end().child(
+                        Button::new("management-gateway-defaults-save")
+                            .xsmall()
+                            .primary()
+                            .label(management_locale_text(
+                                "Save defaults",
+                                "保存默认值",
+                                "儲存預設值",
+                            ))
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, _, cx| this.save_gateway_defaults(cx))),
+                    ),
+                )
+                .into_any_element(),
             cx,
         ));
 
@@ -43175,6 +43372,25 @@ mod gateway_surface_tests {
     }
 
     #[test]
+    fn gateway_settings_expose_alert_thresholds_and_timeouts() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "management-gateway-defaults-save",
+            "fn save_gateway_defaults(",
+            "error_rate_warn_percent",
+            "latency_warn_ms",
+            "default_connect_timeout_ms",
+            "default_request_timeout_ms",
+            "default_stream_idle_timeout_ms",
+        ] {
+            assert!(
+                source.contains(marker),
+                "Gateway settings must keep {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn binding_pills_toggle_and_guard_the_last_source() {
         let source = include_str!("management.rs");
         for marker in [
@@ -43444,6 +43660,11 @@ mod gateway_surface_tests {
             account_limits: policy.account_limits.clone(),
             translate: policy.translate,
             account_updates: Vec::new(),
+            error_rate_warn_percent: policy.error_rate_warn_percent,
+            latency_warn_ms: policy.latency_warn_ms,
+            default_connect_timeout_ms: policy.default_connect_timeout_ms,
+            default_request_timeout_ms: policy.default_request_timeout_ms,
+            default_stream_idle_timeout_ms: policy.default_stream_idle_timeout_ms,
             expected_revision: 1,
         };
         assert_eq!(

@@ -1650,6 +1650,11 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
         policy.token_limit = request.token_limit;
         policy.account_limits = request.account_limits;
         policy.translate = request.translate;
+        policy.error_rate_warn_percent = request.error_rate_warn_percent;
+        policy.latency_warn_ms = request.latency_warn_ms;
+        policy.default_connect_timeout_ms = request.default_connect_timeout_ms;
+        policy.default_request_timeout_ms = request.default_request_timeout_ms;
+        policy.default_stream_idle_timeout_ms = request.default_stream_idle_timeout_ms;
         for update in &request.account_updates {
             match update.preferred {
                 Some(true) => {
