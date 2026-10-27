@@ -12523,16 +12523,31 @@ impl ManagementCenter {
                 .w_full()
                 .min_w_0()
                 .gap_1()
-                .rounded(px(6.0))
+                // The same card the Agent sidebar draws: an 8px surface, a
+                // hairline border, and a filled background. Selection is a
+                // primary wash rather than an outline, so the row does not
+                // change thickness when it becomes current.
+                .rounded(px(8.0))
                 .border_1()
                 .border_color(if gateway_selected {
-                    cx.theme().primary
+                    cx.theme().primary.opacity(0.0)
                 } else {
-                    cx.theme().border
+                    cx.theme().border.opacity(0.65)
                 })
-                .bg(cx.theme().muted.opacity(0.25))
+                .bg(if gateway_selected {
+                    cx.theme().primary.opacity(0.08)
+                } else {
+                    cx.theme().background.opacity(0.70)
+                })
                 .p_2()
                 .cursor_pointer()
+                .hover(|style| {
+                    style.bg(if gateway_selected {
+                        cx.theme().primary.opacity(0.08)
+                    } else {
+                        cx.theme().accent
+                    })
+                })
                 .child(
                     h_flex()
                         .w_full()
@@ -12633,15 +12648,27 @@ impl ManagementCenter {
                     .w_full()
                     .min_w_0()
                     .gap_1()
-                    .rounded(px(6.0))
+                    .rounded(px(8.0))
                     .border_1()
                     .border_color(if is_selected {
-                        cx.theme().primary
+                        cx.theme().primary.opacity(0.0)
                     } else {
-                        cx.theme().border
+                        cx.theme().border.opacity(0.65)
+                    })
+                    .bg(if is_selected {
+                        cx.theme().primary.opacity(0.08)
+                    } else {
+                        cx.theme().background.opacity(0.70)
                     })
                     .p_2()
                     .cursor_pointer()
+                    .hover(|style| {
+                        style.bg(if is_selected {
+                            cx.theme().primary.opacity(0.08)
+                        } else {
+                            cx.theme().accent
+                        })
+                    })
                     .child(
                         h_flex()
                             .w_full()
@@ -12834,16 +12861,27 @@ impl ManagementCenter {
                     .w_full()
                     .min_w_0()
                     .gap_1()
-                    .rounded(px(6.0))
+                    .rounded(px(8.0))
                     .border_1()
                     .border_color(if is_selected {
-                        cx.theme().primary
+                        cx.theme().primary.opacity(0.0)
                     } else {
-                        cx.theme().border
+                        cx.theme().border.opacity(0.65)
+                    })
+                    .bg(if is_selected {
+                        cx.theme().primary.opacity(0.08)
+                    } else {
+                        cx.theme().background.opacity(0.70)
                     })
                     .p_2()
                     .cursor_pointer()
-                    .hover(|style| style.bg(cx.theme().accent))
+                    .hover(|style| {
+                        style.bg(if is_selected {
+                            cx.theme().primary.opacity(0.08)
+                        } else {
+                            cx.theme().accent
+                        })
+                    })
                     .child(
                         h_flex()
                             .w_full()
@@ -12926,7 +12964,10 @@ impl ManagementCenter {
             .unwrap_or(0);
         let tab_bar = TabBar::new("management-provider-sidebar-tabs")
             .w_full()
-            .pill()
+            // Segmented tabs with flexed children split the bar into equal
+            // filling cells, so the selected track reads as one sliding control
+            // instead of a row of free-standing pills.
+            .segmented()
             .selected_index(selected_tab_index)
             .children(ProviderSidebarTab::ALL.into_iter().map(|tab| {
                 Tab::new()
@@ -13012,10 +13053,10 @@ impl ManagementCenter {
             ),
         };
 
-        // The two groups are separated by a rule as well as by their headings:
-        // the gateway card sits on the sidebar's own surface and the Provider
-        // rows on cards, so without the rule the boundary between "the machine
-        // Vibex runs" and "the records I keep" was only a gap in a list.
+        // The two groups are separated by the tab bar and their own headings:
+        // the gateway and the Provider records are both cards now, so the
+        // boundary between "the machine Vibex runs" and "the records I keep" is
+        // structural rather than a change in surface.
         v_flex()
             .id("management-provider-page-sidebar")
             .w_full()
@@ -13145,7 +13186,7 @@ impl ManagementCenter {
         body = body.child(
             TabBar::new("management-provider-detail-tabs")
                 .w_full()
-                .pill()
+                .segmented()
                 .selected_index(selected_tab_index)
                 .children(ProviderDetailTab::ALL.into_iter().map(|tab| {
                     Tab::new()
@@ -14313,7 +14354,7 @@ impl ManagementCenter {
         body = body.child(
             TabBar::new("management-route-group-detail-tabs")
                 .w_full()
-                .pill()
+                .segmented()
                 .selected_index(selected_tab_index)
                 .children(RouteGroupDetailTab::ALL.into_iter().map(|tab| {
                     Tab::new()
