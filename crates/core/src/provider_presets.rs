@@ -483,6 +483,406 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
                 &[],
             )
         },
+        ProviderPreset {
+            catalog_id: Some("cohere".to_string()),
+            website: Some("https://cohere.com".to_string()),
+            keys_url: Some("https://dashboard.cohere.com/api-keys".to_string()),
+            ..preset(
+                "cohere",
+                "Cohere",
+                &[(chat, "https://api.cohere.ai/compatibility/v1")],
+                &["command-a-03-2025", "command-r-plus-08-2024"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("togetherai".to_string()),
+            website: Some("https://www.together.ai".to_string()),
+            keys_url: Some("https://api.together.ai/settings/api-keys".to_string()),
+            ..preset(
+                "together",
+                "Together AI",
+                &[(chat, "https://api.together.xyz/v1")],
+                &[
+                    "deepseek-ai/DeepSeek-V3",
+                    "Qwen/Qwen3-235B-A22B-Instruct-2507-tput",
+                    "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                ],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("fireworks-ai".to_string()),
+            website: Some("https://fireworks.ai".to_string()),
+            keys_url: Some("https://fireworks.ai/account/api-keys".to_string()),
+            ..preset(
+                "fireworks",
+                "Fireworks AI",
+                &[(chat, "https://api.fireworks.ai/inference/v1")],
+                &[
+                    "accounts/fireworks/models/deepseek-v3",
+                    "accounts/fireworks/models/qwen3-235b-a22b",
+                ],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("perplexity".to_string()),
+            website: Some("https://www.perplexity.ai".to_string()),
+            keys_url: Some("https://www.perplexity.ai/settings/api".to_string()),
+            ..preset(
+                "perplexity",
+                "Perplexity",
+                &[(chat, "https://api.perplexity.ai")],
+                &["sonar-pro", "sonar-reasoning-pro"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("cerebras".to_string()),
+            website: Some("https://www.cerebras.ai".to_string()),
+            keys_url: Some("https://cloud.cerebras.ai".to_string()),
+            ..preset(
+                "cerebras",
+                "Cerebras",
+                &[(chat, "https://api.cerebras.ai/v1")],
+                &["llama-3.3-70b", "qwen-3-32b"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("deepinfra".to_string()),
+            website: Some("https://deepinfra.com".to_string()),
+            keys_url: Some("https://deepinfra.com/dash/api_keys".to_string()),
+            ..preset(
+                "deepinfra",
+                "DeepInfra",
+                &[(chat, "https://api.deepinfra.com/v1/openai")],
+                &[
+                    "deepseek-ai/DeepSeek-V3",
+                    "Qwen/Qwen3-235B-A22B-Instruct-2507",
+                ],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("hyperbolic".to_string()),
+            website: Some("https://hyperbolic.xyz".to_string()),
+            keys_url: Some("https://app.hyperbolic.xyz/settings".to_string()),
+            ..preset(
+                "hyperbolic",
+                "Hyperbolic",
+                &[(chat, "https://api.hyperbolic.xyz/v1")],
+                &["deepseek-ai/DeepSeek-V3", "Qwen/Qwen3-235B-A22B"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("nebius".to_string()),
+            website: Some("https://nebius.com".to_string()),
+            keys_url: Some("https://studio.nebius.com/settings/api-keys".to_string()),
+            ..preset(
+                "nebius",
+                "Nebius",
+                &[(chat, "https://api.studio.nebius.com/v1")],
+                &["deepseek-ai/DeepSeek-V3", "Qwen/Qwen3-235B-A22B"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("novita-ai".to_string()),
+            website: Some("https://novita.ai".to_string()),
+            keys_url: Some("https://novita.ai/settings/key-management".to_string()),
+            ..preset(
+                "novita",
+                "Novita AI",
+                &[(chat, "https://api.novita.ai/v3/openai")],
+                &["deepseek/deepseek-v3", "qwen/qwen3-235b-a22b-fp8"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("sambanova".to_string()),
+            website: Some("https://sambanova.ai".to_string()),
+            keys_url: Some("https://cloud.sambanova.ai/apis".to_string()),
+            ..preset(
+                "sambanova",
+                "SambaNova",
+                &[(chat, "https://api.sambanova.ai/v1")],
+                &["DeepSeek-V3-0324", "Meta-Llama-3.3-70B-Instruct"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("minimax".to_string()),
+            website: Some("https://www.minimax.io".to_string()),
+            keys_url: Some(
+                "https://platform.minimax.io/user-center/basic-information/interface-key"
+                    .to_string(),
+            ),
+            ..preset(
+                "minimax",
+                "MiniMax",
+                &[(chat, "https://api.minimax.io/v1")],
+                &["MiniMax-M2", "MiniMax-Text-01"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("alibaba".to_string()),
+            website: Some("https://www.alibabacloud.com/product/modelstudio".to_string()),
+            keys_url: Some("https://bailian.console.alibabacloud.com".to_string()),
+            ..preset(
+                "qwen",
+                "Qwen (DashScope)",
+                &[(chat, "https://dashscope.aliyuncs.com/compatible-mode/v1")],
+                &["qwen3-max", "qwen3-coder-plus", "qwen3-235b-a22b"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("baidu".to_string()),
+            website: Some("https://cloud.baidu.com/product/wenxinworkshop".to_string()),
+            keys_url: Some("https://console.bce.baidu.com/iam/#/iam/apikey/list".to_string()),
+            ..preset(
+                "qianfan",
+                "Baidu Qianfan",
+                &[(chat, "https://qianfan.baidubce.com/v2")],
+                &["ernie-4.5-8k-preview", "ernie-x1-32k-preview"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("volcengine".to_string()),
+            website: Some("https://www.volcengine.com/product/ark".to_string()),
+            keys_url: Some("https://console.volcengine.com/ark".to_string()),
+            ..preset(
+                "doubao",
+                "ByteDance Doubao",
+                &[(chat, "https://ark.cn-beijing.volces.com/api/v3")],
+                &["doubao-seed-1-6-250615", "doubao-1-5-pro-32k-250115"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("tencent".to_string()),
+            website: Some("https://cloud.tencent.com/product/hunyuan".to_string()),
+            keys_url: Some("https://console.cloud.tencent.com/hunyuan".to_string()),
+            ..preset(
+                "hunyuan",
+                "Tencent Hunyuan",
+                &[(chat, "https://api.hunyuan.cloud.tencent.com/v1")],
+                &["hunyuan-turbos-latest", "hunyuan-large"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("iflytek".to_string()),
+            website: Some("https://xinghuo.xfyun.cn".to_string()),
+            keys_url: Some("https://console.xfyun.cn/services/bmxh".to_string()),
+            ..preset(
+                "spark",
+                "iFlytek Spark",
+                &[(chat, "https://spark-api-open.xf-yun.com/v1")],
+                &["4.0Ultra", "generalv3.5"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("yi".to_string()),
+            website: Some("https://www.lingyiwanwu.com".to_string()),
+            keys_url: Some("https://platform.lingyiwanwu.com/apikeys".to_string()),
+            ..preset(
+                "yi",
+                "01.AI Yi",
+                &[(chat, "https://api.lingyiwanwu.com/v1")],
+                &["yi-lightning", "yi-large"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("stepfun".to_string()),
+            website: Some("https://www.stepfun.com".to_string()),
+            keys_url: Some("https://platform.stepfun.com/interface-key".to_string()),
+            ..preset(
+                "stepfun",
+                "StepFun",
+                &[(chat, "https://api.stepfun.com/v1")],
+                &["step-2-16k", "step-1v-8k"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("baichuan".to_string()),
+            website: Some("https://www.baichuan-ai.com".to_string()),
+            keys_url: Some("https://platform.baichuan-ai.com/console/apikey".to_string()),
+            ..preset(
+                "baichuan",
+                "Baichuan",
+                &[(chat, "https://api.baichuan-ai.com/v1")],
+                &["Baichuan4", "Baichuan3-Turbo"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("upstage".to_string()),
+            website: Some("https://upstage.ai".to_string()),
+            keys_url: Some("https://console.upstage.ai/api-keys".to_string()),
+            ..preset(
+                "upstage",
+                "Upstage",
+                &[(chat, "https://api.upstage.ai/v1")],
+                &["solar-pro2", "solar-mini"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("reka".to_string()),
+            website: Some("https://www.reka.ai".to_string()),
+            keys_url: Some("https://platform.reka.ai".to_string()),
+            ..preset(
+                "reka",
+                "Reka",
+                &[(chat, "https://api.reka.ai/v1")],
+                &["reka-core", "reka-flash"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("ai21".to_string()),
+            website: Some("https://www.ai21.com".to_string()),
+            keys_url: Some("https://studio.ai21.com/account/api-key".to_string()),
+            ..preset(
+                "ai21",
+                "AI21 Labs",
+                &[(chat, "https://api.ai21.com/studio/v1")],
+                &["jamba-large-1.7", "jamba-mini-1.7"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("nvidia".to_string()),
+            website: Some("https://build.nvidia.com".to_string()),
+            keys_url: Some("https://build.nvidia.com/settings/api-keys".to_string()),
+            ..preset(
+                "nvidia",
+                "NVIDIA NIM",
+                &[(chat, "https://integrate.api.nvidia.com/v1")],
+                &["deepseek-ai/deepseek-v3.1", "qwen/qwen3-235b-a22b"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("github".to_string()),
+            website: Some("https://github.com/marketplace/models".to_string()),
+            keys_url: Some("https://github.com/settings/tokens".to_string()),
+            ..preset(
+                "github-models",
+                "GitHub Models",
+                &[(chat, "https://models.inference.ai.azure.com")],
+                &["gpt-4.1", "gpt-4.1-mini"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("requesty".to_string()),
+            website: Some("https://requesty.ai".to_string()),
+            keys_url: Some("https://app.requesty.ai/api-keys".to_string()),
+            ..preset(
+                "requesty",
+                "Requesty",
+                &[(chat, "https://router.requesty.ai/v1")],
+                &["openai/gpt-4.1", "anthropic/claude-sonnet-4"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("portkey".to_string()),
+            website: Some("https://portkey.ai".to_string()),
+            keys_url: Some("https://app.portkey.ai/api-keys".to_string()),
+            ..preset(
+                "portkey",
+                "Portkey",
+                &[(chat, "https://api.portkey.ai/v1")],
+                &["gpt-4.1", "claude-sonnet-4"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("aihubmix".to_string()),
+            website: Some("https://aihubmix.com".to_string()),
+            keys_url: Some("https://aihubmix.com/token".to_string()),
+            ..preset(
+                "aihubmix",
+                "AiHubMix",
+                &[(chat, "https://aihubmix.com/v1")],
+                &["gpt-4.1", "claude-sonnet-4-20250514"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("vercel".to_string()),
+            website: Some("https://vercel.com/ai-gateway".to_string()),
+            keys_url: Some("https://vercel.com/dashboard/ai-gateway".to_string()),
+            ..preset(
+                "vercel-gateway",
+                "Vercel AI Gateway",
+                &[(chat, "https://ai-gateway.vercel.sh/v1")],
+                &["openai/gpt-4.1", "anthropic/claude-sonnet-4"],
+            )
+        },
+        ProviderPreset {
+            catalog_id: Some("helicone".to_string()),
+            website: Some("https://www.helicone.ai".to_string()),
+            keys_url: Some("https://us.helicone.ai/settings/api-keys".to_string()),
+            ..preset(
+                "helicone",
+                "Helicone",
+                &[(chat, "https://oai.helicone.ai/v1")],
+                &["gpt-4.1-mini", "claude-sonnet-4"],
+            )
+        },
+        ProviderPreset {
+            website: Some("https://lmstudio.ai".to_string()),
+            no_key: true,
+            no_list: false,
+            endpoint_hint: Some("A model server on this machine; no API key is needed".to_string()),
+            models: vec!["local-model".to_string()],
+            ..preset(
+                "lmstudio",
+                "LM Studio",
+                &[(chat, "http://127.0.0.1:1234/v1")],
+                &[],
+            )
+        },
+        ProviderPreset {
+            website: Some("https://docs.vllm.ai".to_string()),
+            no_key: true,
+            no_list: false,
+            endpoint_hint: Some("A model server on this machine; no API key is needed".to_string()),
+            models: vec!["local-model".to_string()],
+            ..preset("vllm", "vLLM", &[(chat, "http://127.0.0.1:8000/v1")], &[])
+        },
+        ProviderPreset {
+            website: Some("https://github.com/ggml-org/llama.cpp".to_string()),
+            no_key: true,
+            no_list: false,
+            endpoint_hint: Some("A model server on this machine; no API key is needed".to_string()),
+            models: vec!["local-model".to_string()],
+            ..preset(
+                "llamacpp",
+                "llama.cpp",
+                &[(chat, "http://127.0.0.1:8080/v1")],
+                &[],
+            )
+        },
+        ProviderPreset {
+            website: Some("https://localai.io".to_string()),
+            no_key: true,
+            no_list: false,
+            endpoint_hint: Some("A model server on this machine; no API key is needed".to_string()),
+            models: vec!["local-model".to_string()],
+            ..preset(
+                "localai",
+                "LocalAI",
+                &[(chat, "http://127.0.0.1:8080/v1")],
+                &[],
+            )
+        },
+        ProviderPreset {
+            website: Some("https://jan.ai".to_string()),
+            no_key: true,
+            no_list: false,
+            endpoint_hint: Some("A model server on this machine; no API key is needed".to_string()),
+            models: vec!["local-model".to_string()],
+            ..preset("jan", "Jan", &[(chat, "http://127.0.0.1:1337/v1")], &[])
+        },
+        ProviderPreset {
+            website: Some("https://github.com/oobabooga/text-generation-webui".to_string()),
+            no_key: true,
+            no_list: false,
+            endpoint_hint: Some("A model server on this machine; no API key is needed".to_string()),
+            models: vec!["local-model".to_string()],
+            ..preset(
+                "textgenwebui",
+                "Text Generation WebUI",
+                &[(chat, "http://127.0.0.1:5000/v1")],
+                &[],
+            )
+        },
         // Plans that resell open coding models rather than serving their own.
         // They are last because they are the exception: everything above is a
         // vendor's own API. A plan's limits are part of the preset, because
@@ -578,7 +978,11 @@ mod tests {
     #[test]
     fn first_batch_is_complete_and_unique() {
         let presets = provider_presets();
-        assert!(presets.len() >= 8);
+        assert!(
+            (40..=60).contains(&presets.len()),
+            "the curated picker ships 40-60 presets, got {}",
+            presets.len()
+        );
         let mut ids = presets
             .iter()
             .map(|preset| preset.id.as_str())
@@ -591,6 +995,52 @@ mod tests {
                 preset.default_wire_api().is_some(),
                 "preset {} has no usable endpoint",
                 preset.id
+            );
+        }
+    }
+
+    #[test]
+    fn the_curated_picker_covers_the_top_vendors() {
+        for id in [
+            "anthropic",
+            "openai",
+            "google-gemini",
+            "deepseek",
+            "moonshot-kimi",
+            "zhipu-glm",
+            "openrouter",
+            "xai",
+            "mistral",
+            "groq",
+            "siliconflow",
+            "cohere",
+            "together",
+            "fireworks",
+            "perplexity",
+            "cerebras",
+            "deepinfra",
+            "hyperbolic",
+            "nebius",
+            "novita",
+            "sambanova",
+            "minimax",
+            "qwen",
+            "qianfan",
+            "doubao",
+            "hunyuan",
+            "spark",
+            "yi",
+            "stepfun",
+            "baichuan",
+            "upstage",
+            "reka",
+            "ai21",
+            "nvidia",
+            "github-models",
+        ] {
+            assert!(
+                provider_preset(id).is_some(),
+                "the curated picker must include {id}"
             );
         }
     }

@@ -6310,3 +6310,13 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
 - `vibex-desktop`: all three categories classify known presets; search filters
   tiles; category selection never empties the set; the source step keeps the
   import and custom entries; the picker starts at step one for a new Provider.
+
+### Source library sizing and recents
+
+- The curated source library ships 40–60 presets and covers the top vendor set
+  by id; it is not a flat dump of the models.dev long tail.
+- Recent presets are a separate row above the grid, most-recent first, capped at
+  six. They persist in `management-provider-recents.json` beside the desktop UI
+  state; a read or write failure is non-fatal and never blocks adding a Provider.
+- A preset choice is recorded before the draft is filled, so a failed save still
+  leaves the source in recents.

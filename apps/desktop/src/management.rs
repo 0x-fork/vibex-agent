@@ -1008,6 +1008,8 @@ pub struct ManagementCenter {
     /// Providers the user starred, persisted beside the other desktop UI state.
     provider_favorites: BTreeSet<String>,
     provider_favorites_path: Option<PathBuf>,
+    provider_recent_presets: Vec<String>,
+    provider_recent_presets_path: Option<PathBuf>,
     /// Which half of the Providers page the left column is showing.
     ///
     /// Providers and route groups are two kinds of record the same page owns,
@@ -2357,6 +2359,8 @@ impl ManagementCenter {
             provider_sort: ProviderSort::Name,
             provider_favorites: BTreeSet::new(),
             provider_favorites_path: None,
+            provider_recent_presets: Vec::new(),
+            provider_recent_presets_path: None,
             providers_sidebar_tab: ProviderSidebarTab::Providers,
             selected_global_route_id: None,
             profile_editor_open: false,
@@ -13471,22 +13475,33 @@ impl ManagementCenter {
     }
 
     fn ensure_provider_favorites_loaded(&mut self) {
-        if self.provider_favorites_path.is_some() {
-            return;
-        }
         let Some(runtime) = self.runtime.as_ref() else {
             return;
         };
-        let path = runtime
-            .config()
-            .home_dir
-            .join("management-provider-favorites.json");
-        if let Ok(bytes) = std::fs::read(&path)
-            && let Ok(ids) = serde_json::from_slice::<Vec<String>>(&bytes)
-        {
-            self.provider_favorites = ids.into_iter().collect();
+        if self.provider_favorites_path.is_none() {
+            let path = runtime
+                .config()
+                .home_dir
+                .join("management-provider-favorites.json");
+            if let Ok(bytes) = std::fs::read(&path)
+                && let Ok(ids) = serde_json::from_slice::<Vec<String>>(&bytes)
+            {
+                self.provider_favorites = ids.into_iter().collect();
+            }
+            self.provider_favorites_path = Some(path);
         }
-        self.provider_favorites_path = Some(path);
+        if self.provider_recent_presets_path.is_none() {
+            let path = runtime
+                .config()
+                .home_dir
+                .join("management-provider-recents.json");
+            if let Ok(bytes) = std::fs::read(&path)
+                && let Ok(ids) = serde_json::from_slice::<Vec<String>>(&bytes)
+            {
+                self.provider_recent_presets = ids;
+            }
+            self.provider_recent_presets_path = Some(path);
+        }
     }
 
     fn save_provider_favorites(&self) {
@@ -13495,6 +13510,18 @@ impl ManagementCenter {
         };
         if let Ok(bytes) =
             serde_json::to_vec_pretty(&self.provider_favorites.iter().cloned().collect::<Vec<_>>())
+        {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+
+    fn remember_provider_preset(&mut self, preset_id: &str) {
+        self.provider_recent_presets.retain(|id| id != preset_id);
+        self.provider_recent_presets
+            .insert(0, preset_id.to_string());
+        self.provider_recent_presets.truncate(6);
+        if let Some(path) = self.provider_recent_presets_path.as_ref()
+            && let Ok(bytes) = serde_json::to_vec_pretty(&self.provider_recent_presets)
         {
             let _ = std::fs::write(path, bytes);
         }
@@ -21554,6 +21581,39 @@ impl ManagementCenter {
                         })),
                 );
         }
+        let recent_presets = self
+            .provider_recent_presets
+            .iter()
+            .filter_map(|id| vibex_core::provider_preset(id))
+            .collect::<Vec<_>>();
+        let mut recent_row = h_flex().w_full().flex_wrap().gap_1();
+        if !recent_presets.is_empty() {
+            recent_row = recent_row.child(
+                div()
+                    .w_full()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text("Recent", "最近使用", "最近使用")),
+            );
+            for preset in recent_presets {
+                let preset_id = preset.id.clone();
+                recent_row = recent_row.child(
+                    Button::new(SharedString::from(format!(
+                        "management-provider-recent-{}",
+                        preset.id
+                    )))
+                    .xsmall()
+                    .ghost()
+                    .icon(Icon::default().path(
+                        provider_preset_icon_path(&preset).unwrap_or("icons/vibex/database.svg"),
+                    ))
+                    .label(preset.display_name)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.choose_provider_preset(&preset_id, window, cx)
+                    })),
+                );
+            }
+        }
         let preset_tiles = provider_preset_tiles(
             vibex_core::provider_presets(),
             &query,
@@ -21648,6 +21708,7 @@ impl ManagementCenter {
                 "使用供应商",
                 "使用供應商",
             )))
+            .child(recent_row)
             .child(scope_row)
             .child(category_chips)
             .child(management_search_input(&self.provider_preset_query, cx))
@@ -21852,6 +21913,7 @@ impl ManagementCenter {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.remember_provider_preset(preset_id);
         self.apply_provider_preset(preset_id, window, cx);
         self.provider_preset_picker = false;
         cx.notify();
@@ -34445,7 +34507,15 @@ fn provider_preset_category(preset: &vibex_core::ProviderPreset) -> ProviderPres
     }
     if matches!(
         preset.id.as_str(),
-        "openrouter" | "opencode-go" | "clinepass" | "commandcode"
+        "openrouter"
+            | "opencode-go"
+            | "clinepass"
+            | "commandcode"
+            | "requesty"
+            | "portkey"
+            | "aihubmix"
+            | "vercel-gateway"
+            | "helicone"
     ) {
         return ProviderPresetCategory::Relay;
     }
@@ -34464,17 +34534,21 @@ fn provider_preset_tiles(
         .collect()
 }
 
-fn provider_preset_logo(
-    preset: &vibex_core::ProviderPreset,
-    cx: &mut Context<ManagementCenter>,
-) -> AnyElement {
-    let path = match preset.id.as_str() {
+fn provider_preset_icon_path(preset: &vibex_core::ProviderPreset) -> Option<&'static str> {
+    match preset.id.as_str() {
         "openai" => Some("icons/openai.svg"),
         "anthropic" => Some("icons/claude.svg"),
         "google-gemini" => Some("icons/gemini.svg"),
         "qwen" => Some("icons/qwen.svg"),
         _ => None,
-    };
+    }
+}
+
+fn provider_preset_logo(
+    preset: &vibex_core::ProviderPreset,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    let path = provider_preset_icon_path(preset);
     if let Some(path) = path {
         return div()
             .flex_none()
@@ -41387,6 +41461,8 @@ mod gateway_surface_tests {
         );
         assert!(source.contains("provider_preset_logo("));
         assert!(source.contains("management-provider-source-import"));
+        assert!(source.contains("management-provider-recent-"));
+        assert!(source.contains("management-provider-recents.json"));
     }
 
     #[test]
