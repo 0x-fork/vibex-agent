@@ -53,6 +53,7 @@ pub struct GatewayUpstream {
     pub display_name: String,
     pub endpoints: Vec<ModelProviderEndpoint>,
     pub models: Vec<String>,
+    pub metadata: vibex_core::ModelProviderMetadata,
     pub credentials: Vec<ModelProviderCredentialReference>,
     pub keys: Vec<GatewayKeySummary>,
 }
@@ -595,6 +596,7 @@ impl ModelGatewayService {
                 profile_id: profile_id.clone(),
                 display_name: profile.display_name.clone(),
                 endpoints: profile.endpoints.clone(),
+                metadata: profile.metadata.clone(),
                 models: profile
                     .configured_models
                     .iter()
@@ -1343,6 +1345,10 @@ impl ModelGatewayService {
             agent_id,
             conversation,
             stream: request.stream,
+            user_agent: headers
+                .get(reqwest::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
             group_id,
             probe: probe.armed,
             request_id: RequestId::new(),
@@ -1690,6 +1696,7 @@ impl ModelGatewayService {
             target,
             passthrough,
             endpoint,
+            metadata: upstream.metadata.clone(),
             body,
             alternates,
             keys,
@@ -1992,24 +1999,46 @@ impl ModelGatewayService {
     /// Returns the response and the credential that produced it. The caller
     /// owns the decision to move to another member, so this function never
     /// retries across members itself.
-    fn client_for_key(&self, proxy: Option<&str>) -> reqwest::Client {
-        let Some(proxy) = proxy.map(str::trim).filter(|value| !value.is_empty()) else {
+    fn client_for_key(
+        &self,
+        proxy: Option<&str>,
+        metadata: &vibex_core::ModelProviderMetadata,
+    ) -> reqwest::Client {
+        let proxy = proxy.map(str::trim).filter(|value| !value.is_empty());
+        if proxy.is_none()
+            && !metadata.tls_accept_invalid
+            && metadata.connect_timeout_ms.is_none()
+            && metadata.request_timeout_ms.is_none()
+        {
             return self.client.clone();
-        };
-        let Ok(proxy) = reqwest::Proxy::all(proxy) else {
-            tracing::warn!(
-                target: "vibex.model_gateway",
-                "ignoring an unusable per-Key proxy url"
-            );
-            return self.client.clone();
-        };
-        reqwest::Client::builder()
-            .connect_timeout(self.limits.connect_timeout)
-            .timeout(std::time::Duration::from_secs(600))
-            .user_agent("vibex-model-gateway/1")
-            .proxy(proxy)
-            .build()
-            .unwrap_or_else(|_| self.client.clone())
+        }
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(
+                metadata
+                    .connect_timeout_ms
+                    .map(std::time::Duration::from_millis)
+                    .unwrap_or(self.limits.connect_timeout),
+            )
+            .timeout(
+                metadata
+                    .request_timeout_ms
+                    .map(std::time::Duration::from_millis)
+                    .unwrap_or(std::time::Duration::from_secs(600)),
+            )
+            .danger_accept_invalid_certs(metadata.tls_accept_invalid)
+            .user_agent("vibex-model-gateway/1");
+        if let Some(proxy) = proxy {
+            match reqwest::Proxy::all(proxy) {
+                Ok(proxy) => builder = builder.proxy(proxy),
+                Err(_) => {
+                    tracing::warn!(
+                        target: "vibex.model_gateway",
+                        "ignoring an unusable per-Key proxy url"
+                    );
+                }
+            }
+        }
+        builder.build().unwrap_or_else(|_| self.client.clone())
     }
 
     async fn open_member_attempt(
@@ -2107,14 +2136,53 @@ impl ModelGatewayService {
             }
             let mut call_error: Option<GatewayError> = None;
             for (call_index, call) in calls.iter().enumerate() {
+                let send_model = member
+                    .metadata
+                    .model_aliases
+                    .iter()
+                    .find(|alias| alias.alias == member.model)
+                    .map(|alias| alias.upstream.clone())
+                    .unwrap_or_else(|| member.model.clone());
                 let url = endpoint_url(
                     &call.endpoint.url,
                     call.target,
-                    &member.model,
+                    &send_model,
                     prepared.stream,
                 )?;
-                let client = self.client_for_key(credential.proxy_url.as_deref());
-                let mut wire = apply_auth(client.post(&url).json(&call.body), call.target, &secret);
+                let mut body = call.body.clone();
+                if let Some(extra) = member
+                    .metadata
+                    .extra_body_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                    .and_then(|value| value.as_object().cloned())
+                    && let Some(target) = body.as_object_mut()
+                {
+                    for (key, value) in extra {
+                        target.insert(key, value);
+                    }
+                }
+                if send_model != member.model
+                    && let Some(target) = body.as_object_mut()
+                {
+                    target.insert(
+                        "model".to_string(),
+                        serde_json::Value::String(send_model.clone()),
+                    );
+                }
+                let client = self.client_for_key(credential.proxy_url.as_deref(), &member.metadata);
+                let mut request = client.post(&url).json(&body);
+                if member.metadata.user_agent_mode.as_deref() == Some("pass_through")
+                    && let Some(user_agent) = prepared.user_agent.as_deref()
+                {
+                    request = request.header(reqwest::header::USER_AGENT, user_agent);
+                }
+                let mut wire = apply_auth(
+                    request,
+                    call.target,
+                    &secret,
+                    member.metadata.auth_header_mode.as_deref(),
+                );
                 if let Some(beta) = beta_header(&call.target, &call.body) {
                     wire = wire.header("anthropic-beta", beta);
                 }
@@ -2606,6 +2674,7 @@ pub struct PreparedCall {
     pub agent_id: Option<String>,
     pub conversation: Option<String>,
     pub stream: bool,
+    pub user_agent: Option<String>,
     /// The group that produced this call. A gateway request always names one:
     /// groups are the only models the listener serves.
     pub group_id: Option<String>,
@@ -2648,6 +2717,7 @@ pub struct PreparedMember {
     pub target: WireProtocol,
     pub passthrough: bool,
     pub endpoint: ModelProviderEndpoint,
+    pub metadata: vibex_core::ModelProviderMetadata,
     pub body: Value,
     /// Ordered attempts: the candidate and the credential record it uses.
     pub keys: Vec<(CandidateKey, ModelProviderCredentialReference)>,
@@ -3029,13 +3099,22 @@ fn apply_auth(
     request: reqwest::RequestBuilder,
     protocol: WireProtocol,
     secret: &str,
+    mode: Option<&str>,
 ) -> reqwest::RequestBuilder {
-    match protocol {
-        WireProtocol::ChatCompletions | WireProtocol::Responses => request.bearer_auth(secret),
-        WireProtocol::AnthropicMessages => request
-            .header("x-api-key", secret)
-            .header("anthropic-version", "2023-06-01"),
-        WireProtocol::GeminiGenerateContent => request.header("x-goog-api-key", secret),
+    let request = if protocol == WireProtocol::AnthropicMessages {
+        request.header("anthropic-version", "2023-06-01")
+    } else {
+        request
+    };
+    match mode {
+        Some("x-api-key") => request.header("x-api-key", secret),
+        Some("bearer") => request.bearer_auth(secret),
+        Some("both") => request.bearer_auth(secret).header("x-api-key", secret),
+        _ => match protocol {
+            WireProtocol::ChatCompletions | WireProtocol::Responses => request.bearer_auth(secret),
+            WireProtocol::AnthropicMessages => request.header("x-api-key", secret),
+            WireProtocol::GeminiGenerateContent => request.header("x-goog-api-key", secret),
+        },
     }
 }
 
@@ -3521,6 +3600,7 @@ mod tests {
                 })
                 .collect(),
             models: vec!["m".to_string()],
+            metadata: vibex_core::ModelProviderMetadata::default(),
             credentials: Vec::new(),
             keys: Vec::new(),
         }
@@ -3538,6 +3618,7 @@ mod tests {
                 wire_protocol_id: None,
             }],
             models: vec!["m".to_string()],
+            metadata: vibex_core::ModelProviderMetadata::default(),
             credentials: Vec::new(),
             keys: Vec::new(),
         }

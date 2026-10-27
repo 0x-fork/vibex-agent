@@ -6558,3 +6558,17 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
   disabled for catalogued non-local Providers.
 - Provider, Model, and Gateway Request rows are focusable; Enter opens the same
   detail the click opens, while the default star stops propagation.
+
+### Advanced metadata consumption and request virtualization
+
+- The model gateway now consumes per-Provider auth header mode, extra body JSON,
+  User-Agent pass-through, TLS acceptance, connect/request timeouts, and model
+  aliases.
+- `autoRefreshModels` remains UI metadata; model refresh is still an explicit
+  action.
+- Auth modes override the protocol default; Anthropic keeps its version header.
+- Extra body is a shallow top-level object merge; it cannot replace the model
+  field except through an alias map.
+- The gateway request ledger renders through `v_virtual_list` with a fixed
+  collapsed row height and a larger expanded trace height; filtering happens
+  before the list, and the clear action still clears the whole ledger.

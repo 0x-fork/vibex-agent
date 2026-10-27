@@ -1059,7 +1059,6 @@ pub struct ManagementCenter {
     gateway_requests: Vec<vibex_core::GatewayRequestSummary>,
     gateway_request_search: Entity<InputState>,
     gateway_request_filter: GatewayRequestFilter,
-    gateway_request_page: usize,
     /// Requests the gateway is serving right now, newest last.
     ///
     /// The ledger draws them ahead of finished rows: a request that is still
@@ -2370,7 +2369,6 @@ impl ManagementCenter {
                 ))
             }),
             gateway_request_filter: GatewayRequestFilter::All,
-            gateway_request_page: 0,
             gateway_inflight: Vec::new(),
             gateway_failover_prompt: None,
             gateway_request_detail: None,
@@ -18515,6 +18513,100 @@ impl ManagementCenter {
     /// This is the surface the "which Key answered, and why not the other one"
     /// question is answered on. It shows metadata only, because that is all the
     /// ledger keeps.
+    fn render_gateway_request_row(
+        &mut self,
+        request: &vibex_core::GatewayRequestSummary,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let outcome = match request.outcome {
+            vibex_core::GatewayRequestOutcome::Ok => Tag::success()
+                .xsmall()
+                .child(management_locale_text("ok", "成功", "成功"))
+                .into_any_element(),
+            vibex_core::GatewayRequestOutcome::Failover => Tag::info()
+                .xsmall()
+                .child(management_locale_text("failover", "已切换", "已切換"))
+                .into_any_element(),
+            vibex_core::GatewayRequestOutcome::Cooldown => Tag::warning()
+                .xsmall()
+                .child(management_locale_text("cooling", "冷却中", "冷卻中"))
+                .into_any_element(),
+            _ => Tag::danger()
+                .xsmall()
+                .child(management_locale_text("failed", "失败", "失敗"))
+                .into_any_element(),
+        };
+        let wire = if request.wire_in == request.wire_out {
+            management_locale_text("direct", "直通", "直通").to_string()
+        } else {
+            format!("{} → {}", request.wire_in, request.wire_out)
+        };
+        let request_id = request.request_id.clone();
+        let expanded = self.gateway_request_detail.as_ref() == Some(&request_id);
+        let toggle_id = request_id.clone();
+        let key_id = request_id.clone();
+        let row = h_flex()
+            .id(SharedString::from(format!(
+                "management-gateway-request-row-{}",
+                request_id.as_str()
+            )))
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .py_1()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_gateway_request_detail(toggle_id.clone(), cx)
+            }))
+            .focusable()
+            .tab_index(0)
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "enter" {
+                    this.toggle_gateway_request_detail(key_id.clone(), cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(div().min_w_0().truncate().text_sm().child(format!(
+                        "{} · {}",
+                        request.provider_name, request.model_requested
+                    )))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{wire} · {} tokens", request.total_tokens)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .child(outcome)
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronUp
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(px(14.0))
+                        .text_color(cx.theme().muted_foreground),
+                    ),
+            );
+        let mut entry = v_flex().w_full().child(row);
+        if expanded {
+            entry = entry.child(self.render_gateway_request_detail(request, cx));
+        }
+        entry.into_any_element()
+    }
+
     fn render_gateway_request_detail(
         &self,
         request: &vibex_core::GatewayRequestSummary,
@@ -20837,160 +20929,9 @@ impl ManagementCenter {
                 status_ok && query_ok
             })
             .collect::<Vec<_>>();
-        let page_size = 50usize;
-        let page_count = filtered_requests.len().div_ceil(page_size).max(1);
-        let page = self.gateway_request_page.min(page_count - 1);
-        self.gateway_request_page = page;
-        for request in filtered_requests
-            .iter()
-            .skip(page * page_size)
-            .take(page_size)
-        {
-            let outcome = match request.outcome {
-                vibex_core::GatewayRequestOutcome::Ok => Tag::success()
-                    .xsmall()
-                    .child(management_locale_text("ok", "成功", "成功"))
-                    .into_any_element(),
-                vibex_core::GatewayRequestOutcome::Failover => Tag::info()
-                    .xsmall()
-                    .child(management_locale_text("failover", "已切换", "已切換"))
-                    .into_any_element(),
-                vibex_core::GatewayRequestOutcome::Cooldown => Tag::warning()
-                    .xsmall()
-                    .child(management_locale_text("cooling", "冷却中", "冷卻中"))
-                    .into_any_element(),
-                _ => Tag::danger()
-                    .xsmall()
-                    .child(management_locale_text("failed", "失败", "失敗"))
-                    .into_any_element(),
-            };
-            let wire = if request.wire_in == request.wire_out {
-                management_locale_text("direct", "直通", "直通").to_string()
-            } else {
-                format!("{} → {}", request.wire_in, request.wire_out)
-            };
-            let request_id = request.request_id.clone();
-            let expanded = self.gateway_request_detail.as_ref() == Some(&request_id);
-            let toggle_id = request_id.clone();
-            let key_id = request_id.clone();
-            let row = h_flex()
-                .id(SharedString::from(format!(
-                    "management-gateway-request-row-{}",
-                    request_id.as_str()
-                )))
-                .w_full()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .border_b_1()
-                .border_color(cx.theme().border)
-                .py_1()
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_gateway_request_detail(toggle_id.clone(), cx)
-                }))
-                .focusable()
-                .tab_index(0)
-                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                    if event.keystroke.key == "enter" {
-                        this.toggle_gateway_request_detail(key_id.clone(), cx);
-                        cx.stop_propagation();
-                    }
-                }))
-                .child(
-                    v_flex()
-                        .min_w_0()
-                        .gap_0p5()
-                        .child(div().min_w_0().truncate().text_sm().child(format!(
-                            "{} · {}",
-                            request.provider_name, request.model_requested
-                        )))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!("{wire} · {} tokens", request.total_tokens)),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .flex_none()
-                        .items_center()
-                        .gap_2()
-                        .child(outcome)
-                        .child(
-                            Icon::new(if expanded {
-                                IconName::ChevronUp
-                            } else {
-                                IconName::ChevronDown
-                            })
-                            .size(px(14.0))
-                            .text_color(cx.theme().muted_foreground),
-                        ),
-                );
-            let mut entry = v_flex().w_full().child(row);
-            if expanded {
-                entry = entry.child(self.render_gateway_request_detail(request, cx));
-            }
-            request_rows = request_rows.child(entry);
-        }
-        request_rows = request_rows.child(
-            h_flex()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "{}-{} / {}",
-                            if filtered_requests.is_empty() {
-                                0
-                            } else {
-                                page * page_size + 1
-                            },
-                            (page * page_size + page_size).min(filtered_requests.len()),
-                            filtered_requests.len()
-                        )),
-                )
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .child(
-                            Button::new("management-gateway-request-page-prev")
-                                .xsmall()
-                                .ghost()
-                                .icon(IconName::ChevronLeft)
-                                .disabled(page == 0)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.gateway_request_page =
-                                        this.gateway_request_page.saturating_sub(1);
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new("management-gateway-request-page-next")
-                                .xsmall()
-                                .ghost()
-                                .icon(IconName::ChevronRight)
-                                .disabled(page + 1 >= page_count)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.gateway_request_page =
-                                        this.gateway_request_page.saturating_add(1);
-                                    cx.notify();
-                                })),
-                        ),
-                ),
-        );
         if filtered_requests.is_empty() {
             request_rows = request_rows.child(compact_empty_state(
-                management_locale_text(
-                    "No requests yet",
-                    "还没有请求",
-                    "還沒有請求",
-                ),
+                management_locale_text("No requests yet", "还没有请求", "還沒有請求"),
                 management_locale_text(
                     "Once an Agent sends a request through the gateway it appears here, without its prompt or reply.",
                     "Agent 通过网关发出请求后会显示在这里，但不含提示词和回复正文。",
@@ -20998,6 +20939,41 @@ impl ManagementCenter {
                 ),
                 cx,
             ));
+        } else {
+            let requests_rc = Rc::new(
+                filtered_requests
+                    .iter()
+                    .map(|request| (*request).clone())
+                    .collect::<Vec<vibex_core::GatewayRequestSummary>>(),
+            );
+            let expanded_id = self.gateway_request_detail.clone();
+            let row_sizes = Rc::new(
+                requests_rc
+                    .iter()
+                    .map(|request| {
+                        let height = if expanded_id.as_ref() == Some(&request.request_id) {
+                            340.0
+                        } else {
+                            52.0
+                        };
+                        gpui_size(px(0.0), px(height))
+                    })
+                    .collect::<Vec<GpuiSize<gpui::Pixels>>>(),
+            );
+            let list = v_virtual_list(
+                cx.entity(),
+                "management-gateway-request-virtual-list",
+                row_sizes,
+                move |this, range: Range<usize>, _, cx| {
+                    range
+                        .filter_map(|index| {
+                            let request = requests_rc.get(index)?;
+                            Some(this.render_gateway_request_row(request, cx))
+                        })
+                        .collect()
+                },
+            );
+            request_rows = request_rows.child(div().w_full().h(px(520.0)).min_h_0().child(list));
         }
         // The clearing entry sits at the foot of the ledger it clears, and the
         // retention rule is stated beside it: the copy names both the window
@@ -45073,8 +45049,7 @@ mod gateway_surface_tests {
             "management-provider-traffic-range-",
             "management-route-traffic-range-",
             "Top error",
-            "management-gateway-request-page-prev",
-            "management-gateway-request-page-next",
+            "management-gateway-request-virtual-list",
         ] {
             assert!(
                 source.contains(marker),
@@ -46615,8 +46590,8 @@ mod gateway_surface_tests {
     fn the_ledger_row_opens_the_route_detail() {
         let source = include_str!("management.rs");
         let row = source
-            .split_once("            let row = h_flex()")
-            .and_then(|(_, tail)| tail.split_once("            let mut entry = v_flex()"))
+            .split_once("        let row = h_flex()")
+            .and_then(|(_, tail)| tail.split_once("        let mut entry = v_flex()"))
             .map(|(body, _)| body)
             .expect("the ledger row should remain inspectable");
         assert!(row.contains("toggle_gateway_request_detail"));
