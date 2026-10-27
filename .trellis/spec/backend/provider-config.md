@@ -6443,3 +6443,11 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
   key remain.
 - Detection is a sequence of draft fetches, so it uses the draft fetch API and
   never persists a transient Profile.
+
+### Traffic percentiles
+
+- Provider and route-group Traffic cards compute p50/p95 from observed
+  `GatewayRequestSummary.latency_ms` values; missing latency is ignored and an
+  empty sample renders `—`.
+- The calculation is nearest-rank over observed values, not a vendor report or
+  a money/cost projection.

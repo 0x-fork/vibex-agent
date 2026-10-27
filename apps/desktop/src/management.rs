@@ -13360,6 +13360,16 @@ impl ManagementCenter {
                 .iter()
                 .map(|request| request.total_tokens)
                 .sum::<u64>();
+            let latencies = requests
+                .iter()
+                .filter_map(|request| request.latency_ms)
+                .collect::<Vec<_>>();
+            let p50 = management_percentile(latencies.clone(), 0.5)
+                .map(|value| format!("{value} ms"))
+                .unwrap_or_else(|| "—".to_string());
+            let p95 = management_percentile(latencies, 0.95)
+                .map(|value| format!("{value} ms"))
+                .unwrap_or_else(|| "—".to_string());
             let (health_label, _) = self.shared_provider_health_label(profile);
             let mut traffic = v_flex().w_full().gap_2();
             traffic = traffic.child(
@@ -13386,7 +13396,9 @@ impl ManagementCenter {
                         management_locale_text("Tokens", "Token", "Token"),
                         tokens.to_string(),
                         cx,
-                    )),
+                    ))
+                    .child(stat_line("p50", p50, cx))
+                    .child(stat_line("p95", p95, cx)),
             );
             if total == 0 {
                 traffic = traffic.child(compact_empty_state(
@@ -14118,6 +14130,16 @@ impl ManagementCenter {
                 .iter()
                 .map(|request| request.total_tokens)
                 .sum::<u64>();
+            let latencies = requests
+                .iter()
+                .filter_map(|request| request.latency_ms)
+                .collect::<Vec<_>>();
+            let p50 = management_percentile(latencies.clone(), 0.5)
+                .map(|value| format!("{value} ms"))
+                .unwrap_or_else(|| "—".to_string());
+            let p95 = management_percentile(latencies, 0.95)
+                .map(|value| format!("{value} ms"))
+                .unwrap_or_else(|| "—".to_string());
             let traffic = h_flex()
                 .w_full()
                 .flex_wrap()
@@ -14136,7 +14158,9 @@ impl ManagementCenter {
                     management_locale_text("Tokens", "Token", "Token"),
                     tokens.to_string(),
                     cx,
-                ));
+                ))
+                .child(stat_line("p50", p50, cx))
+                .child(stat_line("p95", p95, cx));
             body = body.child(management_card_with_icon(
                 management_locale_text("Traffic & Health", "流量与健康", "流量與健康"),
                 management_locale_text(
@@ -37094,6 +37118,15 @@ fn management_catalog_age_label(fetched_at_ms: i64) -> String {
     }
 }
 
+fn management_percentile(mut values: Vec<i64>, percentile: f64) -> Option<i64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let index = ((values.len() as f64 - 1.0) * percentile).round() as usize;
+    values.get(index).copied()
+}
+
 fn management_model_limits_label(capabilities: &vibex_core::ProviderModelCapabilities) -> String {
     let mut parts = Vec::new();
     if let Some(context) = capabilities.context_tokens {
@@ -42913,6 +42946,16 @@ mod gateway_surface_tests {
         assert!(source.contains("management-provider-agent-default-"));
         assert!(source.contains("management-route-group-agent-default-"));
         assert!(source.contains("set_agent_default_model_source("));
+    }
+
+    #[test]
+    fn traffic_reports_p50_and_p95_latency() {
+        let source = include_str!("management.rs");
+        assert!(source.contains("fn management_percentile("));
+        assert!(source.contains("management_percentile(latencies.clone(), 0.5)"));
+        assert!(source.contains("management_percentile(latencies, 0.95)"));
+        assert!(source.contains("stat_line(\"p50\""));
+        assert!(source.contains("stat_line(\"p95\""));
     }
 
     #[test]
