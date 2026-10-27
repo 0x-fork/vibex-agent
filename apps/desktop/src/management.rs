@@ -14124,7 +14124,14 @@ impl ManagementCenter {
                 serde_json::Map::new()
             }
             Err(error) => {
-                self.shared_provider_edit_error = Some(format!("Headers JSON: {error}"));
+                self.shared_provider_edit_error = Some(format!(
+                    "{}: {error}",
+                    management_locale_text(
+                        "Headers JSON is invalid",
+                        "请求头 JSON 无效",
+                        "請求標頭 JSON 無效",
+                    )
+                ));
                 cx.notify();
                 return;
             }
@@ -14156,7 +14163,12 @@ impl ManagementCenter {
                         .and_then(vibex_core::ModelProviderHeaderVariable::from_id);
                     let Some(variable) = variable else {
                         self.shared_provider_edit_error = Some(format!(
-                            "Header {name} must be a string or a known variable"
+                            "{}: {name}",
+                            management_locale_text(
+                                "A header must be a string or a known variable",
+                                "请求头必须是字符串或已知变量",
+                                "請求標頭必須是字串或已知變數",
+                            )
                         ));
                         cx.notify();
                         return;
