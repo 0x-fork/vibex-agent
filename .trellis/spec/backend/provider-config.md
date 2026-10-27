@@ -6371,3 +6371,12 @@ ModelCatalogStatus { availability: Fresh|Stale|Bundled|Missing, fetched_at_ms? }
   local token ceiling. It never shows a remaining-token percentage.
 - Traffic aggregates only observed Gateway requests across the group's member
   Providers; it shows request/success/token counts and no cost or quota.
+
+### Gateway request ledger filters
+
+- The recent-request ledger has a search field (Provider, model, Agent) and
+  outcome filters: all, OK, failover, failed/cooldown.
+- The visible list is capped at 50 rows per read; it is metadata-only and keeps
+  the existing per-row trace detail.
+- Clearing still deletes the whole ledger, not the filtered view; the button and
+  its retention copy sit at the foot of the unfiltered list.

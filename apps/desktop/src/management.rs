@@ -1021,6 +1021,8 @@ pub struct ManagementCenter {
     selected_global_route_id: Option<String>,
     /// The gateway's most recent requests, as the authority recorded them.
     gateway_requests: Vec<vibex_core::GatewayRequestSummary>,
+    gateway_request_search: Entity<InputState>,
+    gateway_request_filter: GatewayRequestFilter,
     /// Requests the gateway is serving right now, newest last.
     ///
     /// The ledger draws them ahead of finished rows: a request that is still
@@ -2301,6 +2303,14 @@ impl ManagementCenter {
             agent_model_route_bindings: Vec::new(),
             agent_model_source_defaults: Vec::new(),
             gateway_requests: Vec::new(),
+            gateway_request_search: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(management_locale_text(
+                    "Search requests",
+                    "搜索请求",
+                    "搜尋請求",
+                ))
+            }),
+            gateway_request_filter: GatewayRequestFilter::All,
             gateway_inflight: Vec::new(),
             gateway_failover_prompt: None,
             gateway_request_detail: None,
@@ -17703,8 +17713,75 @@ impl ManagementCenter {
         // Recent requests: which upstream answered, which protocol changed,
         // and how many tokens it took. This is the only view that explains a
         // failover after the fact.
-        let mut request_rows = v_flex().w_full().gap_1();
-        for request in self.gateway_requests.iter().take(20) {
+        let request_query = self
+            .gateway_request_search
+            .read(cx)
+            .value()
+            .trim()
+            .to_lowercase();
+        let mut request_controls = h_flex().w_full().items_center().flex_wrap().gap_1();
+        for filter in GatewayRequestFilter::ALL {
+            let selected = filter == self.gateway_request_filter;
+            request_controls = request_controls.child(
+                Button::new(SharedString::from(format!(
+                    "management-gateway-request-filter-{:?}",
+                    filter
+                )))
+                .xsmall()
+                .when(selected, |button| button.primary())
+                .when(!selected, |button| button.ghost())
+                .label(filter.label())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.gateway_request_filter = filter;
+                    cx.notify();
+                })),
+            );
+        }
+        let mut request_rows = v_flex()
+            .w_full()
+            .gap_1()
+            .child(management_search_input(&self.gateway_request_search, cx))
+            .child(request_controls);
+        let mut visible_requests = 0usize;
+        for request in self
+            .gateway_requests
+            .iter()
+            .filter(|request| {
+                let status_ok = matches!(
+                    (self.gateway_request_filter, request.outcome),
+                    (GatewayRequestFilter::All, _)
+                        | (
+                            GatewayRequestFilter::Ok,
+                            vibex_core::GatewayRequestOutcome::Ok
+                        )
+                        | (
+                            GatewayRequestFilter::Failover,
+                            vibex_core::GatewayRequestOutcome::Failover
+                        )
+                        | (
+                            GatewayRequestFilter::Failed,
+                            vibex_core::GatewayRequestOutcome::Failed
+                                | vibex_core::GatewayRequestOutcome::Cooldown
+                        )
+                );
+                let query_ok = request_query.is_empty()
+                    || request
+                        .provider_name
+                        .to_lowercase()
+                        .contains(&request_query)
+                    || request
+                        .model_requested
+                        .to_lowercase()
+                        .contains(&request_query)
+                    || request
+                        .agent_id
+                        .as_deref()
+                        .is_some_and(|agent| agent.to_lowercase().contains(&request_query));
+                status_ok && query_ok
+            })
+            .take(50)
+        {
+            visible_requests += 1;
             let outcome = match request.outcome {
                 vibex_core::GatewayRequestOutcome::Ok => Tag::success()
                     .xsmall()
@@ -17784,7 +17861,7 @@ impl ManagementCenter {
             }
             request_rows = request_rows.child(entry);
         }
-        if self.gateway_requests.is_empty() {
+        if visible_requests == 0 {
             request_rows = request_rows.child(compact_empty_state(
                 management_locale_text(
                     "No requests yet",
@@ -32361,6 +32438,27 @@ impl ProviderSort {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayRequestFilter {
+    All,
+    Ok,
+    Failover,
+    Failed,
+}
+
+impl GatewayRequestFilter {
+    const ALL: [Self; 4] = [Self::All, Self::Ok, Self::Failover, Self::Failed];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => management_locale_text("All", "全部", "全部"),
+            Self::Ok => management_locale_text("OK", "成功", "成功"),
+            Self::Failover => management_locale_text("Failover", "已切换", "已切換"),
+            Self::Failed => management_locale_text("Failed", "失败", "失敗"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RouteGroupDetailTab {
     Overview,
     Members,
@@ -41699,6 +41797,23 @@ mod gateway_surface_tests {
         }
         assert!(source.contains("management-provider-detail-tabs"));
         assert!(source.contains("management_model_limits_label"));
+    }
+
+    #[test]
+    fn gateway_requests_can_be_searched_and_filtered() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "management-gateway-request-filter-",
+            "GatewayRequestFilter::Failover",
+            "GatewayRequestFilter::Failed",
+            "management_search_input(&self.gateway_request_search",
+            "render_gateway_request_detail",
+        ] {
+            assert!(
+                source.contains(marker),
+                "the request ledger must keep {marker}"
+            );
+        }
     }
 
     #[test]
