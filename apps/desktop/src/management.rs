@@ -771,6 +771,12 @@ enum ManagementMutation {
     BackupRestore,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeImportReport {
+    imported: usize,
+    missing_secrets: usize,
+}
+
 struct ManagementTaskSuccess {
     message: String,
     agent_install_state: Option<(AgentId, vibex_core::AgentManagedInstallState)>,
@@ -781,6 +787,8 @@ struct ManagementTaskSuccess {
     /// The Prompt a save created or updated, so the editor can follow the
     /// record it just wrote instead of guessing an id.
     prompt: Option<vibex_core::Prompt>,
+    native_import_report: Option<NativeImportReport>,
+    native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
 }
 
 impl ManagementTaskSuccess {
@@ -795,6 +803,8 @@ impl ManagementTaskSuccess {
             provider_profiles: Vec::new(),
             recovery_destination: None,
             prompt: None,
+            native_import_report: None,
+            native_import_preview: None,
         }
     }
 
@@ -808,6 +818,8 @@ impl ManagementTaskSuccess {
             provider_profiles,
             recovery_destination: None,
             prompt: None,
+            native_import_report: None,
+            native_import_preview: None,
         }
     }
 
@@ -818,7 +830,22 @@ impl ManagementTaskSuccess {
             provider_profiles: Vec::new(),
             recovery_destination: Some(destination),
             prompt: None,
+            native_import_report: None,
+            native_import_preview: None,
         }
+    }
+
+    fn with_native_import_preview(
+        mut self,
+        preview: vibex_core::ProviderNativeImportPreview,
+    ) -> Self {
+        self.native_import_preview = Some(preview);
+        self
+    }
+
+    fn with_native_import_report(mut self, report: NativeImportReport) -> Self {
+        self.native_import_report = Some(report);
+        self
     }
 
     fn with_prompt(message: String, prompt: vibex_core::Prompt) -> Self {
@@ -828,6 +855,8 @@ impl ManagementTaskSuccess {
             provider_profiles: Vec::new(),
             recovery_destination: None,
             prompt: Some(prompt),
+            native_import_report: None,
+            native_import_preview: None,
         }
     }
 }
@@ -840,6 +869,8 @@ impl From<String> for ManagementTaskSuccess {
             provider_profiles: Vec::new(),
             recovery_destination: None,
             prompt: None,
+            native_import_report: None,
+            native_import_preview: None,
         }
     }
 }
@@ -975,6 +1006,7 @@ pub struct ManagementCenter {
     model_provider_agent_ids: BTreeSet<String>,
     acp_configs: Vec<(String, vibex_core::AcpProviderConfig)>,
     native_import_preview: Option<vibex_core::ProviderNativeImportPreview>,
+    native_import_report: Option<NativeImportReport>,
     agent_profile_states: Vec<AgentProviderProfileState>,
     provider_display_order: BTreeMap<String, i64>,
     projection_states: Vec<AgentProviderProjectionState>,
@@ -1133,6 +1165,7 @@ pub struct ManagementCenter {
     route_group_detail_tab: RouteGroupDetailTab,
     provider_models_search: Entity<InputState>,
     provider_models_filter: ProviderModelsFilter,
+    provider_models_page: usize,
     shared_provider_advanced_target: Option<vibex_core::ModelProviderProfileId>,
     shared_provider_advanced_input: Option<Entity<TextareaState>>,
     shared_provider_advanced_error: Option<String>,
@@ -2188,6 +2221,7 @@ impl ManagementCenter {
             model_provider_agent_ids: BTreeSet::new(),
             acp_configs: Vec::new(),
             native_import_preview: None,
+            native_import_report: None,
             agent_profile_states: Vec::new(),
             provider_display_order: BTreeMap::new(),
             projection_states: Vec::new(),
@@ -2379,6 +2413,7 @@ impl ManagementCenter {
             route_group_detail_tab: RouteGroupDetailTab::Overview,
             provider_models_search,
             provider_models_filter: ProviderModelsFilter::All,
+            provider_models_page: 0,
             shared_provider_advanced_target: None,
             shared_provider_advanced_input: None,
             shared_provider_advanced_error: None,
@@ -9087,6 +9122,12 @@ impl ManagementCenter {
                             agent.apply_managed_install_state(state);
                         }
                         this.apply_provider_profile_success(&success.provider_profiles);
+                        if let Some(report) = success.native_import_report {
+                            this.native_import_report = Some(report);
+                        }
+                        if let Some(preview) = success.native_import_preview {
+                            this.native_import_preview = Some(preview);
+                        }
                         if let Some(prompt) = success.prompt.as_ref() {
                             // The editor keeps the text the user just saved and
                             // the sidebar selects what it belongs to, so the
@@ -11682,7 +11723,8 @@ impl ManagementCenter {
                             preview.items.len(),
                             preview.files.len()
                         ),
-                    }));
+                    })
+                    .with_native_import_preview(preview.clone()));
                 }
                 if let Some(target_agent_id) = target_agent_id.as_ref() {
                     let import_item_ids = pending_cc_switch_import_item_ids(
@@ -11744,7 +11786,11 @@ impl ManagementCenter {
                     return Ok(ManagementTaskSuccess::with_provider_profiles(
                         message,
                         imported_profiles,
-                    ));
+                    )
+                    .with_native_import_report(NativeImportReport {
+                        imported: imported_count,
+                        missing_secrets: missing_secret_count,
+                    }));
                 }
                 let item = preview
                     .items
@@ -11777,10 +11823,17 @@ impl ManagementCenter {
                             format!("已匯入原生配置 {}", result.profile.display_name)
                         }
                     };
+                let missing = usize::from(result.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "provider_native_import_cc_switch_secret_keychain_unavailable"
+                }));
                 Ok(ManagementTaskSuccess::with_provider_profiles(
                     message,
                     vec![result.profile],
-                ))
+                )
+                .with_native_import_report(NativeImportReport {
+                    imported: 1,
+                    missing_secrets: missing,
+                }))
             },
         );
     }
@@ -12735,6 +12788,8 @@ impl ManagementCenter {
             .then(|| self.render_catalog_status_row(cx));
         let provider_filter_row = (active_tab == ProviderSidebarTab::Providers)
             .then(|| self.render_provider_filter_row(cx));
+        let import_report_row = (active_tab == ProviderSidebarTab::Providers)
+            .then(|| self.render_native_import_report(cx));
         let (section_title, actions, section_body) = match active_tab {
             ProviderSidebarTab::Providers => (
                 management_locale_text("Providers", "供应商", "供應商"),
@@ -12812,11 +12867,51 @@ impl ManagementCenter {
                     ))
                     .children(provider_search_row)
                     .children(provider_filter_row)
+                    .children(import_report_row)
                     .children(catalog_row)
                     .child(
                         div()
+                            .id("management-provider-section-list")
                             .min_h_0()
                             .flex_1()
+                            .focusable()
+                            .tab_index(0)
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                let mut rows = this.shared_providers();
+                                rows.sort_by(|left, right| {
+                                    left.profile
+                                        .display_name
+                                        .to_lowercase()
+                                        .cmp(&right.profile.display_name.to_lowercase())
+                                });
+                                if rows.is_empty() {
+                                    return;
+                                }
+                                let current =
+                                    this.selected_global_provider_id.as_deref().and_then(|id| {
+                                        rows.iter().position(|row| row.profile.id.as_str() == id)
+                                    });
+                                let index = match event.keystroke.key.as_str() {
+                                    "down" => {
+                                        current.map_or(0, |index| (index + 1).min(rows.len() - 1))
+                                    }
+                                    "up" => current
+                                        .map_or(rows.len() - 1, |index| index.saturating_sub(1)),
+                                    "home" => 0,
+                                    "end" => rows.len() - 1,
+                                    "enter" => {
+                                        cx.stop_propagation();
+                                        return;
+                                    }
+                                    _ => return,
+                                };
+                                this.selected_global_provider_id =
+                                    Some(rows[index].profile.id.as_str().to_string());
+                                this.selected_global_route_id = None;
+                                this.providers_sidebar_tab = ProviderSidebarTab::Providers;
+                                cx.stop_propagation();
+                                cx.notify();
+                            }))
                             .overflow_y_scrollbar()
                             .scroll_gutter()
                             .child(section_body),
@@ -13222,21 +13317,32 @@ impl ManagementCenter {
                             }
                         })),
                 );
+            let matched = profile
+                .configured_models
+                .iter()
+                .filter(|model| {
+                    let matches_query =
+                        query.is_empty() || model.id.to_lowercase().contains(&query);
+                    let matches_filter = match self.provider_models_filter {
+                        ProviderModelsFilter::All => true,
+                        ProviderModelsFilter::Enabled => model.enabled,
+                        ProviderModelsFilter::Disabled => !model.enabled,
+                        ProviderModelsFilter::Reasoning => {
+                            model.capabilities.reasoning == Some(true)
+                        }
+                        ProviderModelsFilter::Vision => {
+                            model.capabilities.image_input == Some(true)
+                        }
+                    };
+                    matches_query && matches_filter
+                })
+                .collect::<Vec<_>>();
+            let page_size = 50usize;
+            let page_count = matched.len().div_ceil(page_size).max(1);
+            let page = self.provider_models_page.min(page_count - 1);
+            self.provider_models_page = page;
             let mut model_rows = v_flex().w_full().gap_1();
-            let mut visible = 0usize;
-            for model in &profile.configured_models {
-                let matches_query = query.is_empty() || model.id.to_lowercase().contains(&query);
-                let matches_filter = match self.provider_models_filter {
-                    ProviderModelsFilter::All => true,
-                    ProviderModelsFilter::Enabled => model.enabled,
-                    ProviderModelsFilter::Disabled => !model.enabled,
-                    ProviderModelsFilter::Reasoning => model.capabilities.reasoning == Some(true),
-                    ProviderModelsFilter::Vision => model.capabilities.image_input == Some(true),
-                };
-                if !matches_query || !matches_filter {
-                    continue;
-                }
-                visible += 1;
+            for model in matched.iter().skip(page * page_size).take(page_size) {
                 let is_default = profile.default_model_id.as_deref() == Some(model.id.as_str());
                 let model_id = model.id.clone();
                 let profile_id = profile.id.clone();
@@ -13300,7 +13406,7 @@ impl ManagementCenter {
                         ),
                 );
             }
-            if visible == 0 {
+            if matched.is_empty() {
                 model_rows = model_rows.child(compact_empty_state(
                     management_locale_text(
                         "No matching models",
@@ -13328,6 +13434,56 @@ impl ManagementCenter {
                     .gap_2()
                     .child(management_search_input(&self.provider_models_search, cx))
                     .child(controls)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "{}-{} / {}",
+                                        if matched.is_empty() {
+                                            0
+                                        } else {
+                                            page * page_size + 1
+                                        },
+                                        (page * page_size + page_size).min(matched.len()),
+                                        matched.len()
+                                    )),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Button::new("management-provider-models-page-prev")
+                                            .xsmall()
+                                            .ghost()
+                                            .icon(IconName::ChevronLeft)
+                                            .disabled(page == 0)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.provider_models_page =
+                                                    this.provider_models_page.saturating_sub(1);
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("management-provider-models-page-next")
+                                            .xsmall()
+                                            .ghost()
+                                            .icon(IconName::ChevronRight)
+                                            .disabled(page + 1 >= page_count)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.provider_models_page =
+                                                    this.provider_models_page.saturating_add(1);
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    )
                     .child(model_rows)
                     .into_any_element(),
                 cx,
@@ -14884,6 +15040,58 @@ impl ManagementCenter {
             .gap_1()
             .child(filters)
             .child(sorts)
+            .into_any_element()
+    }
+
+    fn render_native_import_report(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(report) = self.native_import_report else {
+            return div().into_any_element();
+        };
+        h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(if report.missing_secrets > 0 {
+                cx.theme().warning.opacity(0.5)
+            } else {
+                cx.theme().border
+            })
+            .px_2()
+            .py_1p5()
+            .child(
+                div()
+                    .min_w_0()
+                    .text_xs()
+                    .child(if report.missing_secrets > 0 {
+                        format!(
+                            "{} {} · {} {}",
+                            management_locale_text("Imported", "已导入", "已匯入"),
+                            report.imported,
+                            management_locale_text("need keys", "需要 Key", "需要 Key"),
+                            report.missing_secrets
+                        )
+                    } else {
+                        format!(
+                            "{} {}",
+                            management_locale_text("Imported", "已导入", "已匯入"),
+                            report.imported
+                        )
+                    }),
+            )
+            .child(
+                Button::new("management-provider-import-report-dismiss")
+                    .xsmall()
+                    .ghost()
+                    .icon(IconName::Close)
+                    .tooltip(management_locale_text("Dismiss", "关闭", "關閉"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.native_import_report = None;
+                        cx.notify();
+                    })),
+            )
             .into_any_element()
     }
 
@@ -18082,6 +18290,22 @@ impl ManagementCenter {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        if proxy_url.as_deref().is_some_and(|proxy| {
+            !["http://", "https://", "socks5://", "socks5h://"]
+                .iter()
+                .any(|scheme| proxy.starts_with(scheme))
+        }) {
+            self.gateway_key_policy_error = Some(
+                management_locale_text(
+                    "The proxy URL must start with http://, https://, socks5://, or socks5h://",
+                    "代理地址必须以 http://、https://、socks5:// 或 socks5h:// 开头",
+                    "代理位址必須以 http://、https://、socks5:// 或 socks5h:// 開頭",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
         let Some(mut profile) = self
             .providers
             .iter()
@@ -18160,6 +18384,70 @@ impl ManagementCenter {
                     )),
             )
             .child(Textarea::new(&input).small().w_full().h(px(100.0)))
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Proxy suggestions",
+                                "代理建议",
+                                "代理建議",
+                            )),
+                    )
+                    .children(
+                        [
+                            (
+                                "system",
+                                management_locale_text("System", "跟随系统", "跟隨系統"),
+                                None,
+                            ),
+                            (
+                                "7890",
+                                management_locale_text("Local 7890", "本机 7890", "本機 7890"),
+                                Some("http://127.0.0.1:7890".to_string()),
+                            ),
+                            (
+                                "1080",
+                                management_locale_text("Local 1080", "本机 1080", "本機 1080"),
+                                Some("socks5://127.0.0.1:1080".to_string()),
+                            ),
+                        ]
+                        .into_iter()
+                        .map(|(id, label, proxy)| {
+                            let input = input.clone();
+                            Button::new(SharedString::from(format!(
+                                "management-shared-provider-key-proxy-{id}"
+                            )))
+                            .xsmall()
+                            .ghost()
+                            .label(label)
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    let mut value = serde_json::from_str::<serde_json::Value>(
+                                        &input.read(cx).value(),
+                                    )
+                                    .ok()
+                                    .filter(serde_json::Value::is_object)
+                                    .unwrap_or_else(|| serde_json::json!({}));
+                                    value["proxyUrl"] = proxy
+                                        .clone()
+                                        .map(serde_json::Value::String)
+                                        .unwrap_or(serde_json::Value::Null);
+                                    let text =
+                                        serde_json::to_string_pretty(&value).unwrap_or_default();
+                                    input.update(cx, |state, cx| state.set_value(text, window, cx));
+                                    this.gateway_key_policy_error = None;
+                                    cx.notify();
+                                },
+                            ))
+                        }),
+                    ),
+            )
             .children(
                 error.map(|message| div().text_xs().text_color(cx.theme().danger).child(message)),
             )
@@ -24457,10 +24745,46 @@ impl ManagementCenter {
                                 "匯入設定",
                             ))
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.close_profile_editor(window, cx);
-                                this.preview_native_import(true, Some(agent_id.clone()), cx);
+                                this.preview_native_import(false, Some(agent_id.clone()), cx);
+                                let _ = window;
                             }))
                     })
+            }))
+            .children(self.native_import_preview.as_ref().map(|preview| {
+                let importable = preview
+                    .items
+                    .iter()
+                    .filter(|item| native_import_status_is_eligible(item.status))
+                    .count();
+                let agent_id = self.selected_agent_id.clone().unwrap_or_default();
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .px_2()
+                    .py_1p5()
+                    .child(div().min_w_0().text_xs().child(format!(
+                        "{} · {} {}",
+                        management_locale_text("Import preview", "导入预览", "匯入預覽",),
+                        importable,
+                        management_locale_text("importable", "可导入", "可匯入")
+                    )))
+                    .child(
+                        Button::new("management-provider-import-apply")
+                            .xsmall()
+                            .primary()
+                            .label(management_locale_text("Import all", "全部导入", "全部匯入"))
+                            .disabled(pending || importable == 0)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_profile_editor(window, cx);
+                                this.preview_native_import(true, Some(agent_id.clone()), cx);
+                            })),
+                    )
+                    .into_any_element()
             }))
             .child(
                 // The manual path never disappears: a preset library that
@@ -43685,6 +44009,38 @@ mod gateway_surface_tests {
     }
 
     #[test]
+    fn large_model_lists_page_and_the_list_is_keyboard_navigable() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "management-provider-models-page-prev",
+            "management-provider-models-page-next",
+            "page_size = 50usize",
+            "management-provider-section-list",
+            "on_key_down(cx.listener(|this, event: &KeyDownEvent",
+            "\"home\" => 0",
+        ] {
+            assert!(
+                source.contains(marker),
+                "the list controls must keep {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_import_exposes_preview_and_report() {
+        let source = include_str!("management.rs");
+        for marker in [
+            "management-provider-import-apply",
+            "management-provider-import-report-dismiss",
+            "native_import_preview",
+            "native_import_report",
+            "with_native_import_preview",
+        ] {
+            assert!(source.contains(marker), "import flow must keep {marker}");
+        }
+    }
+
+    #[test]
     fn keys_can_carry_a_model_scope_and_proxy() {
         let source = include_str!("management.rs");
         for marker in [
@@ -43697,6 +44053,9 @@ mod gateway_surface_tests {
             "management-shared-provider-test-key-",
             "test_shared_provider_key(",
             "test_model_provider_credential(",
+            "management-shared-provider-key-proxy-",
+            "Proxy suggestions",
+            "must start with http://",
         ] {
             assert!(source.contains(marker), "Key scope must keep {marker}");
         }
