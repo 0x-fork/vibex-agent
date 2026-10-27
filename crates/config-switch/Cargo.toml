@@ -6,9 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The OS keychain is opt-in: a headless server must not link libdbus or the
+# platform secret-service stack, while the desktop shell turns this on.
+default = []
+os-keychain = ["dep:keyring"]
+
 [dependencies]
 dirs = "6"
-keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
+keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"], optional = true }
 reqwest = { version = "0.13.4", features = ["blocking", "json"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 semver.workspace = true

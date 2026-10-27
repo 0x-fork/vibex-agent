@@ -73,11 +73,11 @@ vibex-browser = { path = "../../crates/browser" }
 vibex-computer = { path = "../../crates/computer" }
 vibex-agent-acp = { path = "../../crates/agent-acp" }
 vibex-app-update = { path = "../../crates/app-update" }
-vibex-config-switch = { path = "../../crates/config-switch" }
+vibex-config-switch = { path = "../../crates/config-switch", features = ["os-keychain"] }
 vibex-content = { path = "../../crates/content" }
 vibex-core = { path = "../../crates/core" }
 vibex-desktop-model = { path = "../../crates/desktop-model" }
-vibex-desktop-runtime = { path = "../../crates/desktop-runtime" }
+vibex-desktop-runtime = { path = "../../crates/desktop-runtime", features = ["os-keychain"] }
 vibex-backend = { path = "../../crates/vibex-backend", features = ["native"] }
 vibex-client = { path = "../tui" }
 vibex-tui = { path = "../../crates/vibex-tui" }

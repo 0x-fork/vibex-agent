@@ -18,8 +18,8 @@ vibex-core = { path = "../core" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { workspace = true, optional = true }
-vibex-desktop-runtime = { path = "../desktop-runtime", optional = true }
-vibex-config-switch = { path = "../config-switch", optional = true }
+vibex-desktop-runtime = { path = "../desktop-runtime", optional = true, default-features = false }
+vibex-config-switch = { path = "../config-switch", optional = true, default-features = false }
 vibex-db = { path = "../db", optional = true }
 vibex-desktop-model = { path = "../desktop-model", optional = true }
 

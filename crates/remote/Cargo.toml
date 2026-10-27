@@ -24,7 +24,7 @@ tokio.workspace = true
 tower.workspace = true
 url.workspace = true
 vibex-agent = { path = "../agent" }
-vibex-config-switch = { path = "../config-switch" }
+vibex-config-switch = { path = "../config-switch", default-features = false }
 vibex-core = { path = "../core" }
 vibex-db = { path = "../db" }
 vibex-fs = { path = "../fs" }

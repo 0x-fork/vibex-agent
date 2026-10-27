@@ -8,7 +8,7 @@ use vibex_core::{
     VibexError, VibexResult,
 };
 
-#[cfg(not(test))]
+#[cfg(all(not(test), feature = "os-keychain"))]
 const VIBEX_SECRET_SERVICE: &str = "dev.vibex.provider-secrets";
 
 /// Host-side secret file used when no usable OS keychain exists.
@@ -160,16 +160,25 @@ pub fn store_provider_secret(lookup_key: &str, secret: &str) -> VibexResult<()> 
                 let root = host_file_root()?;
                 store_host_file_secret(&root, lookup_key, secret)
             }
-            ProviderSecretStore::OsKeychain => keyring_entry(lookup_key)?
-                .set_password(secret)
-                .map_err(|error| {
-                    VibexError::storage(
-                        "provider_secret_keychain_store_failed",
-                        "failed to store provider secret in OS keychain",
-                    )
-                    .with_diagnostic("backend", "os_keychain")
-                    .with_diagnostic("error", error.to_string())
-                }),
+            ProviderSecretStore::OsKeychain => {
+                #[cfg(feature = "os-keychain")]
+                {
+                    keyring_entry(lookup_key)?
+                        .set_password(secret)
+                        .map_err(|error| {
+                            VibexError::storage(
+                                "provider_secret_keychain_store_failed",
+                                "failed to store provider secret in OS keychain",
+                            )
+                            .with_diagnostic("backend", "os_keychain")
+                            .with_diagnostic("error", error.to_string())
+                        })
+                }
+                #[cfg(not(feature = "os-keychain"))]
+                {
+                    Err(os_keychain_unavailable())
+                }
+            }
         }
     }
 }
@@ -237,10 +246,22 @@ pub fn delete_provider_secret(lookup_key: &str) -> VibexResult<()> {
                 delete_host_file_secret(&root, lookup_key)?;
                 // A desktop home reused as a server home can still hold an
                 // earlier copy in the OS keychain; that cleanup is best effort.
-                let _ = delete_keychain_secret(lookup_key);
+                #[cfg(feature = "os-keychain")]
+                {
+                    let _ = delete_keychain_secret(lookup_key);
+                }
                 Ok(())
             }
-            ProviderSecretStore::OsKeychain => delete_keychain_secret(lookup_key),
+            ProviderSecretStore::OsKeychain => {
+                #[cfg(feature = "os-keychain")]
+                {
+                    delete_keychain_secret(lookup_key)
+                }
+                #[cfg(not(feature = "os-keychain"))]
+                {
+                    Err(os_keychain_unavailable())
+                }
+            }
         }
     }
 }
@@ -334,14 +355,41 @@ fn load_os_secret(lookup_key: &str) -> VibexResult<Option<String>> {
                 }
                 // Best-effort fallback for a home that a desktop shell used
                 // before it became a server home.
-                Ok(load_keychain_secret(lookup_key).ok().flatten())
+                #[cfg(feature = "os-keychain")]
+                {
+                    Ok(load_keychain_secret(lookup_key).ok().flatten())
+                }
+                #[cfg(not(feature = "os-keychain"))]
+                {
+                    Ok(None)
+                }
             }
-            ProviderSecretStore::OsKeychain => load_keychain_secret(lookup_key),
+            ProviderSecretStore::OsKeychain => {
+                #[cfg(feature = "os-keychain")]
+                {
+                    load_keychain_secret(lookup_key)
+                }
+                #[cfg(not(feature = "os-keychain"))]
+                {
+                    Err(os_keychain_unavailable())
+                }
+            }
         }
     }
 }
 
-#[cfg(not(test))]
+/// The server was built without the keychain backend. Selecting it explicitly
+/// must fail loudly rather than silently falling back to a plaintext file.
+#[cfg(not(feature = "os-keychain"))]
+fn os_keychain_unavailable() -> VibexError {
+    VibexError::capability(
+        "provider_secret_keychain_unavailable",
+        "this build has no OS keychain support; set VIBEX_PROVIDER_SECRET_STORE=file",
+    )
+    .with_diagnostic("backend", "os_keychain")
+}
+
+#[cfg(all(not(test), feature = "os-keychain"))]
 fn load_keychain_secret(lookup_key: &str) -> VibexResult<Option<String>> {
     match keyring_entry(lookup_key)?.get_password() {
         Ok(secret) => Ok(Some(secret)),
@@ -355,7 +403,7 @@ fn load_keychain_secret(lookup_key: &str) -> VibexResult<Option<String>> {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), feature = "os-keychain"))]
 fn delete_keychain_secret(lookup_key: &str) -> VibexResult<()> {
     match keyring_entry(lookup_key)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -471,7 +519,7 @@ fn validate_lookup_key(lookup_key: &str) -> VibexResult<&str> {
     Ok(lookup_key)
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), feature = "os-keychain"))]
 fn keyring_entry(lookup_key: &str) -> VibexResult<keyring::Entry> {
     keyring::Entry::new(VIBEX_SECRET_SERVICE, lookup_key).map_err(|error| {
         VibexError::storage(
@@ -486,6 +534,14 @@ fn keyring_entry(lookup_key: &str) -> VibexResult<keyring::Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "os-keychain"))]
+    #[test]
+    fn selecting_the_os_keychain_without_the_feature_is_an_explicit_error() {
+        let error = os_keychain_unavailable();
+        assert_eq!(error.code, "provider_secret_keychain_unavailable");
+        assert!(error.message.contains("VIBEX_PROVIDER_SECRET_STORE=file"));
+    }
 
     #[test]
     fn host_secret_file_round_trips_and_stays_private() {

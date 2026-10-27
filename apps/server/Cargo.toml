@@ -14,9 +14,9 @@ vibex-browser = { path = "../../crates/browser" }
 vibex-computer = { path = "../../crates/computer" }
 vibex-core = { path = "../../crates/core" }
 vibex-db = { path = "../../crates/db" }
-vibex-desktop-runtime = { path = "../../crates/desktop-runtime" }
+vibex-desktop-runtime = { path = "../../crates/desktop-runtime", default-features = false }
 vibex-remote = { path = "../../crates/remote" }
-vibex-client = { path = "../tui" }
+vibex-client = { path = "../tui", default-features = false }
 vibex-tui = { path = "../../crates/vibex-tui" }
 
 [[bin]]

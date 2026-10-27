@@ -25609,8 +25609,26 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         assert!(config.contains("base_url = \"https://relay.example.invalid/v1\""));
     }
 
+    /// These tests exercise secret projection, not the keychain. Pin the
+    /// provider secret store to a process-local file so they do not depend on
+    /// an OS keychain the headless build does not link.
+    fn configure_test_secret_store() {
+        use std::sync::OnceLock;
+        static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
+        ROOT.get_or_init(|| {
+            let root = std::env::temp_dir()
+                .join(format!("vibex-agent-acp-secrets-{}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("create the test secret store root");
+            vibex_config_switch::secrets::configure_provider_secret_store(
+                vibex_config_switch::secrets::ProviderSecretStoreConfig::host_file(root.clone()),
+            );
+            root
+        });
+    }
+
     #[test]
     fn codex_provider_projection_supplies_managed_adapter_auth_environment() {
+        configure_test_secret_store();
         let dir = tempfile::tempdir().unwrap();
         let lookup_key = format!("codex-provider-secret-{}", RequestId::new().as_str());
         vibex_config_switch::secrets::store_provider_secret(&lookup_key, "codex-test-secret")
@@ -25673,6 +25691,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
 
     #[test]
     fn codex_official_profile_does_not_invent_a_custom_model_provider() {
+        configure_test_secret_store();
         let dir = tempfile::tempdir().unwrap();
         let lookup_key = format!("codex-official-secret-{}", RequestId::new().as_str());
         vibex_config_switch::secrets::store_provider_secret(&lookup_key, "official-test-secret")

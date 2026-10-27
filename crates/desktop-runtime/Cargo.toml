@@ -6,6 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Turns on the OS keychain backend in vibex-config-switch. Desktop and TUI
+# builds enable it; the headless server leaves it off so the artifact does not
+# link libdbus or the platform secret-service stack.
+os-keychain = ["vibex-config-switch/os-keychain"]
+
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
@@ -35,7 +42,7 @@ vibex-agent = { path = "../agent" }
 vibex-agent-acp = { path = "../agent-acp" }
 vibex-browser = { path = "../browser", features = ["profile-import"] }
 vibex-computer = { path = "../computer" }
-vibex-config-switch = { path = "../config-switch" }
+vibex-config-switch = { path = "../config-switch", default-features = false }
 vibex-core = { path = "../core" }
 vibex-db = { path = "../db" }
 vibex-desktop-model = { path = "../desktop-model" }
