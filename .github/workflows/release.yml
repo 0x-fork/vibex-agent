@@ -247,6 +247,52 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  server-linux:
+    name: Server Linux
+    needs: release-meta
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      # The artifact must run on Ubuntu 22.04 (glibc 2.35), so the link step
+      # happens inside the pinned Debian 12 image, never on this runner.
+      - name: Build Debian 12 server artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.release-meta.outputs.version }}"
+          docker build -t vibex-server-build -f deploy/server/Dockerfile.build deploy/server
+          mkdir -p target/server-artifacts
+          for arch in x86_64 aarch64; do
+            target="${arch}-unknown-linux-gnu"
+            docker run --rm \
+              -v "${PWD}:/src" -w /src \
+              -v "${PWD}/target/server-artifacts:/out" \
+              -e TARGET="${target}" \
+              vibex-server-build \
+              sh -c 'cargo build -p vibex-server --release --locked --target "$TARGET" && cp "target/$TARGET/release/vibex-server" "/out/vibex-server-$TARGET"'
+            node scripts/check-server-artifact.mjs \
+              --binary "target/server-artifacts/vibex-server-${target}" \
+              --arch "${arch}" --max-glibc 2.35
+            node scripts/package-server-release.mjs \
+              --version "${version}" --arch "${arch}" \
+              --binary "target/server-artifacts/vibex-server-${target}" \
+              --output target/server-artifacts
+            rm -f "target/server-artifacts/vibex-server-${target}"
+          done
+      - name: Upload server artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: server-linux-${{ github.sha }}
+          path: |
+            target/server-artifacts/*.tar.gz
+            target/server-artifacts/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
   mobile-android:
     name: Mobile Android release artifact
     needs: release-meta
@@ -375,8 +421,8 @@ jobs:
     name: Aggregate and publish release
     permissions:
       contents: write
-    needs: [release-meta, desktop, mobile-android, mobile-ios]
-    if: ${{ always() && needs.release-meta.result == 'success' && needs.desktop.result == 'success' && needs.mobile-android.result == 'success' && needs.mobile-ios.result == 'success' }}
+    needs: [release-meta, desktop, server-linux, mobile-android, mobile-ios]
+    if: ${{ always() && needs.release-meta.result == 'success' && needs.desktop.result == 'success' && needs.server-linux.result == 'success' && needs.mobile-android.result == 'success' && needs.mobile-ios.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -459,6 +505,16 @@ jobs:
             fi
           done
           require_artifact_class '*-linux-*-appimage.AppImage' 'Linux AppImage'
+          # Headless runtime artifacts are built in the pinned Debian 12 image
+          # and checked against the glibc 2.35 floor before publishing.
+          for arch in aarch64 x86_64; do
+            server_tarball="target/publish/vibex-server-${version}-linux-${arch}.tar.gz"
+            if [[ -f "${server_tarball}" ]]; then
+              manifest_args+=(--server-artifact "linux|$(manifest_arch "${arch}")|${server_tarball}|${repository_url}/$(basename "${server_tarball}")")
+            fi
+          done
+          require_artifact_class 'vibex-server-*-linux-x86_64.tar.gz' 'Linux x86_64 server'
+          require_artifact_class 'vibex-server-*-linux-aarch64.tar.gz' 'Linux aarch64 server'
           for arch in aarch64 x86_64; do
             dmg="target/publish/vibex-${version}-macos-${arch}-app.dmg"
             if [[ -f "${dmg}" ]]; then

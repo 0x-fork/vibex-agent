@@ -1,0 +1,37 @@
+# Headless server artifact builder.
+#
+# The binary must run on Ubuntu 22.04 (glibc 2.35) and newer, so it is built on
+# Debian 12 (glibc 2.36) and checked with scripts/check-server-artifact.mjs
+# before it is packaged. The base image is pinned by digest; do not replace it
+# with a floating tag or with the ubuntu-24.04 runner's host linker.
+FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      curl \
+      git \
+      g++-aarch64-linux-gnu \
+      gcc-aarch64-linux-gnu \
+      libc6-dev-arm64-cross \
+      pkg-config \
+      xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.97.0
+ENV PATH=/usr/local/cargo/bin:${PATH}
+
+# The server is built for both Linux architectures from this one image.
+RUN rustup target add aarch64-unknown-linux-gnu
+
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+
+WORKDIR /src

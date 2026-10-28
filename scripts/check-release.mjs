@@ -560,6 +560,58 @@ function validateDependencyAndSupplyChain() {
   assert(sbom.bomFormat === "CycloneDX" && sbom.components?.length > 0, "release SBOM is invalid");
 }
 
+function validateServerRelease() {
+  const dockerfile = source("deploy/server/Dockerfile.build");
+  assert(
+    dockerfile.includes("FROM debian:bookworm-slim@sha256:"),
+    "server builder must pin the Debian 12 base image by digest"
+  );
+  assert(
+    dockerfile.includes("--default-toolchain 1.97.0"),
+    "server builder must pin the workspace Rust toolchain"
+  );
+  for (const required of [
+    "gcc-aarch64-linux-gnu",
+    "g++-aarch64-linux-gnu",
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"
+  ]) {
+    assert(dockerfile.includes(required), `server builder is missing ${required}`);
+  }
+  for (const required of [
+    "scripts/check-server-artifact.mjs",
+    "scripts/package-server-release.mjs"
+  ]) {
+    assert(existsSync(path(required)), `server release script is missing: ${required}`);
+  }
+
+  const workflow = workflowSource(".github/workflows/release.yml");
+  for (const required of [
+    "name: Server Linux",
+    "deploy/server/Dockerfile.build",
+    "cargo build -p vibex-server --release --locked",
+    "for arch in x86_64 aarch64",
+    "--max-glibc 2.35",
+    "scripts/check-server-artifact.mjs",
+    "scripts/package-server-release.mjs",
+    "--server-artifact",
+    "require_artifact_class 'vibex-server-*-linux-x86_64.tar.gz'",
+    "require_artifact_class 'vibex-server-*-linux-aarch64.tar.gz'",
+    "name: server-linux-${{ github.sha }}"
+  ]) {
+    assert(workflow.includes(required), `publish workflow is missing server release contract ${required}`);
+  }
+  assert(
+    workflow.includes("docker run --rm"),
+    "server artifact must be linked inside the pinned builder, not on the runner"
+  );
+
+  const manifest = source("crates/app-update/src/manifest.rs");
+  assert(manifest.includes("pub struct ServerArtifact"), "update manifest has no headless server artifact type");
+  assert(manifest.includes("server_artifacts"), "update manifest has no server artifact field");
+  const generator = source("crates/app-update/src/bin/vibex-update-manifest.rs");
+  assert(generator.includes("--server-artifact"), "manifest generator cannot add a server artifact");
+}
+
 function validateSelfTest() {
   const tampered = source("apps/desktop/Packager.stable.toml").replace(
     'identifier = "dev.vibex.desktop"',
@@ -590,6 +642,7 @@ function validateSelfTest() {
 const checks = [
   runCheck("stable_identity", validateStableIdentity),
   runCheck("packaging", validatePackaging),
+  runCheck("server_release", validateServerRelease),
   runCheck("ui_state_safety", validateUiStateSafety),
   runCheck("current_release_docs", validateCurrentReleaseDocs),
   runCheck("dependency_and_supply_chain", validateDependencyAndSupplyChain)

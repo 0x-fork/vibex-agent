@@ -72,6 +72,20 @@ pub struct UpdateArtifact {
     pub sha512: Option<String>,
 }
 
+/// A headless runtime artifact the desktop installs over SSH.
+///
+/// Server artifacts are not desktop packages: they carry no install mode and
+/// are selected by OS/architecture alone. The release tag and the signed
+/// manifest bind them to the same release as the desktop packages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerArtifact {
+    pub os: String,
+    pub arch: String,
+    pub url: Url,
+    pub size: u64,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateManifest {
     pub schema: u32,
@@ -82,6 +96,10 @@ pub struct UpdateManifest {
     pub minimum_updater_version: String,
     pub notes_url: Url,
     pub artifacts: Vec<UpdateArtifact>,
+    /// Optional so older manifests stay readable and older clients ignore the
+    /// field they do not know.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_artifacts: Vec<ServerArtifact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +118,14 @@ impl VerifiedManifest {
         self.manifest.artifacts.iter().find(|artifact| {
             artifact.os == os && artifact.arch == arch && artifact.package == package
         })
+    }
+
+    /// The headless runtime artifact for one target, if this release ships it.
+    pub fn server_artifact(&self, os: &str, arch: &str) -> Option<&ServerArtifact> {
+        self.manifest
+            .server_artifacts
+            .iter()
+            .find(|artifact| artifact.os == os && artifact.arch == arch)
     }
 }
 
@@ -210,22 +236,73 @@ fn validate_manifest(
     for artifact in &manifest.artifacts {
         validate_artifact(artifact, &manifest.tag)?;
     }
+    if manifest.server_artifacts.len() > MAX_ARTIFACTS {
+        return Err(AppUpdateError::new(
+            "app_update_server_artifact_set_invalid",
+            "the headless runtime artifact set is invalid",
+        ));
+    }
+    let mut server_targets = std::collections::BTreeSet::new();
+    for artifact in &manifest.server_artifacts {
+        validate_server_artifact(artifact, &manifest.tag)?;
+        if !server_targets.insert((artifact.os.as_str(), artifact.arch.as_str())) {
+            return Err(AppUpdateError::new(
+                "app_update_server_artifact_duplicate",
+                "the update manifest contains a duplicate headless runtime target",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_server_artifact(artifact: &ServerArtifact, tag: &str) -> AppUpdateResult<()> {
+    if !matches!(artifact.os.as_str(), "linux" | "macos") {
+        return Err(AppUpdateError::new(
+            "app_update_server_artifact_target_invalid",
+            "a headless runtime artifact target is invalid",
+        ));
+    }
+    if !matches!(artifact.arch.as_str(), "x86_64" | "arm64") {
+        return Err(AppUpdateError::new(
+            "app_update_server_artifact_target_invalid",
+            "a headless runtime artifact architecture is invalid",
+        ));
+    }
+    validate_target_token(&artifact.os)?;
+    validate_target_token(&artifact.arch)?;
+    if artifact.size == 0 || artifact.size > MAX_ARTIFACT_BYTES {
+        return Err(AppUpdateError::new(
+            "app_update_server_artifact_size_invalid",
+            "a headless runtime artifact size is invalid",
+        ));
+    }
+    if !valid_hex_digest(&artifact.sha256, 64) {
+        return Err(AppUpdateError::new(
+            "app_update_server_artifact_digest_invalid",
+            "a headless runtime artifact digest is invalid",
+        ));
+    }
+    validate_release_url(&artifact.url, tag, true)
+}
+
+fn validate_target_token(token: &str) -> AppUpdateResult<()> {
+    if token.is_empty()
+        || token.len() > 40
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(AppUpdateError::new(
+            "app_update_artifact_target_invalid",
+            "an update artifact target is invalid",
+        ));
+    }
     Ok(())
 }
 
 fn validate_artifact(artifact: &UpdateArtifact, tag: &str) -> AppUpdateResult<()> {
     for token in [&artifact.os, &artifact.arch, &artifact.package] {
-        if token.is_empty()
-            || token.len() > 40
-            || !token
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-        {
-            return Err(AppUpdateError::new(
-                "app_update_artifact_target_invalid",
-                "an update artifact target is invalid",
-            ));
-        }
+        validate_target_token(token)?;
     }
     if artifact.size == 0 || artifact.size > MAX_ARTIFACT_BYTES {
         return Err(AppUpdateError::new(
@@ -430,6 +507,113 @@ mod tests {
             .unwrap_err()
             .code,
             "app_update_release_url_invalid"
+        );
+    }
+
+    fn manifest_with_server_artifacts() -> serde_json::Value {
+        let mut value = manifest();
+        value["server_artifacts"] = json!([
+            {
+                "os": "linux",
+                "arch": "x86_64",
+                "url": "https://github.com/vibex-ai/vibex/releases/download/v0.2.0/vibex-server-0.2.0-linux-x86_64.tar.gz",
+                "size": 4,
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            {
+                "os": "linux",
+                "arch": "arm64",
+                "url": "https://github.com/vibex-ai/vibex/releases/download/v0.2.0/vibex-server-0.2.0-linux-aarch64.tar.gz",
+                "size": 4,
+                "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            }
+        ]);
+        value
+    }
+
+    #[test]
+    fn selects_server_artifacts_without_touching_desktop_packages() {
+        let (raw, signature, public_key) = signed_manifest(manifest_with_server_artifacts());
+        let verified = verify_manifest(
+            &raw,
+            &signature,
+            &public_key,
+            UpdateChannel::Stable,
+            "v0.2.0",
+        )
+        .unwrap();
+        assert_eq!(verified.manifest.artifacts.len(), 2);
+        let server = verified
+            .server_artifact("linux", "x86_64")
+            .expect("the Linux server artifact is selected");
+        assert_eq!(server.size, 4);
+        assert!(verified.server_artifact("macos", "arm64").is_none());
+
+        // An older manifest without the optional field still verifies and
+        // simply exposes no headless runtime artifact.
+        let (raw, signature, public_key) = signed_manifest(manifest());
+        let verified = verify_manifest(
+            &raw,
+            &signature,
+            &public_key,
+            UpdateChannel::Stable,
+            "v0.2.0",
+        )
+        .unwrap();
+        assert!(verified.manifest.server_artifacts.is_empty());
+        assert!(verified.server_artifact("linux", "x86_64").is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_server_artifacts() {
+        let mut wrong_tag = manifest_with_server_artifacts();
+        wrong_tag["server_artifacts"][0]["url"] = json!(
+            "https://github.com/vibex-ai/vibex/releases/download/v0.1.0/vibex-server-0.2.0-linux-x86_64.tar.gz"
+        );
+        let (raw, signature, public_key) = signed_manifest(wrong_tag);
+        assert_eq!(
+            verify_manifest(
+                &raw,
+                &signature,
+                &public_key,
+                UpdateChannel::Stable,
+                "v0.2.0"
+            )
+            .unwrap_err()
+            .code,
+            "app_update_release_url_invalid"
+        );
+
+        let mut duplicate = manifest_with_server_artifacts();
+        duplicate["server_artifacts"][1]["arch"] = json!("x86_64");
+        let (raw, signature, public_key) = signed_manifest(duplicate);
+        assert_eq!(
+            verify_manifest(
+                &raw,
+                &signature,
+                &public_key,
+                UpdateChannel::Stable,
+                "v0.2.0"
+            )
+            .unwrap_err()
+            .code,
+            "app_update_server_artifact_duplicate"
+        );
+
+        let mut bad_arch = manifest_with_server_artifacts();
+        bad_arch["server_artifacts"][0]["arch"] = json!("aarch64");
+        let (raw, signature, public_key) = signed_manifest(bad_arch);
+        assert_eq!(
+            verify_manifest(
+                &raw,
+                &signature,
+                &public_key,
+                UpdateChannel::Stable,
+                "v0.2.0"
+            )
+            .unwrap_err()
+            .code,
+            "app_update_server_artifact_target_invalid"
         );
     }
 }

@@ -6,7 +6,7 @@ use semver::Version;
 use sha2::{Digest as _, Sha256, Sha512};
 use url::Url;
 use vibex_app_update::{
-    InstallMode, UpdateArtifact, UpdateChannel, UpdateManifest, verify_manifest,
+    InstallMode, ServerArtifact, UpdateArtifact, UpdateChannel, UpdateManifest, verify_manifest,
 };
 
 fn main() -> ExitCode {
@@ -26,6 +26,7 @@ struct Arguments {
     output: PathBuf,
     signature_output: PathBuf,
     artifacts: Vec<ArtifactArgument>,
+    server_artifacts: Vec<ServerArtifactArgument>,
 }
 
 struct ArtifactArgument {
@@ -33,6 +34,13 @@ struct ArtifactArgument {
     arch: String,
     package: String,
     install_mode: InstallMode,
+    path: PathBuf,
+    url: Url,
+}
+
+struct ServerArtifactArgument {
+    os: String,
+    arch: String,
     path: PathBuf,
     url: Url,
 }
@@ -46,6 +54,11 @@ fn run() -> Result<(), String> {
         .into_iter()
         .map(|artifact| build_artifact(artifact, &tag))
         .collect::<Result<Vec<_>, _>>()?;
+    let server_artifacts = arguments
+        .server_artifacts
+        .into_iter()
+        .map(|artifact| build_server_artifact(artifact, &tag))
+        .collect::<Result<Vec<_>, _>>()?;
     let manifest = UpdateManifest {
         schema: 1,
         channel: arguments.channel,
@@ -58,6 +71,7 @@ fn run() -> Result<(), String> {
         ))
         .expect("release notes URL is valid"),
         artifacts,
+        server_artifacts,
     };
     let mut raw = serde_json::to_vec_pretty(&manifest)
         .map_err(|_| "manifest JSON could not be encoded".to_string())?;
@@ -89,6 +103,7 @@ fn parse_arguments(values: Vec<String>) -> Result<Arguments, String> {
     let mut output = None;
     let mut signature_output = None;
     let mut artifacts = Vec::new();
+    let mut server_artifacts = Vec::new();
     let mut values = values.into_iter();
     while let Some(flag) = values.next() {
         let value = values
@@ -106,6 +121,7 @@ fn parse_arguments(values: Vec<String>) -> Result<Arguments, String> {
             "--output" => output = Some(PathBuf::from(value)),
             "--signature-output" => signature_output = Some(PathBuf::from(value)),
             "--artifact" => artifacts.push(parse_artifact(&value)?),
+            "--server-artifact" => server_artifacts.push(parse_server_artifact(&value)?),
             _ => return Err(format!("unknown argument {flag}")),
         }
     }
@@ -125,6 +141,7 @@ fn parse_arguments(values: Vec<String>) -> Result<Arguments, String> {
         signature_output: signature_output
             .ok_or_else(|| "--signature-output is required".to_string())?,
         artifacts,
+        server_artifacts,
     })
 }
 
@@ -161,18 +178,48 @@ fn parse_artifact(value: &str) -> Result<ArtifactArgument, String> {
     })
 }
 
+fn parse_server_artifact(value: &str) -> Result<ServerArtifactArgument, String> {
+    let parts = value.split('|').collect::<Vec<_>>();
+    let [os, arch, path, url] = parts.as_slice() else {
+        return Err("--server-artifact must be os|arch|path|download_url".to_string());
+    };
+    Ok(ServerArtifactArgument {
+        os: (*os).to_string(),
+        arch: (*arch).to_string(),
+        path: PathBuf::from(path),
+        url: Url::parse(url).map_err(|_| "server artifact download_url is invalid".to_string())?,
+    })
+}
+
+fn build_server_artifact(
+    argument: ServerArtifactArgument,
+    tag: &str,
+) -> Result<ServerArtifact, String> {
+    let (size, sha256, _) = hash_file(&argument.path)?;
+    if size == 0 {
+        return Err(format!(
+            "server artifact is empty: {}",
+            argument.path.display()
+        ));
+    }
+    if !argument
+        .url
+        .path()
+        .starts_with(&format!("/vibex-ai/vibex/releases/download/{tag}/"))
+    {
+        return Err("server artifact URL tag does not match the manifest version".to_string());
+    }
+    Ok(ServerArtifact {
+        os: argument.os,
+        arch: argument.arch,
+        url: argument.url,
+        size,
+        sha256,
+    })
+}
+
 fn build_artifact(argument: ArtifactArgument, tag: &str) -> Result<UpdateArtifact, String> {
-    let mut file = fs::File::open(&argument.path)
-        .map_err(|_| format!("artifact could not be read: {}", argument.path.display()))?;
-    let size = file
-        .metadata()
-        .map_err(|_| {
-            format!(
-                "artifact metadata could not be read: {}",
-                argument.path.display()
-            )
-        })?
-        .len();
+    let (size, sha256, sha512) = hash_file(&argument.path)?;
     if size == 0 {
         return Err(format!("artifact is empty: {}", argument.path.display()));
     }
@@ -183,19 +230,6 @@ fn build_artifact(argument: ArtifactArgument, tag: &str) -> Result<UpdateArtifac
     {
         return Err("artifact URL tag does not match the manifest version".to_string());
     }
-    let mut sha256 = Sha256::new();
-    let mut sha512 = Sha512::new();
-    let mut buffer = vec![0u8; 1024 * 1024];
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .map_err(|_| format!("artifact could not be hashed: {}", argument.path.display()))?;
-        if count == 0 {
-            break;
-        }
-        sha256.update(&buffer[..count]);
-        sha512.update(&buffer[..count]);
-    }
     Ok(UpdateArtifact {
         os: argument.os,
         arch: argument.arch,
@@ -203,9 +237,36 @@ fn build_artifact(argument: ArtifactArgument, tag: &str) -> Result<UpdateArtifac
         install_mode: argument.install_mode,
         url: argument.url,
         size,
-        sha256: hex_lower(&sha256.finalize()),
-        sha512: Some(hex_lower(&sha512.finalize())),
+        sha256,
+        sha512: Some(sha512),
     })
+}
+
+fn hash_file(path: &PathBuf) -> Result<(u64, String, String), String> {
+    let mut file = fs::File::open(path)
+        .map_err(|_| format!("artifact could not be read: {}", path.display()))?;
+    let size = file
+        .metadata()
+        .map_err(|_| format!("artifact metadata could not be read: {}", path.display()))?
+        .len();
+    let mut sha256 = Sha256::new();
+    let mut sha512 = Sha512::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| format!("artifact could not be hashed: {}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        sha256.update(&buffer[..count]);
+        sha512.update(&buffer[..count]);
+    }
+    Ok((
+        size,
+        hex_lower(&sha256.finalize()),
+        hex_lower(&sha512.finalize()),
+    ))
 }
 
 fn signing_key_from_environment() -> Result<SigningKey, String> {

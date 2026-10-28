@@ -13,6 +13,7 @@ embeds the other product's assets.
 | Desktop RC/Stable Windows x86_64/aarch64 | NSIS `.exe` | `node scripts/package-desktop-release.mjs --platform windows --arch x86_64\|aarch64` | Source, Cargo lock, native Windows runner (aarch64 via cross-compile) | Package existence and checksum; Authenticode when credentials exist |
 | Android mobile | Signed native GPUI APK + AAB | `pnpm package:mobile:android` locally; tagged workflow signs before upload | Rust source, Cargo lock, pinned gpui-pre/gpui-pre-mobile revisions, Gradle wrapper, Android API 35/NDK, release key | `pnpm check:mobile-native`, `apksigner`/`jarsigner` verification, APK/AAB checksum, device validation |
 | iOS mobile | Unsigned simulator app + unsigned device IPA + XCFramework | `pnpm build:mobile:ios` and `pnpm package:mobile:ios` on macOS | Rust source, Cargo lock, pinned gpui-pre/gpui-pre-mobile revisions, XcodeGen project | `pnpm check:mobile-native`, simulator/device validation; the installer re-signs the IPA, see [Installing the Unsigned iOS Build](./ios-unsigned-install.md) |
+| Headless server Linux x86_64/aarch64 | `vibex-server-<version>-linux-<arch>.tar.gz` + `.sha256` | `deploy/server/Dockerfile.build` in the tagged workflow; the link step runs inside the pinned Debian 12 image | Debian 12 base digest, Rust 1.97.0, Cargo lock, deterministic tar | `scripts/check-server-artifact.mjs` (ELF arch, no `libdbus`/`libsystemd`, `GLIBC_*` ≤ 2.35), `sha256sum -c`, clean Ubuntu 22.04/24.04 `--version` and `config-check` |
 | Relay | Transport container | `pnpm smoke:relay:local` plus deployment scripts | Rust source and Cargo lock | Health/API smoke, TLS/NAT/operator validation |
 | Terminal (TUI) | Ships inside the desktop packages as a second, non-main `vibex` binary | Same package commands as the desktop channel | Same as the desktop channel | The binary must be reachable on `PATH` after install on Linux and macOS, and the console subsystem must be verified on Windows. |
 | AUR `vibex-bin` | `PKGBUILD` + `.SRCINFO` that unpack the published Linux `.deb` | `.github/workflows/publish-aur.yml`; local dry run is `node scripts/publish-aur.mjs --version <x.y.z> --dry-run` | Stable only; the checksums of the release `.deb` payloads | `makepkg` must build the package from the release assets, `namcap` runs on it, and `publish-aur.mjs` refuses a prerelease or a version that is not newer than the AUR's |
@@ -27,6 +28,24 @@ embeds the other product's assets.
 - AppImage packaging stays x86_64-only. The linuxdeploy toolchain cannot
   process cross-architecture binaries, so aarch64 releases ship the `.deb`
   package instead of an AppImage.
+
+## Headless Server Packaging Rules
+
+- Linux server artifacts are linked inside `deploy/server/Dockerfile.build`, a
+  Debian 12 image pinned by digest. Never build them on the `ubuntu-24.04`
+  release runner: its glibc is too new and the artifact would not run on
+  Ubuntu 22.04.
+- The supported floor is glibc 2.35 (Ubuntu 22.04). Building on Debian 12 is
+  not enough on its own; `scripts/check-server-artifact.mjs` fails when any
+  referenced `GLIBC_*` symbol is newer than 2.35.
+- The headless server must not link `libdbus` or `libsystemd`; the OS keychain
+  is an opt-in desktop/TUI feature. The same checker enforces this.
+- The tarball contains exactly one top-level `vibex-server` file, plus a
+  `.sha256` beside it. The signed updater manifest carries the entries in
+  `server_artifacts`, selected by OS and architecture.
+- macOS server artifacts need Developer ID signing and notarization; they stay
+  deferred until those credentials are available and do not block the Linux
+  artifacts.
 
 ## Cross-Architecture Packaging Rules
 

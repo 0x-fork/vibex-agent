@@ -168,6 +168,13 @@ architecture (`arm64` or `x86_64`) against it. The Linux x86_64 package carries
 the currently approved PDFium runtime; every other packaging target remains
 build/package evidence until its target runtime review passes.
 
+The same signed manifest carries optional `server_artifacts` entries for the
+headless runtime (`linux/x86_64`, `linux/arm64`). They are built in the pinned
+Debian 12 image, checked against the glibc 2.35 floor, and published as
+`vibex-server-<version>-linux-<arch>.tar.gz` with a `.sha256`. Older clients
+ignore the field; the desktop selects a server artifact by OS and architecture
+and verifies its digest before uploading it over SSH.
+
 Before a release claim, validate the exact generated artifact on the intended
 device class. Exercise pairing, Direct/Tailnet/Relay route selection, reconnect,
 timeline catch-up, approval resolution, send/stop/continue, and credential
