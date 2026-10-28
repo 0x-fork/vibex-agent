@@ -10398,7 +10398,10 @@ dependencies = [
 name = "vibex-server"
 version = "0.1.0-rc.8"
 dependencies = [
+ "libc",
  "qrcode",
+ "serde",
+ "serde_json",
  "tokio",
  "vibex-agent",
  "vibex-browser",

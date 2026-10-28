@@ -1,8 +1,16 @@
 use std::error::Error;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::fmt;
+use std::fs;
+use std::io::ErrorKind;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 use tokio::signal;
 use vibex_core::{
     RemoteCreatePairingCodeRequest, RemoteDevicePermissionLevel, RemotePairingCodeLink, VibexError,
+    unix_timestamp_ms,
 };
 use vibex_db::{apply_migrations, open_database};
 use vibex_desktop_runtime::{
@@ -11,6 +19,127 @@ use vibex_desktop_runtime::{
 use vibex_remote::{RemoteIdentity, RemoteIdentityStore, RemoteTrustService};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const SERVER_STATE_FILE: &str = "server-state.json";
+const PAIRING_SCHEMA_VERSION: &str = "vibex-server-pairing.v1";
+const STATUS_SCHEMA_VERSION: &str = "vibex-server-status.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerState {
+    pid: u32,
+    port: u16,
+    version: String,
+    started_at_ms: i64,
+}
+
+/// Owns `<home>/server-state.json` for the lifetime of one `serve` process.
+/// A crash leaves the file behind on purpose: `status` can then report a stale
+/// pid instead of pretending nothing happened, and `stop` can refuse to signal
+/// a pid it cannot verify.
+struct ServerStateGuard {
+    path: PathBuf,
+    pid: u32,
+}
+
+impl ServerStateGuard {
+    fn install(config: &DesktopRuntimeConfig, port: u16) -> Result<Self, VibexError> {
+        let pid = std::process::id();
+        let state = ServerState {
+            pid,
+            port,
+            version: VERSION.to_string(),
+            started_at_ms: unix_timestamp_ms(),
+        };
+        fs::create_dir_all(&config.home_dir).map_err(|_| {
+            VibexError::storage(
+                "server_state_directory_failed",
+                "the runtime state directory could not be created",
+            )
+        })?;
+        let path = server_state_path(config);
+        let temporary = path.with_extension("json.tmp");
+        let encoded = serde_json::to_vec(&state).map_err(|_| {
+            VibexError::storage(
+                "server_state_encode_failed",
+                "the runtime state could not be encoded",
+            )
+        })?;
+        fs::write(&temporary, encoded).map_err(|_| {
+            VibexError::storage(
+                "server_state_write_failed",
+                "the runtime state could not be written",
+            )
+        })?;
+        #[cfg(windows)]
+        let _ = fs::remove_file(&path);
+        fs::rename(&temporary, &path).map_err(|_| {
+            VibexError::storage(
+                "server_state_commit_failed",
+                "the runtime state could not be committed",
+            )
+        })?;
+        Ok(Self { path, pid })
+    }
+}
+
+impl Drop for ServerStateGuard {
+    fn drop(&mut self) {
+        let owned = fs::read(&self.path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<ServerState>(&raw).ok())
+            .is_some_and(|state| state.pid == self.pid);
+        if owned {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusJson {
+    schema_version: &'static str,
+    running: bool,
+    pid: Option<u32>,
+    port: u16,
+    version: &'static str,
+    home: String,
+    health: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingJson {
+    schema_version: &'static str,
+    server_id: String,
+    server_version: &'static str,
+    pairing_code: String,
+    pairing_link: String,
+    tls_certificate_der: Option<String>,
+    endpoint: String,
+    expires_at_ms: i64,
+}
+
+impl fmt::Debug for PairingJson {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The code and the link both carry the one-time secret. `--json` writes
+        // them to stdout because that is the command's contract, but a debug
+        // log must never reproduce them.
+        formatter
+            .debug_struct("PairingJson")
+            .field("schema_version", &self.schema_version)
+            .field("server_id", &self.server_id)
+            .field("server_version", &self.server_version)
+            .field("pairing_code", &"<redacted>")
+            .field("pairing_link", &"<redacted>")
+            .field(
+                "tls_certificate_der",
+                &self.tls_certificate_der.as_ref().map(|_| "<redacted>"),
+            )
+            .field("endpoint", &self.endpoint)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -81,17 +210,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("configuration=valid");
             print_config_summary(&config);
         }
-        Command::PairingCode { permission, ttl_ms } => {
+        Command::PairingCode {
+            permission,
+            ttl_ms,
+            json,
+        } => {
             let config = headless_config()?;
             config_check(&config)?;
             let response = create_pairing_code(&config, permission, ttl_ms)?;
             let certificate = pinned_certificate_for_config(&config)?;
-            print_pairing_entry(&config, None, &response, certificate);
-            println!("warning=one-time code; it is not stored in plaintext");
+            if json {
+                print_pairing_json(&config, &response, certificate)?;
+            } else {
+                print_pairing_entry(&config, None, &response, certificate);
+                println!("warning=one-time code; it is not stored in plaintext");
+            }
         }
         Command::Serve { pairing } => serve(pairing).await?,
         Command::Tui { local } => tui(local).await?,
-        Command::Status => status()?,
+        Command::Status { json } => status(json)?,
+        Command::Stop => stop()?,
         Command::Revoke { device_id, reason } => revoke(&device_id, reason.as_deref())?,
     }
     Ok(())
@@ -110,10 +248,14 @@ enum Command {
         /// already running daemon.
         local: bool,
     },
-    Status,
+    Status {
+        json: bool,
+    },
+    Stop,
     PairingCode {
         permission: RemoteDevicePermissionLevel,
         ttl_ms: Option<u32>,
+        json: bool,
     },
     Revoke {
         device_id: String,
@@ -138,7 +280,10 @@ impl Command {
             "serve" => Ok(Self::Serve {
                 pairing: !args.iter().any(|arg| arg == "--no-pairing"),
             }),
-            "status" => Ok(Self::Status),
+            "status" => Ok(Self::Status {
+                json: args.iter().any(|arg| arg == "--json"),
+            }),
+            "stop" => Ok(Self::Stop),
             "tui" => Ok(Self::Tui {
                 local: args.iter().any(|arg| arg == "--local"),
             }),
@@ -158,7 +303,11 @@ impl Command {
                         })
                     })
                     .transpose()?;
-                Ok(Self::PairingCode { permission, ttl_ms })
+                Ok(Self::PairingCode {
+                    permission,
+                    ttl_ms,
+                    json: args.iter().any(|arg| arg == "--json"),
+                })
             }
             "revoke" => {
                 let device_id = args.get(1).cloned().ok_or_else(|| {
@@ -185,8 +334,14 @@ async fn serve(print_pairing: bool) -> Result<(), Box<dyn Error>> {
     config_check(&config)?;
     let runtime = DesktopRuntime::start(config.clone()).await?;
     let status = runtime.remote().gateway().status();
+    let port = status
+        .bound_addr
+        .map(|address| address.port())
+        .unwrap_or_else(|| configured_port(&config));
+    let _state = ServerStateGuard::install(&config, port)?;
     let identity = runtime.remote().gateway().identity()?;
     println!("server_id={}", identity.server_id());
+    println!("pid={}", std::process::id());
     println!(
         "server_identity_public_key={}",
         identity.public_key_base64()
@@ -343,6 +498,36 @@ fn print_pairing_entry(
     }
 }
 
+fn print_pairing_json(
+    config: &DesktopRuntimeConfig,
+    response: &vibex_core::RemoteCreatePairingCodeResponse,
+    certificate: Option<String>,
+) -> Result<(), VibexError> {
+    let link = pairing_link(config, None, &response.pairing_code, certificate)?;
+    let encoded_link = link.encode()?;
+    let identity = load_remote_identity(config)?;
+    let payload = PairingJson {
+        schema_version: PAIRING_SCHEMA_VERSION,
+        server_id: identity.server_id().to_string(),
+        server_version: VERSION,
+        pairing_code: response.pairing_code.clone(),
+        pairing_link: encoded_link,
+        tls_certificate_der: link.tls_certificate_der.clone(),
+        endpoint: link.server_url.clone(),
+        expires_at_ms: response.pairing.expires_at_ms,
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&payload).map_err(|_| {
+            VibexError::storage(
+                "server_pairing_encode_failed",
+                "the pairing entry could not be encoded",
+            )
+        })?
+    );
+    Ok(())
+}
+
 fn pairing_link(
     config: &DesktopRuntimeConfig,
     bound: Option<SocketAddr>,
@@ -455,28 +640,312 @@ fn load_remote_identity(config: &DesktopRuntimeConfig) -> Result<RemoteIdentity,
     RemoteIdentityStore::new(path).load_or_create()
 }
 
-fn status() -> Result<(), VibexError> {
-    let config = DesktopRuntimeConfig::headless_from_environment()?;
+fn status(json: bool) -> Result<(), VibexError> {
+    let config = headless_config()?;
     config_check(&config)?;
-    let running = if config.acquire_home_lock {
-        match DesktopHomeLock::acquire(&config.home_dir, &config.application_id) {
-            Ok(lock) => {
-                drop(lock);
-                false
-            }
-            Err(error) if error.code == "desktop_runtime_home_locked" => true,
-            Err(error) => return Err(error),
-        }
+    fs::create_dir_all(&config.home_dir).map_err(|_| {
+        VibexError::storage(
+            "server_state_directory_failed",
+            "the runtime state directory could not be created",
+        )
+    })?;
+    let state = read_server_state(&config)?;
+    let state_alive = state
+        .as_ref()
+        .is_some_and(|state| process_matches(state.pid));
+    let lock_held = home_lock_held(&config)?;
+    let running = state_alive || lock_held;
+    let pid = if state_alive {
+        state.as_ref().map(|state| state.pid)
     } else {
-        false
+        None
     };
-    println!("running={running}");
-    println!(
-        "configured_bind={}",
-        config.remote_gateway.service.bind_addr
-    );
-    println!("active_connections=unavailable_without_runtime_probe");
+    let port = if state_alive {
+        state.as_ref().map(|state| state.port)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| configured_port(&config));
+    let health = if running {
+        probe_health(&config, port)
+    } else {
+        "stopped"
+    };
+
+    if json {
+        let payload = StatusJson {
+            schema_version: STATUS_SCHEMA_VERSION,
+            running,
+            pid,
+            port,
+            version: VERSION,
+            home: config.home_dir.to_string_lossy().into_owned(),
+            health,
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&payload).map_err(|_| {
+                VibexError::storage(
+                    "server_status_encode_failed",
+                    "the runtime status could not be encoded",
+                )
+            })?
+        );
+    } else {
+        println!("running={running}");
+        if let Some(pid) = pid {
+            println!("pid={pid}");
+        }
+        println!("port={port}");
+        println!("version={VERSION}");
+        println!("home={}", config.home_dir.display());
+        println!("health={health}");
+        println!(
+            "configured_bind={}",
+            config.remote_gateway.service.bind_addr
+        );
+    }
     Ok(())
+}
+
+fn stop() -> Result<(), VibexError> {
+    let config = headless_config()?;
+    config_check(&config)?;
+    fs::create_dir_all(&config.home_dir).map_err(|_| {
+        VibexError::storage(
+            "server_state_directory_failed",
+            "the runtime state directory could not be created",
+        )
+    })?;
+    let path = server_state_path(&config);
+    let Some(state) = read_server_state(&config)? else {
+        if home_lock_held(&config)? {
+            return Err(VibexError::conflict(
+                "server_pid_missing",
+                "the runtime is running but has no state file; stop it from the console that started it",
+            ));
+        }
+        println!("already_stopped=true");
+        return Ok(());
+    };
+    let lock_held = home_lock_held(&config)?;
+    if config.acquire_home_lock && !lock_held {
+        // Nothing owns this home any more. The state is stale even if the pid
+        // still exists: never signal a stranger because of a recycled pid.
+        let _ = fs::remove_file(&path);
+        println!("already_stopped=true");
+        return Ok(());
+    }
+    if !process_matches(state.pid) {
+        if lock_held {
+            return Err(VibexError::conflict(
+                "server_pid_missing",
+                "the runtime owns this home but its state file does not name a matching process",
+            ));
+        }
+        // A crash leaves the state behind; the pid may now belong to something
+        // else. Never signal a pid that is not this runtime.
+        let _ = fs::remove_file(&path);
+        println!("already_stopped=true");
+        return Ok(());
+    }
+
+    terminate_process(state.pid)?;
+    wait_for_exit(state.pid, Duration::from_secs(10));
+    if process_matches(state.pid) {
+        kill_process(state.pid)?;
+        wait_for_exit(state.pid, Duration::from_secs(2));
+    }
+    if process_matches(state.pid) {
+        return Err(VibexError::storage(
+            "server_stop_failed",
+            "the runtime did not exit after SIGTERM and SIGKILL",
+        ));
+    }
+    let _ = fs::remove_file(&path);
+    println!("stopped=true");
+    println!("pid={}", state.pid);
+    Ok(())
+}
+
+fn wait_for_exit(pid: u32, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while process_matches(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32) -> Result<(), VibexError> {
+    signal_process(pid, libc::SIGTERM)
+}
+
+#[cfg(unix)]
+fn kill_process(pid: u32) -> Result<(), VibexError> {
+    signal_process(pid, libc::SIGKILL)
+}
+
+#[cfg(unix)]
+fn signal_process(pid: u32, signal: i32) -> Result<(), VibexError> {
+    let result = unsafe { libc::kill(pid as i32, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(VibexError::storage(
+            "server_signal_failed",
+            "the runtime process could not be signalled",
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process(_pid: u32) -> Result<(), VibexError> {
+    Err(VibexError::capability(
+        "server_stop_unsupported",
+        "stopping the runtime is only supported on Unix hosts",
+    ))
+}
+
+#[cfg(not(unix))]
+fn kill_process(_pid: u32) -> Result<(), VibexError> {
+    Err(VibexError::capability(
+        "server_stop_unsupported",
+        "stopping the runtime is only supported on Unix hosts",
+    ))
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    pid > 0 && unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(target_os = "linux")]
+fn process_matches(pid: u32) -> bool {
+    if !process_is_alive(pid) {
+        return false;
+    }
+    let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let arguments = raw
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .collect::<Vec<_>>();
+    command_is_serve(&arguments)
+}
+
+/// A bare `vibex-server` starts `serve` by default; every other subcommand is
+/// a client, a sidecar, or a one-shot command that must never be signalled.
+fn command_is_serve(arguments: &[&[u8]]) -> bool {
+    let Some(executable) = arguments.first() else {
+        return false;
+    };
+    if !executable.ends_with(b"vibex-server") {
+        return false;
+    }
+    arguments
+        .get(1)
+        .is_none_or(|command| *command == b"serve".as_slice())
+}
+
+/// macOS has no `/proc`; `ps` is the portable way to read the command line
+/// back before signalling a pid.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_matches(pid: u32) -> bool {
+    use std::process::Command;
+    if !process_is_alive(pid) {
+        return false;
+    }
+    let Ok(output) = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let command = String::from_utf8_lossy(&output.stdout);
+    command.contains("vibex-server")
+        && command
+            .split_whitespace()
+            .any(|argument| argument == "serve")
+}
+
+#[cfg(not(unix))]
+fn process_matches(_pid: u32) -> bool {
+    false
+}
+
+fn server_state_path(config: &DesktopRuntimeConfig) -> PathBuf {
+    config.home_dir.join(SERVER_STATE_FILE)
+}
+
+fn read_server_state(config: &DesktopRuntimeConfig) -> Result<Option<ServerState>, VibexError> {
+    let path = server_state_path(config);
+    match fs::read(&path) {
+        Ok(raw) => match serde_json::from_slice(&raw) {
+            Ok(state) => Ok(Some(state)),
+            Err(_) => {
+                // A truncated state file must not wedge the CLI; the next
+                // `serve` recreates it.
+                let _ = fs::remove_file(&path);
+                Ok(None)
+            }
+        },
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(VibexError::storage(
+            "server_state_read_failed",
+            "the runtime state file could not be read",
+        )),
+    }
+}
+
+fn home_lock_held(config: &DesktopRuntimeConfig) -> Result<bool, VibexError> {
+    if !config.acquire_home_lock {
+        return Ok(false);
+    }
+    match DesktopHomeLock::acquire(&config.home_dir, &config.application_id) {
+        Ok(lock) => {
+            drop(lock);
+            Ok(false)
+        }
+        Err(error) if error.code == "desktop_runtime_home_locked" => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+fn configured_port(config: &DesktopRuntimeConfig) -> u16 {
+    config
+        .remote_gateway
+        .service
+        .bind_addr
+        .parse::<SocketAddr>()
+        .map(|address| address.port())
+        .unwrap_or(0)
+}
+
+fn probe_health(config: &DesktopRuntimeConfig, port: u16) -> &'static str {
+    if port == 0 {
+        return "unreachable";
+    }
+    let bind_ip = config
+        .remote_gateway
+        .service
+        .bind_addr
+        .parse::<SocketAddr>()
+        .ok()
+        .map(|address| address.ip());
+    let ip = match bind_ip {
+        Some(IpAddr::V4(ip)) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        Some(IpAddr::V6(ip)) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        Some(ip) => ip,
+        None => IpAddr::V4(Ipv4Addr::LOCALHOST),
+    };
+    match TcpStream::connect_timeout(&SocketAddr::new(ip, port), Duration::from_millis(500)) {
+        Ok(_) => "ok",
+        Err(_) => "unreachable",
+    }
 }
 
 fn revoke(device_id: &str, reason: Option<&str>) -> Result<(), VibexError> {
@@ -553,7 +1022,7 @@ fn parse_permission(value: &str) -> Result<RemoteDevicePermissionLevel, VibexErr
 
 fn print_help() {
     println!("vibex-server {VERSION}");
-    println!("Usage: vibex-server [serve|status|pairing-code|revoke|config-check|tui]");
+    println!("Usage: vibex-server [serve|status|stop|pairing-code|revoke|config-check|tui]");
     println!("  --agent-delegation-mcp                run the Agent delegation MCP stdio sidecar");
     println!("  --browser-mcp                         run the embedded browser MCP stdio sidecar");
     println!(
@@ -562,8 +1031,10 @@ fn print_help() {
     println!("  --computer-mcp                        run the computer-use MCP stdio sidecar");
     println!("  computer <command>                    drive the desktop of a running runtime");
     println!("  serve [--no-pairing]                 run the authoritative headless runtime");
-    println!("  pairing-code [--permission full-control] [--ttl-ms N]");
+    println!("  pairing-code [--permission full-control] [--ttl-ms N] [--json]");
     println!("                                       mint a one-time code plus its pairing link");
+    println!("  status [--json]                      report runtime state and loopback health");
+    println!("  stop                                 stop the runtime owned by this home");
     println!("  revoke DEVICE_ID [--reason TEXT]     revoke a paired device");
     println!("  config-check                          validate VIBEX_* deployment settings");
     println!("  tui [--local]                        run the terminal client; attaches to a");
@@ -576,4 +1047,84 @@ fn print_help() {
     println!("VIBEX_TLS_MODE=pinned_certificate serves a self-signed certificate derived from the");
     println!("  runtime identity, so no CA is needed on the client; VIBEX_PUBLIC_HOST should then");
     println!("  name the address clients reach, for example 192.168.1.10:8765.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pairing_payload() -> PairingJson {
+        PairingJson {
+            schema_version: PAIRING_SCHEMA_VERSION,
+            server_id: "server-test".to_string(),
+            server_version: VERSION,
+            pairing_code: "123-456-789".to_string(),
+            pairing_link: "vibex://pair#/code/secret".to_string(),
+            tls_certificate_der: Some("certificate".to_string()),
+            endpoint: "https://127.0.0.1:8765".to_string(),
+            expires_at_ms: 42,
+        }
+    }
+
+    #[test]
+    fn pairing_json_debug_hides_the_one_time_secret() {
+        let debug = format!("{:?}", pairing_payload());
+        assert!(!debug.contains("123-456-789"));
+        assert!(!debug.contains("vibex://pair"));
+        assert!(debug.contains("server-test"));
+    }
+
+    #[test]
+    fn status_json_has_the_stable_schema() {
+        let payload = StatusJson {
+            schema_version: STATUS_SCHEMA_VERSION,
+            running: true,
+            pid: Some(7),
+            port: 8765,
+            version: VERSION,
+            home: "/tmp/vibex".to_string(),
+            health: "ok",
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
+        assert_eq!(value["schemaVersion"], "vibex-server-status.v1");
+        assert_eq!(value["running"], true);
+        assert_eq!(value["pid"], 7);
+        assert_eq!(value["port"], 8765);
+        assert_eq!(value["health"], "ok");
+    }
+
+    #[test]
+    fn a_bare_server_process_counts_as_serve() {
+        assert!(command_is_serve(&[b"vibex-server".as_slice()]));
+        assert!(command_is_serve(&[
+            b"/opt/vibex-server".as_slice(),
+            b"serve".as_slice(),
+            b"--no-pairing".as_slice()
+        ]));
+        assert!(!command_is_serve(&[
+            b"/opt/vibex-server".as_slice(),
+            b"tui".as_slice()
+        ]));
+        assert!(!command_is_serve(&[
+            b"/opt/vibex-server".as_slice(),
+            b"--help".as_slice()
+        ]));
+    }
+
+    #[test]
+    fn command_parsing_accepts_json_and_stop() {
+        assert!(matches!(
+            Command::parse(vec!["status".to_string(), "--json".to_string()]).unwrap(),
+            Command::Status { json: true }
+        ));
+        assert!(matches!(
+            Command::parse(vec!["stop".to_string()]).unwrap(),
+            Command::Stop
+        ));
+        assert!(matches!(
+            Command::parse(vec!["pairing-code".to_string(), "--json".to_string()]).unwrap(),
+            Command::PairingCode { json: true, .. }
+        ));
+    }
 }

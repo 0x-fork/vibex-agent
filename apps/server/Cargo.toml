@@ -8,6 +8,8 @@ repository.workspace = true
 
 [dependencies]
 qrcode.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 vibex-agent = { path = "../../crates/agent" }
 vibex-browser = { path = "../../crates/browser" }
@@ -18,6 +20,9 @@ vibex-desktop-runtime = { path = "../../crates/desktop-runtime", default-feature
 vibex-remote = { path = "../../crates/remote" }
 vibex-client = { path = "../tui", default-features = false }
 vibex-tui = { path = "../../crates/vibex-tui" }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [[bin]]
 name = "vibex-server"

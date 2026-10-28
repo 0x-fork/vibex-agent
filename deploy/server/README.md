@@ -155,6 +155,12 @@ other unauthenticated route. Alongside the code it prints a `pairing_link`
 rendering of the link; `docker exec vibex-server vibex-server pairing-code`
 mints a fresh set at any time.
 
+For automation, `pairing-code --json` prints one line with the
+`vibex-server-pairing.v1` schema (`serverId`, `serverVersion`, `pairingCode`,
+`pairingLink`, `tlsCertificateDer`, `endpoint`, `expiresAtMs`). Start a
+deployment with `serve --no-pairing` and mint codes on demand; the default
+`serve` keeps printing the code to stdout for the interactive flow.
+
 ## Local network (home or office LAN)
 
 The common self-hosted shape is one machine running `vibex-server` with a
@@ -228,9 +234,20 @@ the client to drop its stored credential.
 
 ```bash
 docker exec vibex-server vibex-server pairing-code --permission read-only
+docker exec vibex-server vibex-server pairing-code --json
 docker exec vibex-server vibex-server status
+docker exec vibex-server vibex-server status --json
+docker exec vibex-server vibex-server stop
 docker exec vibex-server vibex-server revoke DEVICE_ID --reason "lost device"
 ```
+
+`serve` writes `<VIBEX_HOME>/server-state.json` with its pid, bound port, and
+version. `status --json` reports `running`, `pid`, `port`, `version`, `home`,
+and `health` (`ok`, `unreachable`, or `stopped`), and probes the loopback
+listener rather than trusting the pid alone. `stop` verifies the home lock and
+the process command line before signalling, so a recycled pid is never killed;
+a runtime started before this state file existed must be stopped from its
+original console and reports `server_pid_missing`.
 
 `read-only` devices may read sessions, files, Git state, and provider
 storage records but cannot mutate anything. `approve-only` adds permission
